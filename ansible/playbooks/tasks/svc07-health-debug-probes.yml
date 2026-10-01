@@ -1,0 +1,159 @@
+---
+# tasks/svc07-health-debug-probes.yml — consolidated Phase-4 DEV-ONLY debug probes
+#
+# Imported ONCE from svc07-health.yml as the FIRST task in the play, guarded by
+#   - ansible.builtin.import_tasks: tasks/svc07-health-debug-probes.yml
+#     when: svc07_debug_instrumentation | default(false) | bool
+# so a normal run is byte-for-byte unaffected (Req 4.1, 4.7 / P8). NONE of the
+# probes here is inline in the functional Stage-1/Stage-2 health loops in
+# svc07-health.yml — those loops were implemented clean in Task 6.1 and MUST
+# stay clean; this include is the single home for the Phase-4 instrumentation
+# (Debug-Instrumentation Model, design plan item 4).
+#
+# These are the baseline svc-07-bootstrap.yml Phase-4 debug probes, consolidated:
+#   - the `docker ps -a` container listing at Phase-4 entry (+ its rc/stdout dump);
+#   - the Stage-1 and Stage-2 per-invocation probe log-appends
+#     (/tmp/svc07-stage1-probe.log, /tmp/svc07-stage2-probe.log on the guest);
+#   - the final Stage-1 `docker inspect` and Stage-2 `bao status` result dumps.
+#
+# NATIVE-ON-GUEST vs BASELINE DELEGATE_TO — DELIBERATE DEVIATION:
+# svc07-health.yml runs `hosts: openbao` NATIVELY on the guest (no delegate_to
+# anywhere — the HARD CONSTRAINT), so every probe below runs on the guest as an
+# ordinary task; the baseline's `delegate_to: svc07-20-01` is DROPPED (it would
+# reintroduce a delegate_to health-adjacent task and is unnecessary here — we ARE
+# on the guest). The baseline's per-attempt hostname/delegation-forensics
+# (the "REAL execution host" line that proved whether delegate_to landed on the
+# guest or the control node) is therefore moot in this native model and omitted.
+#
+# PER-ATTEMPT-INSIDE-LOOP vs FINAL-RESULT DUMPS — DELIBERATE DEVIATION:
+# The baseline appended a timestamped block to the stageN probe logs on EVERY
+# retry attempt by keying an in-lockstep `until` loop off a probe-only registered
+# var. That per-attempt-inside-the-loop capture cannot be preserved here without
+# re-inlining a debug task into the functional Stage-1/Stage-2 loops — which the
+# task constraints forbid (import_tasks is imported ONCE at play start, before the
+# functional loops even run, and is NOT inside their `until` loop). Per the task
+# guidance we therefore prefer the FINAL result dumps + a `docker ps -a`, and the
+# per-invocation log-appends run once each (not per attempt). The final Stage-1
+# `docker inspect` and Stage-2 `bao status` register dumps are reproduced
+# faithfully — they are the single most important probes and show exactly what
+# the functional gates evaluated on their final attempt. This deviation is noted
+# in the spec's validation notes.
+#
+# SECRET SAFETY (Req 4.4): every probe here touches only `docker ps -a`,
+# `docker inspect`, and `bao status -format=json` output — all of which expose
+# NO secret material (seal/init/HA status only). So `no_log: false` is correct
+# throughout this Phase-4 include; the operator MUST be able to read them.
+
+# --- Container listing at Phase-4 entry ------------------------------------- #
+# List ALL containers on the primary guest so the operator sees exactly what
+# exists at Phase-4 entry. Plain argv `docker ps -a` (NOT a Go-template
+# `--format`) to avoid the Jinja/Go-template double-evaluation trap. No secret,
+# so no_log:false.
+- name: "Health DEBUG | List all containers on the primary guest at Phase-4 entry (no secret)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - ps
+      - -a
+  register: svc07_debug_docker_ps
+  failed_when: false
+  changed_when: false
+  no_log: false
+
+- name: "Health DEBUG | Print `docker ps -a` rc/stdout/stderr from the primary guest (no secret)"
+  ansible.builtin.debug:
+    msg:
+      - "docker_ps_rc={{ svc07_debug_docker_ps.rc | default('n/a') }}"
+      - "docker_ps_stdout={{ svc07_debug_docker_ps.stdout | default('') }}"
+      - "docker_ps_stderr={{ svc07_debug_docker_ps.stderr | default('') }}"
+  no_log: false
+
+# --- Stage-1 probe log-append (single invocation) --------------------------- #
+# Baseline appended this block to /tmp/svc07-stage1-probe.log on EVERY Stage-1
+# retry attempt (in-lockstep loop). Here it runs ONCE (import_tasks is not inside
+# the functional Stage-1 `until` loop) — a deliberate, noted deviation from the
+# strict per-attempt capture. `tee -a` still appends (never truncates) so a
+# manual re-run of the debug import accumulates history. Uses plain
+# `docker inspect <name>` / `docker ps -a` (NO Go-template `--format`) to avoid
+# the Jinja/Go-template double-evaluation trap; the container name is a plain
+# Jinja var. No secret, so no_log:false. Read it with:
+#     ssh root@10.0.20.10 'cat /tmp/svc07-stage1-probe.log'
+- name: "Health DEBUG | Stage-1 probe — append cmd+output to /tmp/svc07-stage1-probe.log on the guest (no secret)"
+  ansible.builtin.shell: |
+    set -o pipefail
+    LOG=/tmp/svc07-stage1-probe.log
+    { echo "=== $(date -Is) STAGE1-PROBE on $(hostname) ==="
+      echo "+ docker inspect {{ svc07_openbao_primary_container_name }}"
+      docker inspect {{ svc07_openbao_primary_container_name }} 2>&1; echo "inspect_rc=$?"
+      echo "+ docker ps -a"
+      docker ps -a 2>&1
+      echo ""; } | tee -a "$LOG"
+  args:
+    executable: /bin/bash
+  register: svc07_stage1_probe
+  failed_when: false
+  changed_when: false
+  no_log: false
+
+# --- Stage-2 probe log-append (single invocation) --------------------------- #
+# Baseline appended this block to /tmp/svc07-stage2-probe.log on EVERY Stage-2
+# retry attempt. Here it runs ONCE (same deviation as the Stage-1 probe above).
+# The baseline's hostname/delegation-forensics line is omitted: svc07-health.yml
+# runs NATIVELY on the guest with no delegate_to, so "where did this actually
+# run" is unambiguous (always the guest). Uses plain `docker ps -a` (NO
+# Go-template `--format`). `bao status`/`docker exec` expose NO secret, so
+# no_log:false. Read it with:
+#     ssh root@10.0.20.10 'cat /tmp/svc07-stage2-probe.log'
+- name: "Health DEBUG | Stage-2 probe — append cmd+output to /tmp/svc07-stage2-probe.log on the guest (no secret)"
+  ansible.builtin.shell: |
+    set -o pipefail
+    LOG=/tmp/svc07-stage2-probe.log
+    TLS="{{ '-tls-skip-verify' if (svc07_openbao_primary_tls_skip_verify | default(true) | bool) else '' }}"
+    CTR="{{ svc07_openbao_primary_container_name }}"
+    BAO="{{ svc07_openbao_bao_bin }}"
+    { echo "=== $(date -Is) STAGE2-PROBE on $(hostname) ==="
+      echo "+ docker exec $CTR $BAO status $TLS -format=json"
+      docker exec "$CTR" "$BAO" status $TLS -format=json 2>&1; echo "exec_rc=$?"
+      echo "+ docker ps -a (containers visible to THIS docker daemon)"
+      docker ps -a 2>&1
+      echo ""; } | tee -a "$LOG"
+  args:
+    executable: /bin/bash
+  register: svc07_stage2_probe
+  failed_when: false
+  changed_when: false
+  no_log: false
+
+# --- Final Stage-1 / Stage-2 result dumps ----------------------------------- #
+# The single most important probes: print the FULL registered results of the
+# functional Stage-1 `docker inspect` and Stage-2 `bao status` loops so the
+# operator sees EXACTLY what each gate evaluated on its FINAL attempt. These
+# reference the functional tasks' registered vars (svc07_primary_container_running,
+# svc07_primary_status) from svc07-health.yml.
+#
+# NOTE ON ORDERING: because this include is imported as the FIRST task in the
+# play (so per-invocation probes are available at play start), the functional
+# Stage-1/Stage-2 loops have NOT yet run when these two dump tasks execute on the
+# import pass. They are `default('...')`-guarded so they emit a clear
+# "not yet evaluated" placeholder in that case rather than throwing on an
+# undefined var — the authoritative source of truth for the final gate state is
+# the play's own Stage-1/Stage-2 assert tasks, which fail with the full
+# diagnostic on timeout. `.cmd` shows the rendered argv to confirm no
+# Jinja/Go-template double-evaluation occurred. No secret, so no_log:false.
+- name: "Health DEBUG | Print the FULL Stage-1 `docker inspect` result (rc/stdout/stderr/cmd, no secret)"
+  ansible.builtin.debug:
+    msg:
+      - "stage1_rc={{ svc07_primary_container_running.rc | default('n/a — Stage-1 not yet evaluated at import time') }}"
+      - "stage1_stdout={{ svc07_primary_container_running.stdout | default('') }}"
+      - "stage1_stderr={{ svc07_primary_container_running.stderr | default('') }}"
+      - "stage1_cmd={{ svc07_primary_container_running.cmd | default('n/a') }}"
+  no_log: false
+
+- name: "Health DEBUG | Print the FULL Stage-2 `bao status` result (rc/stdout/stderr/cmd, no secret)"
+  ansible.builtin.debug:
+    msg:
+      - "stage2_rc={{ svc07_primary_status.rc | default('n/a — Stage-2 not yet evaluated at import time') }}"
+      - "stage2_stdout={{ svc07_primary_status.stdout | default('') }}"
+      - "stage2_stderr={{ svc07_primary_status.stderr | default('') }}"
+      - "stage2_cmd={{ svc07_primary_status.cmd | default('n/a') }}"
+  no_log: false

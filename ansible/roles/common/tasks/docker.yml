@@ -1,0 +1,146 @@
+---
+# Docker CE + Compose-plugin install/pin for the `common` role
+# (spec task 3.2, requirements 1.2 + 1.7 + 3.3, PF §9 / FR-9,
+# security-standards.md "single pin").
+#
+# THIS IS THE SINGLE Docker-install implementation on the platform. It is applied
+# per host at provision time (ADR-0003, superseding ADR-0002): services boot the
+# stock debian-12-standard template and this role installs Docker on top. Because
+# there is exactly one install implementation and one pin, every host reaches the
+# identical Docker/Compose version by construction, with nothing to drift; a
+# re-run against a converged host is a changed=0 no-op (Correctness Property P1).
+#
+# NEVER `latest` (requirement 1.2 / PF §9 / FR-9): docker-ce and docker-ce-cli
+# are installed at `common_docker_version_pin` with `state: present`; the Compose
+# and Buildx plugins and containerd.io are pinned to their own matching apt
+# version strings via `common_docker_compose_plugin_version_pin`,
+# `common_docker_buildx_plugin_version_pin`, and `common_containerd_version_pin`.
+# None of these use a floating specifier.
+#
+# SECRET-FREE (requirement 1.5 / P3): the only key installed here is Docker's
+# PUBLIC apt repository signing key — repo/key configuration, NOT a secret. No
+# credential appears in any task, variable, or file. The key is fetched to a
+# file-based keyring via an idempotent module (get_url), never piped through a
+# shell one-liner.
+#
+# IDEMPOTENT (requirement 1.3 / PF FR-9): every task uses a proper Ansible module
+# with correct change reporting. A pinned `state: present` install is a no-op
+# (changed=0) once the pinned version is already present, so a second run against
+# a converged (or pre-baked) host reports changed=0 for these Docker tasks. No
+# raw shell is used where a module exists.
+#
+# DEBIAN 12 ("bookworm") / amd64 scope (requirements 5.x): the repository is wired
+# for the Debian bookworm suite and amd64 arch. Ubuntu 24.04 ("noble") and arm64
+# are out of scope for this spec.
+
+# --- Prerequisites ----------------------------------------------------------
+# Packages needed to fetch and trust the Docker apt repository. `state: present`
+# (never `latest`): we only require them present, not floated to newest.
+- name: Install Docker apt-repository prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+
+# --- Docker apt repository signing key (PUBLIC key, not a secret) ------------
+# Ensure the keyring directory exists (Debian's conventional location for
+# third-party apt keyrings). Idempotent: changed only when created.
+- name: Ensure apt keyring directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Fetch Docker's official public apt signing key to a file-based keyring using an
+# idempotent module (get_url) rather than a piped `curl | gpg` shell one-liner.
+# get_url is idempotent: with a stable remote key and a fixed dest it reports
+# changed only when the file content actually differs. mode 0644 so apt can read
+# it. This is PUBLIC repo-signing material — explicitly NOT a secret (req 1.5).
+- name: Install Docker apt repository signing key (public)
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/debian/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+
+# --- Docker CE apt repository -----------------------------------------------
+# Declare the Docker CE repository using the idempotent deb822_repository module
+# (the modern, file-based apt source format) rather than hand-writing a
+# sources.list line. It references the keyring file above via Signed-By, so the
+# repo is authenticated by the public key we just installed. Wired for the
+# Debian bookworm suite and amd64 (spec scope). Notifies an apt-cache refresh so
+# the pinned package versions below resolve against fresh metadata.
+- name: Add Docker CE apt repository (Debian bookworm, amd64)
+  ansible.builtin.deb822_repository:
+    name: docker
+    types: [deb]
+    uris: https://download.docker.com/linux/debian
+    suites: [bookworm]
+    components: [stable]
+    architectures: [amd64]
+    signed_by: /etc/apt/keyrings/docker.asc
+    state: present
+    enabled: true
+  notify: Update apt cache after Docker repo change
+
+# Apply any pending repo-change cache refresh before the pinned installs run, so
+# the notified handler's cache update is guaranteed to have happened first.
+- name: Flush handlers so the Docker apt cache refresh runs before install
+  ansible.builtin.meta: flush_handlers
+
+# --- Docker CE + Compose plugin install at the single pin --------------------
+# docker-ce and docker-ce-cli are installed at the single platform pin
+# `common_docker_version_pin` using `state: present` with an explicit `=<version>`
+# — NEVER `latest`, never a floating specifier (requirement 1.2 / PF §9 / FR-9).
+# containerd.io, docker-buildx-plugin, and docker-compose-plugin carry their OWN
+# apt version strings (they are versioned independently of docker-ce in Docker's
+# repo), so each is pinned to its own matching variable rather than floated. A
+# pinned `state: present` install is idempotent — changed=0 once present.
+- name: Install Docker CE engine and CLI at the single version pin
+  ansible.builtin.apt:
+    name:
+      - "docker-ce={{ common_docker_version_pin }}"
+      - "docker-ce-cli={{ common_docker_version_pin }}"
+    state: present
+    allow_downgrade: true
+
+- name: Install containerd, Buildx, and Compose plugins at their pinned versions
+  ansible.builtin.apt:
+    name:
+      - "containerd.io={{ common_containerd_version_pin }}"
+      - "docker-buildx-plugin={{ common_docker_buildx_plugin_version_pin }}"
+      - "docker-compose-plugin={{ common_docker_compose_plugin_version_pin }}"
+    state: present
+    allow_downgrade: true
+
+# --- Docker service ----------------------------------------------------------
+# Enable the docker service so it starts across reboots. Same unprivileged-LXC /
+# bake-context guarding pattern task 3.1 used for the unattended-upgrades
+# service: `enabled: true` persists the intent, and we do NOT hard-fail if
+# systemd is not managing units during a template bake or inside an unprivileged
+# LXC. On a full host with systemd this leaves docker enabled+started; in a bake
+# context enabling is best-effort and never breaks the baseline. `failed_when:
+# false` + `changed_when: false` keep it from failing or churning a converged run.
+- name: Enable and start the docker service (best-effort under systemd)
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+  failed_when: false
+  changed_when: false
+
+# --- Compose-plugin verification (spec task 3.3) -----------------------------
+# Fills the seam left by task 3.2. Verifies the Compose v2 plugin is usable via
+# `community.docker.docker_compose_v2` conventions (NO shell `docker compose up`),
+# as a check-mode, resource-free, changed=0 probe that is guarded to never
+# hard-fail during a daemon-less template bake. See compose_verify.yml for the
+# full rationale on how it satisfies both AC 1.4 (module conventions) and AC 1.3 /
+# P1 (changed=0 + leaves no resources).
+- name: Verify the Compose plugin is usable (community.docker.docker_compose_v2)
+  ansible.builtin.include_tasks: compose_verify.yml

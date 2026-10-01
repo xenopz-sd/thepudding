@@ -1,0 +1,33 @@
+{#
+  templates/openbao-raft-snapshot.service.j2 — systemd service unit for the
+  nightly OpenBao Raft snapshot job (PRIMARY only). Rendered by openbao_install /
+  task 11.1 onto {{ openbao_backup_systemd_dir }}/{{ openbao_backup_service_name }}.service
+  and triggered by the companion .timer at 02:00 UTC.
+
+  This is a oneshot unit: it runs the snapshot script once per timer fire. The
+  never-committed PBS credential is loaded from the root-only EnvironmentFile
+  {{ openbao_backup_env_file }} (referenced by path; contents never logged).
+  EnvironmentFile is prefixed with "-" so a missing file does not abort the unit
+  when PBS is disabled (the script itself fails closed if PBS is enabled but the
+  credential is absent).
+#}
+# MANAGED BY ANSIBLE (openbao_install / task 11.1) — DO NOT EDIT BY HAND.
+[Unit]
+Description=OpenBao nightly Raft snapshot -> gate -> PBS (SVC-07 / Req 11)
+Documentation=file://{{ openbao_backup_script_path }}
+# The snapshot needs the primary container running; docker must be up first.
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Load the never-committed PBS credential (and any other runtime secret) from a
+# root-only file. "-" => tolerate the file being absent (PBS disabled case).
+EnvironmentFile=-{{ openbao_backup_env_file }}
+ExecStart={{ openbao_backup_script_path }}
+# Run as root: the script reads the root-only scoped-token file and drives
+# docker exec / proxmox-backup-client.
+User=root
+Group=root
+# Never let a hung snapshot run into the next night.
+TimeoutStartSec=3600

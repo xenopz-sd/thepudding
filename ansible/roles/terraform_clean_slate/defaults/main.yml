@@ -1,0 +1,39 @@
+---
+# Defaults for the `terraform_clean_slate` role (spec terraform-clean-slate-reset).
+#
+# The CANONICAL clean-slate reset of a Terraform-provisioned Proxmox guest:
+# `pct destroy` the guest, then `terraform state rm` its resource, so a subsequent
+# normal `terraform apply` recreates it TRULY fresh (no surviving Docker volume, no
+# stale init state). This is a DESTRUCTIVE development tool — every knob below is
+# OFF/empty by default and the role FAILS CLOSED without an explicit, matching
+# confirmation.
+#
+# It deliberately routes AROUND the `prevent_destroy = true` seatbelt on the guests
+# (which Terraform cannot toggle via a variable) by destroying out-of-band + removing
+# from state — the seatbelt stays intact for every normal operation.
+
+# MASTER opt-in. OFF by default: with this false the role destroys NOTHING (Req 1).
+clean_slate_enabled: false
+
+# MANDATORY per-guest confirm token (Req 2). Must MATCH the target's vmid (as a
+# string) or the role fails closed before any destroy. Supply per run, e.g.
+# `-e clean_slate_confirm=1070`. Empty default => nothing is ever destroyed by
+# accident. A token matching one target does NOT authorise another (validated per
+# target inside the loop).
+clean_slate_confirm: ""
+
+# Registry of guests to reset. Each entry MUST carry all of:
+#   name             — human label for the loud pre-flight (e.g. svc07-20-01)
+#   terraform_root   — repo-relative path to the guest's Terraform root
+#   resource_address — the guest's Terraform resource address (state rm target)
+#   node             — the Proxmox node hosting the guest (for `pct`)
+#   vmid             — the guest's VMID (for `pct` AND the confirm-token match)
+# Empty by default. Sourced from the Terraform root's resource addresses + the
+# inventory's node/vmid — NEVER hardcoded in the role. Example:
+#   clean_slate_targets:
+#     - name: svc07-20-01
+#       terraform_root: infra/projects/svc-07-secrets-manager
+#       resource_address: proxmox_virtual_environment_container.primary
+#       node: shrimp
+#       vmid: 1070
+clean_slate_targets: []

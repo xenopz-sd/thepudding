@@ -1,0 +1,487 @@
+---
+# platform-bootstrap.yml — Platform Prerequisites Bootstrap — Day-0 orchestrator.
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/ (requirements.md,
+# design.md, tasks.md).
+#
+# SKELETON (spec task 3.1): this play establishes the thin-orchestrator shape,
+# the play-level vars, and the empty per-bucket block/rescue wrappers. The real
+# per-bucket `import_role` bodies + the throwaway-guard consult land in SPEC
+# TASK 9 (9.1 wires the buckets, 9.2 wires the guard consult into host + api).
+#
+# THIN ORCHESTRATOR: mirrors the thinned svc-07-bootstrap.yml — a Day-0
+# orchestrator that drives focused bucket roles, each behind its own per-phase
+# block/rescue that preserves a phase-naming `fail` diagnostic in the play. The
+# three selectable buckets (Req 1.2):
+#   * host       — over SSH to the Proxmox host: opt-in PVE identity
+#                  (platform_pve_identity), ensure the base template
+#                  (platform_host_prep), and — as a LATER phase — the host L3
+#                  SDN gateway (platform_gateway, see the reorder note below).
+#   * api        — against the Proxmox API: terraform apply of the
+#                  platform-foundation root (platform_api).
+#   * devmachine — on the developer's workstation: emit (default) / apply the
+#                  static route + ~/.ssh/config identity pin (platform_devmachine).
+# platform_preflight runs first for every invocation. The role internals hold
+# the tasks; this play only sequences and phase-names.
+#
+# PHASE ORDER (Fix A — reorder, ADR-0010): identity -> template -> api -> gateway.
+#   The host L3 gateway (platform_gateway / the sdn_gateway role) binds the
+#   gateway address .1 to the SDN VNet bridge `p<vlan>` (e.g. `p20`). That bridge
+#   is created by the api bucket's `terraform apply` of the platform-foundation
+#   SDN fabric. On a TRUE clean slate (no pre-existing `p20`) the gateway
+#   therefore CANNOT run before the api bucket — it fails closed with "Device p20
+#   does not exist". So the gateway is SPLIT OUT of the host bucket's inline
+#   sequence into its own `platform_gateway` phase, sequenced AFTER the api
+#   block. It is still HOST-layer config, so it runs whenever `host` is selected
+#   (`'host' in platform_selected_buckets`) — but only after the fabric exists.
+#   The effective combined `host,api` / `all` order is:
+#     platform_pve_identity (mint token) -> platform_host_prep (ensure template)
+#     -> platform_api (terraform apply creates p20) -> platform_gateway (bind .1
+#     to p20). If `host` is selected WITHOUT `api` on a clean slate where `p20`
+#     does not already exist, platform_preflight fails closed naming the api
+#     bucket / that `terraform apply` must run first (the cross-bucket
+#     precondition, in the opposite direction to the api-needs-token one).
+#
+# DUAL ROLE OF ANSIBLE (design "central architectural seam"): this play runs as
+# the Day-0 Workflow ORCHESTRATOR on hosts: localhost. Its roles drive `pveum`
+# over SSH, `pveam`, the sdn_gateway role, and a child-process `terraform apply`
+# of platform-foundation. It never parses .tfstate or queries Proxmox for host
+# discovery — the Terraform->Ansible handoff stays one-directional and
+# file-mediated (integration-boundaries.md §4).
+#
+# Operator entry point (service-installer.md §2):
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/platform-bootstrap.yml \
+#     -e cluster_env_file=cluster.dev.env -e bootstrap_scope=all
+- name: Platform prerequisites bootstrap — Day-0 orchestrator
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  # any_errors_fatal so a failed bucket aborts the whole run immediately rather
+  # than continuing to the next bucket (Req 1; design "Error Handling").
+  any_errors_fatal: true
+  vars:
+    # --- PlayLevelVars (design "Component 1" / "Data Models") — cross-bucket
+    # constants only. Every bucket-specific var lives in its role's
+    # defaults/main.yml; only constants read by MORE THAN ONE role (or by the
+    # play itself) stay here. ---
+
+    # Cluster_Env_File — the gitignored KEY=VALUE .env the orchestrator reads its
+    # Proxmox/provider parameters from. Overridable with -e cluster_env_file=...
+    cluster_env_file: cluster.env
+    # Bucket selection (Req 1.2): `all` (default), a single bucket
+    # (host / api / devmachine), or a comma-separated subset. Parsed once into
+    # platform_selected_buckets below.
+    bootstrap_scope: all
+    # OPT-IN PVE identity creation (Req 2.1): default OFF, so routine host runs
+    # need no admin credential. Set -e bootstrap_pve_identity=true to mint the
+    # terraform@pve role + token.
+    bootstrap_pve_identity: false
+    # OPT-IN force-recreate of the terraform@pve token (Req 2.3): default OFF.
+    # PVE never re-emits an existing token's secret, so a deliberate rotation
+    # re-mints under a fresh secret only when this is true.
+    bootstrap_pve_token_force: false
+    # DevMachine emit (default) vs apply (Req 5.2): default emit-only, mutating
+    # nothing. Set -e devmachine_apply=true to apply the route + ssh_config.
+    devmachine_apply: false
+    # Repository root. The play runs on localhost from anywhere; roots and
+    # helpers are addressed relative to the repo root, anchored to the
+    # playbook's own location (…/ansible/playbooks/) two levels up.
+    platform_repo_root: "{{ playbook_dir | dirname | dirname }}"
+    # Project venv python (dev-workflow.md Python Environment Invocation rule):
+    # helpers are invoked through the devinfra venv interpreter by absolute path.
+    platform_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+    # Throwaway-cluster guard + allowlist paths (repo-relative). Cross-bucket
+    # constants read by the host + api guard consults wired in spec task 9.2.
+    platform_throwaway_guard: scripts/installer/throwaway_guard.py
+    platform_throwaway_allowlist: scripts/installer/throwaway-clusters.yml
+    # Agent Live-Test Authorization (testing-strategy.md; Req 7.2). Truthy ONLY
+    # when the AGENT_LIVE_AUTHORIZED interlock is set (non-empty) in the process
+    # environment. Gates the throwaway-guard consult on the destructive buckets
+    # (host + api) wired in spec task 9.2: an armed run consults the guard before
+    # any mutation, while an ordinary operator run (interlock unset) is
+    # unaffected. Read from the ENVIRONMENT, never a committed default.
+    agent_live_run: "{{ (lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') | trim) | length > 0 }}"
+    # bootstrap_scope parsed to a list ONCE (accepts `all` or a comma-list);
+    # each bucket block is gated on membership in this list (Req 1.2, 1.3).
+    platform_selected_buckets: >-
+      {{ ['host', 'api', 'devmachine'] if (bootstrap_scope | trim) == 'all'
+         else (bootstrap_scope | split(',') | map('trim') | select | list) }}
+
+    # --- Clean-slate reset controls (spec platform-clean-slate, Component 2;
+    # Req 1, 5) — the tear-DOWN counterpart to the bring-up buckets above.
+    # Off by default; the clean-slate branch in tasks: routes to the reset path
+    # (the platform_clean_slate role) ONLY when clean_slate is truthy, and EVERY
+    # bring-up phase below is additionally gated `when: not clean_slate` so a
+    # clean-slate invocation runs the reset INSTEAD of the bring-up. All defaults
+    # keep the destructive path OFF and scoped safely. Read by BOTH the play's
+    # `when:` gates AND the platform_clean_slate role. ---
+
+    # Master switch. -e clean_slate=true routes to the tear-down branch.
+    clean_slate: false
+    # Confirmation token (Req 5). Empty => interactive confirmation prompt is
+    # shown before any destruction; `force` (-e clean_slate_confirm=force) skips
+    # the prompt and proceeds. Mirrors svc07_clean_slate's confirm gate.
+    clean_slate_confirm: ""
+    # Reboot / SDN-reload teardown step (Req 4). OPT-IN, default OFF, NEVER
+    # silent: `terraform destroy` alone does not reliably clear a stuck Proxmox
+    # SDN zone/bridge (it can persist in an ERROR state until the host re-reads
+    # its generated interfaces.d). When this stays false AND the SDN zone/bridge
+    # survives Fabric_Teardown, the role HALTS naming the survivor and directing
+    # a reboot (no false-clean) rather than rebooting a shared host silently.
+    platform_clean_slate_reboot: false
+    # Teardown scope (Req 1.3). SAFE default `all`: the fully-guarded teardown
+    # that discovers services on the fabric and invokes each one's OWN
+    # clean-slate BEFORE the fabric comes down. `fabric-only` skips the service
+    # clean-slates but still fails closed if a discovered service's guest is
+    # still attached to the fabric (it does not silently orphan-destroy). This is
+    # the tear-down scope knob, distinct from the bring-up `bootstrap_scope`.
+    clean_slate_scope: all         # all | fabric-only
+
+  tasks:
+    # ------------------------------------------------------------------ #
+    # TOP-LEVEL BRANCH: clean-slate reset vs. the normal bring-up path.   #
+    # Mirrors svc-07-bootstrap.yml's top-level branch exactly — a single  #
+    # `when: clean_slate | bool` block delegating to the platform_clean_  #
+    # slate role, wrapped in its own block/rescue that names the failing  #
+    # step. EVERY bring-up phase below (preflight, host, api, gateway,    #
+    # devmachine) additionally carries `when: not (clean_slate | bool)`   #
+    # so a clean-slate invocation runs the reset INSTEAD of the bring-up  #
+    # (spec platform-clean-slate, Component 1; Req 1.1, 1.2). The role    #
+    # body (the destroy-safe REVERSE order) is scaffolded in spec task    #
+    # 2.1 and filled in tasks 3–8; this play only branches + phase-names. #
+    # ------------------------------------------------------------------ #
+
+    # === Clean-Slate branch (Req 1) — runs ONLY when clean_slate is truthy. ===
+    - name: Platform Clean-Slate reset
+      when: clean_slate | default(false) | bool
+      block:
+        - name: "Clean-Slate | Run the platform_clean_slate role"
+          ansible.builtin.import_role:
+            name: platform_clean_slate
+      rescue:
+        - name: Report Platform Clean-Slate failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Platform Clean-Slate FAILED:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # === Normal bring-up path — skipped entirely on clean_slate. Every phase   #
+    # below carries `when: not (clean_slate | bool)` (combined with its own     #
+    # existing bucket-membership `when:` via a `when:` list where present).     #
+
+    # ------------------------------------------------------------------ #
+    # platform_preflight — runs FIRST for EVERY bring-up invocation      #
+    # (Req 1.4, 1.5), before any bucket. It resolves + validates         #
+    # cluster.env (no_log), binds the params the selected buckets need,  #
+    # and fails closed on missing mandatory-per-bucket params / unmet    #
+    # cross-bucket preconditions before any host or API mutation. Not    #
+    # gated on a bucket — it is the shared gate — but IS gated on         #
+    # not-clean_slate so a tear-down run skips it. Wrapped in its own     #
+    # block/rescue so a preflight failure names the phase (mirrors the    #
+    # svc07 rescues).                                                     #
+    # ------------------------------------------------------------------ #
+    - name: "Preflight — resolve/validate cluster.env + cross-bucket preconditions"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        # DYNAMIC load (include_role, not import_role): the enclosing block's
+        # `when: not clean_slate` is evaluated ONCE and, on a clean_slate run,
+        # the entire include is SKIPPED without evaluating the role's internal
+        # tasks. A static import_role would splice the role's tasks in at parse
+        # time and push the block `when:` down onto every task individually — so
+        # the tasks would still be evaluated (and could error on vars only
+        # defined on the bring-up path) even on a clean_slate run.
+        - name: "Preflight | Run the platform_preflight role"
+          ansible.builtin.include_role:
+            name: platform_preflight
+      rescue:
+        - name: Report preflight failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Platform bootstrap FAILED in preflight:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # ------------------------------------------------------------------ #
+    # Per-phase block/rescue wrappers, each gated on membership in        #
+    # platform_selected_buckets and ordered (Fix A / ADR-0010):          #
+    #   host (identity + template) -> api (SDN fabric) -> GATEWAY phase   #
+    #   -> devmachine.                                                    #
+    # The gateway phase is HOST-layer config (gated on 'host') but is     #
+    # sequenced AFTER the api block because it binds .1 to the SDN VNet   #
+    # bridge p<vlan> the api bucket creates (Req 1.3). Each rescue names  #
+    # its phase and fails non-zero (mirrors the svc07 phase rescues).     #
+    # ------------------------------------------------------------------ #
+
+    # ---- host bucket — opt-in PVE identity + ensure template ----
+    # (The host L3 gateway used to live here; it is now the SEPARATE gateway
+    # phase below, sequenced after the api block — see the play header note.)
+    - name: "Bucket — host (PVE identity, template)"
+      # Combined gate (spec platform-clean-slate, Req 1.2): both must hold — the
+      # bring-up path is skipped on a clean-slate run AND this bucket runs only
+      # when `host` is selected. A `when:` list ANDs its members.
+      when:
+        - not (clean_slate | default(false) | bool)
+        - "'host' in platform_selected_buckets"
+      block:
+        # ============================================================ #
+        # Throwaway-cluster guard consult (spec task 9.2; Req 7.1,     #
+        # 7.2, 7.3; Property 6). Mirrors the svc07_preflight consult:  #
+        # command -> INFO -> rc-assert, all `when: agent_live_run`.    #
+        # ------------------------------------------------------------ #
+        # GATE: all three tasks are `when: agent_live_run` — an        #
+        # ordinary operator run (AGENT_LIVE_AUTHORIZED unset) skips     #
+        # them entirely and is byte-for-byte unaffected (Req 7.2).      #
+        #                                                               #
+        # FAIL-CLOSED, BEFORE ANY MUTATION: positioned at the HEAD of   #
+        # the host bucket block, before the platform_pve_identity /     #
+        # platform_host_prep import_role calls below — so any pveum /   #
+        # pveam mutation is refused before it runs when the resolved    #
+        # cluster identity is not an allowlisted throwaway              #
+        # cluster (Req 7.1). rc is the signal (0 = AUTHORIZED, non-zero #
+        # = REFUSED). Play-level vars (platform_venv_python,            #
+        # platform_throwaway_guard, platform_throwaway_allowlist,       #
+        # cluster_env_file, platform_repo_root) come from this play.    #
+        # `--service platform` scopes the AGENT_LIVE_AUTHORIZED_SERVICES#
+        # grant to this feature.                                        #
+        # ============================================================ #
+        - name: "host | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+          ansible.builtin.command:
+            argv:
+              - "{{ platform_venv_python }}"
+              - "{{ platform_throwaway_guard }}"        # scripts/installer/throwaway_guard.py
+              - --service
+              - platform
+              - --env-file
+              - "{{ cluster_env_file }}"
+              - --allowlist
+              - "{{ platform_throwaway_allowlist }}"    # scripts/installer/throwaway-clusters.yml
+          args:
+            chdir: "{{ platform_repo_root }}"
+          register: platform_host_throwaway_decision
+          changed_when: false
+          failed_when: false        # rc is the signal; we branch on it, not fail here
+          when: agent_live_run | default(false) | bool
+
+        - name: "host | INFO — agent-live authorization decision"
+          ansible.builtin.debug:
+            msg: >-
+              INFO: agent-live authorization:
+              {{ (platform_host_throwaway_decision.stdout | default('{}') | from_json).reason
+                 | default('guard produced no decision') }}
+          when: agent_live_run | default(false) | bool
+
+        - name: "host | Refuse the run unless the throwaway guard AUTHORIZED it"
+          ansible.builtin.assert:
+            that:
+              - "platform_host_throwaway_decision.rc == 0"
+            fail_msg: >-
+              Agent-live host-bucket run REFUSED by the throwaway-cluster guard:
+              {{ (platform_host_throwaway_decision.stdout | default('{}') | from_json).reason
+                 | default('guard produced no decision') }}.
+              Nothing was mutated and no Proxmox resource was touched.
+              Arm the run only against a throwaway cluster listed in
+              throwaway-clusters.yml with AGENT_LIVE_AUTHORIZED set.
+            success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live host-bucket run."
+          when: agent_live_run | default(false) | bool
+
+        # PVE identity (opt-in, default off) FIRST — it mints the
+        # terraform@pve token the api bucket later consumes (Req 2).
+        - name: "host | Run the platform_pve_identity role (opt-in)"
+          ansible.builtin.include_role:      # dynamic: block `when:` skips it whole on clean_slate
+            name: platform_pve_identity
+
+        # Ensure the base template (pveam) (Req 3.1/3.2/3.4). The host L3
+        # gateway (Req 3.3/3.5) is NOT run here — it is the SEPARATE gateway
+        # phase after the api block, because it binds .1 to the SDN VNet bridge
+        # p<vlan> the api bucket creates (Fix A / ADR-0010).
+        - name: "host | Run the platform_host_prep role (ensure template)"
+          ansible.builtin.include_role:      # dynamic: block `when:` skips it whole on clean_slate
+            name: platform_host_prep
+      rescue:
+        - name: Report host bucket failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Platform bootstrap FAILED in the host bucket:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # ---- api bucket — SDN VLAN fabric (platform-foundation apply) ----
+    - name: "Bucket — api (SDN VLAN fabric)"
+      # Combined gate (spec platform-clean-slate, Req 1.2): skipped on a
+      # clean-slate run AND runs only when `api` is selected.
+      when:
+        - not (clean_slate | default(false) | bool)
+        - "'api' in platform_selected_buckets"
+      block:
+        # ============================================================ #
+        # Throwaway-cluster guard consult (spec task 9.2; Req 7.1,     #
+        # 7.2, 7.3; Property 6). Same three-task consult as the host   #
+        # bucket, at the HEAD of the api bucket block, BEFORE the      #
+        # platform_api terraform apply below — so the SDN fabric apply  #
+        # is refused before it runs when the resolved identity is not  #
+        # an allowlisted throwaway cluster. Gated `when: agent_live_run`#
+        # so an ordinary operator run is unaffected (Req 7.1, 7.2).    #
+        # ============================================================ #
+        - name: "api | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+          ansible.builtin.command:
+            argv:
+              - "{{ platform_venv_python }}"
+              - "{{ platform_throwaway_guard }}"        # scripts/installer/throwaway_guard.py
+              - --service
+              - platform
+              - --env-file
+              - "{{ cluster_env_file }}"
+              - --allowlist
+              - "{{ platform_throwaway_allowlist }}"    # scripts/installer/throwaway-clusters.yml
+          args:
+            chdir: "{{ platform_repo_root }}"
+          register: platform_api_throwaway_decision
+          changed_when: false
+          failed_when: false        # rc is the signal; we branch on it, not fail here
+          when: agent_live_run | default(false) | bool
+
+        - name: "api | INFO — agent-live authorization decision"
+          ansible.builtin.debug:
+            msg: >-
+              INFO: agent-live authorization:
+              {{ (platform_api_throwaway_decision.stdout | default('{}') | from_json).reason
+                 | default('guard produced no decision') }}
+          when: agent_live_run | default(false) | bool
+
+        - name: "api | Refuse the run unless the throwaway guard AUTHORIZED it"
+          ansible.builtin.assert:
+            that:
+              - "platform_api_throwaway_decision.rc == 0"
+            fail_msg: >-
+              Agent-live api-bucket run REFUSED by the throwaway-cluster guard:
+              {{ (platform_api_throwaway_decision.stdout | default('{}') | from_json).reason
+                 | default('guard produced no decision') }}.
+              Nothing was mutated and no Proxmox resource was touched.
+              Arm the run only against a throwaway cluster listed in
+              throwaway-clusters.yml with AGENT_LIVE_AUTHORIZED set.
+            success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live api-bucket run."
+          when: agent_live_run | default(false) | bool
+
+        # Apply the platform-foundation Terraform root (SDN VLAN fabric, Req 4).
+        - name: "api | Run the platform_api role (SDN VLAN fabric apply)"
+          ansible.builtin.include_role:      # dynamic: block `when:` skips it whole on clean_slate
+            name: platform_api
+      rescue:
+        - name: Report api bucket failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Platform bootstrap FAILED in the api bucket:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # ---- gateway phase — host L3 SDN gateway, run AFTER the api fabric apply --
+    # HOST-layer config (gated on 'host' in platform_selected_buckets, same as
+    # the host bucket), but sequenced HERE — AFTER the api block — because the
+    # sdn_gateway role binds the gateway address .1 to the SDN VNet bridge
+    # p<vlan> that the api bucket's terraform apply creates. On a clean slate the
+    # gateway CANNOT run before the fabric exists (Fix A / ADR-0010). The
+    # cross-bucket precondition in platform_preflight already fails closed, before
+    # any mutation, if 'host' selects the gateway but the fabric will not exist
+    # (api not selected AND p20 not already present) — so a host-only clean-slate
+    # run is refused up front naming the api bucket, rather than failing deep in
+    # the sdn_gateway role on a missing bridge.
+    - name: "Phase — gateway (host L3 SDN gateway, after the api fabric apply)"
+      # Combined gate (spec platform-clean-slate, Req 1.2): skipped on a
+      # clean-slate run AND runs only when `host` is selected (the gateway is
+      # host-layer config, gated on the same `host` bucket as above but
+      # sequenced after the api block).
+      when:
+        - not (clean_slate | default(false) | bool)
+        - "'host' in platform_selected_buckets"
+      block:
+        # ============================================================ #
+        # Throwaway-cluster guard consult (Req 7.1, 7.2, 7.3;         #
+        # Property 6). Same three-task consult as the host + api      #
+        # buckets, at the HEAD of the gateway phase block, BEFORE the #
+        # platform_gateway import_role below — so the gateway         #
+        # mutation (binding .1 to p<vlan>, writing pve-firewall rules)#
+        # is refused before it runs when the resolved identity is not #
+        # an allowlisted throwaway cluster. Gated `when:              #
+        # agent_live_run` so an ordinary operator run is unaffected   #
+        # (Req 7.1, 7.2). The gateway is a destructive host mutation, #
+        # so it carries the consult directly like the other two       #
+        # destructive phases.                                         #
+        # ============================================================ #
+        - name: "gateway | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+          ansible.builtin.command:
+            argv:
+              - "{{ platform_venv_python }}"
+              - "{{ platform_throwaway_guard }}"        # scripts/installer/throwaway_guard.py
+              - --service
+              - platform
+              - --env-file
+              - "{{ cluster_env_file }}"
+              - --allowlist
+              - "{{ platform_throwaway_allowlist }}"    # scripts/installer/throwaway-clusters.yml
+          args:
+            chdir: "{{ platform_repo_root }}"
+          register: platform_gateway_throwaway_decision
+          changed_when: false
+          failed_when: false        # rc is the signal; we branch on it, not fail here
+          when: agent_live_run | default(false) | bool
+
+        - name: "gateway | INFO — agent-live authorization decision"
+          ansible.builtin.debug:
+            msg: >-
+              INFO: agent-live authorization:
+              {{ (platform_gateway_throwaway_decision.stdout | default('{}') | from_json).reason
+                 | default('guard produced no decision') }}
+          when: agent_live_run | default(false) | bool
+
+        - name: "gateway | Refuse the run unless the throwaway guard AUTHORIZED it"
+          ansible.builtin.assert:
+            that:
+              - "platform_gateway_throwaway_decision.rc == 0"
+            fail_msg: >-
+              Agent-live gateway-phase run REFUSED by the throwaway-cluster guard:
+              {{ (platform_gateway_throwaway_decision.stdout | default('{}') | from_json).reason
+                 | default('guard produced no decision') }}.
+              Nothing was mutated and no Proxmox resource was touched.
+              Arm the run only against a throwaway cluster listed in
+              throwaway-clusters.yml with AGENT_LIVE_AUTHORIZED set.
+            success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live gateway-phase run."
+          when: agent_live_run | default(false) | bool
+
+        # Run the host L3 SDN gateway via the child sdn-gateway.yml play (Req 3.3,
+        # 3.5). Binds .1 to the SDN VNet bridge p<vlan> the api bucket created.
+        - name: "gateway | Run the platform_gateway role (host L3 SDN gateway)"
+          ansible.builtin.include_role:      # dynamic: block `when:` skips it whole on clean_slate
+            name: platform_gateway
+      rescue:
+        - name: Report gateway phase failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Platform bootstrap FAILED in the gateway phase:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}.
+              If this is "Device p20 does not exist", the SDN fabric (api bucket)
+              has not been applied — run the api bucket first
+              (-e bootstrap_scope=host,api).
+
+    # ---- devmachine bucket — emit (default) / apply the route + ssh_config ----
+    # NO throwaway-guard consult here (Req 7.4): the devmachine bucket
+    # mutates only the developer's own workstation, never the shared cluster.
+    - name: "Bucket — devmachine (route + ssh_config emit/apply)"
+      # Combined gate (spec platform-clean-slate, Req 1.2): skipped on a
+      # clean-slate run AND runs only when `devmachine` is selected.
+      when:
+        - not (clean_slate | default(false) | bool)
+        - "'devmachine' in platform_selected_buckets"
+      block:
+        - name: "devmachine | Run the platform_devmachine role (emit default / apply on GO)"
+          ansible.builtin.include_role:      # dynamic: block `when:` skips it whole on clean_slate
+            name: platform_devmachine
+      rescue:
+        - name: Report devmachine bucket failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Platform bootstrap FAILED in the devmachine bucket:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}

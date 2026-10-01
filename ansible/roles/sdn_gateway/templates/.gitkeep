@@ -1,0 +1,9 @@
+# Placeholder so the `templates/` directory exists in the role skeleton.
+#
+# Spec task 9 adds the real templates here — at minimum the
+# /etc/network/interfaces.d/ VLAN sub-interface stanza (e.g.
+# `vlan-subiface.j2` rendering `auto {{ bridge }}.{{ vlan_id }}` /
+# `iface {{ bridge }}.{{ vlan_id }} inet static` with address
+# `10.0.{{ vlan_id }}.1/24`), and any templated pve-firewall config file.
+#
+# Remove this file once a real template is added.

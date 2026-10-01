@@ -1,0 +1,24 @@
+---
+# tasks/main.yml — terraform_clean_slate (spec terraform-clean-slate-reset).
+#
+# Entry point. Runs against the Proxmox host (for `pct`); the Terraform state op in
+# reset_target.yml is `delegate_to: localhost` (state lives on the control node).
+# Loud, opt-in, fail-closed. Destroys NOTHING unless clean_slate_enabled is true AND
+# each target's confirm token matches.
+
+- name: "Clean-slate | Report the reset is DISABLED (no-op) unless explicitly enabled"
+  ansible.builtin.debug:
+    msg: >-
+      terraform_clean_slate is a NO-OP: clean_slate_enabled is false. This is a
+      DESTRUCTIVE reset (pct destroy + terraform state rm). To run it, set
+      `-e clean_slate_enabled=true` AND `-e clean_slate_confirm=<vmid>` matching the
+      target guest.
+  when: not (clean_slate_enabled | bool)
+
+- name: "Clean-slate | Reset each target guest (pct destroy -> terraform state rm)"
+  ansible.builtin.include_tasks: reset_target.yml
+  loop: "{{ clean_slate_targets }}"
+  loop_control:
+    loop_var: clean_slate_target
+    label: "{{ clean_slate_target.name | default(clean_slate_target.vmid | default('?')) }}"
+  when: clean_slate_enabled | bool

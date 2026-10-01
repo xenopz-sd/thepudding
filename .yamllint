@@ -1,0 +1,26 @@
+# yamllint configuration for the Developer Services Platform repository.
+#
+# Extends yamllint's built-in `default` preset and aligns it with the settings
+# ansible-lint expects from a shared yamllint config, so a standalone
+# `yamllint` invocation and `ansible-lint` agree instead of disagreeing:
+#   - line-length raised from yamllint's strict 80 to 120 (the Ansible community
+#     / ansible-lint convention);
+#   - comments.min-spaces-from-content 1 and comments-indentation disabled,
+#     braces.max-spaces-inside 1, and octal-value checks enabled — the exact
+#     rule set ansible-lint requires of a custom yamllint config.
+# Everything else stays at yamllint's conservative defaults.
+---
+extends: default
+
+rules:
+  line-length:
+    max: 120
+    level: error
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: false
+  braces:
+    max-spaces-inside: 1
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true

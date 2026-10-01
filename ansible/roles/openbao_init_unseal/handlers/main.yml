@@ -1,0 +1,11 @@
+---
+# handlers/main.yml — openbao_init_unseal
+#
+# No handler is required by task 6.1: the status guard and the unsealer Transit
+# engine init are both reconciled inline and need no service restart. This
+# file is present as part of the standard role skeleton so tasks 6.2 (primary
+# init/bootstrap) and 7.x (engine/auth/audit) can add handlers — e.g. a
+# "Reload OpenBao audit device" or "Restart openbao after seal rewrap" — without
+# introducing a new file mid-feature.
+#
+# (intentionally empty for task 6.1)

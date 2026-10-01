@@ -1,0 +1,37 @@
+---
+# Ansible Galaxy collection requirements for the Developer Services Platform roles.
+#
+# Install with:
+#   ~/venv/devinfra/bin/ansible-galaxy collection install -r ansible/requirements.yml
+#
+# - community.docker provides the `docker_compose_v2` module used by
+#   `docker-compose-app` (and `openbao_install`'s restart handler) and by the
+#   `common` role to reconcile/verify Compose stacks declaratively, per PF §9
+#   (no shell `docker compose up`).
+# - community.general provides the `timezone` module used by the `common` role's
+#   baseline (tasks/baseline.yml). Conservative lower bound — 8.0.0 already ships
+#   the `timezone` module; bump only if a later-release module is adopted.
+#
+# This is the canonical, single home for the collection pins; roles reference the
+# collections but do NOT duplicate the versions (e.g. role meta/main.yml keeps
+# `dependencies: []`).
+collections:
+  - name: community.docker
+    version: ">=3.10.0"
+  - name: community.general
+    version: ">=8.0.0"
+  # ansible.posix provides the `sysctl` module used by the `sdn_gateway` role's
+  # `ip_forward` set-then-verify task (the openbao_init_unseal swap-lockdown task
+  # that formerly used it was removed per ADR-0006). Conservative lower bound —
+  # 1.5.0 predates nothing this role needs and is present in every Galaxy
+  # mirror / offline bundle. Standard Red Hat/community collection, offline-installable.
+  - name: ansible.posix
+    version: ">=1.5.0"
+  # community.crypto provides openssl_privatekey / openssl_csr / x509_certificate,
+  # used by the openbao_install role's OPT-IN mock-EJBCA self-signed TLS cert task
+  # (tasks/tls_self_signed.yml, gated on openbao_tls_self_signed). Only needed when
+  # SVC-08/EJBCA is not yet built and TLS material must be generated on-host as a
+  # stand-in. Conservative lower bound — 2.0.0 predates nothing these modules need
+  # and is present in every Galaxy mirror / offline bundle.
+  - name: community.crypto
+    version: ">=2.0.0"

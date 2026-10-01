@@ -1,0 +1,124 @@
+---
+# tasks/teardown.yml — sdn_gateway (spec task 9, C5)
+#
+# Runs ONCE PER DECOMMISSIONED VLAN (looped from tasks/main.yml with loop_var
+# `sdn_gateway_vlan_id`). It ensures, with `state: absent`, that a torn-down
+# project retains NO live routed gateway or firewall opening — the remove/
+# teardown direction that makes a `status: active -> decommissioned` flip the
+# single action that both retires the ID (row kept in projects.yaml) and drives
+# teardown on the next converge (Req 6.3, 6.4).
+#
+#   1. Bring the sub-interface down (guarded) and remove its persistent
+#      `/etc/network/interfaces.d/` stanza, so the host stops owning
+#      `10.0.{{ sdn_gateway_vlan_id }}.1/24`. (Req 6.3)
+#   2. Remove that VLAN's `pve-firewall` ALLOW rule, so no stale opening remains.
+#      (Req 2.6, 6.3, SEC.3)
+#
+# Idempotent: re-running after the config is already gone reports changed=0
+# (Req 6.5). A failed removal fails clearly and does not leave a half-torn-down
+# host (FD.5).
+#
+# NO secret material is read, templated, or echoed here.
+
+# --- 1. Remove the persistent host L3 sub-interface --------------------------
+# Read the SDN VNet bridge's current addresses so the address removal below is
+# check-then-change (a converged teardown reports changed=0). `ip ... show` is
+# check-mode-safe and mutates nothing. Do NOT `ifdown p<vlan>` here: p<vlan> is
+# the SDN-owned VNet bridge the GUESTS attach to — only OUR gateway address is
+# ours to remove, not the bridge itself.
+- name: Read current addresses on the SDN VNet bridge p{{ sdn_gateway_vlan_id }}
+  ansible.builtin.command:
+    cmd: "ip -o -4 addr show dev p{{ sdn_gateway_vlan_id }}"
+  register: sdn_gateway_teardown_addrs
+  changed_when: false
+  check_mode: false
+  # A missing bridge means nothing to tear down — not a failure here.
+  failed_when: false
+
+# Remove ONLY our gateway address from the shared bridge (guarded), so the host
+# stops answering at .1 for this VLAN while leaving the SDN-owned bridge intact.
+# Runs only when .1 is still present (idempotent). A genuine failure surfaces.
+- name: Remove the guarded gateway address from the SDN VNet bridge for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.command:
+    cmd: "ip addr del 10.0.{{ sdn_gateway_vlan_id }}.1/24 dev p{{ sdn_gateway_vlan_id }}"
+  when: >-
+    sdn_gateway_teardown_addrs.rc == 0
+    and ('10.0.' ~ sdn_gateway_vlan_id ~ '.1/24') in
+    (sdn_gateway_teardown_addrs.stdout | default(''))
+  register: sdn_gateway_addr_del
+  changed_when: sdn_gateway_addr_del.rc == 0
+
+# Remove the live egress masquerade for this VLAN (guarded, idempotent), so a
+# decommissioned project's guests retain no host-provided internet egress. The
+# `-C` check means the `-D` delete runs only when the rule is still present, so a
+# converged teardown reports changed=0. (The interfaces.d stanza carrying the
+# reboot-persistent copy is removed just below.)
+- name: Check the egress masquerade presence for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.command:
+    cmd: >-
+      iptables -t nat -C POSTROUTING
+      -s 10.0.{{ sdn_gateway_vlan_id }}.0/24
+      ! -d {{ sdn_gateway_no_nat_dest_supernet }}
+      -o {{ sdn_gateway_egress_interface }} -j MASQUERADE
+  register: sdn_gateway_teardown_masq_check
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Remove the egress masquerade for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.command:
+    cmd: >-
+      iptables -t nat -D POSTROUTING
+      -s 10.0.{{ sdn_gateway_vlan_id }}.0/24
+      ! -d {{ sdn_gateway_no_nat_dest_supernet }}
+      -o {{ sdn_gateway_egress_interface }} -j MASQUERADE
+  when: sdn_gateway_teardown_masq_check.rc == 0
+  register: sdn_gateway_masq_del
+  changed_when: sdn_gateway_masq_del.rc == 0
+
+# Remove the persistent stanza (the post-up/pre-down hook). `file state: absent`
+# is check-then-change — a missing file reports changed=0 — and notifies the
+# networking reload so the host reconciles the SDN-owned bridge without our hook.
+- name: Remove the persistent gateway address stanza for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.file:
+    path: "/etc/network/interfaces.d/sdn-gw-{{ sdn_gateway_vlan_id }}.cfg"
+    state: absent
+  notify: Reload host networking
+
+# --- 2. Remove the scoped pve-firewall ALLOW rule ----------------------------
+# Read the current cluster firewall rules so we can find this VLAN's ALLOW rule
+# by its managed comment tag and its position (pvesh deletes rules by index).
+- name: Read current cluster firewall rules to tear down VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.command:
+    cmd: sudo pvesh get /cluster/firewall/rules --output-format json
+  register: sdn_gateway_fw_rules_raw
+  changed_when: false
+  check_mode: false
+
+- name: Compute the ALLOW-rule comment tag and position for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.set_fact:
+    sdn_gateway_allow_comment: "sdn_gateway: ALLOW admin -> VLAN {{ sdn_gateway_vlan_id }} (managed)"
+    sdn_gateway_allow_positions: >-
+      {{
+        (sdn_gateway_fw_rules_raw.stdout | from_json)
+        | selectattr('comment', 'defined')
+        | selectattr('comment', 'equalto',
+            'sdn_gateway: ALLOW admin -> VLAN ' ~ sdn_gateway_vlan_id ~ ' (managed)')
+        | map(attribute='pos') | map('int') | list | sort(reverse=true)
+      }}
+
+# Delete the rule only when it is still present (idempotent — a torn-down VLAN
+# whose rule is already gone reports changed=0). pvesh deletes a cluster firewall
+# rule by its integer position. A failed delete is a hard failure (no
+# `failed_when: false`) so a stale opening is never silently left behind.
+- name: Remove the scoped ALLOW rule (pvesh, state absent) for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - pvesh
+      - delete
+      - "/cluster/firewall/rules/{{ item }}"
+  loop: "{{ sdn_gateway_allow_positions }}"
+  register: sdn_gateway_allow_delete
+  changed_when: sdn_gateway_allow_delete.rc == 0
+  notify: Reload pve-firewall

@@ -1,0 +1,36 @@
+---
+# Handlers for the `sdn_gateway` role.
+#
+# The entry-point work implemented in spec task 8 (preflight asserts + the
+# ip_forward set-then-verify) needs NO handler: `ansible.posix.sysctl` with
+# `reload: true` applies the value live, and the asserts mutate nothing.
+#
+# The handlers below exist for the configure/teardown/isolation task bodies
+# implemented in spec task 9, which bring up/tear down VLAN sub-interfaces and
+# write pve-firewall rules and will `notify` these to apply them. They are
+# defined now as part of the standard role skeleton so those tasks have a stable
+# `notify:` target; nothing in task 8 notifies them yet.
+
+# Reload host networking after a VLAN sub-interface stanza in
+# /etc/network/interfaces.d/ is added or removed, so the sub-interface is
+# brought up/down without a full host reboot. The concrete reload mechanism
+# (`ifreload -a` on ifupdown2, or a guarded `ifup`/`ifdown`) is finalized with
+# the task-9 configure/teardown body; guarded so a reload that is a no-op or
+# runs where networking is not the active manager never hard-fails the role.
+- name: Reload host networking
+  ansible.builtin.command:
+    cmd: ifreload -a
+  register: sdn_gateway_ifreload
+  changed_when: false
+  failed_when: false
+
+# Reload pve-firewall after its rules change so the new ALLOW/DENY set is
+# compiled and applied. `pve-firewall compile` / `pve-firewall restart` is the
+# Proxmox mechanism; task 9 wires the concrete command. Guarded so a reload
+# never leaves the host in a half-applied state without a clear failure.
+- name: Reload pve-firewall
+  ansible.builtin.command:
+    cmd: pve-firewall restart
+  register: sdn_gateway_fwreload
+  changed_when: false
+  failed_when: false

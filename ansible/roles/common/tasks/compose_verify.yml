@@ -1,0 +1,140 @@
+---
+# Compose-plugin verification for the `common` role
+# (spec task 3.3, requirements 1.3 + 1.4, PF §9, design Component 2
+# "Responsibilities" + Correctness Properties P1 basis).
+#
+# GOAL (AC 1.4): confirm the Docker Compose v2 plugin is FUNCTIONAL via the
+# `community.docker.docker_compose_v2` module's conventions — NOT via a raw shell
+# `docker compose up`. The `docker-compose-app` role is the established precedent
+# for driving Compose through this module rather than shelling out.
+#
+# THE IDEMPOTENCY / RESOURCE-FREE CONSTRAINT (AC 1.3, P1 basis) — why this is
+# NOT a plain module "up/down":
+#   `community.docker.docker_compose_v2` only offers the states present / stopped
+#   / absent / restarted, each of which ACTS on real resources: `state: present`
+#   is `docker compose up` (it CREATES containers/networks and reports changed),
+#   and a follow-up `state: absent` teardown is `docker compose down` (it likewise
+#   reports changed). There is no "config"/"validate"/"render-only" state on the
+#   module. So a naive up (even immediately followed by a down) would:
+#     (a) report changed=true on every converged run — violating AC 1.3
+#         (`changed=0` on a converged/pre-baked host, the P1 no-op basis), and
+#     (b) risk leaving a lingering container/network/volume if the teardown step
+#         is skipped or fails — violating "leave NO lingering resources".
+#   The module's own docs classify its idempotency as only "partial" for exactly
+#   this reason. Therefore a plain up (or up+down) CANNOT satisfy both
+#   "changed=0 on reconverge" AND "resource-free".
+#
+# THE APPROACH — module in CHECK MODE against a trivial no-op definition:
+#   The `docker_compose_v2` module documents `check_mode: full` support: in check
+#   mode it "return[s] changed status prediction without modifying target." Since
+#   the module has no Python SDK and directly invokes the Docker CLI + Compose
+#   plugin (requiring "Docker CLI with Docker compose plugin 2.18.0 or later"),
+#   running it AT ALL — even in check mode — exercises the real Compose v2 plugin
+#   binary end to end: it must discover `docker`, invoke `docker compose`, parse
+#   the trivial `definition`, and compute the plan. If the plugin were missing or
+#   broken, the module errors out. That is precisely the "is the Compose plugin
+#   usable?" signal AC 1.4 asks for — obtained through the module's conventions,
+#   with no shell `docker compose up`.
+#
+#   Because we force `check_mode: true` on the task, the module NEVER creates a
+#   container/network/volume: nothing is applied, so nothing lingers
+#   (resource-free by construction). And because a verification is intentionally
+#   a read-only probe rather than a mutation, we set `changed_when: false` so the
+#   task reports changed=0 on EVERY run — first run, converged run, and pre-baked
+#   host alike (AC 1.3, P1 basis). The check-mode "would create" prediction is a
+#   plan, not a change we made, so suppressing it from change reporting is correct
+#   — we assert the plugin worked separately, below.
+#
+#   The `definition` is a single trivial, image-only, no-command service
+#   (`hello-world`, never started) with an explicit fixed `project_name`. Using an
+#   inline `definition` (community.docker >=3.9.0, and requirements.yml pins
+#   >=3.10.0) means the module writes a throwaway temp compose file it cleans up
+#   itself — we do not drop any compose file on the host. No `pull`, no `build`,
+#   no `wait`; check mode does not pull images either (docs: "In check mode,
+#   pulling the image does not result in a changed result").
+#
+# BAKE / UNPRIVILEGED-LXC GUARD (rationale): during a template bake — or inside an
+# unprivileged LXC where the docker daemon may not be running yet — the module
+# cannot reach a daemon and would error. Per the same best-effort pattern tasks
+# 3.1/3.2 use for the systemd service enable, this verification MUST NOT hard-fail
+# the whole run in that context (a bake produces the template; the daemon comes up
+# at real first boot). We therefore run the probe with `failed_when: false`,
+# capture its result, and only surface a hard assertion when a daemon was actually
+# reachable. On a real, running host the probe reaches the daemon and a genuinely
+# broken/missing Compose plugin is still caught by the assert; in a bake context
+# the probe is a soft no-op that never breaks the baseline.
+#
+# SECRET-FREE (requirement 1.5 / P3): the trivial definition contains only a
+# public image reference (`hello-world`) — no credential, no registry auth, no
+# env secret. Nothing here is baked into the template.
+
+# --- Probe: exercise the Compose v2 plugin via the module (check mode) --------
+# Forced check mode => prediction only, zero resources created. `changed_when:
+# false` => reports changed=0 on every run (AC 1.3 / P1 basis). `failed_when:
+# false` => never hard-fails the baseline in a daemon-less bake context; we
+# inspect the result and assert conditionally below.
+- name: Verify the Docker Compose v2 plugin is usable (community.docker, no shell up)
+  community.docker.docker_compose_v2:
+    # Inline definition => module manages a throwaway temp compose file itself
+    # (community.docker >=3.9.0); nothing is written to the host filesystem.
+    project_name: common-compose-verify
+    definition:
+      services:
+        # A single trivial, image-only service. It is NEVER started (check mode),
+        # so `hello-world` is only ever referenced, never run. Public image, no
+        # secret (req 1.5 / P3).
+        verify:
+          image: hello-world
+    # Do not touch images or wait on anything — this is a plan-only probe.
+    pull: never
+    build: never
+    state: present
+  check_mode: true  # prediction only — creates/leaves NO container/network/volume
+  changed_when: false  # a read-only verification is never a change (AC 1.3 / P1)
+  failed_when: false  # bake / daemon-less LXC guard — never hard-fail the baseline
+  register: common_compose_verify
+
+# --- Classify the probe outcome: was the failure just "no daemon reachable"? ----
+# The probe runs with failed_when: false, so we must interpret its result. A
+# genuinely-broken/missing Compose plugin on a live host is a REAL failure we want
+# to surface. A failure whose message points at an unreachable daemon/socket is
+# the EXPECTED guarded soft path during a template bake or in an unprivileged LXC
+# before first boot — there is simply no daemon to talk to yet. We distinguish the
+# two by inspecting the module's message, so the assertion below fires on real
+# hosts (pass or fail) but is skipped in the daemon-less bake context.
+- name: Classify whether the Compose probe failed only because no daemon was reachable
+  ansible.builtin.set_fact:
+    common_compose_verify_daemon_absent: >-
+      {{
+        (common_compose_verify.failed | default(false)) and
+        (
+          'daemon' in (common_compose_verify.msg | default('') | lower) or
+          'docker.sock' in (common_compose_verify.msg | default('') | lower) or
+          'connection refused' in (common_compose_verify.msg | default('') | lower) or
+          'cannot connect' in (common_compose_verify.msg | default('') | lower)
+        )
+      }}
+  changed_when: false
+
+# --- Hard assertion (skipped only in the daemon-less bake / LXC path) ----------
+# When a daemon was reachable, this asserts the module did NOT fail — i.e. the
+# Compose v2 plugin is genuinely usable. If the plugin were missing/broken on a
+# live host, common_compose_verify.failed is true (and NOT daemon-absent), so this
+# fails loudly. During a bake with no daemon, common_compose_verify_daemon_absent
+# is true and we skip — the verification is a soft no-op that never breaks the
+# template build. `changed_when: false` keeps the assert clean on a converged run.
+- name: Assert the Docker Compose v2 plugin is usable (skipped when no daemon during bake)
+  ansible.builtin.assert:
+    that:
+      - not (common_compose_verify.failed | default(false))
+    fail_msg: >-
+      The Docker Compose v2 plugin appears to be unusable on a host where the
+      docker daemon is reachable: `community.docker.docker_compose_v2` failed in
+      check mode. Confirm docker-compose-plugin is installed at
+      common_docker_compose_plugin_version_pin (task 3.2) and that `docker compose
+      version` succeeds.
+    success_msg: >-
+      Docker Compose v2 plugin verified as usable via
+      community.docker.docker_compose_v2 (check-mode probe, no resources created).
+  when: not (common_compose_verify_daemon_absent | bool)
+  changed_when: false

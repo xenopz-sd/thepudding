@@ -1,0 +1,25 @@
+---
+# handlers/main.yml — openbao_install
+#
+# Concrete restart handler (task 5.2). When config.hcl (or the compose stack)
+# changes, reconcile the correct stack with a forced recreate via
+# community.docker.docker_compose_v2 (PF §9 — declarative, not shell
+# `docker compose up`). The stack name is selected by openbao_role so the same
+# handler serves both the primary and the unsealer.
+
+- name: Restart openbao
+  community.docker.docker_compose_v2:
+    project_src: >-
+      {{ dca_base_dir | default('/opt/compose') }}/{{
+        openbao_stack_name if openbao_role == 'primary' else openbao_unsealer_stack_name
+      }}
+    project_name: >-
+      {{ openbao_stack_name if openbao_role == 'primary' else openbao_unsealer_stack_name }}
+    state: present
+    recreate: always
+
+# Task 11.1 — reload systemd after the nightly-snapshot service/timer units are
+# (re)rendered, so the enable/start step below acts on the current definitions.
+- name: Reload systemd for snapshot units
+  ansible.builtin.systemd:
+    daemon_reload: true

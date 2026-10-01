@@ -1,0 +1,21 @@
+# Stub inventory for the `openbao_init_unseal` role's offline syntax-check /
+# wiring smoke test (spec fix-openbao-sysctl-posix-collection, task 5 / C3;
+# design C3).
+#
+# This inventory exists ONLY to give `ansible-playbook --syntax-check` a target
+# to bind the role against — it performs NO host mutation. It points at the
+# loopback host with a local connection so no SSH, no remote host, and no real
+# infrastructure is ever touched. The conventional Ansible role `tests/` layout
+# (tests/inventory + tests/test.yml + tests/ansible.cfg) is used, mirroring
+# ansible/roles/common/tests/inventory.
+#
+# `--syntax-check` is the HARD GATE for this role: it resolves every bound
+# module (including `ansible.posix.sysctl`, the module whose wrong-collection
+# FQCN this fix corrects) against the pinned + installed collections without
+# touching a host. A `--check` run against this local host, by contrast, may
+# surface ENVIRONMENTAL errors rather than role defects — this role does live
+# `docker exec` against a running OpenBao container, `uri` calls to a live
+# OpenBao API, and a live `sysctl` write, none of which exist on the authoring
+# host (which runs no OpenBao), and the role's full run MUTATES. So `--check` is
+# best-effort wiring confirmation only; `--syntax-check` is the real gate.
+localhost ansible_connection=local

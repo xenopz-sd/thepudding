@@ -1,0 +1,34 @@
+---
+# Offline syntax-check / wiring smoke play for the `openbao_init_unseal` role
+# (spec fix-openbao-sysctl-posix-collection, task 5 / C3; design C3).
+#
+# This play does nothing but apply the `openbao_init_unseal` role, so that
+# `ansible-playbook --syntax-check` proves the whole task graph parses and every
+# module resolves — including `ansible.posix.sysctl` from the now-pinned +
+# installed `ansible.posix` collection, which FAILED on the pre-fix
+# `ansible.builtin.sysctl` FQCN (`couldn't resolve module/action`). This is the
+# durable regression guard that would have caught the bug: it turns red on an
+# unresolvable bound module and green once the FQCN + collection pin + install
+# are in place. Mirrors ansible/roles/common/tests/test.yml.
+#
+# It is OFFLINE syntax-check / wiring confirmation ONLY — it is NOT a live
+# converge. The role's full run MUTATES real OpenBao hosts (a live `sysctl`
+# write, `docker exec` against a running OpenBao container, `uri` calls to a
+# live OpenBao API), so a live `--check`/converge against the authoring host is
+# explicitly out of scope for this harness (see tests/inventory for why a
+# `--check` run may surface environmental noise). Run from the role directory:
+#
+#   ~/venv/devinfra/bin/ansible-playbook --syntax-check tests/test.yml
+#
+# gather_facts is enabled (the role's assertions reference standard facts such
+# as inventory_hostname); no privilege escalation is requested (become is left
+# off) so the syntax-check/dry-run never attempts a real host mutation.
+# `openbao_role` is already defaulted (defaults/main.yml -> "primary"), so no
+# play var is needed for the role graph to bind under --syntax-check.
+- name: Offline syntax-check smoke test — apply the openbao_init_unseal role
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+  roles:
+    - role: openbao_init_unseal

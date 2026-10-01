@@ -1,0 +1,276 @@
+---
+# Task entry point for the `sdn_gateway` host-level role (spec
+# sdn-vlan-gateway-reachability, C5; ADR-0004).
+#
+# This role makes served SDN VLANs reachable off-host while preserving the
+# isolation model. A Proxmox SDN VLAN zone is Layer-2 ONLY — nothing on the host
+# answers at the subnet's advertised gateway (`10.0.<vlan_id>.1`). This role
+# materialises the missing L3 by giving the Proxmox host the gateway address on
+# the SDN VNet bridge `p<vlan_id>` plus `net.ipv4.ip_forward=1`, then scopes the path
+# with `pve-firewall`. That host L3 config is deliberately OUTSIDE the
+# Terraform-managed SDN — the recorded L2/L3 seam (Req 1.3).
+#
+# Task work is split into included files by concern (standard role structure):
+#   - configure.yml  (spec task 9) — per served VLAN: ensure the host VLAN
+#                      sub-interface + gateway address exist (persistent), and a
+#                      scoped pve-firewall ALLOW rule is present.
+#   - teardown.yml   (spec task 9) — per decommissioned VLAN: ensure that VLAN's
+#                      sub-interface gateway config and ALLOW rule are ABSENT, so
+#                      a torn-down project retains no live gateway or opening.
+#
+# NOTE (spec task 8 scope): configure.yml and teardown.yml are placeholder stubs
+# at this point; their real pve-firewall + sub-interface bodies are implemented
+# in spec task 9. This file (the entry point), the preflight guards, and the
+# ip_forward set-then-verify ARE implemented here.
+#
+# The served-VLAN set is: the always-served shared VLAN (20) UNION the opted-in
+# project VLANs that are also active. Serving a project VLAN is opt-in
+# (`sdn_gateway_served_project_vlan_ids`), never a blanket route (Req 6.6).
+#
+# NO secret value is templated, echoed, or defaulted anywhere in this role.
+
+# =============================================================================
+# Preflight guards — fail CLOSED before mutating anything (Req 2.5, 2.2, SEC.2)
+# =============================================================================
+# The admin source CIDR is REQUIRED: if it is empty we must NOT fall back to a
+# wide-open rule, so we fail closed here rather than let configure.yml write an
+# unscoped ALLOW.
+- name: Assert an admin source CIDR is set (fail closed — no wide-open rule)
+  ansible.builtin.assert:
+    that:
+      - sdn_gateway_admin_source_cidr is string
+      - (sdn_gateway_admin_source_cidr | trim) | length > 0
+    fail_msg: >-
+      sdn_gateway_admin_source_cidr is empty. Refusing to configure a served-VLAN
+      firewall opening without a scoped source network (spec Req 2.5 / SEC.2) —
+      supply e.g. --extra-vars "sdn_gateway_admin_source_cidr=192.168.1.0/24".
+    success_msg: "Admin source CIDR is set; firewall openings will be scoped to it."
+    quiet: true
+
+# =============================================================================
+# Normalize the caller-supplied VLAN-ID SETS to real integer lists (fail-safe
+# against `--extra-vars key=value` string coercion).
+# -----------------------------------------------------------------------------
+# The active/decommissioned VLAN-ID sets are caller-supplied. When a caller
+# passes them through the `command`/`ansible-playbook` child-run idiom as a
+# single `--extra-vars "sdn_gateway_..._vlan_ids=[20]"` token (both
+# platform_gateway and platform_clean_slate do exactly this), Ansible parses that
+# `key=value` extra-var as the STRING "[20]" — NOT a list. A later
+# `... | map('int')` then iterates the STRING'S CHARACTERS ('[', '2', '0', ']'),
+# yielding phantom VLANs [0, 2] instead of [20], so the teardown loop below never
+# runs for the real VLAN and a decommissioned VLAN's `sdn-gw-<vlan>.cfg` (its
+# `auto p<vlan>` stanza) is never removed — the bridge silently reappears on the
+# next boot. (Diagnosed live: platform clean-slate left `sdn-gw-20.cfg` behind so
+# p20 came back after reboot.)
+#
+# Coerce here, ONCE, into DEDICATED `_norm` facts that every downstream consumer
+# (served-set computation and the teardown loop) reads instead of the raw
+# caller-supplied vars:
+#   * a genuine list (the in-process default, or a JSON/`@file` extra-var) passes
+#     through unchanged — bring-up behaviour is byte-for-byte preserved;
+#   * a string like "[20]" / "[100, 101]" / "20,21" / "20" is reduced to its
+#     integer elements with `regex_findall('[0-9]+')`, which needs no bracket/
+#     quote/whitespace stripping (it simply extracts every run of digits),
+#     sidestepping the folded-scalar escaping pitfalls of a character-class strip.
+#
+# WHY new `_norm` names (not overwrite in place): a `key=value` `--extra-vars`
+# has the HIGHEST Ansible variable precedence, so a `set_fact` that reused the
+# SAME name would be silently OVERRIDDEN by the raw extra-var wherever the loop
+# template is later re-evaluated — the fact would read `["20"]` but the loop
+# would still see the string "[20]". Writing to distinct `_norm` facts and
+# consuming THOSE avoids the precedence trap entirely (verified live: reusing the
+# name left the teardown loop iterating phantom VLANs 0/2).
+#
+# This is the shared-role-safe fix: it repairs both the clean-slate teardown and
+# the bring-up decommission path (same latent bug) and hardens any future caller
+# against the same `key=value` footgun, without changing the configure/render
+# path for an ACTIVE VLAN.
+- name: Normalize the active / decommissioned VLAN-ID sets to real integer lists
+  ansible.builtin.set_fact:
+    sdn_gateway_active_vlan_ids_norm: >-
+      {{
+        (sdn_gateway_active_vlan_ids
+         if (sdn_gateway_active_vlan_ids is not string)
+         else (sdn_gateway_active_vlan_ids | regex_findall('[0-9]+')))
+        | map('int') | unique | sort
+      }}
+    sdn_gateway_decommissioned_vlan_ids_norm: >-
+      {{
+        (sdn_gateway_decommissioned_vlan_ids
+         if (sdn_gateway_decommissioned_vlan_ids is not string)
+         else (sdn_gateway_decommissioned_vlan_ids | regex_findall('[0-9]+')))
+        | map('int') | unique | sort
+      }}
+
+# Compute the served-VLAN set once: the always-served shared VLAN (20) plus the
+# opted-in project VLANs that are also in the active set. `unique` dedupes if the
+# shared VLAN were also listed; sorting keeps the loop order deterministic.
+#
+# DECOMMISSIONED VLANs are SUBTRACTED from the served set (`| difference(...)`).
+# The shared VLAN (20) is otherwise served UNCONDITIONALLY, so a run that
+# decommissions it (the platform clean-slate passes active=[] +
+# decommissioned=[20]) would otherwise land VLAN 20 in BOTH the configure set AND
+# the teardown set at once. configure.yml runs FIRST (before teardown.yml in this
+# file) and hard-fails at `ip addr show dev p<vlan>` when the SDN bridge is
+# already gone — which is EXACTLY the clean-slate ordering, since the fabric
+# `terraform destroy` runs before this gateway teardown. That hard-fail aborts
+# the play before teardown.yml can remove `sdn-gw-<vlan>.cfg`. Subtracting the
+# decommissioned set means a VLAN being torn down is NEVER re-configured in the
+# same run, so teardown.yml is reached and the `auto p<vlan>` stanza is removed.
+# SAFE for bring-up: it passes an EMPTY decommissioned set, so `difference([])`
+# leaves the served set (incl. VLAN 20) unchanged — the render/configure path for
+# an ACTIVE VLAN is byte-for-byte preserved.
+- name: Compute the served-VLAN set (shared VLAN 20 UNION opted-in active project VLANs, minus decommissioned)
+  ansible.builtin.set_fact:
+    sdn_gateway_served_vlan_ids: >-
+      {{
+        (
+          [sdn_gateway_shared_vlan_id]
+          + (sdn_gateway_served_project_vlan_ids | map('int')
+             | intersect(sdn_gateway_active_vlan_ids_norm))
+        ) | map('int') | difference(sdn_gateway_decommissioned_vlan_ids_norm)
+          | unique | sort
+      }}
+
+# No served VLAN may be the management VLAN (10) — that would route the very
+# segment the isolation model requires to stay unreachable (Req 2.2,
+# domain-rules.md §1).
+- name: Assert no served VLAN equals the management VLAN (10)
+  ansible.builtin.assert:
+    that:
+      - (sdn_gateway_management_vlan_id | int) not in sdn_gateway_served_vlan_ids
+    fail_msg: >-
+      A served VLAN equals the management VLAN
+      ({{ sdn_gateway_management_vlan_id }}). VLAN 10 is management-only and must
+      never be routed/served (security-standards.md, domain-rules.md §1).
+    success_msg: "No served VLAN collides with the management VLAN."
+    quiet: true
+
+# =============================================================================
+# net.ipv4.ip_forward = 1 — set persistently, then VERIFY the live value
+# -----------------------------------------------------------------------------
+# The host must forward between its LAN NIC and the served VLAN sub-interfaces
+# (Req 1.2). `ansible.posix.sysctl` sets it persistently (writes /etc/sysctl.d
+# and applies live); the follow-up slurp+assert proves /proc/sys reflects it.
+# This mirrors the openbao_init_unseal vm.swappiness set-then-verify precedent.
+# =============================================================================
+- name: Enable IPv4 forwarding (persistent) so the host routes between LAN and served VLANs
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+
+- name: Read /proc/sys/net/ipv4/ip_forward to verify the live value (check-safe)
+  ansible.builtin.slurp:
+    src: "{{ sdn_gateway_ip_forward_proc_path }}"
+  register: sdn_gateway_ip_forward_proc
+  check_mode: false        # read even under --check so verification can run
+  changed_when: false      # a read never reports a change
+
+- name: Assert net.ipv4.ip_forward == 1 (Req 1.2)
+  ansible.builtin.assert:
+    that:
+      - (sdn_gateway_ip_forward_proc.content | b64decode | trim) == "1"
+    fail_msg: >-
+      net.ipv4.ip_forward is
+      '{{ sdn_gateway_ip_forward_proc.content | b64decode | trim }}' on
+      {{ inventory_hostname }}, expected '1'. The host cannot route to served
+      VLANs — refusing to proceed.
+    success_msg: "net.ipv4.ip_forward verified as 1 on {{ inventory_hostname }}."
+    quiet: true
+
+# =============================================================================
+# Configure the served VLANs (create/configure direction — Req 6.2)
+# -----------------------------------------------------------------------------
+# Per served VLAN: ensure the host sub-interface + gateway address exist and a
+# scoped pve-firewall ALLOW rule is present. Every mutating task inside is
+# check-then-change / `state:`-driven so a second run is changed=0.
+# (configure.yml body is implemented in spec task 9.)
+# =============================================================================
+- name: Configure each served VLAN's host gateway + scoped ALLOW rule
+  ansible.builtin.include_tasks: configure.yml
+  loop: "{{ sdn_gateway_served_vlan_ids }}"
+  loop_control:
+    loop_var: sdn_gateway_vlan_id
+
+# =============================================================================
+# Tear down decommissioned VLANs (remove/teardown direction — Req 6.3)
+# -----------------------------------------------------------------------------
+# Per decommissioned VLAN: ensure that VLAN's sub-interface gateway config and
+# ALLOW rule are ABSENT, so a torn-down project retains no live gateway/opening.
+# This is what makes a `status: active -> decommissioned` flip the single action
+# that both retires the ID (row kept) and drives teardown on the next converge.
+# (teardown.yml body is implemented in spec task 9.)
+# =============================================================================
+- name: Tear down each decommissioned VLAN's host gateway + ALLOW rule
+  ansible.builtin.include_tasks: teardown.yml
+  loop: "{{ sdn_gateway_decommissioned_vlan_ids_norm }}"
+  loop_control:
+    loop_var: sdn_gateway_vlan_id
+
+# =============================================================================
+# Standing isolation DENY rules (always applied — Req 2.2, 2.3)
+# -----------------------------------------------------------------------------
+# Routing establishes reachability; the firewall establishes PERMISSION. These
+# DENY rules are the isolation floor and are NOT per-VLAN teardown-able:
+#   - served/project VLANs -> management VLAN (10) : DENY (Req 2.2)
+#   - cross-project VLAN -> VLAN                    : DENY (Req 2.3)
+# They must remain in force even though a routed path now exists.
+# (Concrete pve-firewall rule bodies are implemented in spec task 9, alongside
+# the ALLOW rules, so the isolation floor and the openings are managed together.)
+# =============================================================================
+- name: Ensure the standing isolation DENY rules are present
+  ansible.builtin.include_tasks: isolation.yml
+  when: sdn_gateway_isolation_rules_enabled | default(true) | bool
+# =============================================================================
+# Guest firewall baseline egress (per firewalled guest — Req 8)
+# -----------------------------------------------------------------------------
+# A guest whose NIC sets `firewall=1` has its own traffic filtered once
+# pve-firewall is enabled, which REMOVES ITS EGRESS unless guest-scoped rules
+# exist — so it can no longer resolve DNS, `apt update`, or pull images, i.e. it
+# cannot PROVISION itself. This ensures the scoped egress baseline (DNS/HTTP/
+# HTTPS/NTP) for every guest listed in `sdn_gateway_firewalled_guests`.
+#
+# Runs BEFORE the unsealer scoping below: egress must exist before a guest can be
+# provisioned or meaningfully locked down. Generic — any service/VLAN reuses it by
+# adding an entry; empty by default.
+# =============================================================================
+- name: Ensure the scoped egress baseline for each firewalled guest
+  ansible.builtin.include_tasks: guest_firewall_baseline.yml
+  loop: "{{ sdn_gateway_firewalled_guests }}"
+  loop_control:
+    loop_var: sdn_gateway_fw_guest
+    label: "vmid={{ sdn_gateway_fw_guest.vmid | default('?') }}"
+
+# Reverse of the baseline (ADR-0008): remove the managed egress rules from a guest
+# whose NIC firewall was reverted, so it is not left with orphaned `out` ACCEPT
+# rules. Explicit opt-in list, empty by default.
+- name: Remove the scoped egress baseline from each guest being torn down
+  ansible.builtin.include_tasks: guest_firewall_baseline_teardown.yml
+  loop: "{{ sdn_gateway_firewalled_guests_teardown }}"
+  loop_control:
+    loop_var: sdn_gateway_fw_guest_td
+    label: "vmid={{ sdn_gateway_fw_guest_td.vmid | default('?') }}"
+
+# =============================================================================
+# OpenBao unsealer seal-API scoping (once, OFF by default — Req 1, Req 2)
+# -----------------------------------------------------------------------------
+# Scope the Transit unsealer's seal API (:8200) to the OpenBao primary ONLY, so
+# no other VLAN-20 guest can reach the platform's root-of-trust seal path
+# (SVC-07 Req 6.4 / Security AC 6; ADR-0007). Gated on an off-by-default flag so
+# merging changes nothing at runtime; the rules are also inert until the operator
+# deliberately enables the pve-firewall master switch (ADR-0007 part B).
+# =============================================================================
+- name: Scope the OpenBao unsealer seal API to the primary only
+  ansible.builtin.include_tasks: openbao_unsealer_scoping.yml
+  when: sdn_gateway_openbao_unsealer_scoping_enabled | bool
+
+# Reversible teardown of the unsealer scoping rules (once, OFF by default — Req 4).
+# Set sdn_gateway_openbao_unsealer_scoping_teardown=true to remove exactly the two
+# managed-comment unsealer rules. Kept separate from the enable gate so disabling
+# scoping never silently deletes rules — removal is an explicit, deliberate action.
+- name: Tear down the OpenBao unsealer scoping rules (explicit opt-in)
+  ansible.builtin.include_tasks: openbao_unsealer_scoping_teardown.yml
+  when: sdn_gateway_openbao_unsealer_scoping_teardown | default(false) | bool

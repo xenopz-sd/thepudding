@@ -1,0 +1,84 @@
+{#
+  templates/alertmanager-openbao-route.yml.j2 — Alertmanager ROUTE + RECEIVER
+  fragment SVC-07 contributes TO the shared SVC-17 Alertmanager.
+
+  Rendered by task 10.2 (tasks/alerts.yml, §10.2) into an Alertmanager
+  config-fragment directory ({{ openbao_alertmanager_route_file }}) that the
+  SVC-17 Alertmanager includes/merges. SVC-17 is a SEPARATE catalog service; a
+  full Alertmanager role may not exist yet, so this is the ROUTE + RECEIVER
+  contribution SVC-07 owns — mirroring the scrape (10.1) and alert-rule (this
+  task) fragments. The platform Alertmanager merges this route as a child of its
+  top-level route and these receivers into its receivers list.
+
+  WHAT THIS FRAGMENT PROVIDES:
+    * a route that matches SVC-07's alerts (service="openbao") and sends them to
+      the PRIMARY platform-operations receiver (Req 10.4 "platform operations
+      receiver");
+    * a child/continue route implementing the 30-MINUTE UNACKNOWLEDGED
+      ESCALATION (Req 10.9): a still-firing OpenBao alert that has not been
+      acknowledged/resolved within 30 minutes is (re)notified to the SECONDARY
+      on-call receiver. Alertmanager has no native "acknowledged" state, so the
+      escalation is expressed as a continue-route whose `group_wait` +
+      `repeat_interval` cause the secondary receiver to be notified once the
+      alert has persisted ~30 min (an unresolved alert is treated as
+      unacknowledged — resolving/silencing it stops the re-notify).
+
+  Placeholder RECEIVER names + endpoints only — a real deployment overrides the
+  receiver webhook/email/pager endpoints. NO secret value is templated here:
+  receiver NAMES, matchers, and timings are non-secret config; any receiver
+  credential (a pager integration key, an SMTP password) is supplied to
+  Alertmanager out-of-band (never committed), referenced by env/file, not inlined.
+#}
+# MANAGED BY ANSIBLE (openbao_init_unseal / task 10.2) — DO NOT EDIT BY HAND.
+# Alertmanager route + receiver fragment contributed by SVC-07 (OpenBao).
+# Primary routing (Req 10.4) + 30-min unack escalation to the secondary
+# on-call receiver (Req 10.9). Placeholder receiver names/endpoints only.
+
+# --- Route fragment: merged as a child of the platform top-level route -------
+# The platform Alertmanager attaches this under its `route.routes:` list.
+route:
+  # Match SVC-07's alerts (all carry service="openbao" from the rule labels).
+  matchers:
+    - 'service="openbao"'
+  # Group OpenBao alerts together so a seal + unsealer-unreachable storm is one
+  # notification, not two.
+  group_by: ["alertname", "service"]
+  group_wait: "{{ openbao_alertmanager_group_wait }}"
+  group_interval: "{{ openbao_alertmanager_group_interval }}"
+  repeat_interval: "{{ openbao_alertmanager_repeat_interval }}"
+  # Primary destination — the platform operations receiver (Req 10.4).
+  receiver: "{{ openbao_alertmanager_primary_receiver }}"
+  routes:
+    # --- 30-min unacknowledged escalation (Req 10.9) -------------------------
+    # `continue: true` so the alert ALSO stays matched by the parent (the
+    # primary keeps getting the normal notifications) while this child arranges
+    # the escalation. The escalation notification to the SECONDARY on-call
+    # receiver is delayed by ~30 min via group_wait: an alert that is
+    # resolved/acknowledged (silenced) before this window elapses never reaches
+    # the secondary; one still firing (i.e. UNACKNOWLEDGED) after 30 min does.
+    - matchers:
+        - 'service="openbao"'
+      continue: true
+      receiver: "{{ openbao_alertmanager_secondary_receiver }}"
+      # ~30-minute hold before the secondary is first notified (Req 10.9). An
+      # alert cleared before this elapses is never escalated.
+      group_wait: "{{ openbao_alertmanager_escalation_after }}"
+      # After escalation, keep re-notifying the secondary at this cadence until
+      # the alert resolves (still-unacknowledged == still-firing).
+      repeat_interval: "{{ openbao_alertmanager_escalation_repeat_interval }}"
+
+# --- Receivers fragment: merged into the platform `receivers:` list ----------
+# Placeholder receiver definitions. A real deployment overrides the endpoints
+# (webhook URL / email / pager). Names are stable so the route above resolves.
+receivers:
+  - name: "{{ openbao_alertmanager_primary_receiver }}"
+    # Placeholder webhook endpoint for the platform operations receiver.
+    # Override per-environment; any auth credential is supplied out-of-band.
+    webhook_configs:
+      - url: "{{ openbao_alertmanager_primary_receiver_url }}"
+        send_resolved: true
+  - name: "{{ openbao_alertmanager_secondary_receiver }}"
+    # Placeholder webhook endpoint for the secondary on-call receiver (Req 10.9).
+    webhook_configs:
+      - url: "{{ openbao_alertmanager_secondary_receiver_url }}"
+        send_resolved: true

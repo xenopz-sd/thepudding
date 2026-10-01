@@ -1,0 +1,31 @@
+---
+# Handlers for the `common` role.
+#
+# The baseline portion (spec task 3.1 — timezone, apt hygiene,
+# unattended-upgrades) needs no handler: timezone and the 20auto-upgrades config
+# take effect immediately, and the unattended-upgrades service is enabled
+# directly rather than via a notify. There is therefore intentionally no baseline
+# handler.
+#
+# --- Docker handlers (spec task 3.2) ----------------------------------------
+
+# Refresh the apt cache after the Docker CE repository is added/changed, so the
+# pinned-version installs resolve against fresh metadata. Notified by the
+# deb822_repository task in docker.yml and flushed immediately before the install
+# tasks run. changed_when is left to the module (apt reports changed on update);
+# a converged run does not re-notify because the repo definition is unchanged.
+- name: Update apt cache after Docker repo change
+  ansible.builtin.apt:
+    update_cache: true
+
+# Restart docker when daemon configuration changes. Provided per the seam so a
+# future daemon-config task (e.g. writing /etc/docker/daemon.json) can `notify`
+# it. Task 3.2 installs/pins the engine but does NOT alter daemon config, so this
+# handler is intentionally not notified yet. Guarded the same
+# unprivileged-LXC/bake-safe way as the service enable: never hard-fail if
+# systemd is not managing units during a template bake.
+- name: Restart docker
+  ansible.builtin.systemd_service:
+    name: docker
+    state: restarted
+  failed_when: false

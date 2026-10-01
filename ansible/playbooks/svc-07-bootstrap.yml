@@ -1,0 +1,205 @@
+---
+# svc-07-bootstrap.yml — SVC-07 (OpenBao) Automated Service Installer.
+# Spec: .kiro/specs/svc07-installer-simplification/ (requirements.md, design.md,
+# tasks.md); original installer spec: .kiro/specs/svc-07-automated-installer/.
+#
+# THIN ORCHESTRATOR (task 10): this play is a ~150-line Day-0 orchestrator that
+# drives five focused roles, each behind its own per-phase block/rescue that
+# preserves the phase-naming `fail` diagnostic in the play:
+#   * svc07_clean_slate — the destructive reset branch (clean_slate | bool)
+#   * svc07_preflight   — Phase 1: env-file resolve/validate, Proxmox
+#                         reachability/auth, VLAN-20 p20 bridge, datastore
+#                         autodetect, SSH-key injection, local prereq/version.
+#   * svc07_provision   — Phase 2: backend swap-gate, terraform init/apply,
+#                         generate_inventory.py, add_host, known_hosts.
+#   * svc07_bootstrap   — Phase 3: common baseline, delegated unsealer bootstrap
+#                         + seal-token handoff capture, primary bootstrap +
+#                         drift guard + Admin_Token persistence (no_log restored).
+#   * svc07_handoff     — Phase 4: invoke svc07-health.yml child play + banner.
+# The role internals hold the tasks; this play only sequences and phase-names.
+#
+# DUAL ROLE OF ANSIBLE (design "central architectural seam"): this play runs
+# as the Day-0 Workflow ORCHESTRATOR on hosts: localhost. Its roles drive
+# Terraform, generate_inventory.py, and child ansible-playbook runs of the
+# CONFIGURATOR plays (common.yml, openbao.yml, svc07-health.yml) against the
+# VLAN-20 guests. It never parses .tfstate or queries Proxmox for host discovery
+# — the Terraform→Ansible handoff stays one-directional and file-mediated
+# (integration-boundaries.md §4).
+#
+# Developer B entry point (service-installer.md §2):
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/svc-07-bootstrap.yml \
+#     -e cluster_env_file=cluster.dev.env
+#
+# Clean-slate reset (Req 5):
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/svc-07-bootstrap.yml \
+#     -e clean_slate=true -e clean_slate_confirm=force
+- name: SVC-07 (OpenBao) automated installer — Day-0 orchestrator
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  # any_errors_fatal so a failed phase (or a child ansible-playbook non-zero
+  # exit) aborts the whole run immediately rather than continuing to the next
+  # phase (Req 1, design "Error Handling").
+  any_errors_fatal: true
+  vars:
+    # --- PlayLevelVars (design "Data Models") — cross-phase constants only. --- #
+    # Every phase-specific var now lives in its role's defaults/main.yml; only
+    # constants read by MORE THAN ONE role (or by the play itself) stay here.
+
+    # Cluster_Env_File — the gitignored KEY=VALUE .env the installer reads its
+    # Proxmox/provider parameters from. Read by preflight, provision, bootstrap,
+    # handoff, and clean_slate. Overridable with -e cluster_env_file=...
+    cluster_env_file: cluster.env
+    # Repository root. The play runs on localhost from anywhere; roots and
+    # helpers are addressed relative to the repo root, so we anchor to the
+    # playbook's own location (…/ansible/playbooks/) two levels up. Read by
+    # every role.
+    svc07_repo_root: "{{ playbook_dir | dirname | dirname }}"
+    # Project venv python (dev-workflow.md Python Environment Invocation rule):
+    # helpers are invoked through the devinfra venv interpreter by absolute path.
+    # Read by preflight (cluster_env.py) and clean_slate (node-name resolve).
+    svc07_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+    # The generated inventory path (repo-relative), written by provision and
+    # consumed by bootstrap's + handoff's child ansible-playbook runs as `-i`.
+    svc07_generated_inventory: ansible/inventory/svc-07-secrets-manager.generated.yml
+    # Bootstrap_Transit_Token Handoff_File (0600, gitignored). Written by the
+    # delegated unsealer bootstrap child run and captured back by svc07_bootstrap
+    # — a cross-role handoff constant, so it stays play-level. Absolute so the
+    # child run (also on localhost) and the capture agree regardless of cwd.
+    svc07_seal_token_handoff_path: "{{ svc07_repo_root }}/.svc07-seal-token.handoff"
+    # Fixed SVC-07 guest VMIDs (the installer assigns these, not operator-
+    # supplied). Read by provision (apply -var) and referenced across phases.
+    svc07_openbao_primary_vmid: 1070
+    svc07_openbao_unsealer_vmid: 1071
+    # The two SVC-07 guest IPs, computed by NET-00 (cidrhost 10.0.20.0/24, +10 /
+    # +11). Non-secret; read by provision (known_hosts) and handoff.
+    svc07_guest_ips:
+      - "10.0.20.10"
+      - "10.0.20.11"
+    # Clean-slate reset controls (Req 5). Off by default; the clean_slate branch
+    # below routes to the reset path only when clean_slate is truthy. Both are
+    # read by the play's `when:` gates AND the svc07_clean_slate role.
+    clean_slate: false
+    clean_slate_confirm: ""
+    # DEV-ONLY diagnostic instrumentation flag (mock-stand-in philosophy,
+    # security-standards.md dev-opt-in): OFF by default, NEVER committed as true.
+    # When enabled (-e svc07_debug_instrumentation=true) it turns on guarded,
+    # additive debug includes inside svc07_bootstrap (Phase 3) and svc07-health
+    # (Phase 4). Read by more than one role, so it stays play-level.
+    svc07_debug_instrumentation: false
+    # OPT-IN through-Traefik Phase-4 health check. OFF by default: SVC-09/Traefik
+    # is not deployed yet, so the works-now `docker exec ... bao status` guest
+    # check alone gates Phase 4. Read by svc07_handoff / svc07-health.yml. Set to
+    # true (-e svc07_health_check_via_traefik=true) ONLY once Traefik is live.
+    svc07_health_check_via_traefik: false
+    # Platform domain for the primary's Traefik ingress URL shown in the Phase-4
+    # completion banner. Non-secret placeholder; supplied per env. Read by the
+    # handoff banner (and the opt-in Traefik health check).
+    platform_domain: platform.example.test
+    # Agent Live-Test Authorization (spec agent-live-test-authorization, Req 1.2,
+    # 5.5). agent_live_run is truthy ONLY when the AGENT_LIVE_AUTHORIZED interlock
+    # is set (non-empty) in the process environment. It gates the throwaway-guard
+    # consult tasks in svc07_preflight (5.3) and svc07_clean_slate (5.2): an armed
+    # run consults the guard before any destructive action, while an ordinary
+    # operator run (interlock unset) is byte-for-byte unaffected — the consult is
+    # skipped and the existing confirmation-prompt path is untouched. The
+    # interlock is read from the ENVIRONMENT, never a committed default.
+    agent_live_run: "{{ (lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') | trim) | length > 0 }}"
+    # Throwaway-cluster guard + allowlist paths (repo-relative). Cross-role
+    # constants read by BOTH svc07_preflight (5.3) and svc07_clean_slate (5.2)
+    # when consulting the guard, so they stay play-level. The guard is the pure,
+    # fail-closed decision helper; the allowlist is the committed, non-secret list
+    # of throwaway-cluster identities it matches the resolved identity against.
+    svc07_throwaway_guard: scripts/installer/throwaway_guard.py
+    svc07_throwaway_allowlist: scripts/installer/throwaway-clusters.yml
+
+  tasks:
+    # ------------------------------------------------------------------ #
+    # TOP-LEVEL BRANCH: clean-slate reset vs. the normal 4-phase install. #
+    # Each phase is exactly one import_role wrapped in its own            #
+    # block/rescue; the rescue preserves the phase-naming diagnostic in   #
+    # the play (design "Thin orchestrator play"). All role tasks and      #
+    # phase-specific vars live in the roles, not here.                    #
+    # ------------------------------------------------------------------ #
+
+    # === Clean-Slate branch (Req 5) — runs ONLY when clean_slate is truthy. ===
+    - name: Clean-Slate reset
+      when: clean_slate | default(false) | bool
+      block:
+        - name: "Clean-Slate | Run the svc07_clean_slate role"
+          ansible.builtin.import_role:
+            name: svc07_clean_slate
+      rescue:
+        - name: Report Clean-Slate reset failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-07 installer FAILED during the Clean-Slate reset:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # === Normal install path — Phases 1→4, skipped entirely on clean_slate. ===
+
+    # ---- Phase 1: Preflight & environment validation (fail-fast gate) ----
+    # A failure here leaves ZERO Proxmox resources and unmodified TF state.
+    - name: "Phase 1 — Preflight & environment validation"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Preflight | Run the svc07_preflight role"
+          ansible.builtin.import_role:
+            name: svc07_preflight
+      rescue:
+        - name: Report Phase 1 (Preflight) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-07 installer FAILED in Phase 1 (Preflight & environment validation):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # ---- Phase 2: Infrastructure provisioning (Terraform + inventory) ----
+    - name: "Phase 2 — Infrastructure provisioning"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Provisioning | Run the svc07_provision role"
+          ansible.builtin.import_role:
+            name: svc07_provision
+      rescue:
+        - name: Report Phase 2 (Provisioning) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-07 installer FAILED in Phase 2 (Infrastructure provisioning):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # ---- Phase 3: Host hardening & ordered bootstrap (secret bridging) ----
+    - name: "Phase 3 — Host hardening & ordered bootstrap"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Bootstrap | Run the svc07_bootstrap role"
+          ansible.builtin.import_role:
+            name: svc07_bootstrap
+      rescue:
+        - name: Report Phase 3 (Bootstrap) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-07 installer FAILED in Phase 3 (Host hardening & ordered bootstrap):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # ---- Phase 4: Health sanity & Developer B handoff ----
+    - name: "Phase 4 — Health sanity & Developer B handoff"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Handoff | Run the svc07_handoff role"
+          ansible.builtin.import_role:
+            name: svc07_handoff
+      rescue:
+        - name: Report Phase 4 (Handoff) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-07 installer FAILED in Phase 4 (Health sanity & handoff):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}

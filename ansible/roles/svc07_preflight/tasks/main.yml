@@ -1,0 +1,456 @@
+---
+# tasks/main.yml — svc07_preflight (SVC-07 installer — Phase 1: Preflight)
+#
+# Phase-1 "Preflight & environment validation" tasks (spec task 3.1), moved
+# VERBATIM from the Phase-1 block of ansible/playbooks/svc-07-bootstrap.yml.
+# A failure here leaves ZERO Proxmox resources and unmodified TF state.
+#
+# Owns: cluster_env.py resolve + validate (no_log), TF_VAR_* binding, endpoint
+# canonical-base normalization, operator SSH-public-key injection
+# (stat/assert/read/JSON-encode) + the INFO decision log, Proxmox /version
+# reachability + auth, VLAN-20 `p20` SDN VNet check, datastore autodetect
+# (local-zfs else local-lvm), local prereq/version checks. Publishes the facts
+# consumed by svc07_provision (Phase 2). See design.md "Role 1: svc07_preflight".
+#
+# Cross-phase constants (cluster_env_file, svc07_repo_root, svc07_venv_python)
+# come from the play-level vars on svc-07-bootstrap.yml; the phase-specific
+# vars (svc07_cluster_env_helper, svc07_autodetect_sentinel,
+# svc07_proxmox_validate_certs, svc07_required_collections,
+# svc07_required_venv_binaries) live in this role's defaults/main.yml.
+
+# ============================================================ #
+# Task 6.2 — Env-file load + validation (delegates to          #
+# scripts/installer/cluster_env.py).                           #
+# ------------------------------------------------------------ #
+# The helper is the single source of truth for parsing,        #
+# alias-resolution, conflict detection, and mandatory-var      #
+# completeness (Req 2.3-2.8). It exits 0 with the resolved      #
+# TF_VAR_* mapping as JSON on stdout, 2 for file-absent, 3 for  #
+# a validation failure — no interactive prompt (Req 2.7, 1.3). #
+# We invoke it via the project venv python so its stdlib is     #
+# the one the helper was authored against (dev-workflow.md      #
+# Python Environment Invocation rule). failed_when is left      #
+# default (rc != 0), so a file-absent (2) or validation (3)     #
+# exit halts Phase 1 before any provisioning task runs — this   #
+# is the fail-fast gate (Req 2.3, 2.5). no_log:true because the #
+# resolved JSON carries the API-token value on stdout           #
+# (security-standards.md; Req 8.8).                             #
+# ============================================================ #
+- name: "Preflight | Resolve + validate the cluster env file ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc07_venv_python }}"
+      - "{{ svc07_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ svc07_repo_root }}"
+  register: svc07_env_resolve
+  changed_when: false
+  # The helper's own stderr message already names the file path /
+  # missing vars / conflicting pair and the cluster.env.example
+  # remedy (Req 2.3, 2.5, 2.8); surface it verbatim on failure.
+  no_log: true
+
+# Parse the helper's JSON stdout into a play fact for Phase 2. This is
+# the canonical TF_VAR_* mapping (endpoint, api_token, node_name,
+# openbao_template_file_id, and openbao_datastore_id — the last being
+# the AUTODETECT sentinel when the operator left the datastore unset).
+# no_log:true — the mapping contains TF_VAR_proxmox_api_token.
+- name: "Preflight | Capture the resolved TF_VAR_* mapping for Phase 2"
+  ansible.builtin.set_fact:
+    svc07_tfvars: "{{ svc07_env_resolve.stdout | from_json }}"
+  no_log: true
+
+# Convenience references to the individual resolved values used by the
+# Proxmox API calls below and by Phase 2. Kept in one set_fact so the
+# token-bearing fact is isolated behind a single no_log task; the
+# endpoint/node/datastore facts are non-secret and read freely later.
+- name: "Preflight | Bind resolved cluster parameters to named facts"
+  ansible.builtin.set_fact:
+    svc07_proxmox_endpoint: "{{ svc07_tfvars['TF_VAR_proxmox_endpoint'] }}"
+    svc07_proxmox_api_token: "{{ svc07_tfvars['TF_VAR_proxmox_api_token'] }}"
+    svc07_proxmox_node_name: "{{ svc07_tfvars['TF_VAR_proxmox_node_name'] }}"
+    svc07_openbao_template_file_id: "{{ svc07_tfvars['TF_VAR_openbao_template_file_id'] }}"
+    svc07_openbao_datastore_id: "{{ svc07_tfvars['TF_VAR_openbao_datastore_id'] }}"
+  no_log: true
+
+# Normalize the resolved endpoint to a canonical base URL, ONCE, before
+# the preflight uri tasks append /api2/json and before Phase 2 hands it
+# to the bpg/proxmox provider (fix-cluster-env-endpoint-path, Option A).
+# Strips a trailing /api2/json (with or without a trailing slash) and any
+# trailing slash — so base, base+/, base+/api2/json, and base+/api2/json/
+# all collapse to scheme://host[:port]. Normalization of an
+# already-canonical base is a no-op (Req 3.1).
+#
+# AUTHORITATIVE REFERENCE: scripts/installer/endpoint.py::canonical_base
+# (pinned by tests/installer/test_endpoint.py) is the single source of
+# truth for this rule. This Jinja chain MUST mirror it exactly:
+#   regex_replace('/+$','') -> regex_replace('/api2/json$','') -> regex_replace('/+$','')
+# If the rule changes, change it in BOTH places together. This is a
+# non-secret value, so no no_log is needed here.
+- name: "Preflight | Normalize Proxmox endpoint to a canonical base"
+  ansible.builtin.set_fact:
+    svc07_proxmox_endpoint_base: >-
+      {{ svc07_proxmox_endpoint | trim
+         | regex_replace('/+$', '')
+         | regex_replace('/api2/json$', '')
+         | regex_replace('/+$', '') }}
+
+# ============================================================ #
+# Agent Live-Test Authorization guard consult (spec            #
+# agent-live-test-authorization, Req 5.1/5.2/5.4/5.5;          #
+# design "Component 4 (b) Preflight"; Property 5).             #
+# ------------------------------------------------------------ #
+# GATE: all three tasks are `when: agent_live_run` — an        #
+# ordinary operator run (AGENT_LIVE_AUTHORIZED unset) skips     #
+# them entirely and is byte-for-byte unchanged (Req 5.5).       #
+#                                                               #
+# FAIL-CLOSED, BEFORE ANY PROXMOX CALL: positioned right after  #
+# the cluster-env resolve + TF_VAR binding (so cluster_env_file #
+# is known resolvable) but BEFORE the first Proxmox API call    #
+# (the /version reachability task below) and before any guest   #
+# provisioning — so an armed from-scratch run against a         #
+# NON-allowlisted cluster identity is REFUSED before ANY        #
+# Proxmox resource is touched or even queried (Req 5.1, 5.2).   #
+# The guard resolves the identity itself from cluster_env_file  #
+# and fails closed on any ambiguity; rc is the signal (0 =      #
+# AUTHORIZED, non-zero = REFUSED). Same three-task consult      #
+# pattern as the svc07_clean_slate wiring. Play-level vars      #
+# (svc07_venv_python, svc07_throwaway_guard,                    #
+# svc07_throwaway_allowlist, cluster_env_file, svc07_repo_root) #
+# come from svc-07-bootstrap.yml — not redefined here.          #
+# ============================================================ #
+
+- name: "Preflight | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc07_venv_python }}"
+      - "{{ svc07_throwaway_guard }}"          # scripts/installer/throwaway_guard.py
+      - --service
+      - svc07
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ svc07_throwaway_allowlist }}"      # scripts/installer/throwaway-clusters.yml
+  args:
+    chdir: "{{ svc07_repo_root }}"
+  register: svc07_throwaway_decision
+  changed_when: false
+  failed_when: false          # rc is the signal; we branch on it, not fail here
+  when: agent_live_run | default(false) | bool
+
+- name: "Preflight | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (svc07_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Preflight | Refuse the from-scratch run unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "svc07_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live from-scratch run REFUSED by the throwaway-cluster guard:
+      {{ (svc07_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      Nothing was provisioned and no Proxmox resource was touched or queried.
+      Arm the run only against a throwaway cluster listed in
+      throwaway-clusters.yml with AGENT_LIVE_AUTHORIZED set.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live from-scratch run."
+  when: agent_live_run | default(false) | bool
+
+# ============================================================ #
+# SSH public-key injection — member (c) of the same            #
+# connection-settings-from-cluster-config family                #
+# (fix-cluster-env-endpoint-path: (a) endpoint path, (b) TLS    #
+# verification, (c) SSH public key for guest reachability).     #
+# ------------------------------------------------------------ #
+# The SVC-07 LXCs are created with NO authorized SSH key unless #
+# the operator supplies one, so `common.yml` (Phase 3) cannot   #
+# SSH in ("Permission denied (publickey,password)"). The        #
+# Terraform plumbing already EXISTS — variables.tf declares      #
+# operator_ssh_public_keys (list(string), default []); main.tf  #
+# injects it into BOTH guests' root accounts via a `dynamic      #
+# user_account` block that is OMITTED when the list is empty     #
+# (strict no-op). The installer's job is only to FEED it.        #
+#                                                               #
+# cluster_env.py resolves the operator-supplied PATH string      #
+# (PROXMOX_SSH_PUBLIC_KEY_FILE / TF_VAR_operator_ssh_public_key_#
+# file) — it does NO file IO and NO JSON-list encoding, staying  #
+# a generic path/string resolver. This playbook does the FILE    #
+# READ + JSON-list encoding: expanduser the path, read the .pub  #
+# file, strip it, and JSON-encode a 1-element list for the       #
+# Terraform list(string) var. PUBLIC key only — never a private  #
+# key. Absent => empty [] list => Terraform block omitted =>     #
+# guests provision but are SSH-unreachable (documented default). #
+# Fail-fast: a path set but pointing at a missing/unreadable     #
+# file HALTS preflight naming the path (same philosophy as the   #
+# env-file-absent gate).                                         #
+# ============================================================ #
+
+# Bind the resolved pub-key-file path (may be absent). cluster_env.py
+# emits it under TF_VAR_operator_ssh_public_key_file (the PATH, distinct
+# from the list-typed TF_VAR_operator_ssh_public_keys). Absent => ''.
+# expanduser expands a leading ~ so ~/.ssh/x.pub resolves to $HOME/... .
+- name: "Preflight | Bind + expanduser the operator SSH public-key file path (may be absent)"
+  ansible.builtin.set_fact:
+    svc07_ssh_public_key_file: >-
+      {{ (svc07_tfvars['TF_VAR_operator_ssh_public_key_file'] | default('') | trim) | expanduser }}
+
+# When a path is supplied, stat it and fail fast if it is missing/
+# unreadable — mirrors the env-file-absent fail-fast (name the path so
+# the operator can fix it). Skipped entirely when no path was supplied.
+- name: "Preflight | Stat the operator SSH public-key file (only when a path is set)"
+  ansible.builtin.stat:
+    path: "{{ svc07_ssh_public_key_file }}"
+  register: svc07_ssh_public_key_stat
+  when: (svc07_ssh_public_key_file | length) > 0
+
+- name: "Preflight | Assert the operator SSH public-key file exists + is readable (fail-fast)"
+  ansible.builtin.assert:
+    that:
+      - "svc07_ssh_public_key_stat.stat.exists | default(false)"
+      - "svc07_ssh_public_key_stat.stat.readable | default(false)"
+    fail_msg: >-
+      The operator SSH public-key file
+      '{{ svc07_ssh_public_key_file }}'
+      (PROXMOX_SSH_PUBLIC_KEY_FILE / TF_VAR_operator_ssh_public_key_file in
+      {{ cluster_env_file }}) does not exist or is not readable. Supply a
+      path to your PUBLIC key file (e.g. ~/.ssh/id_ed25519.pub) — PUBLIC
+      key only, never a private key — or leave it unset to provision the
+      guests without an authorized key (they will be SSH-unreachable).
+    success_msg: "Operator SSH public-key file present + readable: {{ svc07_ssh_public_key_file }}"
+  when: (svc07_ssh_public_key_file | length) > 0
+
+# Read the .pub file and JSON-encode a 1-element list(string) for the
+# Terraform var. The list is [ "<contents>" ]; to_json produces valid
+# JSON (e.g. ["ssh-ed25519 AAAA... comment"]) that Terraform parses as a
+# list(string). Only read when a path was supplied AND the stat above
+# confirmed the file. lookup('file', ...) reads on the control node
+# (connection: local), which is where the operator's key lives.
+- name: "Preflight | Read + JSON-encode the operator SSH public key into a 1-element list"
+  ansible.builtin.set_fact:
+    svc07_operator_ssh_public_keys_json: >-
+      {{ [lookup('ansible.builtin.file', svc07_ssh_public_key_file) | trim] | to_json }}
+  when: (svc07_ssh_public_key_file | length) > 0
+
+# No path supplied => empty JSON list => Terraform's `dynamic
+# user_account` block is omitted => strict no-op (documented default:
+# guests provision but are SSH-unreachable until a key is supplied).
+- name: "Preflight | Default the operator SSH public-key list to empty when no path is set"
+  ansible.builtin.set_fact:
+    svc07_operator_ssh_public_keys_json: "[]"
+  when: (svc07_ssh_public_key_file | length) == 0
+
+# INFO-level decision log (composition-wiring.md): make the SSH-key
+# wiring visible in the run output, never silent. The key CONTENTS are a
+# public key (non-secret), but we log only the path + whether a key was
+# wired, not the key material, to keep the banner terse.
+- name: "Preflight | Log the SSH public-key injection decision (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: operator SSH public-key injection:
+      {{ 'WIRED from ' ~ svc07_ssh_public_key_file
+         ~ ' -> TF_VAR_operator_ssh_public_keys (1 key; applied at guest CREATION only)'
+         if (svc07_ssh_public_key_file | length) > 0
+         else 'NONE (PROXMOX_SSH_PUBLIC_KEY_FILE unset -> empty [] list -> guests will be '
+              ~ 'SSH-unreachable; supply a .pub path to enable Ansible reachability)' }}
+
+# ============================================================ #
+# Task 6.3 — Proxmox reachability, auth, P20 bridge, and        #
+# datastore auto-detect (read-only Proxmox API; no guest yet).  #
+# ------------------------------------------------------------ #
+# The Proxmox API-token auth header is                          #
+#   Authorization: PVEAPIToken=<token>                          #
+# Every task carrying that header sets no_log:true (Req 8.8;    #
+# security-standards.md). A connection failure or non-2xx halts #
+# Phase 1 with no state change (Req 3.1, 3.2).                   #
+# ============================================================ #
+
+# Reachability + auth: GET /api2/json/version. status_code pins the
+# 2xx expectation (a 401 from a bad token is a non-2xx -> failure ->
+# halt, Req 3.2). timeout:30 bounds the connectivity check (Req 3.1).
+- name: "Preflight | Verify Proxmox API reachability + authentication (/version)"
+  ansible.builtin.uri:
+    url: "{{ svc07_proxmox_endpoint_base }}/api2/json/version"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ svc07_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ svc07_proxmox_validate_certs }}"
+    status_code: [200]
+  register: svc07_proxmox_version
+  changed_when: false
+  no_log: true
+
+# P20 bridge check: GET /cluster/sdn/vnets, assert a VNet named p20 is
+# present (Req 3.3, 3.4). The token header keeps this no_log; the vnet
+# id list is extracted into a non-secret fact so the assert message can
+# be read without exposing the token.
+- name: "Preflight | List Proxmox SDN VNets (verify VLAN-20 fabric)"
+  ansible.builtin.uri:
+    url: "{{ svc07_proxmox_endpoint_base }}/api2/json/cluster/sdn/vnets"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ svc07_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ svc07_proxmox_validate_certs }}"
+    status_code: [200]
+  register: svc07_sdn_vnets
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | Extract the set of SDN VNet ids (non-secret)"
+  ansible.builtin.set_fact:
+    svc07_vnet_ids: >-
+      {{ svc07_sdn_vnets.json.data | map(attribute='vnet') | list }}
+
+- name: "Preflight | Assert the p20 VLAN-20 bridge exists"
+  ansible.builtin.assert:
+    that:
+      - "'p20' in svc07_vnet_ids"
+    fail_msg: >-
+      The VLAN-20 bridge 'p20' is absent from the Proxmox SDN VNets
+      ({{ svc07_vnet_ids }}). Apply the platform-foundation root first
+      to create the VLAN-20 fabric, then re-run this installer.
+    success_msg: "VLAN-20 bridge 'p20' is present."
+
+# Datastore auto-detect (Req 3.5, 3.6, 2.6): only when the resolved
+# datastore is the AUTODETECT sentinel. When the operator set the var
+# explicitly, cluster_env.py resolved a concrete value and we skip the
+# node-storage query entirely.
+- name: "Preflight | Query target-node storage (only when datastore unset)"
+  ansible.builtin.uri:
+    url: >-
+      {{ svc07_proxmox_endpoint_base }}/api2/json/nodes/{{ svc07_proxmox_node_name }}/storage
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ svc07_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ svc07_proxmox_validate_certs }}"
+    status_code: [200]
+  register: svc07_node_storage
+  changed_when: false
+  no_log: true
+  when: svc07_openbao_datastore_id == svc07_autodetect_sentinel
+
+- name: "Preflight | Extract available storage ids on the target node (non-secret)"
+  ansible.builtin.set_fact:
+    svc07_node_storage_ids: >-
+      {{ svc07_node_storage.json.data | map(attribute='storage') | list }}
+  when: svc07_openbao_datastore_id == svc07_autodetect_sentinel
+
+# Selection order per Req 3.5: local-zfs preferred, else local-lvm.
+- name: "Preflight | Auto-select datastore (local-zfs preferred, else local-lvm)"
+  ansible.builtin.set_fact:
+    svc07_openbao_datastore_id: >-
+      {{ 'local-zfs' if 'local-zfs' in svc07_node_storage_ids
+         else ('local-lvm' if 'local-lvm' in svc07_node_storage_ids
+         else svc07_autodetect_sentinel) }}
+  when: svc07_openbao_datastore_id == svc07_autodetect_sentinel
+
+# Req 3.6: if neither is available, halt instructing the operator to set
+# the datastore var explicitly. (After the select above, a still-sentinel
+# value means neither candidate was found.)
+- name: "Preflight | Assert a datastore was resolved or auto-detected"
+  ansible.builtin.assert:
+    that:
+      - "svc07_openbao_datastore_id != svc07_autodetect_sentinel"
+    fail_msg: >-
+      No datastore was configured and neither 'local-zfs' nor 'local-lvm'
+      is available on node '{{ svc07_proxmox_node_name }}' (found:
+      {{ svc07_node_storage_ids | default([]) }}). Set the datastore
+      variable explicitly (PROXMOX_DATASTORE_ID or TF_VAR_openbao_datastore_id)
+      in {{ cluster_env_file }} and re-run this installer.
+    success_msg: "Datastore resolved to '{{ svc07_openbao_datastore_id }}'."
+
+# ============================================================ #
+# Task 6.4 — Local control-node prerequisite + version checks   #
+# (Req 3.7, 3.8, 8.6, 8.7). All read-only: no Proxmox resource   #
+# is created and Terraform state is untouched by Phase 1.        #
+# ============================================================ #
+
+# terraform binary on PATH (Req 3.7).
+- name: "Preflight | Locate the terraform binary on PATH"
+  ansible.builtin.command:
+    cmd: terraform version
+  register: svc07_terraform_version
+  changed_when: false
+  failed_when: svc07_terraform_version.rc != 0
+
+# Required Ansible collections installed (Req 3.7). ansible.builtin.uri
+# ships in the base package, so the collections this installer leans on
+# for the CONFIGURATOR child runs are the meaningful check. We list them
+# via ansible-galaxy and assert each is present.
+- name: "Preflight | List installed Ansible collections"
+  ansible.builtin.command:
+    cmd: ansible-galaxy collection list --format json
+  register: svc07_galaxy_list
+  changed_when: false
+  failed_when: svc07_galaxy_list.rc != 0
+
+- name: "Preflight | Compute the set of installed collection names"
+  ansible.builtin.set_fact:
+    svc07_installed_collections: >-
+      {{ (svc07_galaxy_list.stdout | from_json).values()
+         | map('list') | flatten | unique | list }}
+
+- name: "Preflight | Assert the required Ansible collections are installed"
+  ansible.builtin.assert:
+    that:
+      - "item in svc07_installed_collections"
+    fail_msg: >-
+      Required Ansible collection '{{ item }}' is not installed. Install
+      the platform collections with:
+      ansible-galaxy collection install -r ansible/requirements.yml
+    success_msg: "Ansible collection '{{ item }}' is installed."
+  loop: "{{ svc07_required_collections }}"
+
+# Project venv binaries present (Req 3.7): the installer and its child
+# runs invoke these by absolute path (dev-workflow.md), so their absence
+# is a hard preflight failure that names the specific missing binary.
+- name: "Preflight | Assert the project venv binaries are present"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: svc07_venv_bin_stat
+  loop: "{{ svc07_required_venv_binaries }}"
+
+- name: "Preflight | Fail naming any missing venv binary"
+  ansible.builtin.assert:
+    that:
+      - "item.stat.exists"
+      - "item.stat.executable | default(false)"
+    fail_msg: >-
+      Required project venv binary is missing or not executable:
+      {{ item.item }}. Create/repair the devinfra virtualenv
+      (~/venv/devinfra/) before running this installer.
+    success_msg: "venv binary present: {{ item.item }}"
+  loop: "{{ svc07_venv_bin_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# Python >= 3.10 (Req 8.6, 8.7). ansible_python_version is a gathered
+# fact (gather_facts: true on the play); compare via version test.
+- name: "Preflight | Assert Python >= 3.10 on the control node"
+  ansible.builtin.assert:
+    that:
+      - "ansible_python_version is version('3.10', '>=')"
+    fail_msg: >-
+      Detected Python {{ ansible_python_version }}, but this installer
+      requires Python 3.10 or later. Upgrade Python (or the devinfra
+      virtualenv's interpreter) before re-running.
+    success_msg: "Python {{ ansible_python_version }} satisfies >= 3.10."
+
+# Ansible >= 2.15 (Req 8.6, 8.7). ansible_version.full is the running
+# ansible-core/Ansible version.
+- name: "Preflight | Assert Ansible >= 2.15 on the control node"
+  ansible.builtin.assert:
+    that:
+      - "ansible_version.full is version('2.15', '>=')"
+    fail_msg: >-
+      Detected Ansible {{ ansible_version.full }}, but this installer
+      requires Ansible 2.15 or later. Upgrade Ansible before re-running.
+    success_msg: "Ansible {{ ansible_version.full }} satisfies >= 2.15."

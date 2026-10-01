@@ -1,0 +1,162 @@
+---
+# tasks/tls_self_signed.yml — openbao_install
+#
+# ============================================================================
+# MOCK-EJBCA self-signed TLS material — OPT-IN, NOT FOR PRODUCTION
+# ----------------------------------------------------------------------------
+# Production TLS material for OpenBao is issued by SVC-08 (EJBCA) and dropped
+# into openbao_tls_host_dir out-of-band; the role only references it by path
+# (openbao_tls_cert_file / openbao_tls_key_file). SVC-08 is NOT built yet, so
+# this file generates a SELF-SIGNED cert + key as a MOCK stand-in for the
+# EJBCA-issued cert, purely so OpenBao can start and be validated now. When
+# SVC-08 exists, drop the real EJBCA cert at the SAME path and set
+# openbao_tls_self_signed=false — OpenBao references it by path, so nothing in
+# OpenBao changes.
+#
+# WHERE IT RUNS: the community.crypto modules (openssl_privatekey / openssl_csr /
+# x509_certificate) execute where the task runs and require the Python
+# `cryptography` library THERE. The target OpenBao LXCs are minimal and do NOT
+# ship `cryptography`, whereas the Ansible CONTROL NODE's venv already has it
+# (it is a dependency of the pinned community.crypto). So the cert + key are
+# generated ON THE CONTROL NODE (delegate_to: localhost, run_once) into a
+# per-run temp dir, then COPIED to openbao_tls_host_dir on the LXC with the
+# container's openbao uid/gid ownership. This adds NO package to any guest.
+#
+# GATING: included from tasks/main.yml only when `openbao_tls_self_signed` is
+# true, and deliberately NOT gated on the version-check guard — a crash-looping
+# / half-installed host missing its cert must still get one so it can come up.
+#
+# SECRETS DISCIPLINE: the private key is a secret. It is generated into a
+# control-node temp dir (mode 0700), copied to the target, and the control-node
+# temp copy is REMOVED at the end of this file. It is never committed, never
+# registered into a logged variable, and never echoed (key tasks set no_log).
+# On the target the key is 0640 owned by the openbao uid/gid (readable by the
+# server through the :ro mount, not world-readable); the cert is 0644.
+# ============================================================================
+
+- name: "MOCK-TLS: ensure the TLS host directory exists on the target (openbao uid/gid, 0750)"
+  ansible.builtin.file:
+    path: "{{ openbao_tls_host_dir }}"
+    state: directory
+    owner: "{{ openbao_container_uid }}"
+    group: "{{ openbao_container_gid }}"
+    mode: "0750"
+
+# --- IDEMPOTENCY: skip the whole generate+copy block when a cert already exists ---
+# The cert/key are generated into a FRESH per-run temp dir on the control node,
+# so community.crypto has no prior state to diff against and would regenerate on
+# EVERY run — each regeneration changes the copied files, fires `Restart openbao`,
+# and (critically for the unsealer) RE-SEALS it, because a Shamir-sealed unsealer
+# does not auto-unseal. That restart-churn forced a manual re-unseal on every run.
+# Fix: stat the TARGET cert/key first and only (re)generate when the cert is
+# ABSENT. A present cert is left untouched — no copy, no restart, no re-seal.
+# (Rotation/expiry is out of scope for a MOCK cert. To force regeneration, delete
+# the cert on the target or bump openbao_tls_self_signed_valid_days and remove it.)
+#
+# LIFECYCLE (see .kiro/steering/mock-stand-ins.md): this is a PERMANENT, opt-in
+# development stand-in, NOT transitional debt. Production leaves the flag false
+# and drops the real SVC-08/EJBCA cert at the same path (OpenBao references it by
+# path, so nothing here changes). The mock stays available even after EJBCA
+# exists — for bringing a host up early or isolating an EJBCA-vs-OpenBao issue.
+# It is never deleted "once SVC-08 lands"; it is simply not selected in prod.
+- name: "MOCK-TLS: stat the target cert to decide whether generation is needed"
+  ansible.builtin.stat:
+    path: "{{ openbao_tls_cert_file | regex_replace('^' + openbao_tls_dir, openbao_tls_host_dir) }}"
+  register: openbao_mock_tls_cert_stat
+  changed_when: false
+
+- name: "MOCK-TLS: set fact — (re)generate only when the target cert is absent"
+  ansible.builtin.set_fact:
+    openbao_mock_tls_generate: "{{ not (openbao_mock_tls_cert_stat.stat.exists | default(false)) }}"
+  changed_when: false
+
+- name: "MOCK-TLS: report that a present cert is kept (idempotent, no restart/re-seal)"
+  ansible.builtin.debug:
+    msg: >-
+      A mock TLS cert already exists at
+      {{ openbao_tls_cert_file | regex_replace('^' + openbao_tls_dir, openbao_tls_host_dir) }};
+      keeping it (no regenerate, no `Restart openbao`, so the unsealer is not
+      re-sealed). Delete it on the target to force regeneration.
+  when: not openbao_mock_tls_generate
+
+# --- Generate on the CONTROL NODE (has `cryptography`); once for the whole run ---
+- name: "MOCK-TLS: create a control-node temp dir for cert generation"
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: "openbao-mock-tls-"
+  register: openbao_mock_tls_tmp
+  delegate_to: localhost
+  become: false          # control-node temp work needs no sudo (avoids a sudo password prompt on the control host)
+  run_once: true
+  changed_when: false
+  when: openbao_mock_tls_generate
+
+- name: "MOCK-TLS: generate the private key on the control node (stand-in for EJBCA)"
+  community.crypto.openssl_privatekey:
+    path: "{{ openbao_mock_tls_tmp.path }}/key.pem"
+    type: RSA
+    size: 4096
+    mode: "0600"
+  delegate_to: localhost
+  become: false          # control-node temp work needs no sudo (avoids a sudo password prompt on the control host)
+  run_once: true
+  no_log: true          # never surface key material in task output
+  when: openbao_mock_tls_generate
+
+- name: "MOCK-TLS: build a CSR carrying the EJBCA-equivalent SANs (control node)"
+  community.crypto.openssl_csr:
+    path: "{{ openbao_mock_tls_tmp.path }}/openbao.csr"
+    privatekey_path: "{{ openbao_mock_tls_tmp.path }}/key.pem"
+    common_name: "{{ openbao_tls_self_signed_cn }}"
+    subject_alt_name: "{{ openbao_tls_self_signed_sans }}"
+    mode: "0600"
+  delegate_to: localhost
+  become: false          # control-node temp work needs no sudo (avoids a sudo password prompt on the control host)
+  run_once: true
+  when: openbao_mock_tls_generate
+
+- name: "MOCK-TLS: self-sign the certificate from the CSR (control node)"
+  community.crypto.x509_certificate:
+    path: "{{ openbao_mock_tls_tmp.path }}/cert.pem"
+    privatekey_path: "{{ openbao_mock_tls_tmp.path }}/key.pem"
+    csr_path: "{{ openbao_mock_tls_tmp.path }}/openbao.csr"
+    provider: selfsigned
+    selfsigned_not_after: "+{{ openbao_tls_self_signed_valid_days }}d"
+    mode: "0600"
+  delegate_to: localhost
+  become: false          # control-node temp work needs no sudo (avoids a sudo password prompt on the control host)
+  run_once: true
+  when: openbao_mock_tls_generate
+
+# --- Copy the generated material to the TARGET LXC with openbao ownership ---
+- name: "MOCK-TLS: install the private key on the target (openbao uid/gid, 0640)"
+  ansible.builtin.copy:
+    src: "{{ openbao_mock_tls_tmp.path }}/key.pem"
+    dest: "{{ openbao_tls_key_file | regex_replace('^' + openbao_tls_dir, openbao_tls_host_dir) }}"
+    owner: "{{ openbao_container_uid }}"
+    group: "{{ openbao_container_gid }}"
+    mode: "0640"
+  no_log: true
+  when: openbao_mock_tls_generate
+  notify: Restart openbao
+
+- name: "MOCK-TLS: install the certificate on the target (openbao uid/gid, 0644)"
+  ansible.builtin.copy:
+    src: "{{ openbao_mock_tls_tmp.path }}/cert.pem"
+    dest: "{{ openbao_tls_cert_file | regex_replace('^' + openbao_tls_dir, openbao_tls_host_dir) }}"
+    owner: "{{ openbao_container_uid }}"
+    group: "{{ openbao_container_gid }}"
+    mode: "0644"
+  when: openbao_mock_tls_generate
+  notify: Restart openbao
+
+# --- Scrub the control-node temp material (key must not linger off-target) ---
+- name: "MOCK-TLS: remove the control-node temp dir (scrub key material)"
+  ansible.builtin.file:
+    path: "{{ openbao_mock_tls_tmp.path }}"
+    state: absent
+  delegate_to: localhost
+  become: false          # control-node temp work needs no sudo (avoids a sudo password prompt on the control host)
+  run_once: true
+  changed_when: false
+  when: openbao_mock_tls_generate

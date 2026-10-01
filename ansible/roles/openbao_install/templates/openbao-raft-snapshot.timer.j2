@@ -1,0 +1,27 @@
+{#
+  templates/openbao-raft-snapshot.timer.j2 — systemd timer for the nightly
+  OpenBao Raft snapshot job (PRIMARY only). Rendered by openbao_install /
+  task 11.1 onto {{ openbao_backup_systemd_dir }}/{{ openbao_backup_service_name }}.timer.
+
+  Fires at 02:00 UTC nightly (Req 11.1). The explicit UTC in OnCalendar pins the
+  timezone regardless of the host's localtime so "02:00 UTC" holds everywhere.
+  Persistent=true so a run missed while the host was off fires on next boot
+  rather than silently skipping a night's backup.
+
+  Contract asserted by the task-11.1 offline structural test:
+    * OnCalendar = {{ openbao_backup_oncalendar }} (02:00 UTC nightly);
+    * Persistent = {{ openbao_backup_persistent | lower }}.
+#}
+# MANAGED BY ANSIBLE (openbao_install / task 11.1) — DO NOT EDIT BY HAND.
+[Unit]
+Description=Nightly 02:00 UTC trigger for the OpenBao Raft snapshot (SVC-07 / Req 11.1)
+
+[Timer]
+# 02:00 UTC every day (Req 11.1). UTC suffix pins the zone regardless of host localtime.
+OnCalendar={{ openbao_backup_oncalendar }}
+# Fire a missed run on next boot rather than skipping a night's backup.
+Persistent={{ openbao_backup_persistent | lower }}
+Unit={{ openbao_backup_service_name }}.service
+
+[Install]
+WantedBy=timers.target

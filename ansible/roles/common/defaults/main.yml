@@ -1,0 +1,57 @@
+---
+# Default variables for the `common` role — the PF §9 host-baseline role and the
+# single source of truth for the Docker CE + Compose-plugin install/pin.
+#
+# No secret material lives here (nor may it, per requirement 1.5 / P3): these are
+# generic, project-agnostic baseline knobs. Runtime secrets arrive only via the
+# OpenBao Agent at container-start, never from an Ansible variable.
+
+# Host timezone applied by the baseline (task 3.1). "Etc/UTC" is the deterministic,
+# location-neutral default; override per host/inventory if a local zone is required.
+common_timezone: "Etc/UTC"
+
+# The single Docker CE / Compose-plugin version pin for the whole platform
+# (requirement 1.2, PF §9 / FR-9). Task 3.2 consumes this with `state: present`
+# (NEVER `latest` / never a floating specifier), so the baked template and any
+# later `common` reconcile install the identical version — drift-free by
+# construction. The build tool passes its `docker_ver_pin` argument straight
+# through to this variable.
+#
+# Value format: the Docker CE apt package version string as published in Docker's
+# official Debian 12 ("bookworm") repository (https://download.docker.com/linux/debian),
+# which carries the `5:` epoch prefix and the `-1~debian.12~bookworm` suffix, e.g.
+# `apt-cache madison docker-ce` lists `5:27.3.1-1~debian.12~bookworm`. This is the
+# `docker-ce` / `docker-ce-cli` package version; the Compose plugin
+# (`docker-compose-plugin`) is pinned to its own matching apt version in task 3.2.
+#
+# Confirm the exact string is still published before a bake/rebuild (versions age
+# out of the repo); update this default or override it via inventory / the build
+# tool's `docker_ver_pin` as needed. Set to "" to force the operator/CI to supply
+# a pin explicitly.
+common_docker_version_pin: "5:27.3.1-1~debian.12~bookworm"
+
+# The Compose plugin, Buildx plugin, and containerd.io are versioned
+# INDEPENDENTLY of docker-ce in Docker's official Debian repository, so they
+# carry their own apt version strings — a docker-ce pin like
+# "5:27.3.1-1~debian.12~bookworm" is NOT a valid version for docker-compose-plugin
+# or containerd.io. Task 3.2 therefore pins each to its own matching variable
+# below rather than floating it to `latest` (requirement 1.2 / PF §9 / FR-9).
+#
+# Confirm each string is still published for the chosen docker-ce release before a
+# bake/rebuild (versions age out of the repo). Discover the exact strings on a
+# Debian 12 host with the Docker repo configured, e.g.:
+#   apt-cache madison docker-compose-plugin
+#   apt-cache madison docker-buildx-plugin
+#   apt-cache madison containerd.io
+# and align them with the docker-ce release pinned in `common_docker_version_pin`.
+# Override any of these via inventory / the build tool as needed. These are the
+# published apt versions matching docker-ce 27.3.1 on bookworm.
+common_docker_compose_plugin_version_pin: "2.29.7-1~debian.12~bookworm"
+common_docker_buildx_plugin_version_pin: "0.17.1-1~debian.12~bookworm"
+common_containerd_version_pin: "1.7.22-1"
+
+# Whether the baseline enables unattended-upgrades (task 3.1). Default true per
+# PF §9 / security-standards.md ("unattended-upgrades … baked into the common
+# role and applied to every host by default"). Set false only for hosts with a
+# deliberately managed patch cadence.
+common_unattended_enabled: true

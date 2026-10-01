@@ -1,0 +1,175 @@
+---
+# tasks/main.yml — svc07_handoff (SVC-07 installer — Phase 4: Handoff)
+#
+# Phase 4 = health sanity + Developer B completion handoff. This role is invoked
+# from the thin orchestrator play svc-07-bootstrap.yml as
+# `import_role: svc07_handoff` inside the Phase-4 block/rescue (spec task 10).
+#
+# STRUCTURAL CHANGE (design.md "Role 4: svc07_handoff", plan item 2): the
+# two-stage guest health gate no longer runs in-play via `delegate_to`. It moves
+# into the dedicated CHILD configurator play ansible/playbooks/svc07-health.yml,
+# which this role invokes with
+#   `ansible-playbook -i {{ svc07_generated_inventory }} svc07-health.yml`
+# (integration-boundaries.md §4). The child play runs `hosts: openbao` NATIVELY
+# on the guest, so the orchestrator (hosts: localhost / connection: local) never
+# needs an SSH connection profile of its own for the health probe.
+#
+# HARD CONSTRAINT (Req 2.2): there is NO delegate_to health task anywhere in this
+# role — the gate is the child play only. The functional handoff below is the
+# child health run + the banner (the banner has no guest dependency, so it stays
+# on the orchestrator).
+#
+# The consolidated, guarded Phase-4 debug include (tasks/debug_probes.yml) is
+# wired by a LATER task (spec task 7.2), placed in svc07-health.yml; this role
+# intentionally carries NO inline debug probes and does NOT create/wire that
+# include here.
+
+# ============================================================ #
+# Health gate — run svc07-health.yml as a CHILD configurator    #
+# run against the generated inventory (Req 2.1, 2.6).           #
+# ------------------------------------------------------------ #
+# The child play's two-stage recreate-robust gate exits 0 iff    #
+# the primary is initialized + unsealed + Running; a non-zero    #
+# child exit is the DEFAULT failed_when (rc != 0), so it         #
+# propagates up to the Phase-4 rescue in the orchestrator play,  #
+# which names Phase 4. We pass svc07_debug_instrumentation       #
+# through to the child so a debug run turns on the child's       #
+# guarded probes too. changed_when:false — a health poll makes   #
+# no change. no_log:false — the child run surfaces no secret     #
+# (bao status / docker inspect only), and the operator must be   #
+# able to read a health-gate failure. chdir to the repo root so  #
+# the child playbook path + the generated inventory relative     #
+# path resolve exactly as the baseline invoked them.             #
+# ============================================================ #
+- name: "Handoff | Run the guest health gate as a child configurator play (svc07-health.yml)"
+  # The health-gate knobs (svc07_openbao_primary_container_name,
+  # svc07_openbao_bao_bin, svc07_openbao_primary_tls_skip_verify, and the
+  # retry budget) are THIS role's defaults (svc07_handoff/defaults/main.yml).
+  # svc07-health.yml is a STANDALONE child play invoked below — it does NOT load
+  # this role's defaults, so those vars would be UNDEFINED in the child (the
+  # container-name/bao-bin refs carry no `default()` and throw at argv render:
+  # "'svc07_openbao_primary_container_name' is undefined"). We therefore bridge
+  # every knob the child play reads across the child-process boundary via `-e`,
+  # exactly as svc07_debug_instrumentation is bridged. This keeps the role
+  # defaults the single source of truth while making them resolve in the child.
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc07_generated_inventory }}"
+      - ansible/playbooks/svc07-health.yml
+      - -e
+      - "svc07_debug_instrumentation={{ svc07_debug_instrumentation | default(false) }}"
+      - -e
+      - "svc07_openbao_primary_container_name={{ svc07_openbao_primary_container_name }}"
+      - -e
+      - "svc07_openbao_bao_bin={{ svc07_openbao_bao_bin }}"
+      - -e
+      - "svc07_openbao_primary_tls_skip_verify={{ svc07_openbao_primary_tls_skip_verify }}"
+      - -e
+      - "svc07_health_retries={{ svc07_health_retries }}"
+      - -e
+      - "svc07_health_delay={{ svc07_health_delay }}"
+  args:
+    chdir: "{{ svc07_repo_root }}"
+  register: svc07_health_run
+  changed_when: false
+
+# ============================================================ #
+# (opt-in) through-Traefik health check (Req 6.3).             #
+# ------------------------------------------------------------ #
+# The design-correct external route is Traefik (SVC-09) at       #
+# https://openbao.<platform-domain>/v1/sys/health. SVC-09 is not #
+# deployed yet, so this is OFF BY DEFAULT                        #
+# (svc07_health_check_via_traefik=false) and skipped — the       #
+# child play's `docker exec ... bao status` guest gate alone     #
+# gates Phase 4. When an operator opts in (-e                    #
+# svc07_health_check_via_traefik=true) AND Traefik is live, this #
+# additionally verifies the REAL ingress path. It runs on the    #
+# orchestrator (a plain `uri` GET, no guest dependency, no       #
+# delegate_to), targets the real Traefik route only, and         #
+# publishes no primary host port. validate_certs:false because   #
+# the route serves a self-signed cert during dev.                #
+# ============================================================ #
+- name: "Handoff | (opt-in) Poll the primary via the Traefik route until healthy"
+  ansible.builtin.uri:
+    url: "https://openbao.{{ platform_domain }}/v1/sys/health"
+    method: GET
+    validate_certs: false
+    status_code: [200, 429, 472, 473, 501, 503]
+  register: svc07_primary_health_traefik
+  failed_when: false
+  changed_when: false
+  until: >-
+    (svc07_primary_health_traefik.status | default(0)) == 200
+    and (svc07_primary_health_traefik.json is defined)
+    and (svc07_primary_health_traefik.json.initialized | default(false) | bool)
+    and (not (svc07_primary_health_traefik.json.sealed | default(true) | bool))
+  retries: 12
+  delay: 5
+  when: svc07_health_check_via_traefik | default(false) | bool
+
+- name: "Handoff | (opt-in) Assert the primary is healthy via the Traefik route"
+  ansible.builtin.assert:
+    that:
+      - "(svc07_primary_health_traefik.status | default(0)) == 200"
+      - "svc07_primary_health_traefik.json is defined"
+      - "svc07_primary_health_traefik.json.initialized | default(false) | bool"
+      - "not (svc07_primary_health_traefik.json.sealed | default(true) | bool)"
+    fail_msg: >-
+      The OpenBao primary through-Traefik health check
+      (svc07_health_check_via_traefik=true) timed out: the endpoint
+      https://openbao.{{ platform_domain }}/v1/sys/health did not report
+      HTTP 200 with initialized:true and sealed:false within 60 seconds.
+      This opt-in check requires Traefik (SVC-09) to be deployed; leave
+      svc07_health_check_via_traefik at its default (false) until then.
+    success_msg: "OpenBao primary is healthy via the Traefik route."
+  when: svc07_health_check_via_traefik | default(false) | bool
+
+# ============================================================ #
+# Completion summary banner (Req 3.6, 6.6, 7.6).               #
+# ------------------------------------------------------------ #
+# Resolve the ABSOLUTE Cluster_Env_File path where the          #
+# Admin_Token was saved (Req 7.6). The token was persisted to   #
+# {{ svc07_repo_root }}/{{ cluster_env_file }}; svc07_repo_root  #
+# is already absolute (playbook_dir | dirname | dirname), but a  #
+# relative cluster_env_file override would leave the join        #
+# relative — realpath normalizes it to an absolute path.        #
+# The Admin_Token is referenced BY NAME only; no secret value    #
+# appears anywhere in this banner (Req 3.6).                    #
+# ============================================================ #
+- name: "Handoff | Resolve the absolute Cluster_Env_File path (where the token was saved)"
+  ansible.builtin.set_fact:
+    svc07_cluster_env_abspath: >-
+      {{ (svc07_repo_root ~ '/' ~ cluster_env_file) | ansible.builtin.realpath }}
+
+# The exact onboarding command (verbatim, Req 7.6). Built as a folded scalar so
+# the physical source lines stay within the 120-char yamllint limit; a folded
+# (>-) scalar rejoins its wrapped lines with single spaces, exactly reproducing
+# the space-separated command string.
+- name: "Handoff | Compose the exact project-onboarding command (verbatim, Req 7.6)"
+  ansible.builtin.set_fact:
+    svc07_onboarding_command: >-
+      ~/venv/devinfra/bin/ansible-playbook
+      -i ansible/inventory/svc-07-secrets-manager.generated.yml
+      ansible/playbooks/openbao.yml --tags onboard
+      -e project_slug=<project-slug> -e openbao_tls_self_signed=true
+
+- name: "Handoff | Print the Developer B completion summary banner"
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Service SVC-07 (OpenBao) Deployed Successfully!"
+      - "============================================================"
+      - "Service:            SVC-07 (OpenBao)"
+      - "Status:             healthy"
+      - "Internal API:       VLAN-20 only, via `docker exec {{ svc07_openbao_primary_container_name }} bao ...`"
+      - "                    (no host port published — Req 6 crit 2; reach externally via Traefik once SVC-09 is live)"
+      - "Traefik URL:        https://openbao.{{ platform_domain }}  (active once SVC-09 is deployed)"
+      - "Credentials Saved:  {{ svc07_cluster_env_abspath }}"
+      - "                    (admin token stored as OPENBAO_ADMIN_TOKEN — value not shown)"
+      - ""
+      - "Next Steps for Project Developers:"
+      - "  To onboard a project, run:"
+      - "  {{ svc07_onboarding_command }}"
+      - "============================================================"

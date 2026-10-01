@@ -1,0 +1,314 @@
+---
+# tasks/main.yml — openbao_init_unseal
+#
+# Task 6.1 SCOPE (this file, today):
+#   (a) role skeleton;
+#   (b) a `bao status` / health guard that reads `initialized` and gates every
+#       init task so a re-run against an already-initialised instance is a
+#       no-op reporting changed=0 (Req 13.3);
+#   (c) the UNSEALER's full Raft bootstrap — readiness-guarded `operator init` +
+#       threshold `operator unseal` + Transit-engine setup + openbao-seal scoped
+#       policy + periodic Bootstrap_Transit_Token mint + unsealer root revoke —
+#       delegated to tasks/unsealer_bootstrap.yml (spec
+#       svc07-unsealer-bootstrap-delegation), gated on the status check;
+#   plus the 6.2 / 7.x / 10.1 extension points below.
+#
+# The role now OWNS the unsealer's OWN `operator init`/`unseal` (it no longer
+# "assumes an already-initialised unsealer"): the orchestrator delegates the
+# unsealer bootstrap here exactly as it already delegates the primary, so the
+# unsealer path gains the same readiness guard + idempotency the primary has
+# (fixes bug #7 — `operator init` fired before the fresh unsealer's Raft backend
+# was ready — and the sibling post-unseal races, by construction).
+#
+# Swap hardening is NOT done here: per ADR-0006 the "secret material is never
+# written to plaintext swap" control is encrypted host swap (operator-owned,
+# host layer) + the per-container swap cap in openbao_install/Terraform — NOT a
+# host-global vm.swappiness write from inside the LXC (removed: it is unrunnable
+# on an unprivileged LXC, cross-tenant, and only a heuristic).
+#
+# Ordering (design's Init/unseal/bootstrap sequence): the UNSEALER is
+# initialised FIRST (its Transit engine), THEN the primary's Raft store. The
+# primary Raft `bao operator init` — plus root-token bootstrap and revoke — is
+# TASK 6.2's job and slots in at the clearly-marked extension point below.
+# Engine/auth/audit enablement is TASK 7.x and slots in at its own marker.
+#
+# `openbao_role` selects the target:
+#   - "unsealer" -> status guard + full Raft bootstrap via unsealer_bootstrap.yml
+#   - "primary"  -> status guard + Raft init/bootstrap via primary_bootstrap.yml
+#
+# NO secret value is templated, echoed, or defaulted anywhere in this role.
+
+- name: Validate openbao_role
+  ansible.builtin.assert:
+    that:
+      - openbao_role in ["primary", "unsealer"]
+    fail_msg: "openbao_role must be 'primary' or 'unsealer' (got '{{ openbao_role }}')."
+    quiet: true
+
+# =============================================================================
+# (b) `bao status` / health guard (Req 13.3)
+# -----------------------------------------------------------------------------
+# Read GET /v1/sys/health for the current instance and derive
+# `openbao_already_initialized`. Every init task below is gated on this fact, so
+# a re-run against an already-initialised instance skips init and reports
+# changed=0. The read is:
+#   - check_mode: false  -> it runs even under `ansible-playbook --check`,
+#                           otherwise check-mode would return no body and the
+#                           guard could not evaluate;
+#   - changed_when: false -> the probe itself never reports a change;
+#   - status_code accepts 200/429/472/473/501/503 -> OpenBao's health endpoint
+#     returns non-200 codes for sealed/standby/uninitialised states, all of
+#     which carry the JSON body we need; we override the codes above so those
+#     are not treated as request failures.
+# `failed_when: false` keeps a not-yet-up instance (connection refused) from
+# aborting the run — an unreachable instance is simply "not initialised yet".
+# =============================================================================
+
+# Read `bao status` INSIDE the target container via `docker exec` — NOT a host
+# `uri` GET (the former openbao_health_* vars, now removed). WHY: the PRIMARY publishes no host port
+# (Traefik-labels-only, PF FR-7), so nothing listens on https://10.0.20.10:8200
+# from the LXC host where a `uri` task runs — the health read returns no body,
+# `openbao_health.json` stays undefined, and the guard wrongly derives
+# `openbao_already_initialized = false` on an ALREADY-INITIALISED primary, so the
+# init task runs and fails ("already initialized"). Observed live: guard said
+# `initialized=unknown; proceeding with init` while `bao status` in the container
+# showed Initialized true. `docker exec bao status` runs in the container's own
+# network namespace where :8200 is bound (the proven path init/wait/bootstrap
+# use) and works for BOTH roles — the unsealer happened to work via `uri` only
+# because it publishes a host port; the primary does not. `bao status` exits 0
+# (unsealed) / 2 (sealed) / non-zero (uninitialised/down) and prints a JSON body
+# on the initialised paths; we tolerate any rc and derive state from the JSON.
+- name: "Guard — read bao status (docker exec, check-safe, no change)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec',
+          (openbao_primary_container_name if openbao_role == 'primary'
+           else openbao_unsealer_container_name),
+          openbao_bao_bin, 'status']
+         + (['-tls-skip-verify']
+            if ((openbao_primary_tls_skip_verify if openbao_role == 'primary'
+                 else openbao_unsealer_tls_skip_verify) | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_status_probe
+  check_mode: false          # run even under --check so the guard can evaluate
+  changed_when: false        # a read never reports a change
+  failed_when: false         # sealed/uninitialised/down is just "not initialised yet"
+
+# Reusable "did `bao status` return a parseable JSON object?" test. NOTE: a
+# regex like `^\s*[{[]` DOES NOT survive a YAML `>-` FOLDED scalar (the `\s`
+# is mangled and never matches — observed live: the guard read valid JSON yet
+# derived initialized=unknown). We therefore avoid regex here and test the first
+# non-space char is a JSON opener, then short-circuit `from_json`. `bao status
+# -format=json` prints a clean JSON object on stdout (rc 0 unsealed / 2 sealed);
+# an empty/non-JSON stdout (container down) yields a falsey result, never a crash.
+- name: "Guard — derive openbao_already_initialized from the status body"
+  ansible.builtin.set_fact:
+    openbao_status_is_json: >-
+      {{ (openbao_status_probe.stdout | default('') | trim | length > 0)
+         and ((openbao_status_probe.stdout | default('') | trim | first) in ['{', '[']) }}
+  changed_when: false
+
+- name: "Guard — set openbao_already_initialized (init tasks gate on `not` this)"
+  ansible.builtin.set_fact:
+    # True ONLY when `bao status` returned a parseable JSON body reporting
+    # initialized: true. Any other outcome (no JSON, initialized false/absent,
+    # container down) means "not initialised" -> the init tasks below run.
+    openbao_already_initialized: >-
+      {{ openbao_status_is_json
+         and ((openbao_status_probe.stdout | from_json).initialized | default(false) | bool) }}
+  changed_when: false
+
+- name: "Guard — report the init decision (skip when already initialised, Req 13.3)"
+  ansible.builtin.debug:
+    msg: >-
+      {{ openbao_role }} instance reports
+      initialized={{ openbao_status_is_json
+                     | ternary((openbao_status_probe.stdout | default('{}') | from_json).initialized
+                               | default('unknown'), 'unknown') }};
+      {{ 'SKIPPING init (idempotent, Req 13.3)'
+         if openbao_already_initialized
+         else 'proceeding with init' }}.
+
+# =============================================================================
+# FAIL-LOUD — already-initialised-but-SEALED unsealer re-run (spec
+# fix-svc07-unsealer-reseal-on-handler-restart, Change 2 / Req 2.4).
+# -----------------------------------------------------------------------------
+# On the RE-RUN path (openbao_already_initialized == true) the whole unsealer
+# bootstrap include below is SKIPPED (its `not openbao_already_initialized`
+# gate), and the role holds NO Shamir keys — the operator holds them offline.
+# So if that already-initialised unsealer is currently SEALED, the run would
+# otherwise proceed silently to a confusing downstream primary `503 Vault is
+# sealed`. Fail closed HERE instead, with an actionable re-unseal instruction.
+#
+# Derive `openbao_already_sealed` from the SAME `bao status` probe the guard
+# already ran (openbao_status_probe / openbao_status_is_json) — no extra call.
+# The assert fires ONLY when role==unsealer AND already-initialised AND sealed;
+# it does NOT fire on the healthy initialised+unsealed no-op (that stays a clean
+# changed=0 skip), and NOT on the primary (which auto-unseals via Transit). No
+# secret value is referenced or echoed.
+- name: "Guard — derive openbao_already_sealed from the status body"
+  ansible.builtin.set_fact:
+    openbao_already_sealed: >-
+      {{ openbao_status_is_json
+         and ((openbao_status_probe.stdout | from_json).sealed | default(false) | bool) }}
+  changed_when: false
+
+- name: "Guard — fail loud if an already-initialised unsealer is SEALED on a re-run (Req 2.4)"
+  ansible.builtin.assert:
+    that:
+      - not (openbao_role == "unsealer" and openbao_already_initialized | bool and openbao_already_sealed | bool)
+    fail_msg: >-
+      The unsealer '{{ openbao_unsealer_container_name }}' is already
+      initialised (openbao_already_initialized) but currently reports
+      sealed:true. On this re-run path the role holds NO Shamir keys (the
+      operator holds the threshold keys OFFLINE), so it cannot self-re-unseal —
+      the unsealer bootstrap include is idempotently skipped. Proceeding would
+      leave the primary crash-looping on `503 Vault is sealed`. Re-unseal the
+      unsealer manually with the offline-held threshold Shamir keys, then re-run
+      (see INSTALL-RUNBOOK §2), e.g. run, once per key up to the threshold:
+        docker exec {{ openbao_unsealer_container_name }} {{ openbao_bao_bin }}
+        operator unseal -tls-skip-verify <offline-held-key>
+      Do NOT paste any key into this playbook — keys stay offline with the
+      operator.
+    success_msg: "Unsealer is not in the already-initialised-and-sealed state; proceeding."
+    quiet: true
+
+# =============================================================================
+# (c) Unsealer full Raft bootstrap (task 6.1) — delegated, guarded, idempotent
+# -----------------------------------------------------------------------------
+# ORDER: the unsealer is bootstrapped FIRST (design's sequence). The whole
+# unsealer bootstrap — readiness-guarded `operator init` + threshold
+# `operator unseal` + post-unseal readiness wait + Transit-engine enable +
+# unseal-key create + the openbao-seal scoped policy + the periodic
+# Bootstrap_Transit_Token mint + unsealer root-token revoke — lives in
+# tasks/unsealer_bootstrap.yml (spec svc07-unsealer-bootstrap-delegation),
+# mirroring tasks/primary_bootstrap.yml.
+#
+# It is included below and GATED on:
+#   - openbao_role == "unsealer"
+#   - not openbao_already_initialized      (Req 3.1/3.2 — a re-run is a no-op)
+#
+# WHY the gating CHANGED vs the old (c) Transit-only block: that block was
+# DELIBERATELY NOT gated on `not openbao_already_initialized` because it assumed
+# the operator had ALREADY run `bao operator init` on the unsealer manually
+# (flipping `initialized` True) before the role layered Transit on top. The role
+# now OWNS that `operator init` itself, so the WHOLE bootstrap — init included —
+# is correctly gated on `not openbao_already_initialized`: a fresh unsealer runs
+# the full sequence; an already-initialised one skips it (the operator holds the
+# Shamir keys offline). Idempotency within the file is still belt-and-braces
+# (tolerant probe; enable-if-absent; key create-if-absent) so a re-run that DOES
+# reach it stays a clean no-op. The Transit setup that used to live here inline
+# now runs INSIDE that guarded include, AFTER the post-unseal readiness wait, so
+# it never fires against a not-yet-ready backend (fixes the sibling race).
+# =============================================================================
+
+- name: "Task 6.1b — unsealer Raft init + unseal + Transit + seal policy + mint + revoke"
+  ansible.builtin.include_tasks: unsealer_bootstrap.yml
+  when:
+    - openbao_role == "unsealer"
+    - not openbao_already_initialized
+
+# =============================================================================
+# EXTENSION POINT — Task 6.2: primary Raft init + Root_Token bootstrap + revoke
+# -----------------------------------------------------------------------------
+# Task 6.2's primary-bootstrap logic is split into tasks/primary_bootstrap.yml
+# to keep THIS file navigable (so task 7.x can add its own include cleanly).
+# That included file, GATED here on `openbao_role == "primary"` and
+# `not openbao_already_initialized` and running AFTER the unsealer block above:
+#   0. resolves the Bootstrap_Transit_Token from an operator-supplied,
+#      never-committed external source — a local gitignored .env OR a GitLab
+#      CI/CD protected+masked variable (env-var lookup; never a defaulted or
+#      committed value), and fails closed if neither supplied it;
+#   1. renders that token into the primary's seal "transit" stanza (no_log);
+#   2. runs `bao operator init` on the primary (Raft) ONCE, capturing the
+#      Root_Token in an in-memory no_log fact (recovery keys captured offline
+#      by the operator);
+#   3. waits for the primary to report initialized:true AND sealed:false;
+#   4. uses the Root_Token to write the platform-admin policy (Security AC 2)
+#      and mint a tightly-scoped short-TTL KV-writer token;
+#   >> Task 7.x's engine/auth/audit block runs HERE, inside the root-token
+#      window, BEFORE the revoke (see the ordering contract in
+#      tasks/primary_bootstrap.yml at the "EXTENSION POINT — Task 7.x" marker);
+#   5. `bao token revoke -self` on the Root_Token (closes the window);
+#   6. writes the Bootstrap_Transit_Token into KV
+#      secret/platform/svc07/transit-token using the scoped KV-writer token;
+#   7. REMOVES the external copy (.env line or GitLab CI variable), failing
+#      loudly rather than silently skipping if it cannot reach the source;
+#   8. scrubs all token facts from memory.
+# The two hard invariants (never committed in any form; external copy removed
+# once the KV copy is live) are enforced there. Every token-handling task sets
+# no_log: "{{ openbao_no_log }}". Nothing in THIS file holds a secret.
+# =============================================================================
+
+- name: "Task 6.2 — primary Raft init + bootstrap + revoke + token rotation"
+  ansible.builtin.include_tasks: primary_bootstrap.yml
+  when:
+    - openbao_role == "primary"
+    - not openbao_already_initialized
+
+# =============================================================================
+# EXTENSION POINT — Task 7.x: engines / auth methods / audit device bootstrap
+# -----------------------------------------------------------------------------
+# NOTE FOR TASK 7.x: your engine/auth/audit steps REQUIRE the Root_Token, which
+# is only alive INSIDE the bootstrap window that tasks/primary_bootstrap.yml
+# opens (init) and closes (revoke). They therefore MUST run INSIDE that window,
+# NOT here at the end of main.yml — by the time control returns to this point
+# the Root_Token has already been revoked.
+#
+# So task 7.x does NOT add its include here. Instead it adds exactly one
+# `ansible.builtin.include_tasks: engines_auth_audit.yml` at the marker
+#   "EXTENSION POINT — Task 7.x (engine/auth/audit) RUNS HERE, INSIDE the
+#    root-token window, BEFORE the revoke"
+# inside tasks/primary_bootstrap.yml (between STEP-4b and STEP-5). The full
+# ordering contract — how to authenticate with `openbao_root_token`, the
+# not-persist rule, and the not-already-initialised gating it inherits — is
+# documented at that marker. This marker is left here intentionally as the
+# signpost that points task 7.x to the right insertion site.
+#
+#   - 7.1 KV v2 @ secret/ (max_versions=10), database engine (postgres), aws
+#         engine (Garage S3);
+#   - 7.2 jwt + oidc auth methods, file audit device (fail-closed), Promtail;
+#   - 7.3 root-credential rotation wiring.
+# =============================================================================
+
+# --- (task 7.x: see tasks/primary_bootstrap.yml "EXTENSION POINT — Task 7.x") ---
+
+# =============================================================================
+# EXTENSION POINT — Task 10.1: Prometheus (SVC-17) scrape-config fragment
+# -----------------------------------------------------------------------------
+# Unlike task 7.x, rendering the Prometheus scrape-config drop-in needs NO
+# Root_Token and no live OpenBao API call — it is a pure host-file template
+# render (like the §7.2 Promtail fragment). It therefore runs HERE, at the end
+# of main.yml, OUTSIDE the bootstrap window, and is NOT gated on
+# `openbao_already_initialized`: the scrape config is reconciled on every run so
+# it stays present/correct even on an already-initialised primary (the template
+# module is idempotent, Req 13). It is gated on `openbao_role == "primary"` (the
+# fragment is rendered once, from the primary host) — the details, including the
+# metrics-auth choice and the sealed-metric note, live in tasks/observability.yml.
+# =============================================================================
+
+- name: "Task 10.1 — render the OpenBao Prometheus (SVC-17) scrape-config fragment"
+  ansible.builtin.include_tasks: observability.yml
+  when:
+    - openbao_role == "primary"
+
+# =============================================================================
+# EXTENSION POINT — Task 10.2: Alertmanager alerts + Loki audit rule + route
+# -----------------------------------------------------------------------------
+# Like task 10.1 (and unlike task 7.x), rendering the alerting-rule / route
+# fragments needs NO Root_Token and no live OpenBao API call — they are pure
+# host-file template renders. They therefore run HERE, at the end of main.yml,
+# OUTSIDE the bootstrap window, and are NOT gated on `openbao_already_initialized`:
+# the rule/route files are reconciled on every run so they stay present/correct
+# even on an already-initialised primary (the template module is idempotent,
+# Req 13). Gated on `openbao_role == "primary"` (the fragments are rendered once,
+# from the primary host). The details — the three metric alerts (Req 10.4/10.5/
+# 10.6), the Loki audit-failure rule (Req 10.7, distinct from the task-11.1
+# snapshot marker), and the 30-min unacknowledged escalation to the secondary
+# on-call receiver (Req 10.9) — live in tasks/alerts.yml.
+# =============================================================================
+
+- name: "Task 10.2 — render the OpenBao alerting rules + Loki audit rule + Alertmanager escalation route"
+  ansible.builtin.include_tasks: alerts.yml
+  when:
+    - openbao_role == "primary"

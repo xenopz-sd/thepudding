@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+{#
+  templates/openbao-snapshot.sh.j2 — nightly OpenBao Raft snapshot script for
+  the PRIMARY (svc07-20-01). Rendered by openbao_install / task 11.1
+  (tasks/backup.yml) onto the primary host at {{ openbao_backup_script_path }}
+  and driven by the systemd timer {{ openbao_backup_service_name }}.timer
+  (02:00 UTC nightly).
+
+  CONTRACT (design.md "Error Handling (snapshot rows)"; Req 11.1/11.2/11.3/11.5/
+  11.6, FD.6), asserted by the task-11.1 offline structural test:
+    * run `bao operator raft snapshot save <file>` via `docker exec` against the
+      primary container (ONLINE / non-blocking — OpenBao keeps serving during
+      the snapshot, Req 11.6);
+    * GATE the PBS hand-off on BOTH the save exit code == 0 AND a non-empty
+      snapshot file (stat size > 0) — Req 11.1;
+    * on a non-zero exit OR an empty file: do NOT transfer to PBS, log the
+      failure WITH the affected UTC date, and emit ONE structured
+      "{{ openbao_backup_failure_marker }}" line Promtail ships to Loki so the
+      task-10.2 alert rule fires within 15 min (Req 11.2, 11.5, FD.6);
+    * PBS retention keep-daily >= 7 (Req 11.3), refused below if set lower.
+
+  NO SECRET IS TEMPLATED HERE. The scoped snapshot token (authorized for
+  sys/storage/raft/snapshot) is read at RUNTIME from the root-only file
+  {{ openbao_backup_token_file }} (Agent-rendered / operator-supplied,
+  gitignored) — referenced by PATH only. The PBS credential is read at runtime
+  from the systemd EnvironmentFile ({{ openbao_backup_env_file }}) via the
+  env var {{ openbao_backup_pbs_password_env_var }}. Neither value is ever echoed.
+#}
+# MANAGED BY ANSIBLE (openbao_install / task 11.1) — DO NOT EDIT BY HAND.
+# Nightly OpenBao Raft snapshot -> gate (rc==0 AND non-empty) -> PBS (SVC-32).
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# --- Static (Ansible-rendered) configuration — NO secret values here. --------
+readonly JOB_NAME="{{ openbao_backup_job_name }}"
+readonly CONTAINER="{{ openbao_backup_container_name }}"
+readonly BAO_BIN="{{ openbao_backup_bao_bin }}"
+readonly BAO_ADDR="{{ openbao_backup_bao_addr }}"
+readonly TOKEN_FILE="{{ openbao_backup_token_file }}"
+readonly CONTAINER_TMP="{{ openbao_backup_container_tmp }}"
+readonly BACKUP_DIR="{{ openbao_backup_dir }}"
+readonly FILE_BASENAME="{{ openbao_backup_file_basename }}"
+readonly LOG_FILE="{{ openbao_backup_log_file }}"
+readonly FAILURE_MARKER="{{ openbao_backup_failure_marker }}"
+readonly SUCCESS_MARKER="{{ openbao_backup_success_marker }}"
+readonly PBS_ENABLED="{{ openbao_backup_pbs_enabled | lower }}"
+readonly PBS_REPOSITORY="{{ openbao_backup_pbs_repository }}"
+readonly PBS_BACKUP_ID="{{ openbao_backup_pbs_backup_id }}"
+readonly PBS_PASSWORD_ENV_VAR="{{ openbao_backup_pbs_password_env_var }}"
+readonly PBS_KEEP_DAILY="{{ openbao_backup_pbs_keep_daily }}"
+readonly LOCAL_KEEP_DAILY="{{ openbao_backup_local_keep_daily }}"
+
+# --- Derived per-run values --------------------------------------------------
+# The affected date (UTC) is derived ONCE up front so both the filename and any
+# failure log line carry the SAME date (Req 11.2: "the affected date").
+RUN_DATE="$(date -u +%Y-%m-%d)"
+RUN_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+readonly RUN_DATE RUN_TS
+readonly SNAPSHOT_FILE="${BACKUP_DIR}/${FILE_BASENAME}-${RUN_DATE}.snap"
+
+# --- Logging helpers ---------------------------------------------------------
+# Every line is written to BOTH the host log file (tailed by Promtail -> Loki)
+# and journald (via stderr), so the task-10.2 Loki alert rule can match the
+# failure marker within 15 min regardless of which sink Promtail scrapes.
+# NO secret value is ever passed to these — only job/reason/date fields.
+log_line() {
+  # $1 = marker, $2 = level, $3 = message
+  local marker="$1" level="$2" msg="$3"
+  local line="${marker} level=${level} job=${JOB_NAME} date=${RUN_DATE} ts=${RUN_TS} msg=\"${msg}\""
+  # Append to the host log file (best-effort; never abort the run on a log write).
+  printf '%s\n' "${line}" >>"${LOG_FILE}" 2>/dev/null || true
+  # Also emit to stderr so journald captures it under the systemd unit.
+  printf '%s\n' "${line}" >&2
+}
+
+# fail() emits the single structured FAILURE line (Req 11.2/11.5/FD.6), makes
+# sure the PBS transfer is NOT attempted (we only call it after the gate), and
+# exits non-zero so the systemd unit records a failed run. The affected date is
+# always included.
+fail() {
+  local reason="$1"
+  log_line "${FAILURE_MARKER}" "error" "snapshot creation failed: ${reason}"
+  # Remove any partial/empty snapshot file so a later run / operator does not
+  # mistake it for a good backup.
+  rm -f "${SNAPSHOT_FILE}" 2>/dev/null || true
+  exit 1
+}
+
+# --- Preflight ---------------------------------------------------------------
+# Refuse a retention setting below the Req 11.3 minimum rather than silently
+# under-retaining.
+if [ "${PBS_KEEP_DAILY}" -lt 7 ]; then
+  fail "PBS keep-daily retention ${PBS_KEEP_DAILY} is below the required minimum of 7 (Req 11.3)"
+fi
+
+mkdir -p "${BACKUP_DIR}"
+chmod 0700 "${BACKUP_DIR}" 2>/dev/null || true
+
+# The scoped snapshot token must be present (never committed; runtime-supplied).
+if [ ! -r "${TOKEN_FILE}" ]; then
+  fail "scoped snapshot token file ${TOKEN_FILE} is missing or unreadable"
+fi
+
+# =============================================================================
+# STEP 1 — Take the snapshot (ONLINE; OpenBao keeps serving — Req 11.6).
+# -----------------------------------------------------------------------------
+# `bao operator raft snapshot save` is online/non-blocking by design, so this
+# does NOT interrupt read/write serving (the p99-within-500ms guarantee is
+# verified by the task-12.4/12.5 tests, not enforced here). We run it via
+# `docker exec` against the primary container so it uses the server's own `bao`
+# binary/version (consistent with the init/onboard roles).
+#
+# The scoped token is passed into the exec environment as BAO_TOKEN from the
+# root-only token file — read into a variable that is NEVER logged. `set -x` is
+# intentionally NOT enabled so the token is never traced.
+# =============================================================================
+SNAPSHOT_TOKEN="$(cat "${TOKEN_FILE}")"
+
+save_rc=0
+docker exec \
+  -e "BAO_ADDR=${BAO_ADDR}" \
+  -e "BAO_TOKEN=${SNAPSHOT_TOKEN}" \
+  -e "BAO_SKIP_VERIFY=true" \
+  "${CONTAINER}" \
+  "${BAO_BIN}" operator raft snapshot save "${CONTAINER_TMP}" || save_rc=$?
+
+# Scrub the token from the environment as soon as the save returns.
+unset SNAPSHOT_TOKEN
+
+# Copy the snapshot out of the container to the dated host path, then remove the
+# in-container temp file. A copy failure is treated as a snapshot failure.
+if [ "${save_rc}" -eq 0 ]; then
+  docker cp "${CONTAINER}:${CONTAINER_TMP}" "${SNAPSHOT_FILE}" || save_rc=$?
+  docker exec "${CONTAINER}" rm -f "${CONTAINER_TMP}" 2>/dev/null || true
+fi
+
+# =============================================================================
+# STEP 2 — THE GATE (Req 11.1): PBS hand-off requires rc == 0 AND non-empty file.
+# -----------------------------------------------------------------------------
+# Both conditions must hold. If EITHER fails we abort the PBS transfer, log the
+# failure with the affected date, and emit the Loki-alertable failure line.
+# =============================================================================
+if [ "${save_rc}" -ne 0 ]; then
+  fail "bao operator raft snapshot save exited non-zero (rc=${save_rc})"
+fi
+
+if [ ! -s "${SNAPSHOT_FILE}" ]; then
+  # -s is true only when the file EXISTS and has size > 0. A missing or
+  # zero-byte snapshot fails the gate (Req 11.1).
+  fail "snapshot file ${SNAPSHOT_FILE} is missing or empty (0 bytes)"
+fi
+
+snapshot_bytes="$(stat -c '%s' "${SNAPSHOT_FILE}")"
+log_line "${SUCCESS_MARKER}" "info" "snapshot created and passed the gate (${snapshot_bytes} bytes); proceeding to PBS hand-off"
+
+# =============================================================================
+# STEP 3 — PBS hand-off (SVC-32) — only reached AFTER the gate passed.
+# -----------------------------------------------------------------------------
+# SVC-32 is a separate service; the transfer + retention are implemented against
+# proxmox-backup-client with placeholder repository vars. The PBS credential is
+# read at runtime from the systemd EnvironmentFile via the env var named in
+# PBS_PASSWORD_ENV_VAR ({{ openbao_backup_pbs_password_env_var }}) — never a
+# literal, never logged. When PBS is not yet wired (PBS_ENABLED=false) we keep
+# the gated local dated snapshot and skip the transfer, then prune local copies.
+# =============================================================================
+if [ "${PBS_ENABLED}" = "true" ]; then
+  # PBS_PASSWORD (or whatever env var name is configured) must be present in the
+  # unit's EnvironmentFile. Referenced indirectly so the value is never traced.
+  if [ -z "${!PBS_PASSWORD_ENV_VAR:-}" ]; then
+    fail "PBS is enabled but ${PBS_PASSWORD_ENV_VAR} is not set (EnvironmentFile missing the PBS credential)"
+  fi
+
+  # proxmox-backup-client reads its password from PBS_PASSWORD in the env; we
+  # export the configured env var under that canonical name for the client.
+  export PBS_PASSWORD="${!PBS_PASSWORD_ENV_VAR}"
+
+  transfer_rc=0
+  proxmox-backup-client backup \
+    "openbao-raft.img:${SNAPSHOT_FILE}" \
+    --repository "${PBS_REPOSITORY}" \
+    --backup-id "${PBS_BACKUP_ID}" \
+    --backup-time "$(date -u +%s)" || transfer_rc=$?
+
+  # Scrub the PBS password from the environment immediately after the transfer.
+  unset PBS_PASSWORD
+
+  if [ "${transfer_rc}" -ne 0 ]; then
+    fail "PBS transfer via proxmox-backup-client failed (rc=${transfer_rc})"
+  fi
+
+  # Retention: keep >= 7 nightly snapshots in PBS (Req 11.3). PBS_KEEP_DAILY was
+  # already asserted >= 7 in preflight. A prune failure is logged but does NOT
+  # fail the run — the backup itself already landed.
+  export PBS_PASSWORD="${!PBS_PASSWORD_ENV_VAR}"
+  proxmox-backup-client prune \
+    "${PBS_BACKUP_ID}" \
+    --repository "${PBS_REPOSITORY}" \
+    --keep-daily "${PBS_KEEP_DAILY}" \
+    || log_line "${FAILURE_MARKER}" "warn" "PBS prune (keep-daily=${PBS_KEEP_DAILY}) failed; backup itself succeeded"
+  unset PBS_PASSWORD
+
+  log_line "${SUCCESS_MARKER}" "info" "snapshot handed off to PBS repository (keep-daily=${PBS_KEEP_DAILY})"
+else
+  log_line "${SUCCESS_MARKER}" "info" "PBS hand-off disabled; kept gated local snapshot ${SNAPSHOT_FILE}"
+fi
+
+# =============================================================================
+# STEP 4 — Local retention: keep >= 7 nightly snapshots on the primary host.
+# -----------------------------------------------------------------------------
+# Independent of PBS so a PBS outage still leaves >= 7 local copies. Deletes only
+# the oldest beyond LOCAL_KEEP_DAILY (also >= 7). A prune failure is non-fatal.
+# =============================================================================
+# shellcheck disable=SC2012  # ls -t on our own controlled filenames is fine here
+ls -1t "${BACKUP_DIR}/${FILE_BASENAME}-"*.snap 2>/dev/null \
+  | tail -n +"$((LOCAL_KEEP_DAILY + 1))" \
+  | while IFS= read -r old; do
+      rm -f "${old}" 2>/dev/null || true
+    done
+
+exit 0

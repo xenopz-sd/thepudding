@@ -1,0 +1,324 @@
+---
+# tasks/main.yml — platform_preflight (Platform Prerequisites Bootstrap —
+# shared preflight, all buckets).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/ (requirements.md,
+# design.md, tasks.md). Design ref: "Component 2: platform_preflight".
+# Implements SPEC TASK 4 (_Requirements: 1.4, 1.5, 2.5, 4.2 / Property 4_).
+#
+# Runs FIRST for every invocation of platform-bootstrap.yml, before any bucket
+# mutation. A failure here leaves ZERO Proxmox resources touched and unmodified
+# Terraform state — this is the fail-fast gate. It:
+#   1. Resolves + validates cluster.env via scripts/installer/cluster_env.py
+#      (no_log — the JSON carries the API token + admin cred), binding the
+#      NON-secret resolved values the buckets need to named facts and keeping the
+#      API token + admin-cred facts isolated behind a single no_log set_fact.
+#   2. Asserts per-bucket mandatory-param completeness for each SELECTED bucket
+#      (cluster_env.py marks all these OPTIONAL; the ORCHESTRATOR decides
+#      mandatory-ness), failing closed naming the missing param + the
+#      cluster.env.example remedy (Req 1.4), and the cross-bucket preconditions
+#      (Req 1.5, 4.2): api-without-host-and-no-token, host+pve-identity-without-
+#      admin-cred.
+#   3. Runs light local prereq checks (venv binaries + terraform on PATH),
+#      reusing the svc07_preflight pattern.
+#
+# Cross-bucket constants (cluster_env_file, platform_repo_root,
+# platform_venv_python, platform_selected_buckets, bootstrap_pve_identity) come
+# from the play-level vars on platform-bootstrap.yml; the phase-specific vars
+# (platform_cluster_env_helper, platform_required_venv_binaries) live in this
+# role's defaults/main.yml. NO secret value ever lives here.
+
+# ============================================================ #
+# Step 1 — Resolve + validate the cluster env file.            #
+# ------------------------------------------------------------ #
+# cluster_env.py is the single source of truth for parsing,     #
+# alias resolution, conflict detection, and MANDATORY-var       #
+# completeness. It marks all the platform-bootstrap params      #
+# OPTIONAL (per-bucket mandatory-ness is decided HERE, by the   #
+# orchestrator), exits 0 with the resolved TF_VAR_* mapping as  #
+# JSON on stdout, 2 for file-absent, 3 for a validation         #
+# failure. Invoked via the project venv python (dev-workflow.md #
+# Python Environment Invocation). failed_when is left default   #
+# (rc != 0) so a file-absent (2) / validation (3) exit halts    #
+# preflight before any bucket mutation. no_log:true because the #
+# resolved JSON carries the API-token AND the bootstrap admin   #
+# credential values on stdout (security-standards.md).          #
+# ============================================================ #
+- name: "Preflight | Resolve + validate the cluster env file ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python }}"
+      - "{{ platform_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_env_resolve
+  changed_when: false
+  # The helper's own stderr message already names the file path / missing vars /
+  # conflicting pair and the cluster.env.example remedy; surface it verbatim on
+  # failure. no_log keeps the token-bearing stdout out of any shared log.
+  no_log: true
+
+# Parse the helper's JSON stdout into a play fact. This is the canonical
+# TF_VAR_* mapping (endpoint, node, template, host LAN IP, admin cred, role/token
+# ids, template storage, admin source cidr, served vlan ids — plus the API token
+# and, when present, the bootstrap admin credential). no_log:true — the mapping
+# carries the API token + admin-cred values.
+- name: "Preflight | Capture the resolved cluster mapping"
+  ansible.builtin.set_fact:
+    platform_env: "{{ platform_env_resolve.stdout | from_json }}"
+  no_log: true
+
+# ============================================================ #
+# Step 1b — Bind named facts.                                  #
+# ------------------------------------------------------------ #
+# Two set_fact tasks keep the token-bearing / admin-cred facts  #
+# ISOLATED behind a single no_log task, while the NON-secret    #
+# resolved values (endpoint, node, host LAN IP, template,       #
+# template storage, served vlans, admin source cidr, role/token #
+# ids) are published freely for the bucket roles and the asserts #
+# below to read (and to appear in fail_msg diagnostics without  #
+# exposing a secret).                                           #
+# ============================================================ #
+
+# NON-SECRET resolved values — read freely by the bucket roles + the per-bucket
+# asserts below. Has-a-default vars (role id, token id, template storage, served
+# vlans) are absent-when-unset in the mapping; the documented defaults are
+# applied here so downstream consumers always see a concrete value.
+- name: "Preflight | Bind the non-secret resolved cluster parameters to named facts"
+  ansible.builtin.set_fact:
+    platform_proxmox_endpoint: "{{ platform_env['TF_VAR_proxmox_endpoint'] | default('') }}"
+    platform_proxmox_node_name: "{{ platform_env['TF_VAR_proxmox_node_name'] | default('') }}"
+    platform_lxc_template: "{{ platform_env['TF_VAR_openbao_template_file_id'] | default('') }}"
+    platform_host_lan_ip: "{{ platform_env['TF_VAR_proxmox_host_lan_ip'] | default('') }}"
+    platform_admin_source_cidr: "{{ platform_env['TF_VAR_sdn_gateway_admin_source_cidr'] | default('') }}"
+    platform_terraform_role_id: "{{ platform_env['TF_VAR_proxmox_terraform_role_id'] | default('TerraformProv') }}"
+    platform_terraform_token_id: "{{ platform_env['TF_VAR_proxmox_terraform_token_id'] | default('installer') }}"
+    platform_template_storage: "{{ platform_env['TF_VAR_proxmox_template_storage'] | default('local') }}"
+    platform_served_vlan_ids: "{{ platform_env['TF_VAR_platform_served_vlan_ids'] | default('20') }}"
+
+# SECRET / credential-bearing resolved values — kept isolated behind this single
+# no_log task. platform_api_token is the resolved terraform@pve token (may be
+# empty when it has not been minted yet); platform_admin_credential_present is a
+# NON-secret boolean flag (never the value) the asserts below read to decide
+# whether an Admin_Bootstrap_Credential is available, without exposing the value.
+- name: "Preflight | Bind the credential-bearing facts (isolated, no_log)"
+  ansible.builtin.set_fact:
+    platform_api_token: "{{ platform_env['TF_VAR_proxmox_api_token'] | default('') }}"
+    platform_admin_credential_present: >-
+      {{ ((platform_env['TF_VAR_proxmox_admin_password'] | default('') | trim) | length > 0)
+         or ((platform_env['TF_VAR_proxmox_admin_token'] | default('') | trim) | length > 0) }}
+  no_log: true
+
+# ============================================================ #
+# Step 2 — Per-bucket mandatory-param completeness (Req 1.4)   #
+# + cross-bucket preconditions (Req 1.5, 4.2). Each assert is  #
+# gated on the bucket's membership in platform_selected_buckets #
+# so a bucket the operator did not select imposes no            #
+# requirement. All fail closed BEFORE any host/API mutation,    #
+# naming the missing param + the cluster.env.example remedy.    #
+# ============================================================ #
+
+# ---- host bucket ----
+# The host bucket needs the Proxmox host LAN IP (the ansible_host for the
+# proxmox-hosts.yml inventory over which pveum/pveam/sdn_gateway run) and the
+# admin source CIDR (sdn_gateway's allowed management source).
+- name: "Preflight | Assert host-bucket mandatory params are present"
+  ansible.builtin.assert:
+    that:
+      - "(platform_host_lan_ip | trim) | length > 0"
+      - "(platform_admin_source_cidr | trim) | length > 0"
+    fail_msg: >-
+      The host bucket requires PROXMOX_HOST_LAN_IP (the Proxmox host's LAN
+      address, resolved={{ (platform_host_lan_ip | trim) | length > 0 }}) and
+      ADMIN_SOURCE_CIDR (the sdn_gateway management source CIDR,
+      resolved={{ (platform_admin_source_cidr | trim) | length > 0 }}) in
+      {{ cluster_env_file }}. Add the missing key(s) — see the
+      "# --- Host prep" / gateway subsections of cluster.env.example — and
+      re-run.
+    success_msg: "Host-bucket params present (host LAN IP + admin source CIDR)."
+  when: "'host' in platform_selected_buckets"
+
+# host + opt-in PVE identity requires an Admin_Bootstrap_Credential (Req 2.5).
+# When bootstrap_pve_identity is requested but neither PROXMOX_ADMIN_PASSWORD nor
+# PROXMOX_ADMIN_TOKEN resolved, halt naming the credential — never fall back to a
+# lower-privilege path. The assert reads the NON-secret presence flag, so the
+# credential value is never echoed. (no_log so the flag's evaluation context
+# cannot leak the underlying value through verbose task args.)
+- name: "Preflight | Assert an Admin_Bootstrap_Credential is present when PVE identity is requested"
+  ansible.builtin.assert:
+    that:
+      - "platform_admin_credential_present | bool"
+    fail_msg: >-
+      bootstrap_pve_identity=true was requested but no Admin_Bootstrap_Credential
+      resolved from {{ cluster_env_file }}. Supply PROXMOX_ADMIN_PASSWORD or
+      PROXMOX_ADMIN_TOKEN (bootstrap-only, no_log, never persisted — see the
+      "# --- Host prep (bootstrap)" subsection of cluster.env.example) and
+      re-run, or leave bootstrap_pve_identity=false for routine host runs.
+    success_msg: "Admin_Bootstrap_Credential present for the opt-in PVE-identity step."
+  when:
+    - "'host' in platform_selected_buckets"
+    - "bootstrap_pve_identity | bool"
+  no_log: true
+
+# ---- api bucket ----
+# The api bucket always needs a reachable endpoint + node for the
+# platform-foundation terraform apply.
+- name: "Preflight | Assert api-bucket mandatory params are present"
+  ansible.builtin.assert:
+    that:
+      - "(platform_proxmox_endpoint | trim) | length > 0"
+      - "(platform_proxmox_node_name | trim) | length > 0"
+    fail_msg: >-
+      The api bucket requires PROXMOX_ENDPOINT
+      (resolved={{ (platform_proxmox_endpoint | trim) | length > 0 }}) and
+      PROXMOX_NODE_NAME
+      (resolved={{ (platform_proxmox_node_name | trim) | length > 0 }}) in
+      {{ cluster_env_file }} — see the "# --- SDN / API" subsection of
+      cluster.env.example — and re-run.
+    success_msg: "Api-bucket params present (endpoint + node name)."
+  when: "'api' in platform_selected_buckets"
+
+# api token precondition (Req 1.5, 4.2). The api bucket consumes the
+# terraform@pve token. If it is absent AND the host bucket is NOT also selected
+# in this run, there is no way for it to be minted before the apply -> hard fail
+# naming the host bucket. If host IS selected in the same run, the token may be
+# minted by the host bucket's PVE-identity step (spec task 5.2) BEFORE api runs,
+# so we do NOT hard-fail here — the api role re-checks the (possibly just-minted)
+# token at its own precondition (spec task 7.1).
+- name: "Preflight | Assert an api token exists, or the host bucket runs first to mint it"
+  ansible.builtin.assert:
+    that:
+      - "((platform_api_token | trim) | length > 0) or ('host' in platform_selected_buckets)"
+    fail_msg: >-
+      The api bucket needs a resolvable terraform@pve token
+      (PROXMOX_API_TOKEN / TF_VAR_proxmox_api_token in {{ cluster_env_file }}),
+      but none is present and the host bucket is not selected in this run to mint
+      it. Run the host bucket's PVE-identity step first
+      (-e bootstrap_scope=host,api -e bootstrap_pve_identity=true), or supply
+      PROXMOX_API_TOKEN, then re-run.
+    success_msg: >-
+      Api token precondition satisfied
+      (token present, or the host bucket runs first to mint it).
+  when: "'api' in platform_selected_buckets"
+  no_log: true
+
+# ---- gateway phase cross-bucket precondition (Fix A / ADR-0010, Req 1.5) ----
+# The host bucket's gateway phase (platform_gateway) binds the L3 address .1 to
+# the SDN VNet bridge p<vlan> (e.g. p20), which the api bucket's terraform apply
+# CREATES. It runs whenever 'host' is selected. So if the operator selects
+# 'host' (gateway will run) but the api bucket is NOT selected in this run AND
+# the SDN fabric bridge does not already exist on the host, the gateway would
+# fail closed deep in the sdn_gateway role with "Device p<vlan> does not exist".
+# Catch that here, at preflight, BEFORE any mutation — the opposite-direction
+# mirror of the api-needs-token precondition above (Req 1.5). We only pay the
+# host round-trip in the narrow case that can hit the gap: 'host' selected AND
+# 'api' NOT selected; the common combined 'host,api' run skips this entirely
+# (api creates p20 before the gateway phase, so the fabric is guaranteed).
+- name: "Preflight | Detect the shared SDN VNet bridge on the host (gateway-without-api only)"
+  ansible.builtin.command:
+    cmd: "ip link show {{ platform_gateway_bridge }}"
+  delegate_to: "{{ platform_host_lan_ip }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ platform_preflight_ssh_user }}"
+  register: platform_preflight_bridge_probe
+  changed_when: false
+  failed_when: false        # rc is the signal (0 = present, non-zero = absent)
+  when:
+    - "'host' in platform_selected_buckets"
+    - "'api' not in platform_selected_buckets"
+
+- name: "Preflight | Assert the SDN fabric exists (or the api bucket runs) for the gateway phase"
+  ansible.builtin.assert:
+    that:
+      - "platform_preflight_bridge_probe.rc == 0"
+    fail_msg: >-
+      The host bucket's gateway phase binds the L3 gateway to the SDN VNet
+      bridge {{ platform_gateway_bridge }}, but that bridge does not exist on
+      {{ platform_host_lan_ip }} and the api bucket is not selected in this run
+      to create it. Run the api bucket first to apply the SDN fabric
+      (-e bootstrap_scope=host,api), or apply platform-foundation's
+      `terraform apply` out of band, then re-run. Refusing to run the gateway
+      against a missing bridge (Fix A / ADR-0010).
+    success_msg: >-
+      SDN fabric bridge {{ platform_gateway_bridge }} present on the host; the
+      gateway phase can bind to it.
+  when:
+    - "'host' in platform_selected_buckets"
+    - "'api' not in platform_selected_buckets"
+
+# ---- devmachine bucket ----
+# The devmachine bucket composes `ip route add 10.0.<vlan>.0/24 via
+# <proxmox-lan-ip>` for each served VLAN, so it needs the host LAN IP.
+# PLATFORM_SERVED_VLAN_IDS has a documented default (20), so only the host LAN IP
+# is strictly required.
+- name: "Preflight | Assert devmachine-bucket mandatory params are present"
+  ansible.builtin.assert:
+    that:
+      - "(platform_host_lan_ip | trim) | length > 0"
+    fail_msg: >-
+      The devmachine bucket requires PROXMOX_HOST_LAN_IP (the via-gateway for the
+      workstation static route) in {{ cluster_env_file }} — see the
+      "# --- Dev machine" / host-prep subsections of cluster.env.example — and
+      re-run. (PLATFORM_SERVED_VLAN_IDS defaults to 20 when unset.)
+    success_msg: >-
+      Devmachine-bucket params present
+      (host LAN IP; served VLANs={{ platform_served_vlan_ids }}).
+  when: "'devmachine' in platform_selected_buckets"
+
+# ============================================================ #
+# Step 3 — Local control-node prerequisite checks (light,      #
+# reusing the svc07_preflight pattern). Read-only: no Proxmox   #
+# resource is created and Terraform state is untouched.        #
+# ============================================================ #
+
+# terraform binary on PATH (the api bucket child-runs `terraform apply`).
+- name: "Preflight | Locate the terraform binary on PATH"
+  ansible.builtin.command:
+    cmd: terraform version
+  register: platform_terraform_version
+  changed_when: false
+  failed_when: platform_terraform_version.rc != 0
+
+# Project venv binaries present: the orchestrator + its child runs invoke these
+# by absolute path (dev-workflow.md), so their absence is a hard preflight
+# failure naming the specific missing binary.
+- name: "Preflight | Assert the project venv binaries are present"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: platform_venv_bin_stat
+  loop: "{{ platform_required_venv_binaries }}"
+
+- name: "Preflight | Fail naming any missing venv binary"
+  ansible.builtin.assert:
+    that:
+      - "item.stat.exists"
+      - "item.stat.executable | default(false)"
+    fail_msg: >-
+      Required project venv binary is missing or not executable:
+      {{ item.item }}. Create/repair the devinfra virtualenv
+      (~/venv/devinfra/) before running the orchestrator.
+    success_msg: "venv binary present: {{ item.item }}"
+  loop: "{{ platform_venv_bin_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# ============================================================ #
+# Step 4 — INFO decision log (composition-wiring.md): make the #
+# resolved preflight outcome visible, never silent. Only        #
+# NON-secret values + presence flags — never the token or the   #
+# admin credential value.                                       #
+# ============================================================ #
+- name: "Preflight | INFO — resolved preflight summary (non-secret)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: platform preflight OK — buckets={{ platform_selected_buckets }};
+      endpoint set={{ (platform_proxmox_endpoint | trim) | length > 0 }};
+      node='{{ platform_proxmox_node_name }}';
+      host LAN IP set={{ (platform_host_lan_ip | trim) | length > 0 }};
+      template storage='{{ platform_template_storage }}';
+      served VLANs={{ platform_served_vlan_ids }};
+      terraform@pve token present={{ (platform_api_token | trim) | length > 0 }};
+      PVE-identity requested={{ bootstrap_pve_identity | bool }}.

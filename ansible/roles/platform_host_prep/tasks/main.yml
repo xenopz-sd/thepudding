@@ -1,0 +1,174 @@
+---
+# tasks/main.yml — platform_host_prep (Platform Prerequisites Bootstrap —
+# host bucket, ensure the base template).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/ (requirements.md,
+# design.md, tasks.md). Design ref: "Component 4: platform_host_prep".
+#
+# Implements SPEC TASK 6.1:
+#   * Task 6.1 — Ensure_Template (idempotent `pveam`): query the Proxmox host
+#     for the configured template volume id (`pveam list <storage>`), DELEGATED
+#     to the host; if ABSENT, `pveam update` then `pveam download <storage>
+#     <template-filename>`; present -> no download. INFO decision log
+#     (present vs downloaded). Fail closed on a download error naming the
+#     attempted template + the `pveam available` hint (Req 3.1, 3.2, 3.4).
+#
+# NOTE (Fix A — phase reorder, ADR-0010): Task 6.2 (the sdn_gateway child-run)
+# USED to live here, but the gateway binds the L3 address .1 to the SDN VNet
+# bridge `p<vlan>`, which the api bucket's `terraform apply` creates. On a true
+# clean slate the gateway therefore cannot run before the api bucket, so it was
+# MOVED OUT into its own `platform_gateway` role which the orchestrator play
+# sequences AFTER the api block. This role now does ONLY the p20-independent
+# Ensure_Template host prep. See ansible/roles/platform_gateway/ and the
+# platform-bootstrap.yml gateway phase.
+#
+# This role runs inside the orchestrator's `hosts: localhost`,
+# `connection: local` play. Task 6.1's host queries therefore `delegate_to` the
+# Proxmox host.
+#
+# Cross-bucket constants come from the play-level vars on
+# ansible/playbooks/platform-bootstrap.yml; this role's phase-specific vars live
+# in defaults/main.yml. NO secret value ever lives here (the pveam knobs are
+# non-secret storage/template-name topology values).
+
+# =============================================================================
+# Task 6.1 — Ensure_Template (idempotent, delegated to the Proxmox host)
+# =============================================================================
+# Fail closed BEFORE any host contact if the two things we cannot guess — the
+# host address and the template volume id — are unset. We never delegate to a
+# bogus host, and we never invent a template filename.
+- name: "Host prep | Assert the Proxmox host address is set (fail closed)"
+  ansible.builtin.assert:
+    that:
+      - platform_host_prep_host is string
+      - (platform_host_prep_host | trim) | length > 0
+    fail_msg: >-
+      platform_host_prep_host is empty. Set PROXMOX_HOST_LAN_IP in
+      {{ cluster_env_file | default('cluster.env') }} (see cluster.env.example)
+      or pass --extra-vars "platform_host_prep_host=<real-proxmox-lan-ip>";
+      refusing to delegate pveam to an unresolved host.
+    success_msg: "Proxmox host address resolved for the delegated pveam query."
+    quiet: true
+
+- name: "Host prep | Assert the base template volume id is set (fail closed)"
+  ansible.builtin.assert:
+    that:
+      - platform_host_prep_template_volid is string
+      - (platform_host_prep_template_volid | trim) | length > 0
+    fail_msg: >-
+      platform_host_prep_template_volid is empty. Set PROXMOX_LXC_TEMPLATE in
+      {{ cluster_env_file | default('cluster.env') }} (e.g.
+      "local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst") or pass it via
+      --extra-vars; refusing to run `pveam` without a template id to ensure.
+    success_msg: "Base template volume id resolved for Ensure_Template."
+    quiet: true
+
+# Derive the storage + the bare template FILENAME from the `<storage>:vztmpl/<file>`
+# volume id, so we can (a) `pveam list <storage>` and grep the filename, and
+# (b) `pveam download <storage> <filename>` (pveam takes the filename, not the
+# full volid). Prefer the storage embedded in the volid; fall back to the
+# configured template storage default when the volid carries no `<storage>:`.
+- name: "Host prep | Derive the template storage + filename from the volume id"
+  ansible.builtin.set_fact:
+    platform_host_prep_tmpl_storage: >-
+      {{ (platform_host_prep_template_volid.split(':')[0] | trim)
+         if ':' in platform_host_prep_template_volid
+         else platform_host_prep_template_storage }}
+    platform_host_prep_tmpl_filename: >-
+      {{ platform_host_prep_template_volid.split('/')[-1] | trim }}
+
+# Query the host for the configured template (Req 3.1). `pveam list <storage>`
+# prints one line per template with its full volid; a plain read that never
+# changes state — changed_when:false. rc is NOT failed here: an empty or
+# missing storage still returns 0 with no matching line, which we treat as
+# ABSENT below. Delegated to the Proxmox host over SSH.
+- name: "Host prep | Query the host for the configured base template (pveam list)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_host_prep_pveam_bin }}"
+      - list
+      - "{{ platform_host_prep_tmpl_storage }}"
+  delegate_to: "{{ platform_host_prep_host }}"
+  vars:
+    # The orchestrator play loads only localhost.yml, so the delegate target is
+    # not a known inventory host — force a real SSH connection (else the command
+    # runs on the control node). `delegate_to` supplies the target address; do
+    # NOT also set `ansible_host` (that malforms the target). pveam is invoked by
+    # absolute path because the command module resolves argv[0] against its own
+    # PATH, not a login shell's (/usr/bin/pveam on every PVE host).
+    ansible_connection: ssh
+    ansible_user: "{{ platform_host_prep_ssh_user }}"
+  register: platform_host_prep_pveam_list
+  changed_when: false
+
+# Present == the derived filename appears in a `pveam list` line for the storage.
+- name: "Host prep | Decide whether the template is already present"
+  ansible.builtin.set_fact:
+    platform_host_prep_template_present: >-
+      {{ platform_host_prep_tmpl_filename
+         in (platform_host_prep_pveam_list.stdout | default('')) }}
+
+# Refresh the pveam catalog before a download so the filename is resolvable
+# (`pveam available` is populated from this). Only runs when we are about to
+# download — a present template needs no catalog refresh. Delegated to the host.
+- name: "Host prep | Refresh the pveam template catalog (pveam update) — only if absent"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_host_prep_pveam_bin }}"
+      - update
+  delegate_to: "{{ platform_host_prep_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ platform_host_prep_ssh_user }}"
+  register: platform_host_prep_pveam_update
+  changed_when: true
+  when: not (platform_host_prep_template_present | bool)
+
+# Download ONLY when absent (Req 3.1 idempotence). On any download error we FAIL
+# CLOSED naming the attempted template + the `pveam available` hint (Req 3.2):
+# the download runs inside a block whose rescue emits the actionable remedy and
+# then re-raises non-zero, so the raw pveam error is never the last word and the
+# host bucket's own rescue still aborts the run. `pveam download` takes the
+# storage + the bare filename. Delegated to the Proxmox host over SSH.
+- name: "Host prep | Download the base template if absent (fail closed on error)"
+  when: not (platform_host_prep_template_present | bool)
+  block:
+    - name: "Host prep | Download the base template (pveam download)"
+      ansible.builtin.command:
+        argv:
+          - "{{ platform_host_prep_pveam_bin }}"
+          - download
+          - "{{ platform_host_prep_tmpl_storage }}"
+          - "{{ platform_host_prep_tmpl_filename }}"
+      delegate_to: "{{ platform_host_prep_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ platform_host_prep_ssh_user }}"
+      register: platform_host_prep_pveam_download
+      changed_when: platform_host_prep_pveam_download.rc == 0
+  rescue:
+    - name: "Host prep | Fail closed on a template download error (named remedy)"
+      ansible.builtin.fail:
+        msg: >-
+          `pveam download {{ platform_host_prep_tmpl_storage }}
+          {{ platform_host_prep_tmpl_filename }}` FAILED for template
+          '{{ platform_host_prep_template_volid }}'. Confirm the exact filename
+          with `pveam available | grep {{ platform_host_prep_tmpl_filename
+          | regex_replace('_.*$', '') }}` on the host, then re-run the host
+          bucket.
+
+# INFO decision log (composition-wiring.md): exactly ONE line for the template
+# outcome (Req 3.4) — present vs downloaded — naming the volid + storage.
+- name: "Host prep | INFO — template present (no download)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO Ensure_Template: template {{ platform_host_prep_template_volid }}
+      present on storage {{ platform_host_prep_tmpl_storage }} (no download).
+  when: platform_host_prep_template_present | bool
+
+- name: "Host prep | INFO — template downloaded"
+  ansible.builtin.debug:
+    msg: >-
+      INFO Ensure_Template: template {{ platform_host_prep_template_volid }}
+      downloaded to storage {{ platform_host_prep_tmpl_storage }}.
+  when: not (platform_host_prep_template_present | bool)

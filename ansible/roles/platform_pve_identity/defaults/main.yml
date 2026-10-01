@@ -1,0 +1,98 @@
+---
+# defaults/main.yml — platform_pve_identity (Platform Prerequisites Bootstrap —
+# host bucket, OPT-IN PVE identity creation).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/. Design ref:
+# "Component 3: platform_pve_identity". Implemented in spec tasks 5.1 (role +
+# user + ACL) and 5.2 (token mint + 0600 persist + force opt-in).
+#
+# Phase-specific, NON-SECRET defaults the role owns. The opt-in gates
+# (bootstrap_pve_identity, bootstrap_pve_token_force) default OFF as play-level
+# vars on platform-bootstrap.yml (see design.md "Data Models"), NOT here.
+#
+# NO secret value ever lives here — the Admin_Bootstrap_Credential is resolved
+# no_log at run time (from cluster.env PROXMOX_ADMIN_PASSWORD/PROXMOX_ADMIN_TOKEN
+# by the preflight, or read here) and never persisted; the minted terraform@pve
+# token is captured no_log and written ONLY to the 0600 cluster.env.
+
+# --- Identity target host (Req 2, design "Component 3") ---
+# The Proxmox host address `pveum`/`pvesh` run on, over SSH as root. Sourced
+# from cluster.env PROXMOX_HOST_LAN_IP; the shared platform_preflight role binds
+# it into the play-level fact `platform_host_lan_ip` (from
+# TF_VAR_proxmox_host_lan_ip). We consume that fact here. An explicit
+# `platform_pve_identity_resolved_host` extra-var still wins as an override; a
+# bare `proxmox_host_lan_ip` remains a last-resort fallback. The role delegates
+# its host commands to whatever this resolves to (asserted non-empty in
+# tasks/main.yml before any mutation).
+platform_pve_identity_host: >-
+  {{ platform_pve_identity_resolved_host
+     | default(platform_host_lan_ip
+               | default(proxmox_host_lan_ip | default(''))) }}
+# SSH user for the delegated host commands. root@pam on the node has full PVE
+# admin rights, so `pveum` run as root IS the admin path (see the security note
+# in tasks/main.yml) — no separate admin password is needed for pveum itself.
+platform_pve_identity_ssh_user: root
+
+# Absolute path to the `pveum` CLI on the Proxmox host. The ansible.builtin.command
+# module resolves an argv[0] against the module's own PATH, NOT a login shell's
+# PATH — and on a delegated remote host that PATH does not include /usr/sbin,
+# so a bare `pveum` raises "[Errno 2] No such file or directory: b'pveum'".
+# Proxmox VE installs pveum at /usr/sbin/pveum on every node, so invoke it by
+# absolute path (overridable if a site differs). Non-secret.
+platform_pve_identity_pveum_bin: /usr/sbin/pveum
+
+# --- Identity identifiers (Req 2.2, 2.3; cluster.env-overridable) ---
+# The custom least-privilege PVE role id. Default TerraformProv; overridden by
+# cluster.env PROXMOX_TERRAFORM_ROLE_ID (the shared platform_preflight role binds
+# it into the play fact `platform_terraform_role_id`, itself defaulting to
+# TerraformProv). An explicit platform_pve_identity_resolved_role_id extra-var
+# still wins as an override.
+platform_pve_identity_role_id: >-
+  {{ platform_pve_identity_resolved_role_id
+     | default(platform_terraform_role_id | default('TerraformProv')) }}
+# The terraform@pve API token id. Default installer; overridden by cluster.env
+# PROXMOX_TERRAFORM_TOKEN_ID (bound by the preflight into the play fact
+# `platform_terraform_token_id`, itself defaulting to installer). An explicit
+# platform_pve_identity_resolved_token_id extra-var still wins as an override.
+platform_pve_identity_token_id: >-
+  {{ platform_pve_identity_resolved_token_id
+     | default(platform_terraform_token_id | default('installer')) }}
+# The service-account user the role/token belong to — fixed by convention
+# (security-standards.md, PF FR-1); never the built-in Administrator role.
+platform_pve_identity_user: "terraform@pve"
+
+# --- Least-privilege privilege set (Req 2.2, security-standards.md, NET-00 §6) ---
+# The documented terraform@pve privilege set: VM/LXC lifecycle + config, datastore
+# alloc/audit, SDN create/manage (SDN.Allocate) + view (SDN.Audit) + guest-NIC
+# attach (SDN.Use), the system audit/console/modify needed for cloud-init/network
+# config, and pool alloc. NEVER the built-in Administrator role. Space-separated,
+# as `pveum role` expects for `--privs`.
+#
+# SDN privilege rationale (NET-00 §6, ADR-0001, ADR-0009):
+#   - SDN.Allocate = create/manage SDN objects (zone, VNet, subnet). Gates the
+#     platform-foundation SDN fabric apply. (ADR-0001: SDN.Allocate, not SDN.Use,
+#     is the create/manage privilege.)
+#   - SDN.Audit   = view-only.
+#   - SDN.Use     = attach a guest VM/LXC NIC to an EXISTING VNet (NET-00 §6:
+#     "SDN.Use is a separate, later-required privilege for attaching a guest NIC
+#     to an existing VNet, not for creating the SDN objects"). This platform-minted
+#     terraform@pve token MUST place guests onto the shared VLAN (VNet p20), so it
+#     legitimately needs SDN.Use in addition to SDN.Allocate/SDN.Audit — a service
+#     apply (SVC-07) fails at container create with HTTP 403 (.../p20, SDN.Use)
+#     otherwise. This EXTENDS ADR-0001's least-privilege set; it does not contradict
+#     it. (ADR-0009, surfaced by the live 14.2 SVC-07 apply.)
+platform_pve_identity_privs: >-
+  VM.Allocate VM.Clone VM.Config.CDROM VM.Config.CPU VM.Config.Cloudinit
+  VM.Config.Disk VM.Config.HWType VM.Config.Memory VM.Config.Network
+  VM.Config.Options VM.Console VM.Audit VM.PowerMgmt
+  Datastore.Allocate Datastore.AllocateSpace Datastore.AllocateTemplate
+  Datastore.Audit
+  SDN.Allocate SDN.Audit SDN.Use
+  Sys.Audit Sys.Console Sys.Modify
+  Pool.Allocate
+
+# --- Persist target (Req 2.3) ---
+# The gitignored cluster.env file the minted token is written to at 0600 as
+# PROXMOX_API_TOKEN, mirroring svc07_bootstrap's OPENBAO_ADMIN_TOKEN persist.
+# cluster_env_file + platform_repo_root are cross-bucket play-level vars.
+platform_pve_identity_env_path: "{{ platform_repo_root }}/{{ cluster_env_file }}"

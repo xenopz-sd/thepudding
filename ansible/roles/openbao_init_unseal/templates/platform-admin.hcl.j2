@@ -1,0 +1,107 @@
+{#
+  templates/platform-admin.hcl.j2 — the break-glass `platform-admin` policy.
+
+  Rendered by task 6.2 (tasks/primary_bootstrap.yml) and written to
+  sys/policies/acl/{{ openbao_platform_admin_policy_name }} ONCE, using the
+  Root_Token, before that Root_Token is revoked (Security AC 1, 2).
+
+  This is the human-operator break-glass / project-onboarding policy
+  (design.md "Platform_Admin_Policy"; requirements Glossary). It is deliberately
+  broad — but scoped to the operational paths onboarding and rotation need, NOT
+  a `sudo`-everything root replacement — and is MFA-gated + human-only by
+  convention (Security AC 2). Automated pipelines never use a platform-admin
+  token; they authenticate per-project via the jwt method (task 7.x).
+
+  NO secret value is templated here — this is an ACL document only.
+#}
+# MANAGED BY ANSIBLE (openbao_init_unseal / task 6.2) — DO NOT EDIT BY HAND.
+# platform-admin: break-glass, human-operator, MFA-gated (Security AC 2).
+
+# Manage per-project policies (openbao_project_onboard writes policy-<slug>).
+path "sys/policies/acl/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# Manage secrets-engine and auth-method mounts (onboarding new engines/roles).
+path "sys/mounts" {
+  capabilities = ["read", "list"]
+}
+path "sys/mounts/*" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+path "sys/auth" {
+  capabilities = ["read", "list"]
+}
+path "sys/auth/*" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+
+# Configure the jwt/oidc auth methods and their roles (task 7.x, onboarding).
+path "auth/jwt/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+path "auth/oidc/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# Full management of the project KV tree (onboarding creates per-project paths).
+path "{{ openbao_kv_mount }}/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# Manage the database + aws dynamic-secret engines, INCLUDING root rotation
+# (Req 8.1, 8.2, 8.6 — rotate-root usable by a platform-admin token, not root).
+path "database/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+path "aws/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
+
+# Root-credential rotation, spelled out explicitly for least-surprise (Req 8).
+# These two paths are ALREADY covered by the `database/*` / `aws/*` wildcards
+# above (an OpenBao ACL grants the union of every matching path rule), so these
+# blocks add no NEW capability — they exist so a reader auditing "can a
+# platform-admin token rotate roots without the Root_Token?" (Req 8.6) sees the
+# rotate-root endpoints named directly rather than having to reason about the
+# wildcard. `update` is the capability OpenBao's rotate-root endpoints require:
+#   * database/rotate-root/<connection-name>  — rotate the PG `openbao`
+#     superuser password (Req 8.1); the update on the wildcard-covered path is
+#     what a `bao write -force database/rotate-root/<conn>` needs.
+#   * aws/config/rotate-root                   — rotate the Garage admin key
+#     (Req 8.2).
+# The lease-preservation (Req 8.1–8.3), retain-previous-credential-on-failure
+# (Req 8.4), and success/failure audit (Req 8.4, 8.6) behaviours are OpenBao
+# NATIVE to these endpoints and are NOT configured or overridden here. Denial of
+# a non-platform-admin caller (Req 8.5) is the OpenBao policy-engine DEFAULT: a
+# token whose policies grant no matching path rule is denied with a
+# permission-denied error and mutates no stored credential — no explicit `deny`
+# rule is needed or desirable (an explicit deny could not be overridden by a
+# legitimate superset policy).
+path "database/rotate-root/*" {
+  capabilities = ["update"]
+}
+path "aws/config/rotate-root" {
+  capabilities = ["update"]
+}
+
+# Manage audit devices (task 7.2 enables the file audit device fail-closed).
+path "sys/audit" {
+  capabilities = ["read", "list", "sudo"]
+}
+path "sys/audit/*" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+
+# Lease administration (bulk revoke on project decommission — Req 2.8).
+path "sys/leases/*" {
+  capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+}
+
+# Read-only health/seal visibility for break-glass diagnostics.
+path "sys/health" {
+  capabilities = ["read"]
+}
+path "sys/seal-status" {
+  capabilities = ["read"]
+}

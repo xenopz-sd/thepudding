@@ -1,0 +1,30 @@
+---
+# Throwaway / ephemeral Proxmox clusters the Kiro agent MAY act destructively
+# against (from-scratch bring-ups, clean_slate resets, terraform apply/destroy).
+#
+# NON-SECRET: this file contains cluster IDENTITIES ONLY (endpoint host + node
+# name). It MUST NEVER contain a credential, API token, or any other secret key.
+#
+# How authorization works:
+#   * Adding an entry here authorizes destructive agent runs against that cluster
+#     ONLY WHEN the AGENT_LIVE_AUTHORIZED interlock is also armed for the run.
+#     Listing a cluster alone does nothing; the interlock alone does nothing.
+#   * Remove an entry to revoke authorization for that cluster.
+#
+# Matching rules (see scripts/installer/throwaway_guard.py):
+#   * endpoint_host is compared NORMALIZED — scheme (https://), :port, any path
+#     (e.g. /api2/json), and case are stripped. So 192.168.0.69 stays
+#     192.168.0.69, and https://SHRIMP.lan:8006 becomes shrimp.lan. List each
+#     entry in that normalized form (bare host/IP, lowercase).
+#   * node_name is compared EXACT after trimming whitespace.
+#
+# List the identity in the SAME normalized form the throwaway env source
+# (.env.throwaway) resolves to. Both an IP form and a hostname form may be
+# listed; a mismatch fails CLOSED (REFUSED), never open.
+throwaway_clusters:
+  - endpoint_host: 192.168.0.69
+    node_name: shrimp
+  # Alternative hostname spelling for the same throwaway cluster, if the
+  # throwaway env source uses a hostname endpoint instead of the IP:
+  # - endpoint_host: shrimp.lan
+  #   node_name: shrimp

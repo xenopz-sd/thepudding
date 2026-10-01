@@ -1,0 +1,33 @@
+# Python toolchain for the Developer Services Platform repo.
+#
+# Install into the project venv (per dev-workflow.md, tools are invoked by
+# absolute path such as ~/venv/devinfra/bin/pytest):
+#
+#     python3 -m venv ~/venv/devinfra          # if it does not exist yet
+#     ~/venv/devinfra/bin/pip install -r requirements.txt
+#
+# Pins are lower-bounds (>=) matched to what the repo currently runs on
+# (Python 3.12); tighten to '==' if you need fully reproducible installs.
+#
+# NOT installable via pip (install separately with your OS/other tooling):
+#   - shellcheck   — shell linter for infra/templates/build-docker-lxc-template.sh
+#                    e.g. `apt-get install shellcheck` / `brew install shellcheck`
+#   - shfmt        — shell formatter (`shfmt --diff`)
+#                    e.g. `apt-get install shfmt` / `brew install shfmt`
+#                    (Go binary: https://github.com/mvdan/sh)
+#
+# Ansible Galaxy COLLECTIONS (e.g. community.docker) are NOT pip packages either;
+# they are declared in ansible/requirements.yml and installed with
+#   ~/venv/devinfra/bin/ansible-galaxy collection install -r ansible/requirements.yml
+
+# --- Test / property-based-testing runtime (NET-00 derivation layer, infra/tests) ---
+pytest>=8.0
+hypothesis>=6.100          # property-based testing (project-constitution.md)
+PyYAML>=6.0                # projects.yaml parsing, test_state_and_registry.py
+
+# --- Ansible control node (dev-workflow.md: ansible-playbook by venv path) ---
+ansible-core>=2.16         # provides ansible-playbook / ansible-galaxy in the venv
+
+# --- Offline lint tier (testing-strategy.md / documentation-testing.md) ---
+ansible-lint>=24.2         # lints ansible/roles/common/
+yamllint>=1.35             # lints role YAML

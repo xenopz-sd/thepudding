@@ -1,0 +1,100 @@
+{#
+  templates/prometheus-openbao.yml.j2 — Prometheus (SVC-17) scrape-config
+  FRAGMENT that SVC-07 contributes TO the shared observability stack.
+
+  Rendered by task 10.1 (tasks/observability.yml, §10.1) into a Prometheus
+  scrape-config directory ({{ openbao_prometheus_scrape_config_file }}) that the
+  SVC-17 Prometheus loads (a `scrape_config_files:` / file_sd drop-in). SVC-17 is
+  a SEPARATE catalog service; a full Prometheus role may not exist yet, so this
+  is the scrape-config CONTRIBUTION SVC-07 owns, mirroring how task 7.2 ships the
+  Promtail scrape fragment (templates/promtail-openbao.yml.j2) rather than owning
+  Loki.
+
+  Contract asserted by the task-10.1 offline structural test:
+    - a scrape job labelled `openbao` (job_name: openbao) at a scrape_interval
+      of <= 30 s scraping the PRIMARY's /v1/sys/metrics?format=prometheus over
+      TLS (Req 10.2, 10.3);
+    - a scrape target labelled `openbao_unsealer` (job_name: openbao_unsealer)
+      scraping the UNSEALER so its `up` series is queryable — the
+      OpenBaoUnsealerUnreachable alert (task 10.2) keys off `up{job=
+      openbao_unsealer}` (Req 10.2);
+    - the primary job reaches /v1/sys/metrics?format=prometheus, which exposes
+      `openbao_core_unsealed` — including `= 0` while the primary is SEALED
+      (Req 10.8 / FD.7); that sealed-metric guarantee is OpenBao-native and is
+      VERIFIED by the degraded-mode tests (12.4 / 12.5), not implemented here.
+
+  METRICS AUTH: OpenBao's /v1/sys/metrics requires a token by default. This
+  platform sets `unauthenticated_metrics_access = true` in the primary's
+  telemetry stanza (openbao_install config.hcl.j2), so this scrape needs NO
+  bearer token — the metrics endpoint carries only operational counters (no
+  secret material) and the primary's :8200 is reachable only over the internal
+  VLAN-20 path (Req 6.4 / Security AC 6). If a deployment instead wants
+  AUTHENTICATED scrapes, flip that flag to false and uncomment the
+  `authorization.credentials_file` line below, pointing it at a never-committed
+  file holding a scoped metrics-read token (see the note there).
+
+  NO secret value is templated here — endpoints, labels, and the CA path are all
+  non-secret config. Any scrape bearer token (only if the authenticated-scrape
+  path is chosen) is referenced by FILE PATH, never inlined.
+#}
+# MANAGED BY ANSIBLE (openbao_init_unseal / task 10.1) — DO NOT EDIT BY HAND.
+# Prometheus (SVC-17) scrape config contributed by SVC-07 (OpenBao).
+# job openbao: primary /v1/sys/metrics at <= 30 s (Req 10.2, 10.3).
+# job openbao_unsealer: unsealer up{} target (Req 10.2).
+
+scrape_configs:
+  # --- primary OpenBao: /v1/sys/metrics?format=prometheus (Req 10.2, 10.3) ---
+  - job_name: "{{ openbao_prometheus_job_name }}"
+    # Req 10.3 — scrape at 30 s or less. Rendered from a var the offline test
+    # parses back to seconds and asserts is <= 30 s.
+    scrape_interval: "{{ openbao_prometheus_scrape_interval }}"
+    scrape_timeout: "{{ openbao_prometheus_scrape_timeout }}"
+    # OpenBao serves Prometheus exposition at this path when queried with
+    # ?format=prometheus (the query arg is carried as a metric param below).
+    metrics_path: "{{ openbao_prometheus_metrics_path }}"
+    params:
+      format: ["prometheus"]
+    # The primary terminates TLS itself (Req 6.1); scrape over https, verifying
+    # against the platform CA (SVC-08 EJBCA / Let's Encrypt fallback).
+    scheme: https
+    tls_config:
+      # CA bundle Prometheus trusts to verify the primary's listener cert.
+      # Non-secret path; a public CA cert, never a private key.
+      ca_file: "{{ openbao_prometheus_tls_ca_file }}"
+      server_name: "{{ openbao_prometheus_primary_server_name }}"
+    # AUTHENTICATED-SCRAPE alternative (only if unauthenticated_metrics_access
+    # is set false in the primary telemetry stanza): reference a never-committed
+    # file holding a scoped metrics-read token. Left commented because the
+    # platform default is unauthenticated metrics access (see header).
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: "{{ openbao_prometheus_scrape_bearer_token_file }}"
+    static_configs:
+      - targets:
+          - "{{ openbao_prometheus_primary_target }}"
+        labels:
+          service: "openbao"
+          vlan: "20"
+
+  # --- Transit unsealer: up{job=openbao_unsealer} target (Req 10.2) ---------
+  # A distinct job so `up{job="openbao_unsealer"} == 0` drives the
+  # OpenBaoUnsealerUnreachable alert (task 10.2). The unsealer is Transit-only
+  # and internal; scraping its /v1/sys/metrics (or health) is enough to produce
+  # the `up` series — the alert only needs reachability, not its metric detail.
+  - job_name: "{{ openbao_prometheus_unsealer_job_name }}"
+    scrape_interval: "{{ openbao_prometheus_scrape_interval }}"
+    scrape_timeout: "{{ openbao_prometheus_scrape_timeout }}"
+    metrics_path: "{{ openbao_prometheus_metrics_path }}"
+    params:
+      format: ["prometheus"]
+    scheme: https
+    tls_config:
+      ca_file: "{{ openbao_prometheus_tls_ca_file }}"
+      server_name: "{{ openbao_prometheus_unsealer_server_name }}"
+    static_configs:
+      - targets:
+          - "{{ openbao_prometheus_unsealer_target }}"
+        labels:
+          service: "openbao"
+          component: "unsealer"
+          vlan: "20"

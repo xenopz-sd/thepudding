@@ -1,0 +1,29 @@
+---
+# Offline dry-run smoke play for the `common` role
+# (spec lxc-docker-base-template, task 4.2, requirement 7.2; design Testing
+# Strategy Tier 1).
+#
+# This play does nothing but apply the `common` role, so that
+# `ansible-playbook --syntax-check` proves the whole task graph parses and every
+# module (ansible.builtin.*, community.general.timezone,
+# community.docker.docker_compose_v2) resolves now that the pinned collections
+# are installed, and `ansible-playbook -i tests/inventory --check` exercises task
+# wiring in check mode against a no-mutation local host.
+#
+# It is NOT meant to converge the host — see tests/inventory for why `--check`
+# may surface environmental (not role) errors on the authoring host. Run from the
+# role directory, e.g.:
+#
+#   ~/venv/devinfra/bin/ansible-playbook --syntax-check tests/test.yml
+#   ~/venv/devinfra/bin/ansible-playbook -i tests/inventory --check tests/test.yml
+#
+# gather_facts is enabled because the role's package/repo tasks rely on standard
+# distribution facts; no privilege escalation is requested (become is left off)
+# so the dry-run never attempts a real host mutation.
+- name: Dry-run smoke test — apply the common role
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+  roles:
+    - role: common

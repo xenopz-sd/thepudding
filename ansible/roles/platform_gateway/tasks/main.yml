@@ -1,0 +1,122 @@
+---
+# tasks/main.yml — platform_gateway (Platform Prerequisites Bootstrap —
+# host-layer SDN gateway phase, run AFTER the api bucket's SDN fabric apply).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/ (requirements.md,
+# design.md, tasks.md). Design ref: "Component 4b: platform_gateway".
+#
+# WHY THIS IS A SEPARATE ROLE / PHASE (Fix A — phase reorder, ADR-0010):
+#   The sdn_gateway role binds the L3 gateway address .1 to the SDN VNet bridge
+#   `p<vlan>` (e.g. `p20`). That bridge is created by the api bucket's
+#   `terraform apply` of the platform-foundation SDN fabric. On a TRUE clean
+#   slate (no pre-existing `p20`) the gateway therefore CANNOT run before the api
+#   bucket — sdn_gateway/tasks/configure.yml fails closed with "Device p20 does
+#   not exist". The gateway is host-layer config (it belongs to the `host`
+#   bucket's remit), but it has a hard dependency on the api bucket's fabric, so
+#   it is split out of platform_host_prep's inline sequence and sequenced by the
+#   orchestrator play AFTER the api block. The effective combined order is:
+#     platform_pve_identity (mints token) -> platform_host_prep (ensure template)
+#     -> platform_api (terraform apply creates p20) -> platform_gateway (binds .1
+#     to p20).
+#
+# This role holds ONLY the gateway child-run + its registry-derived served-VLAN
+# inputs (moved verbatim from platform_host_prep Task 6.2). The Ensure_Template
+# step stays in platform_host_prep (it is p20-independent host prep).
+#
+# This role runs inside the orchestrator's `hosts: localhost`,
+# `connection: local` play; Task 6.2 shells out to a child `ansible-playbook`
+# run that owns its own `hosts: proxmox` / SSH connection profile.
+#
+# Cross-bucket constants come from the play-level vars on
+# ansible/playbooks/platform-bootstrap.yml; this role's phase-specific vars live
+# in defaults/main.yml. NO secret value ever lives here (the gateway knobs are
+# non-secret network topology values).
+
+# =============================================================================
+# Task 6.2 — Gateway: invoke the existing sdn_gateway role via the child play
+# =============================================================================
+# CHOICE: run the existing child play ansible/playbooks/sdn-gateway.yml (NOT
+# import_role) — it already binds `sdn_gateway` to `hosts: proxmox`,
+# `become: true` against proxmox-hosts.yml, which is exactly the connection
+# profile the role needs. import_role would run the host-level role inside THIS
+# localhost play, forcing per-task delegation/become gymnastics onto a role that
+# expects to run natively on the Proxmox node. The child-play run reuses
+# sdn-gateway.yml exactly as documented and matches the svc07 orchestrator/
+# configurator child-run seam (integration-boundaries.md §4).
+
+# Step 1 — derive the served-VLAN sets from the registry (the one reader of
+# truth — registry_status.py). Offline JSON command, reads projects.yaml only;
+# never re-parses the registry in Ansible. VLAN 20 is served unconditionally by
+# the role's own default, so an empty registry still yields a served VLAN 20.
+- name: "Gateway | Emit the registry desired-state VLAN sets (registry_status.py)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python }}"
+      - "{{ platform_gateway_registry_status }}"
+      - --json
+  args:
+    chdir: "{{ platform_repo_root }}"
+  environment:
+    PYTHONPATH: "{{ platform_gateway_registry_scripts_dir }}"
+  register: platform_gateway_vlan_status
+  changed_when: false
+
+- name: "Gateway | Parse the registry VLAN-status payload"
+  ansible.builtin.set_fact:
+    platform_gateway_vlan_sets: "{{ platform_gateway_vlan_status.stdout | from_json }}"
+
+# Pre-encode the two sets as JSON strings for the child-run --extra-vars, so the
+# argv lines stay within the 120-col limit and the encoding happens once.
+- name: "Gateway | Encode the served-VLAN sets for the gateway child run"
+  ansible.builtin.set_fact:
+    platform_gateway_active_json: >-
+      {{ platform_gateway_vlan_sets.active_vlan_ids | default([]) | to_json }}
+    platform_gateway_decomm_json: >-
+      {{ platform_gateway_vlan_sets.decommissioned_vlan_ids | default([]) | to_json }}
+
+# INFO decision log for the served-VLAN set (Req 3.4): the always-served shared
+# VLAN 20 plus the registry-active project VLANs (the role intersects the
+# active set with the opted-in served list; here we surface the active set the
+# operator can then opt into).
+- name: "Gateway | INFO — served-VLAN set (shared VLAN 20 + registry-active project VLANs)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO Gateway served-VLAN set: shared VLAN 20 (unconditional) +
+      registry-active project VLANs
+      {{ platform_gateway_vlan_sets.active_vlan_ids | default([]) }}
+      (decommissioned:
+      {{ platform_gateway_vlan_sets.decommissioned_vlan_ids | default([]) }}).
+
+# Step 2 — run the existing sdn-gateway.yml child play, feeding it ansible_host
+# (the real Proxmox LAN IP), the scoped admin source CIDR, and the registry-
+# derived active/decommissioned VLAN sets. A non-zero child exit fails this task
+# -> the gateway phase's rescue in the orchestrator play (Req 3.5). changed_when
+# keys off 'changed=0' NOT being in the child recap, matching the svc07 child
+# runs. NOT no_log — no secret is passed (these are non-secret topology values).
+#
+# ORDERING (Fix A / ADR-0010): this child run BINDS .1 to the SDN VNet bridge
+# `p<vlan>`, which the api bucket's terraform apply created. The orchestrator
+# sequences this phase AFTER the api block, so `p20` exists by the time this
+# runs. On a clean slate with no api-in-this-run and no pre-existing `p20`, the
+# sdn_gateway role fails closed on the missing bridge — the orchestrator's
+# preflight cross-bucket precondition catches that case first and names the api
+# bucket as the fix.
+- name: "Gateway | Task 6.2 — run the sdn_gateway role via the child sdn-gateway.yml play"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible-playbook"
+      - -i
+      - "{{ platform_gateway_proxmox_inventory }}"
+      - "{{ platform_gateway_playbook }}"
+      - --extra-vars
+      - "ansible_host={{ platform_gateway_host }}"
+      - --extra-vars
+      - "sdn_gateway_admin_source_cidr={{ platform_gateway_admin_source_cidr }}"
+      - --extra-vars
+      - "sdn_gateway_active_vlan_ids={{ platform_gateway_active_json }}"
+      - --extra-vars
+      - "sdn_gateway_decommissioned_vlan_ids={{ platform_gateway_decomm_json }}"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_gateway_run
+  changed_when: "'changed=0' not in (platform_gateway_run.stdout | default(''))"

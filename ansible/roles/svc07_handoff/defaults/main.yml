@@ -1,0 +1,37 @@
+---
+# defaults/main.yml — svc07_handoff (SVC-07 installer — Phase 4: Handoff)
+#
+# Phase-4 health-gate knobs (spec task 6.3). These are consumed by the CHILD
+# play svc07-health.yml (which is invoked by this role via
+# `ansible-playbook -i {{ svc07_generated_inventory }} svc07-health.yml`,
+# integration-boundaries.md §4) and by the handoff role itself. Values are the
+# EXACT baseline values extracted verbatim from the pre-extraction Phase-4 block
+# of ansible/playbooks/svc-07-bootstrap.yml. Cross-phase constants
+# (svc07_generated_inventory, svc07_repo_root, cluster_env_file, platform_domain,
+# svc07_debug_instrumentation) stay as play-level vars on svc-07-bootstrap.yml
+# (see design.md "Data Models"). NO secret value ever lives here.
+
+# Primary OpenBao container name on the guest. The svc07-health.yml child play
+# does NOT load openbao_install's role defaults, so the container name is fixed
+# here (the container is <openbao_stack_name>-openbao-1 = openbao-openbao-1,
+# matching the running guest). Kept in sync with openbao_install/defaults/main.yml.
+svc07_openbao_primary_container_name: "openbao-openbao-1"
+
+# The bao binary invoked inside the primary container for `docker exec ... status`.
+svc07_openbao_bao_bin: "bao"
+
+# TLS skip-verify for the primary `bao status` guest check during Day-0 bootstrap
+# (self-signed mock cert). Mirrors openbao_unsealer_tls_skip_verify.
+svc07_openbao_primary_tls_skip_verify: true
+
+# Two-stage recreate-robust health gate retry budget: retries:30 × delay:5 =
+# ~150s deadline per stage — comfortable headroom over the observed ~30s startup
+# plus the recreate window and per-attempt SSH/docker latency.
+svc07_health_retries: 30
+svc07_health_delay: 5
+
+# OPT-IN through-Traefik Phase-4 health check. OFF by default: SVC-09/Traefik is
+# not deployed yet, so the `docker exec ... bao status` guest check alone gates
+# Phase 4. Set true (-e svc07_health_check_via_traefik=true) ONLY once Traefik is
+# live to also verify the real ingress route.
+svc07_health_check_via_traefik: false

@@ -1,0 +1,68 @@
+---
+# already_initialized.yml — Task 6.3 fixture playbook (spec: svc-07-secrets-manager)
+#
+# Applies the REAL `openbao_init_unseal` role (unmodified) against localhost to
+# prove the Requirement 13.1/13.3 idempotency guarantee: when the target
+# OpenBao instance already reports `initialized: true` (the "already-initialized"
+# state), a run reports changed=0 — the role's `bao status`/health guard sets
+# `openbao_already_initialized = true`. The PRIMARY Raft init/bootstrap/revoke is
+# gated off `when: not openbao_already_initialized` (Req 13.3). The UNSEALER Transit
+# tasks are NOT gated on that fact (25th correction — the operator inits the
+# unsealer's Raft first, so that gate would make Transit setup a silent no-op);
+# they instead reconcile idempotently (read-only probe; enable-if-mount-absent;
+# key create-if-absent), so a re-run still contributes no change.
+# No token is revoked and no secret is deleted, because those steps live behind
+# that same gate.
+#
+# HOW THE "ALREADY-INITIALIZED" STATE IS SIMULATED
+# ------------------------------------------------
+# The guard reads `GET {{ openbao_health_addr }}{{ openbao_health_path }}` via
+# `ansible.builtin.uri`. `uri` is a BUILTIN module (not a collection), so — unlike
+# task 5.5's `community.docker` stub — it cannot be shadowed by a fake collection.
+# Instead the pytest runner starts a tiny local HTTP stub server (python
+# http.server in a background thread) that answers any `/v1/sys/health...` request
+# with a body of `{"initialized": true, "sealed": false}` and HTTP 200. The runner
+# overrides, via `-e` (highest Ansible precedence):
+#   - `openbao_health_addr`          -> http://127.0.0.1:<stub-port>
+#   - `openbao_health_validate_certs`-> false (belt-and-suspenders; http anyway)
+# so the REAL guard logic runs end to end against the stub and computes
+# `openbao_already_initialized = true`. This exercises the actual guard + gating,
+# not a mock of it.
+#
+# NO secret value is needed or templated: with `initialized: true` the init path
+# is skipped entirely, and the role holds no secret in the first place
+# (no-secret-in-fixtures steering).
+#
+# WHY `become: true` (post ADR-0006): the role still needs root, but NOT for
+# swappiness. Per ADR-0006 the host-global `vm.swappiness` sysctl write was
+# REMOVED from this role (unrunnable on an unprivileged LXC, cross-tenant, only a
+# heuristic — the swap control now lives in encrypted host swap + the
+# per-container cap). The role needs root instead because its observability
+# (task 10.1) and alerts (task 10.2) template tasks render root-owned files/dirs
+# under /etc/openbao/... (owner: root), and the unsealer Transit init runs via
+# `docker exec`. The pytest runner only invokes this playbook where privilege
+# escalation actually works (running as root, or passwordless sudo) and SKIPS
+# cleanly otherwise.
+#
+# A SINGLE `--check` run suffices — no prime-then-check. With the persistent
+# `vm.swappiness` sysctl write gone, nothing on the fixture's `unsealer` path
+# writes persistent host state: the health guard is a check-safe read
+# (changed_when:false), the Transit init tasks are gated off once the stub drives
+# `openbao_already_initialized` True, and the observability/alerts template
+# renders are gated to `openbao_role == "primary"` (this fixture runs the
+# `unsealer` role, so they do not run). The runner therefore does one `--check`
+# run against the already-initialized stub and asserts its recap is changed=0 —
+# a genuine no-op that reflects what the role actually does now.
+
+- name: openbao_init_unseal check-mode idempotency (already-initialized state)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+  vars:
+    # Exercise the unsealer path: its Transit-engine init tasks are the ones
+    # gated off by the guard, and no primary seal `transit` token is involved.
+    # The guard + gating machinery under test is identical for both roles.
+    openbao_role: "unsealer"
+  roles:
+    - role: openbao_init_unseal

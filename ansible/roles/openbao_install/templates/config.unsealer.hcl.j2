@@ -1,0 +1,48 @@
+{#
+  templates/config.unsealer.hcl.j2 — TRANSIT UNSEALER config
+  (svc07-unsealer-20-01, 10.0.20.11)
+
+  Rendered by openbao_install when openbao_role == "unsealer".
+  Contract asserted by the task 5.4 config-validation tests (design.md
+  "config.hcl shape (primary + unsealer)", Req 5.1):
+    - listener "tcp" with tls_disable = false, no plaintext listener
+    - storage "raft" for this instance's own minimal state
+    - NO seal "transit" stanza — this instance IS the seal provider, not a consumer
+    - NO KV / database / aws / PKI mount is declared in config; the Transit
+      secrets engine is the only engine, enabled at runtime by the init role.
+
+  This instance holds only the Transit unseal key and no application secrets.
+#}
+# MANAGED BY ANSIBLE (openbao_install) — DO NOT EDIT BY HAND.
+# Transit unsealer instance: {{ openbao_unsealer_node_id }}
+#
+# Deliberately minimal: TLS listener + Raft storage only.
+# There is intentionally NO seal stanza and NO KV/database/aws/PKI mount here.
+
+ui = false
+
+# No memory locking (ADR-0006 / OpenBao mlock-removal RFC:
+# https://openbao.org/community/rfcs/mlock-removal/). Raft-only OpenBao must NOT
+# mlock — mlockall() faults the whole bbolt-mmap'd DB into RAM, risking an
+# OOM-kill. The IPC_LOCK capability that enabled mlock is removed from the
+# container; this makes the "no mlock" intent explicit (it previously defaulted
+# ON because disable_mlock was unset).
+disable_mlock = true
+
+# Single TLS listener; no plaintext listener is defined (Req 6.1).
+# TLS material source: {{ openbao_tls_cert_source }} (svc08 EJBCA, or letsencrypt fallback).
+listener "tcp" {
+  address       = "{{ openbao_listener_address }}"
+  tls_disable   = false
+  tls_cert_file = "{{ openbao_tls_cert_file }}"
+  tls_key_file  = "{{ openbao_tls_key_file }}"
+}
+
+# Minimal Raft storage for this instance's own tiny state (the Transit key).
+storage "raft" {
+  path    = "{{ openbao_storage_path }}"
+  node_id = "{{ openbao_unsealer_node_id }}"
+}
+
+api_addr     = "{{ openbao_unsealer_api_addr }}"
+cluster_addr = "{{ openbao_unsealer_cluster_addr }}"

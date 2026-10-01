@@ -1,0 +1,49 @@
+---
+# defaults/main.yml — platform_api (Platform Prerequisites Bootstrap —
+# api bucket, SDN VLAN fabric via the platform-foundation Terraform root).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/. Design ref:
+# "Component 5: platform_api". Implemented in spec task 7.1.
+#
+# Phase-specific defaults for the api bucket. Cross-bucket constants
+# (cluster_env_file, platform_repo_root, platform_venv_python) stay as
+# play-level vars on platform-bootstrap.yml (see design.md "Data Models").
+# NO secret value ever lives here — the terraform@pve token is resolved
+# no_log at run time (via cluster_env.py) and passed only through the
+# child `terraform` process environment (platform_api_tf_env), never on a
+# command line and never echoed.
+
+# The EXISTING platform-foundation Terraform root (reused, never modified —
+# design "Reuse, don't rebuild" / Req 4.1). Repo-relative; the child
+# `terraform` process runs from platform_repo_root and chdirs here.
+platform_api_tf_root: infra/platform-foundation
+
+# The helper that resolves + validates cluster.env into the canonical
+# TF_VAR_* mapping (single source of truth for parsing/alias-resolution;
+# reused from the SVC-07 installer). Invoked via the project venv python.
+platform_api_cluster_env_helper: scripts/installer/cluster_env.py
+
+# TLS verification toggle for the bpg/proxmox provider. Mirrors the SVC-07
+# svc07_proxmox_validate_certs default: OFF by default so a self-signed
+# test-cluster cert does not break the apply; override to true where the
+# cluster presents a trusted cert:
+#   -e platform_api_proxmox_validate_certs=true
+# This single toggle governs the provider's TLS verification; the child
+# env derives TF_VAR_proxmox_insecure from it (insecure == NOT validate),
+# the same convention the SVC-07 provision env uses so the two cannot drift.
+platform_api_proxmox_validate_certs: false
+
+# Environment passed to the child `terraform` init/apply processes. The
+# Proxmox endpoint/token travel here as TF_VAR_* (never on the command
+# line); every task using this env sets no_log:true (Req 4.1 note;
+# security-standards.md). Evaluated LAZILY against the token-precondition
+# facts bound in tasks/main.yml (platform_api_proxmox_endpoint /
+# platform_api_proxmox_api_token), so the references resolve after those
+# facts are set. The platform-foundation root consumes exactly these three
+# credential vars via TF_VAR_* (README "Apply (Tier-2)"); the sdn_zone_*
+# vars keep their working defaults (vmbr0 / vlanzone) and are not passed
+# here unless a cluster.env override is introduced later.
+platform_api_tf_env:
+  TF_VAR_proxmox_endpoint: "{{ platform_api_proxmox_endpoint | default('') }}"
+  TF_VAR_proxmox_api_token: "{{ platform_api_proxmox_api_token | default('') }}"
+  TF_VAR_proxmox_insecure: "{{ (not (platform_api_proxmox_validate_certs | bool)) | lower }}"

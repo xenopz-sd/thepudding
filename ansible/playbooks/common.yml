@@ -1,0 +1,15 @@
+---
+# Common baseline playbook (feature: terraform-ansible-handoff, design C5).
+# Binds the `common` role (hardened baseline + Docker CE + Compose plugin) to
+# the hosts in the generated inventory. Bind-only: NO task logic lives here —
+# all logic is in roles/common (structure.md, PF §9). Run against the inventory
+# rendered by ansible/inventory/generate_inventory.py:
+#   ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/<root>.generated.yml \
+#     ansible/playbooks/common.yml
+# Narrow to a subset with --limit <group> where <group> is a service_role or
+# project_slug emitted by the generator.
+- name: Apply the common host baseline (Docker + Compose + hardening)
+  hosts: all
+  become: true
+  roles:
+    - role: common

@@ -1,0 +1,75 @@
+{#
+  templates/loki-openbao-audit-rule.yml.j2 — Loki RULER alerting-rule fragment
+  SVC-07 contributes TO the shared SVC-18 (Loki) observability stack.
+
+  Rendered by task 10.2 (tasks/alerts.yml, §10.2) into the Loki ruler's
+  rule directory ({{ openbao_loki_audit_rule_file }}) that the SVC-18 Loki
+  ruler component evaluates. This is a LogQL-derived alerting rule — the
+  OpenBaoAuditFailure alert (Req 10.7) fires on a LOG SIGNAL (an audit-device
+  write failure line), NOT on a Prometheus metric, so it lives here rather than
+  in the Prometheus rule file (prometheus-openbao-alerts.yml.j2).
+
+  WHY A LOKI RULE (not Prometheus): when OpenBao's file audit device fails to
+  write, OpenBao fails CLOSED — it BLOCKS the triggering operation and returns
+  an audit-distinct error (design.md Error Handling; Req 7.3 / FD.3). That
+  failure surfaces as an ERROR line in OpenBao's OPERATIONAL log stream (stdout,
+  JSON, shipped to Loki tagged service=openbao — task 5.x logging + the
+  Promtail wiring in task 7.2). There is no clean Prometheus counter for "the
+  audit sink is unwritable"; the log line is the authoritative signal. This rule
+  matches that line and fires OpenBaoAuditFailure within 1 minute of the line's
+  ingestion (Req 10.7).
+
+  DISTINCT FROM THE SNAPSHOT ALERT: the nightly Raft snapshot failure emits its
+  OWN marker (OPENBAO_SNAPSHOT_FAILURE, openbao_install: openbao_backup_failure_
+  marker) and is a DIFFERENT alert with a 15-min window (task 11.1 / Req 11.2).
+  This rule deliberately matches the AUDIT-WRITE-FAILURE signal only, via the
+  openbao_audit_failure_log_matcher literal, so the two never conflate.
+
+  AUTO-RESOLVE / one-shot nature: an audit-write failure is a fail-closed safety
+  event — the rule fires as soon as a matching line is ingested within the short
+  evaluation window; it clears when no further matching lines arrive in the
+  window (Loki ruler resolves the alert when the query returns empty). The `for`
+  is intentionally 0s so the FIRST matching line alerts inside the 1-min SLA.
+
+  NO secret value is templated here — the LogQL matcher, labels, and window are
+  all non-secret config. The audit LOG CONTENT itself (which may reference secret
+  paths) is never inlined into this rule; the rule matches only the error-signal
+  substring, not any secret material.
+#}
+# MANAGED BY ANSIBLE (openbao_init_unseal / task 10.2) — DO NOT EDIT BY HAND.
+# Loki ruler alerting rule contributed by SVC-07 (OpenBao) to SVC-18.
+# OpenBaoAuditFailure (critical): fires within 1 min of an audit-write-failure
+# log line ingested from the OpenBao operational log stream (Req 10.7).
+groups:
+  - name: "{{ openbao_loki_audit_rule_group_name }}"
+    # Evaluate frequently enough that the first matching line alerts well within
+    # the 1-minute SLA (Req 10.7). Kept below the 1-min budget.
+    interval: "{{ openbao_loki_audit_rule_interval }}"
+    rules:
+      - alert: OpenBaoAuditFailure
+        # LogQL: count audit-write-failure lines in the OpenBao operational log
+        # stream over a short window; fire when at least one is seen. The
+        # matcher is scoped to service=openbao (the operational stream) and to
+        # the audit-write-failure signal substring — NOT the snapshot marker.
+        expr: >-
+          {{ openbao_loki_audit_failure_expr }}
+        # 0s so the first ingested matching line fires immediately (within the
+        # {{ openbao_loki_audit_rule_interval }} evaluation cadence), keeping the
+        # end-to-end fire well inside the 1-minute SLA (Req 10.7).
+        for: "{{ openbao_loki_audit_failure_for }}"
+        labels:
+          severity: critical
+          service: openbao
+          # Routing label the Alertmanager route fragment keys off (Req 10.9);
+          # the Loki ruler forwards firing alerts to the same Alertmanager.
+          receiver_team: "{{ openbao_alert_primary_team_label }}"
+        annotations:
+          summary: "OpenBao audit device write failure (fail-closed)"
+          description: >-
+            An audit-device write-failure log line was ingested from the OpenBao
+            operational log stream. OpenBao fails CLOSED on audit-write failure:
+            the triggering operation is BLOCKED and an audit-distinct error is
+            returned (Req 7.3 / FD.3). Secret operations are being refused until
+            the audit sink is writable again. Investigate the audit volume
+            ({{ openbao_audit_dir }}) immediately.
+          runbook_url: "{{ openbao_alert_runbook_base }}#openbaoauditfailure"

@@ -1,0 +1,118 @@
+---
+# tasks/guest_firewall_baseline.yml — sdn_gateway
+# (spec openbao-unsealer-firewall-scoping; ADR-0007 rev 3)
+#
+# Runs ONCE PER FIREWALLED GUEST (looped from tasks/main.yml over
+# `sdn_gateway_firewalled_guests`, loop_var `sdn_gateway_fw_guest`).
+#
+# WHY THIS EXISTS — the provisioning chicken-and-egg. Enabling the per-NIC guest
+# firewall (`firewall=1`) on a guest, with `pve-firewall` enabled cluster-wide,
+# makes Proxmox filter that guest's OWN traffic. With no guest-scoped rules the
+# guest loses EGRESS: DNS fails, `apt update` fails, Docker image pulls fail — so
+# the guest can no longer PROVISION itself. Verified live: the firewalled unsealer
+# could not resolve `deb.debian.org` while the non-firewalled primary could, which
+# is why the `common` role's apt step failed and Docker was never installed.
+#
+# This task file is therefore the REUSABLE BASELINE every firewalled guest needs:
+# a scoped set of `out` ALLOW rules that keep provisioning and normal operation
+# working, WITHOUT opening guest INGRESS (the whole point of firewalling the guest
+# is to control who may reach IT — not to stop it fetching packages).
+#
+# It is deliberately GENERIC: any guest on any VLAN that sets `firewall=1` gets the
+# same baseline by adding an entry to `sdn_gateway_firewalled_guests`. Nothing here
+# is specific to OpenBao/SVC-07 or to VLAN 20 — future services and project VLANs
+# reuse it unchanged (spec Req 8).
+#
+# Egress ports opened (scoped, from `sdn_gateway_guest_egress_*`):
+#   - DNS      53/udp + 53/tcp  — name resolution (apt, registries, everything)
+#   - HTTP     80/tcp           — apt repositories
+#   - HTTPS    443/tcp          — apt over TLS, Docker registries, OpenBao peers
+#   - NTP      123/udp          — clock sync (TLS + token TTLs depend on it)
+# Extend via `sdn_gateway_guest_egress_tcp_ports` / `_udp_ports` per guest set —
+# an explicit, reviewable widening, never a blanket `policy_out=ACCEPT`.
+#
+# Each rule is check-then-change (added only when its managed comment tag is
+# absent) so a second run is changed=0. A failed write is a HARD failure (no
+# `failed_when: false`) so a guest is never believed to have working egress when it
+# does not. NO secret material is read or echoed here.
+
+- name: "Guest firewall baseline | Assert the guest node + vmid are set (fail closed)"
+  ansible.builtin.assert:
+    that:
+      - sdn_gateway_fw_guest.node is defined
+      - (sdn_gateway_fw_guest.node | string | trim) | length > 0
+      - sdn_gateway_fw_guest.vmid is defined
+      - (sdn_gateway_fw_guest.vmid | string | trim) | length > 0
+    fail_msg: >-
+      Every entry in sdn_gateway_firewalled_guests must carry a non-empty `node`
+      and `vmid` (they address the guest firewall path
+      /nodes/<node>/lxc/<vmid>/firewall/rules). Got:
+      {{ sdn_gateway_fw_guest | default('<undefined>') }}. These come from the
+      Terraform-generated inventory (inventory_hosts emits the real vmid +
+      node_name), never a hardcoded guess.
+    success_msg: "Firewalled guest {{ sdn_gateway_fw_guest.vmid }} identified."
+    quiet: true
+
+- name: "Guest firewall baseline | Compute the guest rules path for vmid {{ sdn_gateway_fw_guest.vmid }}"
+  ansible.builtin.set_fact:
+    sdn_gateway_gfb_rules_path: >-
+      /nodes/{{ sdn_gateway_fw_guest.node }}/lxc/{{ sdn_gateway_fw_guest.vmid }}/firewall/rules
+
+- name: "Guest firewall baseline | Read current firewall rules for vmid {{ sdn_gateway_fw_guest.vmid }}"
+  ansible.builtin.command:
+    cmd: "sudo pvesh get {{ sdn_gateway_gfb_rules_path }} --output-format json"
+  register: sdn_gateway_gfb_rules_raw
+  changed_when: false
+  check_mode: false
+
+- name: "Guest firewall baseline | Compute the existing rule-comment set"
+  ansible.builtin.set_fact:
+    sdn_gateway_gfb_comments: >-
+      {{ sdn_gateway_gfb_rules_raw.stdout | from_json
+         | map(attribute='comment', default='') | list }}
+
+# --- Scoped TCP egress (DNS/TCP, HTTP, HTTPS by default) ---------------------
+# One ALLOW rule per port so each is independently reviewable/removable and keyed
+# on its own managed comment for idempotency.
+- name: "Guest firewall baseline | Ensure scoped TCP egress ALLOW rules (check-then-change)"
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - pvesh
+      - create
+      - "{{ sdn_gateway_gfb_rules_path }}"
+      - "--enable=1"
+      - "--type=out"
+      - "--action=ACCEPT"
+      - "--proto=tcp"
+      - "--dport={{ item }}"
+      - "--comment=sdn_gateway: ALLOW egress tcp/{{ item }} (managed)"
+  loop: "{{ sdn_gateway_guest_egress_tcp_ports }}"
+  when: >-
+    ('sdn_gateway: ALLOW egress tcp/' ~ item ~ ' (managed)')
+    not in sdn_gateway_gfb_comments
+  register: sdn_gateway_gfb_tcp_create
+  changed_when: sdn_gateway_gfb_tcp_create.rc == 0
+  notify: Reload pve-firewall
+
+# --- Scoped UDP egress (DNS/UDP, NTP by default) -----------------------------
+- name: "Guest firewall baseline | Ensure scoped UDP egress ALLOW rules (check-then-change)"
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - pvesh
+      - create
+      - "{{ sdn_gateway_gfb_rules_path }}"
+      - "--enable=1"
+      - "--type=out"
+      - "--action=ACCEPT"
+      - "--proto=udp"
+      - "--dport={{ item }}"
+      - "--comment=sdn_gateway: ALLOW egress udp/{{ item }} (managed)"
+  loop: "{{ sdn_gateway_guest_egress_udp_ports }}"
+  when: >-
+    ('sdn_gateway: ALLOW egress udp/' ~ item ~ ' (managed)')
+    not in sdn_gateway_gfb_comments
+  register: sdn_gateway_gfb_udp_create
+  changed_when: sdn_gateway_gfb_udp_create.rc == 0
+  notify: Reload pve-firewall

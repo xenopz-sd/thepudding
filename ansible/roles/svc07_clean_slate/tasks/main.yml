@@ -1,0 +1,310 @@
+---
+# tasks/main.yml — svc07_clean_slate (SVC-07 installer — clean-slate branch)
+#
+# Extracted VERBATIM (spec task 8.1) from the baseline clean_slate branch in
+# ansible/playbooks/svc-07-bootstrap.yml. The enclosing `when: clean_slate`
+# gate and the per-phase `block`/`rescue` phase-naming wrapper stay in the thin
+# orchestrator play (spec task 10) — this role owns the branch BODY only:
+#   - confirmation gating (pause 300s unless clean_slate_confirm=force),
+#   - independent cluster_env.py node-name resolution (no_log),
+#   - Proxmox-host-address assertion,
+#   - two-target assembly (1070 primary, 1071 unsealer),
+#   - per-target child clean-slate.yml runs (invoking the existing
+#     terraform_clean_slate role — does NOT reimplement destroy logic),
+#   - two-way empty-baseline verification gate (pct list + terraform state list)
+#     that HALTS naming each survivor.
+# See design.md "Role 5: svc07_clean_slate". Cross-phase constants
+# (clean_slate_confirm, cluster_env_file, svc07_tf_root, svc07_venv_python,
+# svc07_cluster_env_helper) remain play-level vars; svc07_proxmox_host and
+# svc07_proxmox_host_inventory are role defaults (defaults/main.yml).
+
+# ============================================================ #
+# Task 5.2 — Agent-live throwaway-cluster authorization gate     #
+# (spec agent-live-test-authorization, Req 5.1-5.5 / Property 5).#
+# ------------------------------------------------------------ #
+# These THREE tasks run FIRST in the clean-slate branch — BEFORE  #
+# the confirmation pause, the node-name resolution, and every     #
+# per-target destroy — so a REFUSED decision halts before ANY     #
+# prompt, destroy, or Terraform-state mutation (Req 5.1, 5.2).    #
+# All three are gated `when: agent_live_run` (truthy only when     #
+# the AGENT_LIVE_AUTHORIZED interlock is armed), so an ORDINARY    #
+# operator run (interlock unset) SKIPS them entirely and keeps     #
+# the existing pause-confirm path byte-for-byte unchanged          #
+# (Req 5.5). The gate is FAIL-CLOSED: the guard consult never       #
+# fails the task itself (failed_when: false) — the rc is the       #
+# signal, and the assert HALTS unless the guard AUTHORIZED         #
+# (rc == 0), naming the guard's own non-secret reason (Req 5.4).   #
+# ============================================================ #
+
+- name: "Clean-Slate | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc07_venv_python }}"
+      - "{{ svc07_throwaway_guard }}"
+      - --service
+      - svc07
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ svc07_throwaway_allowlist }}"
+  args:
+    chdir: "{{ svc07_repo_root }}"
+  register: svc07_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (svc07_throwaway_decision.stdout | default('{}') | from_json).reason | default('no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | Refuse the reset unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "svc07_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live clean-slate REFUSED by the throwaway-cluster guard:
+      {{ (svc07_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      No container was destroyed and no Terraform state was modified. Arm the run
+      only against a throwaway cluster listed in throwaway-clusters.yml with
+      AGENT_LIVE_AUTHORIZED set.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live clean-slate."
+  when: agent_live_run | default(false) | bool
+
+# ============================================================ #
+# Task 11.1 — Confirmation gating (Req 7.1, 7.2, 7.3).          #
+# ------------------------------------------------------------ #
+# The Clean_Slate_Reset is DESTRUCTIVE (pct destroy + terraform  #
+# state rm on both SVC-07 guests). Before delegating any destroy #
+# we require an affirmative confirmation UNLESS the operator      #
+# already asserted intent with clean_slate_confirm=force:         #
+#   * clean_slate_confirm == 'force'  -> skip the prompt (7.3).   #
+#   * otherwise -> ansible.builtin.pause prompts for explicit     #
+#     confirmation, bounded at 300 s (7.1). A non-affirmative     #
+#     response, or no response within the timeout, aborts the     #
+#     reset destroying NOTHING and returns non-zero (7.2).        #
+# The prompt runs BEFORE proxmox_node_name resolution and before  #
+# any child clean-slate.yml run, so a declined/timed-out prompt   #
+# cannot have touched Proxmox or Terraform state.                 #
+# ============================================================ #
+
+- name: "Clean-Slate | Prompt for explicit confirmation (300s timeout; skipped on force)"
+  ansible.builtin.pause:
+    prompt: >-
+      DESTRUCTIVE Clean-Slate reset of SVC-07 requested. This will
+      pct-destroy containers 1070 (primary) and 1071 (unsealer) and
+      remove them from Terraform state. Type 'yes' to proceed, anything
+      else to abort
+    seconds: 300
+  register: svc07_clean_slate_prompt
+  when: (clean_slate_confirm | default('')) != 'force'
+
+# Decide affirmation. On force, no prompt ran -> proceed. Otherwise the
+# response must be an affirmative ('yes'/'y', case-insensitive, trimmed);
+# anything else — including an empty/timed-out response (pause returns an
+# empty user_input on timeout) — is a non-affirmative abort (Req 7.2).
+- name: "Clean-Slate | Resolve whether the reset is confirmed"
+  ansible.builtin.set_fact:
+    svc07_clean_slate_confirmed: >-
+      {{ (clean_slate_confirm | default('')) == 'force'
+         or ((svc07_clean_slate_prompt.user_input | default('') | trim | lower) in ['yes', 'y']) }}
+
+# A non-affirmative / absent response aborts the reset, destroying
+# nothing, with a non-zero exit (Req 7.2). This runs before any node
+# resolution or delegated destroy, so no state was touched.
+- name: "Clean-Slate | Abort with non-zero exit when not confirmed (destroys nothing, Req 7.2)"
+  ansible.builtin.fail:
+    msg: >-
+      Clean-Slate reset ABORTED — confirmation was not given (received a
+      non-affirmative or empty/timed-out response). No container was
+      destroyed and no Terraform state was modified. Re-run with an
+      affirmative 'yes' at the prompt, or pass -e clean_slate_confirm=force
+      to skip the prompt.
+  when: not (svc07_clean_slate_confirmed | bool)
+
+# ============================================================ #
+# Task 11.2 — Delegated reset + verification gate               #
+# (Req 7.4, 7.5, 7.6, 7.7, 7.8).                                #
+# ------------------------------------------------------------ #
+# Phase 1 does NOT run on a clean-slate invocation (every phase   #
+# is gated `when: not clean_slate`), so proxmox_node_name is NOT  #
+# resolved by preflight. The terraform_clean_slate role needs     #
+# each target's `node`, so we resolve the node name INDEPENDENTLY #
+# here by invoking cluster_env.py against the same Cluster_Env_   #
+# File (its TF_VAR_proxmox_node_name), exactly as Phase 1 would.  #
+# ============================================================ #
+
+# Resolve proxmox_node_name from the cluster env (independent of Phase 1).
+# no_log — the helper's JSON stdout carries the API token by key.
+- name: "Clean-Slate | Resolve cluster env for the Proxmox node name ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc07_venv_python }}"
+      - "{{ svc07_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ svc07_repo_root }}"
+  register: svc07_cs_env_resolve
+  changed_when: false
+  no_log: true
+
+- name: "Clean-Slate | Bind the resolved Proxmox node name (no_log)"
+  ansible.builtin.set_fact:
+    proxmox_node_name: "{{ (svc07_cs_env_resolve.stdout | from_json)['TF_VAR_proxmox_node_name'] }}"
+  no_log: true
+
+# The delegated clean-slate.yml runs `pct` ON THE NODE, so it targets the
+# Proxmox-host inventory whose ansible_host is a committed placeholder —
+# the operator MUST supply the real LAN IP. Fail fast (naming the var) if
+# a reset was requested without it, before any destroy runs (Req 7.4).
+- name: "Clean-Slate | Assert the Proxmox host SSH address was supplied"
+  ansible.builtin.assert:
+    that:
+      - "svc07_proxmox_host is defined"
+      - "(svc07_proxmox_host | trim | length) > 0"
+    fail_msg: >-
+      The Clean-Slate reset delegates to clean-slate.yml against the
+      Proxmox-host inventory ({{ svc07_proxmox_host_inventory }}), which
+      runs `pct` on the node over SSH. Supply the real Proxmox LAN IP with
+      -e svc07_proxmox_host=<real-proxmox-lan-ip>. Nothing was destroyed.
+    success_msg: "Proxmox host SSH address supplied for the reset."
+
+# The two SVC-07 clean_slate_targets (design "Clean-slate component"),
+# node computed from the independently-resolved proxmox_node_name.
+- name: "Clean-Slate | Assemble the two SVC-07 clean_slate_targets"
+  ansible.builtin.set_fact:
+    svc07_clean_slate_targets:
+      - name: svc07-20-01
+        terraform_root: infra/projects/svc-07-secrets-manager
+        resource_address: proxmox_virtual_environment_container.primary
+        node: "{{ proxmox_node_name }}"
+        vmid: 1070
+      - name: svc07-unsealer-20-01
+        terraform_root: infra/projects/svc-07-secrets-manager
+        resource_address: proxmox_virtual_environment_container.unsealer
+        node: "{{ proxmox_node_name }}"
+        vmid: 1071
+
+# Child clean-slate.yml run, ONCE PER TARGET. The role requires the single
+# per-run clean_slate_confirm token to match the target's vmid, so the two
+# targets (1070, 1071) cannot share one run — each is destroyed by its own
+# child invocation whose confirm == that target's vmid (Req 7.4, 7.6). The
+# role tolerates an already-absent container and an already-absent state
+# entry (Req 7.5). ansible_host is overridden to the real Proxmox LAN IP.
+# A child non-zero exit is caught by this branch's rescue (Req 1.7).
+- name: "Clean-Slate | Delegate the reset to clean-slate.yml (one child run per target)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc07_proxmox_host_inventory }}"
+      - ansible/playbooks/clean-slate.yml
+      - --extra-vars
+      - "ansible_host={{ svc07_proxmox_host }}"
+      - -e
+      - clean_slate_enabled=true
+      - -e
+      - "clean_slate_confirm={{ item.vmid }}"
+      - -e
+      - "{{ {'clean_slate_targets': [item]} | to_json }}"
+  args:
+    chdir: "{{ svc07_repo_root }}"
+  loop: "{{ svc07_clean_slate_targets }}"
+  loop_control:
+    label: "{{ item.name }} (vmid {{ item.vmid }})"
+  register: svc07_clean_slate_runs
+  changed_when: "'changed=0' not in (svc07_clean_slate_runs.stdout | default(''))"
+
+# ---- Verification gate (Req 7.7, 7.8) ---------------------------- #
+# After the reset, verify an EMPTY baseline two ways, and fail naming
+# every survivor if either check finds one.
+
+# (a) Zero SVC-07 CONTAINERS on the host. `pct` runs on the node, so the
+# check is a child `ansible` ad-hoc `command` against the Proxmox-host
+# inventory (same inventory clean-slate.yml uses). We filter `pct list`
+# to the two SVC-07 VMIDs; a non-zero grep (no match) means clean. rc is
+# tolerated (grep exits 1 on no match) — the survivor set is parsed from
+# stdout, not the exit code.
+- name: "Clean-Slate | VERIFY — list any surviving SVC-07 containers on the host (pct list)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible"
+      - proxmox
+      - -i
+      - "{{ svc07_proxmox_host_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ svc07_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pct list"
+  args:
+    chdir: "{{ svc07_repo_root }}"
+  register: svc07_pct_list
+  changed_when: false
+  failed_when: false
+
+# Extract surviving SVC-07 VMIDs (1070/1071) from the pct list output.
+# `pct list` prints one guest per line beginning with the VMID; a
+# word-boundary match on either id yields the survivor set.
+- name: "Clean-Slate | Compute the set of surviving SVC-07 container VMIDs"
+  ansible.builtin.set_fact:
+    svc07_surviving_vmids: >-
+      {{ ['1070', '1071']
+         | select('in', (svc07_pct_list.stdout | default('')))
+         | list }}
+
+# (b) Zero SVC-07 CONTAINER RESOURCES in Terraform state. `terraform state
+# list` runs on the CONTROL NODE (state lives there). Filter to the two
+# container resource addresses; survivors are parsed from stdout.
+- name: "Clean-Slate | VERIFY — list SVC-07 container resources in Terraform state"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+  args:
+    chdir: "{{ svc07_tf_root }}"
+  register: svc07_state_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the set of surviving SVC-07 state addresses"
+  ansible.builtin.set_fact:
+    svc07_surviving_state_addrs: >-
+      {{ ['proxmox_virtual_environment_container.primary',
+          'proxmox_virtual_environment_container.unsealer']
+         | select('in', (svc07_state_list.stdout | default('')))
+         | list }}
+
+# Final gate (Req 7.7, 7.8): both survivor sets MUST be empty. If either
+# is non-empty the installer halts with a non-zero exit, naming each
+# surviving resource by container ID or Terraform state address.
+- name: "Clean-Slate | GATE — assert an empty baseline (0 containers, 0 state), Req 7.7/7.8"
+  ansible.builtin.assert:
+    that:
+      - "(svc07_surviving_vmids | length) == 0"
+      - "(svc07_surviving_state_addrs | length) == 0"
+    fail_msg: >-
+      Clean-Slate reset did NOT reach an empty baseline. Surviving SVC-07
+      container(s): {{ svc07_surviving_vmids | default([]) | join(', ') | default('none', true) }};
+      surviving Terraform state address(es):
+      {{ svc07_surviving_state_addrs | default([]) | join(', ') | default('none', true) }}.
+      Investigate on the Proxmox host / in Terraform state and re-run the
+      reset until both are empty before re-installing.
+    success_msg: >-
+      Clean-Slate reset complete — zero SVC-07 containers on the host and
+      zero SVC-07 container resources in Terraform state.
+
+- name: "Clean-Slate | Report the reset completed to an empty baseline"
+  ansible.builtin.debug:
+    msg: >-
+      SVC-07 Clean-Slate reset complete: containers 1070/1071 destroyed
+      (or already absent) and removed from Terraform state. The baseline is
+      empty; a fresh install (this playbook without -e clean_slate=true) can
+      now run a true from-scratch bootstrap.

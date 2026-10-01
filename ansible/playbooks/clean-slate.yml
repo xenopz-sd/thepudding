@@ -1,0 +1,25 @@
+---
+# clean-slate.yml — canonical clean-slate reset (spec terraform-clean-slate-reset).
+#
+# Destroys Terraform-provisioned Proxmox guests (pct destroy) and removes them from
+# Terraform state (terraform state rm, delegated to localhost), so a subsequent
+# normal `terraform apply` recreates them TRULY fresh. This is a DESTRUCTIVE dev tool:
+# it is a NO-OP unless `clean_slate_enabled=true` AND a matching per-target
+# `clean_slate_confirm=<vmid>` are supplied. Recreate is a SEPARATE operator step
+# (the role never runs `terraform apply`).
+#
+# Runs against the Proxmox host inventory (same as sdn-gateway.yml) so `pct` runs on
+# the node; the terraform state op inside the role is `delegate_to: localhost`.
+#
+# Example (destroy the SVC-07 primary, vmid 1070):
+#   ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/proxmox-hosts.yml \
+#     ansible/playbooks/clean-slate.yml \
+#     --extra-vars "ansible_host=<real-proxmox-lan-ip>" \
+#     -e clean_slate_enabled=true -e clean_slate_confirm=1070 \
+#     -e '{"clean_slate_targets":[{"name":"svc07-20-01","terraform_root":"infra/projects/svc-07-secrets-manager","resource_address":"proxmox_virtual_environment_container.primary","node":"shrimp","vmid":1070}]}'
+- name: Canonical clean-slate reset of Terraform-provisioned Proxmox guests
+  hosts: proxmox
+  become: true
+  gather_facts: false
+  roles:
+    - role: terraform_clean_slate

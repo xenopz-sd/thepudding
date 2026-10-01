@@ -1,0 +1,70 @@
+{#
+  templates/promtail-openbao.yml.j2 — Promtail scrape config for the OpenBao
+  audit log on the PRIMARY (svc07-20-01).
+
+  Rendered by task 7.2 (tasks/engines_auth_audit.yml, §7.2) onto the primary
+  host at {{ openbao_promtail_config_file }}. The primary's Promtail agent (host
+  agent or observability sidecar) loads this scrape config; it tails the OpenBao
+  file audit device's log ACROSS ROTATIONS and ships each JSON line to Loki
+  (SVC-18) within 60 s, tagged service=openbao and vlan=20 (Req 7.4).
+
+  Contract asserted by the task-7.2 offline structural test:
+    - a scrape job tailing the audit-log glob {{ openbao_promtail_audit_log_glob }}
+      (glob + Promtail's native file-watch handles rotation without loss/dup);
+    - static labels service=openbao, vlan=20 on every shipped line (Req 7.4);
+    - a positions file so tail offsets survive restarts/rotations (no loss/dup);
+    - the Loki push endpoint pointed at SVC-18.
+
+  NO secret value is templated here — the Loki push URL, paths, and labels are
+  all non-secret config. If Loki ever requires auth, that credential is supplied
+  to Promtail out-of-band (never committed), not embedded in this file.
+#}
+# MANAGED BY ANSIBLE (openbao_init_unseal / task 7.2) — DO NOT EDIT BY HAND.
+# Promtail scrape config: tail the OpenBao audit log -> Loki (SVC-18).
+# Ships within 60 s, tagged service=openbao vlan=20 (Req 7.4).
+
+server:
+  # Promtail's own HTTP/gRPC listeners are disabled (0) — this is a tail-only
+  # shipper, not a queryable endpoint. It registers nothing with Traefik.
+  http_listen_port: 0
+  grpc_listen_port: 0
+
+# Positions track the last-read offset per file so a Promtail restart or an
+# audit-log rotation does not re-ship or drop lines (Req 7.4: no loss/dup).
+positions:
+  filename: "{{ openbao_promtail_positions_file }}"
+
+clients:
+  # Loki push API (SVC-18). Non-secret placeholder endpoint; override per-env.
+  - url: "{{ openbao_loki_push_url }}"
+    # Batch/flush tuned so an audit line reaches Loki well within the 60 s SLA
+    # (Req 7.4) even under light traffic.
+    batchwait: "1s"
+    batchsize: 1048576
+
+scrape_configs:
+  - job_name: "{{ openbao_promtail_job_name }}"
+    static_configs:
+      - labels:
+          # Req 7.4 — every shipped line carries service=openbao and vlan=20.
+{% for key, value in openbao_promtail_labels.items() %}
+          {{ key }}: "{{ value }}"
+{% endfor %}
+          # __path__ is a glob so a rotated audit file (openbao_audit.log ->
+          # openbao_audit.log.1 / .2 ...) is still tailed — Promtail follows the
+          # active file and drains rotated ones without losing/duplicating lines.
+          __path__: "{{ openbao_promtail_audit_log_glob }}"
+    pipeline_stages:
+      # The OpenBao file audit device writes ONE JSON object per line (Req 7.1);
+      # parse it so audit fields are queryable in Loki, and lift the audit
+      # request time into the log timestamp so Loki ordering matches OpenBao's.
+      - json:
+          expressions:
+            audit_time: time
+            audit_type: type
+      - timestamp:
+          source: audit_time
+          format: RFC3339Nano
+          # If a line lacks a parseable timestamp, fall back to ingest time
+          # rather than dropping the line (audit completeness > perfect order).
+          action_on_failure: fudge

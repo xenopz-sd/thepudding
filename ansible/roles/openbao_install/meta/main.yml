@@ -1,0 +1,28 @@
+---
+# meta/main.yml — openbao_install
+galaxy_info:
+  role_name: openbao_install
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Installs and configures OpenBao (SVC-07) on a Proxmox LXC as a Docker
+    Compose stack. Templates the primary and Transit-unsealer config.hcl,
+    pins the OpenBao image, and performs an idempotent version-checked install.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - openbao
+    - secrets
+    - svc07
+
+# No cross-role dependencies. The Compose stack is templated via the existing
+# docker-compose-app role at task 5.2, invoked by the playbook, not as a
+# hard meta dependency here.
+dependencies: []

@@ -1,0 +1,511 @@
+---
+# tasks/main.yml — openbao_install
+#
+# Task 5.1: config.hcl templating (first block below).
+# Task 5.2: Compose stack templating + bring-up (second block below, via the
+#           generic docker-compose-app role).
+# Task 5.3 (pending): version-check idempotency — will PREPEND a guard ahead of
+#           the compose block; the 5.2 section is kept self-contained so that
+#           guard slots in without conflict.
+#
+# `openbao_role` selects which config to render:
+#   - "primary"  -> full config with seal "transit" + telemetry (svc07-20-01)
+#   - "unsealer" -> Transit-only config, NO seal stanza          (svc07-unsealer-20-01)
+
+- name: Validate openbao_role
+  ansible.builtin.assert:
+    that:
+      - openbao_role in ["primary", "unsealer"]
+    fail_msg: "openbao_role must be 'primary' or 'unsealer' (got '{{ openbao_role }}')."
+    quiet: true
+
+- name: Ensure OpenBao config directory exists
+  ansible.builtin.file:
+    path: "{{ openbao_config_dir }}"
+    state: directory
+    # Owned by the container's openbao uid/gid (not root): the dir is bind-mounted
+    # :ro and the image entrypoint drops to this user, which must be able to
+    # traverse it. 0750 keeps it non-world-readable.
+    owner: "{{ openbao_container_uid }}"
+    group: "{{ openbao_container_gid }}"
+    mode: "0750"
+
+# Fail CLOSED before rendering the primary config if the seal "transit" token is
+# empty — otherwise config.hcl would carry an empty `token = ""` and the primary
+# could never auto-unseal. The token resolves from OPENBAO_BOOTSTRAP_TRANSIT_TOKEN
+# (see defaults). This gives a clear, actionable error instead of the previous
+# `'openbao_transit_token' is undefined` crash (now env-defaulted to '') or a
+# silently broken seal stanza.
+- name: Require the primary seal "transit" token before rendering config.hcl
+  ansible.builtin.assert:
+    that:
+      - openbao_transit_token | default('') | length > 0
+    fail_msg: >-
+      The primary OpenBao config.hcl needs the seal "transit" token, but
+      {{ openbao_bootstrap_token_env_var }} is unset/empty in the environment.
+      Export it (the scoped Bootstrap_Transit_Token minted from the unsealer in
+      INSTALL-RUNBOOK §3): `export {{ openbao_bootstrap_token_env_var }}=<token>`
+      (or source your gitignored .env / set the GitLab CI protected+masked
+      variable), then re-run. It is never committed or defaulted to a value.
+    success_msg: "Primary seal token present (value not logged); rendering config.hcl."
+    quiet: true
+  when: openbao_role == "primary"
+  no_log: true   # defence-in-depth: never surface the token in an assert diagnostic
+
+- name: Template the primary config.hcl
+  ansible.builtin.template:
+    src: config.hcl.j2
+    dest: "{{ openbao_config_dir }}/config.hcl"
+    # Owned by the container's openbao uid/gid so the :ro-mounted config is
+    # readable by the user the entrypoint drops to. 0640 keeps the seal-token-
+    # bearing primary config non-world-readable (only the openbao user reads it).
+    owner: "{{ openbao_container_uid }}"
+    group: "{{ openbao_container_gid }}"
+    mode: "0640"
+  when: openbao_role == "primary"
+  no_log: true   # the rendered config carries the seal token
+  notify: Restart openbao
+
+- name: Template the unsealer config.hcl
+  ansible.builtin.template:
+    src: config.unsealer.hcl.j2
+    dest: "{{ openbao_config_dir }}/config.hcl"
+    # Owned by the container's openbao uid/gid so the :ro-mounted config is
+    # readable by the user the entrypoint drops to (0640; the unsealer config
+    # carries no secret, but the restrictive mode is kept for consistency).
+    owner: "{{ openbao_container_uid }}"
+    group: "{{ openbao_container_gid }}"
+    mode: "0640"
+  when: openbao_role == "unsealer"
+  notify: Restart openbao
+
+# =============================================================================
+# Task 5.3 — Version-check idempotency guard (PREPENDED ahead of Task 5.2)
+# -----------------------------------------------------------------------------
+# Req 13.1/13.2: the install role MUST check for an already-running OpenBao
+# container at the pinned version (openbao_image, e.g. openbao/openbao:2.4)
+# BEFORE templating/bringing up the Compose stack, and skip the install/bring-up
+# steps when the correct version is already running — so a second run reports
+# changed=0.
+#
+# The read below is a READ-ONLY inspection: `check_mode: false` forces it to run
+# even under `ansible-playbook --check` (otherwise check-mode would return no
+# facts and the guard could not evaluate), and `changed_when: false` guarantees
+# the probe itself never reports a change. The config.hcl templating tasks above
+# are already idempotent by nature (ansible.builtin.template), so the guard
+# targets only the install/bring-up steps in the Task 5.2 block below.
+# =============================================================================
+
+- name: Inspect the currently-running OpenBao container (read-only, check-safe)
+  community.docker.docker_container_info:
+    name: >-
+      {{ openbao_primary_container_name if openbao_role == 'primary'
+         else openbao_unsealer_container_name }}
+  register: openbao_container_probe
+  check_mode: false          # run even under --check so the guard can evaluate
+  changed_when: false        # a read never reports a change
+  # Missing Docker/daemon or an absent container must not abort the run — treat
+  # it as "not yet installed" so the bring-up proceeds normally.
+  failed_when: false
+
+- name: Set fact — is the pinned OpenBao version already running?
+  ansible.builtin.set_fact:
+    # True only when the container exists, is in the running state, its image
+    # matches the pinned openbao_image, AND it is healthy — i.e. NOT restarting.
+    # A crash-looping container (repeatedly restarting because of a bad config,
+    # missing TLS cert, unwritable volume, etc.) can momentarily report
+    # State.Running=true, which would wrongly mark it "already installed" and
+    # SKIP the very bring-up that would reapply the corrected stack. The two
+    # extra `restarting` guards below force a rebuild for a non-healthy
+    # container instead of skipping it. Any other state (absent, stopped, wrong
+    # image/version, restarting) means we must (re)install, so the fact is False
+    # and the Task 5.2 bring-up below runs. Kept defensive with `| default(...)`.
+    openbao_already_at_pinned_version: >-
+      {{ (openbao_container_probe.exists | default(false))
+         and (openbao_container_probe.container.State.Running | default(false))
+         and (openbao_container_probe.container.Config.Image | default('') == openbao_image)
+         and (openbao_container_probe.container.State.Status | default('')) != 'restarting'
+         and (openbao_container_probe.container.State.Restarting | default(false)) == false }}
+  changed_when: false
+
+- name: Report that install/bring-up will be skipped (already at pinned version)
+  ansible.builtin.debug:
+    msg: >-
+      OpenBao {{ openbao_image }} already running as
+      '{{ openbao_primary_container_name if openbao_role == 'primary'
+          else openbao_unsealer_container_name }}';
+      skipping install/bring-up (idempotent, Req 13.2).
+  when: openbao_already_at_pinned_version
+
+# =============================================================================
+# Task 5.2 — Compose stack templating + bring-up (via docker-compose-app)
+# -----------------------------------------------------------------------------
+# This block is kept as a self-contained section so task 5.3 can PREPEND its
+# version-check idempotency guard (a `block:`/`when:` gate ahead of this) without
+# conflicting with the config.hcl templating above or this compose block.
+#
+# IDEMPOTENCY IS PROVIDED BY THE DECLARATIVE RECONCILE, NOT A VERSION GUARD.
+# The stack is brought up by delegating to the generic docker-compose-app role,
+# which RE-RENDERS compose.yaml/.env and reconciles declaratively via
+# community.docker.docker_compose_v2 (PF §9 — no shell `docker compose up`).
+# docker_compose_v2 is idempotent by construction: on a converged stack it
+# reports changed=0, and it recreates ONLY when the compose spec / .env actually
+# changed (Req 13.2 is satisfied THIS way).
+#
+# The compose includes below are therefore DELIBERATELY NOT gated on
+# `openbao_already_at_pinned_version`. They were, historically — but that froze
+# the on-disk compose.yaml at first-bring-up: once the pinned image was running,
+# the whole include (RENDER included) was skipped, so later spec changes
+# (removing IPC_LOCK, the swap cap, publishing the unsealer's VLAN port) were
+# rendered into the file for a fresh host but NEVER re-applied to an existing
+# one — the container kept running a stale spec. Removing the gate lets the
+# render + reconcile run every time; the reconcile stays a no-op unless the spec
+# drifted. The `openbao_already_at_pinned_version` fact is still computed and
+# still reported above (operator visibility), and still gates the one-time
+# host-dir creation — it just no longer suppresses the declarative reconcile.
+# NO secret value is templated: the seal token lives in the config.hcl rendered
+# above (injected at bootstrap), TLS material is a read-only bind-mount by path.
+# =============================================================================
+
+# =============================================================================
+# MOCK-EJBCA self-signed TLS material (OPT-IN) — included BEFORE the compose
+# bring-up so the cert/key exist at openbao_tls_host_dir when the container
+# starts (OpenBao dies at start with `error loading TLS cert: ... permission
+# denied` / a missing file otherwise). Gated ONLY on openbao_tls_self_signed —
+# deliberately NOT on the version-check guard, so a crash-looping / half-
+# installed host still gets its cert. See tasks/tls_self_signed.yml for the full
+# mock rationale + secrets discipline (a PERMANENT opt-in dev stand-in, not
+# debt — see .kiro/steering/mock-stand-ins.md).
+# =============================================================================
+- name: "Generate mock-EJBCA self-signed TLS material (opt-in)"
+  ansible.builtin.include_tasks: tls_self_signed.yml
+  when: openbao_tls_self_signed | bool
+
+- name: Ensure the OpenBao data / audit / TLS host directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    # Owned by the container's openbao uid/gid (not root): uid 100 must be able
+    # to traverse the TLS host dir to read the :ro-mounted cert/key, and the
+    # config dir is likewise read by the openbao user. Keep 0750 (non-world-
+    # readable). Config-dir ownership is also asserted by the dedicated config
+    # tasks above; this shared creation task must not re-set it to root.
+    owner: "{{ openbao_container_uid }}"
+    group: "{{ openbao_container_gid }}"
+    mode: "0750"
+  loop:
+    - "{{ openbao_config_dir }}"
+    - "{{ openbao_tls_host_dir }}"
+  when: not openbao_already_at_pinned_version
+
+# =============================================================================
+# MOCK edge network (OPT-IN dev/debug/learning stand-in) — created BEFORE the
+# primary stack build so `docker compose up` finds the external `edge` network.
+# Parallel to the mock-EJBCA cert (tasks/tls_self_signed.yml): default OFF,
+# production uses the real Traefik-owned (SVC-09) network. This creates ONLY an
+# L2 bridge — NO Traefik process, so NO routing/ingress; OpenBao stays reachable
+# on its VLAN-20 address only. Permanent selectable affordance, not debt. See
+# .kiro/steering/mock-stand-ins.md (incl. the "never enable alongside real
+# Traefik on the same host" caveat). Idempotent: community.docker.docker_network
+# is create-if-absent and reports changed=0 on a converged host.
+# =============================================================================
+- name: "MOCK-NET: create the placeholder Traefik `edge` network (opt-in dev stand-in)"
+  community.docker.docker_network:
+    name: "{{ openbao_traefik_network }}"
+    state: present
+  when:
+    - openbao_role == "primary"
+    - openbao_mock_edge_network | bool
+
+# =============================================================================
+# PRE-FIRST-START named-volume ownership (Task 3.1 — the fresh-provision fix).
+# -----------------------------------------------------------------------------
+# WHY (root cause, CONFIRMED live): on a fresh provision Docker initialises the
+# named data volume (and, on the primary, the audit volume) as root:root — the
+# in-container mount targets /openbao/data and /openbao/audit are absent from the
+# openbao/openbao:2.4 image, so Docker owns them uid 0. OpenBao runs as the
+# unprivileged openbao user (uid {{ openbao_container_uid }} /
+# gid {{ openbao_container_gid }}) and cannot write, so either the container
+# crash-loops on first start, or the POST-up "Chown … when they differ" block
+# below chowns it and — via its `notify: Restart openbao` — recreates the
+# container at END OF PLAY, AFTER openbao_init_unseal has already unsealed the
+# unsealer. The recreated Shamir-sealed container boots fresh against the now-
+# initialised Raft volume and comes up SEALED (the primary then crash-loops on
+# `503 Vault is sealed`).
+#
+# FIX: pre-create the role's named volume(s) and chown their host mountpoints to
+# the openbao uid/gid BEFORE `docker compose up` runs, so (a) the first start is
+# already writable and (b) the post-up "Chown … when they differ" block finds
+# ownership already correct, reports changed=0, and does NOT notify a restart →
+# no end-of-play recreate → the bootstrapped, unsealed container survives.
+#
+# This block is DELIBERATELY PARALLEL to the post-up block below: same volume
+# set per role, same `<project>_<volume>` naming, same docker_volume_info →
+# file-chown idiom. It differs in three ways, all intentional:
+#   * it runs BEFORE the compose include (that ordering is the whole fix);
+#   * it PRE-CREATES the volume (community.docker.docker_volume) so the
+#     mountpoint exists to chown before the container ever starts;
+#   * its chown is UNCONDITIONAL (recurse chown to the correct owner is
+#     idempotent and cheap on an empty fresh volume) and carries NO
+#     `notify: Restart openbao` — there is no container yet to restart, and its
+#     purpose is to make the FIRST start correct so the post-up chown never
+#     needs to notify.
+#
+# GATING: like the post-up block, intentionally NOT gated on
+# `openbao_already_at_pinned_version` — a crash-looping container can register as
+# "already running", which must still get correct ownership. Gating is only on
+# openbao_role selecting the correct volume set. No secret is involved (volume
+# ownership only), so no no_log is needed.
+# =============================================================================
+
+- name: Pre-create + chown the OpenBao named-volume mountpoints BEFORE first start
+  vars:
+    # Volume set per role: primary owns data + audit; unsealer owns data only.
+    _openbao_volumes: >-
+      {{ [openbao_data_volume, openbao_audit_volume]
+         if openbao_role == 'primary'
+         else [openbao_data_volume] }}
+    # Docker prefixes the volume with the Compose project (== the stack name).
+    _openbao_project: >-
+      {{ openbao_stack_name if openbao_role == 'primary'
+         else openbao_unsealer_stack_name }}
+  block:
+    - name: Pre-create each named volume (create-if-absent, idempotent)
+      community.docker.docker_volume:
+        name: "{{ _openbao_project }}_{{ item }}"
+        state: present
+      loop: "{{ _openbao_volumes }}"
+
+    - name: Inspect each pre-created volume to get its real host Mountpoint
+      community.docker.docker_volume_info:
+        name: "{{ _openbao_project }}_{{ item }}"
+      loop: "{{ _openbao_volumes }}"
+      register: openbao_preup_volume_info
+      changed_when: false
+
+    - name: Chown each volume mountpoint to the openbao uid/gid before first start
+      ansible.builtin.file:
+        path: "{{ item.volume.Mountpoint }}"
+        owner: "{{ openbao_container_uid }}"
+        group: "{{ openbao_container_gid }}"
+        recurse: true
+        state: directory
+      loop: "{{ openbao_preup_volume_info.results }}"
+      loop_control:
+        label: "{{ item.volume.Name | default(item.item) }}"
+      # Unconditional (no `when: ... differ`): recurse chown to the correct owner
+      # is idempotent and cheap on an empty fresh volume. NO `notify: Restart
+      # openbao` — there is no running container yet, and this pre-up chown exists
+      # precisely so the post-up chown never has to notify.
+
+- name: Build the PRIMARY OpenBao Compose stack
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ openbao_stack_name }}"
+    dca_services:
+      - name: openbao
+        image: "{{ openbao_image }}"
+        # Bare `server` — NOT `server -config=<file>`. The image entrypoint's
+        # `server` branch ALWAYS appends `-config=$BAO_CONFIG_DIR`
+        # (BAO_CONFIG_DIR=/openbao/config), so it already loads config.hcl from
+        # the mounted dir. Passing an explicit `-config=<file>` on top made
+        # OpenBao load the same file twice and log
+        # `WARNING: ignoring duplicate configuration found in directory: ...`.
+        # Verified against openbao/openbao:2.4: bare `server` loads the config
+        # once with no warning and does NOT enter dev mode (the entrypoint's
+        # injected -dev-root-token-id / -dev-listen-address are inert without a
+        # -dev flag, which the entrypoint never adds).
+        command: "server"
+        restart: "unless-stopped"
+        volumes:
+          # Raft integrated storage (Req 11).
+          - "{{ openbao_data_volume }}:{{ openbao_data_dir }}"
+          # Audit log volume (Req 7.1).
+          - "{{ openbao_audit_volume }}:{{ openbao_audit_dir }}"
+          # Rendered config.hcl (read-only).
+          - "{{ openbao_config_dir }}:{{ openbao_config_dir }}:ro"
+          # TLS material issued by SVC-08 / Let's Encrypt (read-only, by path).
+          - "{{ openbao_tls_host_dir }}:{{ openbao_tls_dir }}:ro"
+        # Traefik ingress via labels only — NO published host port (PF FR-7).
+        labels:
+          - "traefik.enable=true"
+          - "traefik.http.routers.openbao.rule=Host(`openbao.{{ platform_domain }}`)"
+          - "traefik.http.routers.openbao.entrypoints=websecure"
+          - "traefik.http.routers.openbao.tls=true"
+          - "traefik.http.services.openbao.loadbalancer.server.port=8200"
+          # OpenBao terminates TLS itself; tell Traefik the backend is https.
+          - "traefik.http.services.openbao.loadbalancer.server.scheme=https"
+        networks: ["{{ openbao_traefik_network }}"]
+    dca_volumes:
+      - "{{ openbao_data_volume }}"
+      - "{{ openbao_audit_volume }}"
+    dca_networks:
+      - { name: "{{ openbao_traefik_network }}", external: true }
+    dca_env: "{{ openbao_env_primary }}"
+  # Idempotent: docker_compose_v2 reconciles + reports changed=0 on a converged
+  # stack, recreating only on real spec/.env drift (Req 13.2). NOT gated on the
+  # version check — that would freeze the on-disk compose.yaml (see the Task-5.2
+  # note above). The version fact still drives the operator report + host-dir
+  # gate; it no longer suppresses this reconcile.
+  when:
+    - openbao_role == "primary"
+
+- name: Build the TRANSIT UNSEALER OpenBao Compose stack
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ openbao_unsealer_stack_name }}"
+    dca_services:
+      - name: openbao-unsealer
+        image: "{{ openbao_image }}"
+        # Bare `server` — see the primary stack above for the rationale: the
+        # entrypoint always adds `-config=/openbao/config` (the dir), so an
+        # explicit `-config=<file>` on top caused a duplicate-config warning.
+        command: "server"
+        restart: "unless-stopped"
+        # --memory-swappiness=0 on the runtime so Transit key material cannot be
+        # swapped at the container layer (Req 5.8 / Security AC 3). This is the
+        # per-container swap cap (#2 in ADR-0006) — RETAINED as defence-in-depth.
+        # The IPC_LOCK capability that formerly enabled mlock is removed
+        # (ADR-0006): Raft-only OpenBao must not mlock, and config now pins
+        # disable_mlock = true. See templates/config*.hcl.j2.
+        mem_swappiness: 0
+        runtime_options: ["--memory-swappiness=0"]
+        # PRIVATE VLAN-bound published ports (NOT Traefik/LAN ingress). The
+        # primary OpenBao (a DIFFERENT LXC, svc07-20-01) must reach this
+        # unsealer's Transit seal API over VLAN 20 to wrap/unwrap its seal key —
+        # `seal "transit" { address = https://10.0.20.11:8200 }`. Without a
+        # published port the API listens only inside this container and the
+        # primary gets `connection refused` (the seal path is cross-LXC, so
+        # container-name/localhost do not apply). Bound to the unsealer's VLAN-20
+        # IP ONLY (never 0.0.0.0). Only 8200 (the API port the seal
+        # encrypt/decrypt calls hit) is published — the 8201 Raft CLUSTER port is
+        # NOT, because the primary and unsealer are SEPARATE single-node clusters
+        # (not Raft peers); the seal path is a plain API call to :8200, so 8201
+        # would only widen exposure with no benefit. This is NOT a Traefik/LAN
+        # ingress path (no 0.0.0.0, no Traefik labels, no host-wide exposure), so
+        # it does not violate PF FR-7; it is the private cross-LXC seal path FR-7
+        # never governed. Primary-only access-scoping is a pve-firewall concern
+        # (currently disabled) tracked as a separate hardening spec — see
+        # validation.md.
+        ports:
+          - "{{ openbao_unsealer_ip }}:{{ openbao_api_port }}:{{ openbao_api_port }}"
+        volumes:
+          - "{{ openbao_data_volume }}:{{ openbao_data_dir }}"
+          - "{{ openbao_config_dir }}:{{ openbao_config_dir }}:ro"
+          - "{{ openbao_tls_host_dir }}:{{ openbao_tls_dir }}:ro"
+        # NO Traefik labels, NO 0.0.0.0/LAN port — internal (VLAN-20-only) by the
+        # bound `ports:` above; the primary reaches it over VLAN 20.
+    dca_volumes:
+      - "{{ openbao_data_volume }}"
+    # No external Traefik network — internal-only.
+    dca_networks: []
+    dca_env: "{{ openbao_env_unsealer }}"
+  # Idempotent via docker_compose_v2 (see the primary include + Task-5.2 note);
+  # NOT gated on the version check, so a spec change (e.g. publishing the VLAN
+  # port) is actually re-applied to an already-running unsealer instead of being
+  # frozen at first-bring-up.
+  when:
+    - openbao_role == "unsealer"
+
+# =============================================================================
+# Named-volume ownership fix (out-of-spec correction folded in to unblock live
+# testing) — placed AFTER the Compose-stack include_role tasks above so the
+# named volumes already exist.
+# -----------------------------------------------------------------------------
+# WHY: OpenBao runs the server as the unprivileged `openbao` user
+# (uid {{ openbao_container_uid }} / gid {{ openbao_container_gid }} in
+# openbao/openbao:2.4). The image ships /openbao/{config,file,logs} owned by that
+# user, but it does NOT create /openbao/data (Raft storage) or /openbao/audit.
+# When Docker initialises a named volume whose in-container mount target does not
+# exist in the image, it creates the volume's contents owned root:root. The
+# openbao user (uid {{ openbao_container_uid }}) then cannot write, and startup
+# dies with a fatal:
+#     failed to open bolt file: open /openbao/data/vault.db: permission denied
+# (Same class of bug the earlier commit fixed for the /openbao/config bind-mount.)
+#
+# FIX: after the stack is created (volumes now exist), resolve each named
+# volume's real Mountpoint on the host and chown it to the openbao uid/gid.
+# The docker-compose-app project name is the stack name, and Docker names the
+# volume `<project>_<volume>`, but we do NOT hardcode that — we inspect the
+# volume to get its Mountpoint so a project-prefix change can't silently break
+# this. The chown is check-then-change (idempotent): a converged host reports
+# changed=0, and a changed ownership notifies "Restart openbao" so the container
+# is recreated and picks up the now-writable volume.
+#
+# GATING: intentionally NOT gated on `not openbao_already_at_pinned_version`.
+# A crash-looping container can register as "already running", which would skip
+# the very fix it needs. The chown is idempotent, so it always reconciles;
+# gating is only on openbao_role selecting the correct volume set.
+# =============================================================================
+
+- name: Resolve + chown the OpenBao named-volume mountpoints to the openbao uid/gid
+  vars:
+    # Volume set per role: primary owns data + audit; unsealer owns data only.
+    _openbao_volumes: >-
+      {{ [openbao_data_volume, openbao_audit_volume]
+         if openbao_role == 'primary'
+         else [openbao_data_volume] }}
+    # Docker prefixes the volume with the Compose project (== the stack name).
+    _openbao_project: >-
+      {{ openbao_stack_name if openbao_role == 'primary'
+         else openbao_unsealer_stack_name }}
+  block:
+    - name: Inspect each named volume to get its real host Mountpoint
+      community.docker.docker_volume_info:
+        name: "{{ _openbao_project }}_{{ item }}"
+      loop: "{{ _openbao_volumes }}"
+      register: openbao_volume_info
+      changed_when: false
+
+    - name: Stat the current ownership of each volume mountpoint
+      ansible.builtin.stat:
+        path: "{{ item.volume.Mountpoint }}"
+      loop: "{{ openbao_volume_info.results }}"
+      loop_control:
+        label: "{{ item.volume.Name | default(item.item) }}"
+      register: openbao_volume_stat
+      changed_when: false
+
+    - name: Chown volume mountpoints to the openbao uid/gid when they differ (idempotent)
+      ansible.builtin.file:
+        path: "{{ item.stat.path }}"
+        owner: "{{ openbao_container_uid }}"
+        group: "{{ openbao_container_gid }}"
+        recurse: true
+        state: directory
+      loop: "{{ openbao_volume_stat.results }}"
+      loop_control:
+        label: "{{ item.stat.path }}"
+      # Only chown (and report changed) when the current owner/group does not
+      # already match the target uid/gid — a converged host is a no-op.
+      when: >-
+        item.stat.uid | string != openbao_container_uid | string
+        or item.stat.gid | string != openbao_container_gid | string
+      notify: Restart openbao
+
+# =============================================================================
+# EXTENSION POINT — Task 11.1: nightly Raft snapshot job (backup + PBS hand-off)
+# -----------------------------------------------------------------------------
+# The nightly snapshot job is operational config for the PRIMARY OpenBao LXC
+# (svc07-20-01) this role already provisions — it knows the primary container
+# name, data dir, and stack — so the backup logic extends this role rather than
+# a bespoke role (design.md / steering: extend openbao_install with a
+# clearly-sectioned backup include). It is split into tasks/backup.yml to keep
+# THIS file navigable, and gated on:
+#   - openbao_role == "primary" (only the primary holds the sealed Raft store),
+#   - openbao_backup_enabled (default true; lets a caller opt out).
+# See tasks/backup.yml for the full contract: 02:00-UTC systemd timer, a
+# templated snapshot script that GATES the PBS hand-off on rc==0 AND a non-empty
+# file (Req 11.1), aborts+logs+alerts on failure (Req 11.2/11.5/FD.6), keeps OpenBao
+# serving during the online snapshot (Req 11.6), and retains >= 7 nightly
+# snapshots (Req 11.3). NO secret is templated — the scoped snapshot token and
+# PBS credential are read at runtime from never-committed sources.
+# =============================================================================
+
+- name: "Task 11.1 — nightly Raft snapshot job (gate + PBS hand-off, primary only)"
+  ansible.builtin.include_tasks: backup.yml
+  when:
+    - openbao_role == "primary"
+    - openbao_backup_enabled | bool

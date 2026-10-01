@@ -1,0 +1,58 @@
+# infra/platform-foundation/projects.yaml
+#
+# VLAN-ID registry — the authoritative record of every VLAN-ID assignment,
+# past and present. This is the single in-repo source of VLAN-ID truth
+# (NET-00 §7, Requirement 5.1).
+#
+# APPEND-ONLY. Entries are NEVER removed and vlan_ids are NEVER reused —
+# not even after a project is decommissioned. A removed entry would allow
+# VLAN-ID reuse, which Requirement 1.6 / domain-rules §1 forbid. Decommissioned
+# projects stay recorded here precisely so their IDs stay retired forever.
+#
+# Assignment is performed only by the onboarding script + CI merge-request flow
+# (NET-00 §7); do not hand-pick a vlan_id. Each row is a reviewable diff.
+#
+# TWO VIEWS OVER ONE APPEND-ONLY FILE (see design.md "Data Models",
+# sdn-vlan-gateway-reachability):
+#   Allocation_Ledger_View  = ALL rows regardless of status. This is the input
+#                             to VLAN-ID allocation (next_vlan_id counts every
+#                             ID ever issued), so IDs are NEVER reused — a
+#                             decommissioned row still pushes the ceiling up
+#                             (Requirement 4.5, domain-rules §1).
+#   Desired_State_View      = rows with `status: active` only. This is the input
+#                             to the sdn_gateway converge role: an active row
+#                             gets its host gateway + firewall configured; a
+#                             decommissioned row drives their teardown
+#                             (Requirement 6.1).
+# Append-only and status are ORTHOGONAL facts: decommissioning a project is a
+# `status` flip from `active` to `decommissioned` in a reviewable MR — NEVER a
+# row removal. The row stays so its vlan_id stays retired forever.
+#
+# Field schema (see design.md "Data Models"):
+#   slug                string, lowercase-hyphenated, <=20 chars, unique across
+#                       the file, assigned once and never reused (PF §4,
+#                       Requirement 5.3).
+#   vlan_id             integer, 100-254, globally unique, sequential, never
+#                       reused (Requirements 1.4, 1.6, 9.1).
+#   onboarding_date     ISO 8601 "YYYY-MM-DD" string (Requirement 5.1).
+#   status              string, one of `active` | `decommissioned`. Optional at
+#                       read time — a missing/empty status defaults to `active`
+#                       (Requirement 5.2, FD.3) — but always written on new rows
+#                       and present on every existing row. Drives the
+#                       Desired_State_View; does NOT affect allocation.
+#   decommissioned_date ISO 8601 "YYYY-MM-DD" string, optional; recorded on a
+#                       row when its status flips to `decommissioned`
+#                       (Requirement 4.1).
+projects:
+  - slug: dronefleet        # lowercase, hyphenated, <=20 chars (PF §4)
+    vlan_id: 100            # integer, 100-254, sequential, never reused
+    onboarding_date: "2024-06-01"   # ISO 8601 YYYY-MM-DD
+    status: active          # active | decommissioned (default active)
+  - slug: mlvideo
+    vlan_id: 101
+    onboarding_date: "2024-06-14"
+    status: active
+  - slug: edge-sensors
+    vlan_id: 102
+    onboarding_date: "2024-07-02"
+    status: active

@@ -1,0 +1,186 @@
+---
+# Default variables for the `sdn_gateway` host-level role (spec
+# sdn-vlan-gateway-reachability, C5; ADR-0004).
+#
+# All knobs carry the `sdn_gateway_` prefix. NO secret material lives here (nor
+# may it): these are generic network topology knobs. The static Proxmox-host
+# inventory (ansible/inventory/proxmox-hosts.yml) likewise carries host/IP/user
+# only, never a secret (spec Security AC 4).
+#
+# The desired-state and decommissioned VLAN-ID sets are CALLER-SUPPLIED: they are
+# derived from the `projects.yaml` desired-state view by the JSON emitter (C6)
+# and fed in via `--extra-vars`, so Ansible never re-parses the registry (one
+# reader of truth). See ansible/playbooks/sdn-gateway.yml for the invocation.
+
+# The underlying LAN bridge the SDN VLAN zone tags onto (the platform's `vmbr0`).
+# Retained for reference/forwarding context only.
+#
+# IMPORTANT: the per-VLAN gateway address is NOT placed on a `vmbr0.<vlan>`
+# sub-interface. A Proxmox SDN VLAN zone builds its own L2 chain and the bridge
+# the guests actually attach to is the SDN VNet bridge `p<vlan_id>` (e.g. `p20`);
+# that is the interface L2-adjacent to the guests, so the host only answers them
+# at `10.0.<vlan>.1` when the gateway address sits on `p<vlan_id>`. The role
+# therefore attaches `.1` to `p{{ '{' }}vlan_id{{ '}' }}`, not to
+# `{{ sdn_gateway_bridge }}.<vlan>`. (Verified live; corrects the original
+# vmbr0.<vlan> design — see ADR-0004 addendum and the template header.)
+sdn_gateway_bridge: vmbr0
+
+# The source network permitted to reach served VLANs (the developer/admin net),
+# in CIDR form (e.g. "192.168.1.0/24"). REQUIRED — there is deliberately NO
+# default opening: tasks/main.yml preflight FAILS CLOSED if this is empty rather
+# than writing a wide-open rule (spec Req 2.5, SEC.2). Supply via --extra-vars.
+sdn_gateway_admin_source_cidr: ""
+
+# Ports opened from the admin source network into a served VLAN. Scoped — never a
+# blanket "allow all" (spec Req 2.5). tcp/22 is the minimum for Ansible/SSH; 80
+# and 443 cover Traefik-fronted HTTP/HTTPS. Extend per served VLAN as required.
+sdn_gateway_allowed_ports: [22, 80, 443]
+
+# The always-served shared-services VLAN (VLAN 20 per NET-00 / domain-rules.md
+# §1). It is served unconditionally — it is not driven by the registry, because
+# it hosts shared platform services rather than a single project.
+sdn_gateway_shared_vlan_id: 20
+
+# Opt-in list of project VLAN IDs (100+) to serve. Empty (the default) means ONLY
+# the shared VLAN (20) is served. Serving a project VLAN is DELIBERATE, not a
+# blanket route of every project VLAN (spec Req 6.6, isolation model). The role
+# serves `[sdn_gateway_shared_vlan_id]` plus the intersection of this list with
+# `sdn_gateway_active_vlan_ids`.
+sdn_gateway_served_project_vlan_ids: []
+
+# Caller-supplied desired-state / teardown VLAN-ID sets, derived from
+# projects.yaml by the C6 JSON emitter (active_vlan_ids / the decommissioned
+# complement). Defaults empty so the role is safe to run with only VLAN 20 served
+# before any project VLAN is opted in.
+#   - sdn_gateway_active_vlan_ids:        project VLANs with status: active
+#   - sdn_gateway_decommissioned_vlan_ids: project VLANs with status: decommissioned
+sdn_gateway_active_vlan_ids: []
+sdn_gateway_decommissioned_vlan_ids: []
+
+# The management VLAN that MUST remain unreachable from served/project VLANs
+# (VLAN 10 per domain-rules.md §1, security-standards.md). The preflight asserts
+# no served VLAN equals this, and the standing isolation DENY rules deny
+# served/project VLANs -> this VLAN (spec Req 2.2).
+sdn_gateway_management_vlan_id: 10
+
+# Path used by the ip_forward set-then-verify step to read back the live value
+# (mirrors the openbao_init_unseal swappiness verification precedent).
+sdn_gateway_ip_forward_proc_path: "/proc/sys/net/ipv4/ip_forward"
+
+# Supernet covering the PER-PROJECT VLAN address space, used ONLY by the standing
+# cross-project VLAN->VLAN DENY rule (tasks/isolation.yml, Req 2.3). Per-project
+# VLANs are 100+ and address as 10.0.<vlan_id>.0/24 (NET-00 §3). This default
+# `10.0.64.0/18` spans 10.0.64.0 – 10.0.127.255, comfortably covering the
+# currently-allocated project VLANs (100–102 => 10.0.100–102.x) while DELIBERATELY
+# EXCLUDING the management VLAN (10 => 10.0.10.0/24) and the shared-services VLAN
+# (20 => 10.0.20.0/24), so the cross-project forward DROP never blocks the
+# sanctioned shared-VLAN meeting point. If project VLANs above 127 are allocated
+# in future, extend the isolation rule to also cover 10.0.128.0/17 (an explicit,
+# reviewable change — not a silent widening to 10.0.0.0/16, which would re-block
+# VLAN 10/20).
+sdn_gateway_project_vlan_supernet: "10.0.64.0/18"
+
+# --- Guest egress (SNAT/masquerade) -----------------------------------------
+# Whether the host masquerades served-VLAN guests' OUTBOUND-to-internet traffic
+# behind its LAN IP. Required for guests to reach the internet (apt, Docker image
+# pulls): a Proxmox SDN VLAN guest has a private 10.0.<vlan>.x source that the LAN
+# router has no return route for, so without SNAT the replies are dropped. This
+# is EGRESS-only NAT (guest -> internet); it does NOT masquerade inter-VLAN or
+# guest->LAN-internal traffic (those are excluded via
+# `sdn_gateway_no_nat_dest_supernet` below), so the isolation model and internal
+# source-IP attribution are preserved. See the ADR-0004 egress addendum.
+sdn_gateway_enable_egress_nat: true
+
+# The host's LAN-facing egress interface (the device on the default route). SNAT
+# is applied only to traffic leaving via this interface. Defaults to the SDN zone
+# bridge `vmbr0`, which on this platform also carries the host's LAN uplink +
+# default route.
+sdn_gateway_egress_interface: "{{ sdn_gateway_bridge }}"
+
+# Destination supernet that is NEVER masqueraded — the whole platform address
+# space (every VLAN is 10.0.<vlan>.0/24 per NET-00, so 10.0.0.0/16 covers them
+# all). Traffic from a served VLAN to another 10.0.x.x segment is thus left
+# un-NAT'd (true routing, source IP preserved) and remains governed by the
+# standing isolation DENY rules; only genuine internet-bound egress is SNAT'd.
+sdn_gateway_no_nat_dest_supernet: "10.0.0.0/16"
+# --- OpenBao unsealer seal-API scoping (spec openbao-unsealer-firewall-scoping; ADR-0007 rev 2) ---
+# Master gate for the primary-only unsealer scoping rules. OFF by default: with
+# this false the role writes NO unsealer firewall rule, so merging the feature is
+# a runtime no-op (Req 3). Enable deliberately (--extra-vars) once the operator is
+# ready to enforce primary-only access to the unsealer's seal API.
+sdn_gateway_openbao_unsealer_scoping_enabled: false
+
+# The OpenBao PRIMARY's VLAN-20 IP — the ONLY source permitted to reach the
+# unsealer's seal API (NET-00 computed address for svc07-20-01). Referenced as a
+# var, not a hardcoded literal in the task logic (Req constraint).
+sdn_gateway_openbao_primary_ip: "10.0.20.10"
+
+# The Transit UNSEALER's VLAN-20 IP — the dest whose seal port is scoped to the
+# primary only (NET-00 computed address for svc07-unsealer-20-01).
+sdn_gateway_openbao_unsealer_ip: "10.0.20.11"
+
+# The unsealer's seal-API TCP port (the cross-LXC wrap/unwrap path).
+sdn_gateway_openbao_unsealer_seal_port: 8200
+
+# The Proxmox NODE + LXC VMID identifying the unsealer guest whose OWN firewall
+# the scoping rules are written to (ADR-0007 rev 2: the enforcement point is the
+# guest NIC firewall `/nodes/<node>/lxc/<vmid>/firewall/rules`, NOT the cluster
+# firewall — a cluster `in` rule cannot filter same-bridge intra-VLAN traffic).
+# BOTH carry NO default (empty / null): they identify a SPECIFIC guest, and the
+# scoping/teardown tasks FAIL CLOSED if either is unset rather than target the
+# wrong guest. They come from the Terraform-generated inventory — the SVC-07 root
+# emits the real, provider-assigned vmid + node_name via its `inventory_hosts`
+# output, so Ansible reads them as host facts (or you pass them via --extra-vars);
+# nothing is hardcoded to a particular node name or VMID here.
+sdn_gateway_openbao_unsealer_node: ""
+sdn_gateway_openbao_unsealer_vmid: ""
+
+# --- pve-firewall master switch (ADR-0007 part C) ---------------------------
+# Off-by-default guard for enabling the pve-firewall MASTER switch
+# (/cluster/firewall/options enable=1). This is HIGH BLAST RADIUS (a wrong/missing
+# rule can sever SSH to the Proxmox host and Ansible reachability to every guest),
+# so it is NEVER flipped by merging a feature. Enabling the firewall is a
+# deliberate OPERATOR step with an SSH-safety pre-flight checklist — see ADR-0007
+# and the SVC-07 install runbook. This flag exists as a reviewable knob; the
+# scoping feature does NOT set it.
+sdn_gateway_pve_firewall_enable: false
+
+# Explicit opt-in to REMOVE the two managed unsealer scoping rules (Req 4). OFF by
+# default and kept separate from the enable gate, so merely disabling scoping never
+# silently deletes rules — teardown is a deliberate action.
+sdn_gateway_openbao_unsealer_scoping_teardown: false
+
+# --- Guest firewall baseline egress (REUSABLE for every firewalled guest) ----
+# Any guest whose NIC sets `firewall=1` has its OWN traffic filtered by Proxmox
+# once pve-firewall is enabled — which REMOVES ITS EGRESS unless guest-scoped
+# rules exist. Without egress the guest cannot resolve DNS, run `apt update`, or
+# pull Docker images, so it cannot PROVISION itself (verified live: the firewalled
+# OpenBao unsealer could not resolve deb.debian.org while the non-firewalled
+# primary could, which broke the `common` role's apt step and left Docker
+# uninstalled).
+#
+# `sdn_gateway_firewalled_guests` is the GENERIC registry of guests needing the
+# baseline — a list of {node, vmid} (extra keys like `name` are ignored/allowed for
+# readability). It is NOT specific to OpenBao or VLAN 20: every future service,
+# guest, and project VLAN that firewalls a NIC adds an entry here and gets the same
+# scoped egress baseline. Empty by default (no guest is firewalled out of the box),
+# and each entry's node/vmid come from the Terraform-generated inventory
+# (inventory_hosts emits the real vmid + node_name) — never hardcoded.
+#
+# Example (passed via --extra-vars or group_vars, values from the inventory):
+#   sdn_gateway_firewalled_guests:
+#     - { name: svc07-unsealer-20-01, node: "<node>", vmid: 1071 }
+sdn_gateway_firewalled_guests: []
+
+# Reverse of the above (ADR-0008): guests to REMOVE the managed egress baseline
+# rules from (e.g. after reverting a guest's NIC firewall). Same {node, vmid}
+# shape, empty by default. Kept separate from the enable list so disabling the
+# baseline never silently deletes rules — removal is a deliberate opt-in.
+sdn_gateway_firewalled_guests_teardown: []
+
+# Scoped egress ports the baseline opens per firewalled guest. Deliberately a
+# SHORT allowlist (not `policy_out=ACCEPT`): DNS + HTTP/HTTPS cover apt and
+# container-registry pulls, NTP covers clock sync (TLS validity and token TTLs
+# depend on it). Widen explicitly and reviewably if a service genuinely needs more.
+sdn_gateway_guest_egress_tcp_ports: [53, 80, 443]
+sdn_gateway_guest_egress_udp_ports: [53, 123]

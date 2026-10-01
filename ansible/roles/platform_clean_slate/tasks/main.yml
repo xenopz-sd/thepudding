@@ -1,0 +1,962 @@
+---
+# tasks/main.yml — platform_clean_slate (platform prerequisites — clean-slate branch)
+#
+# This role owns the destroy-safe REVERSE-order body of the platform
+# prerequisites tear-DOWN branch. The enclosing `when: clean_slate` gate and the
+# `block`/`rescue` step-naming wrapper live in the thin orchestrator play
+# (ansible/playbooks/platform-bootstrap.yml) — this role owns the branch BODY
+# only. See design.md "Component 3". The order below is the reverse of the
+# bring-up (identity -> template -> api -> gateway, ADR-0010), scoped to what the
+# clean-slate OWNS: service guests come off the fabric FIRST (via each service's
+# OWN clean-slate), then the SDN objects, then the host gateway, then the
+# stuck-zone clearance, then the gate.
+#
+# Ordered steps (MUST stay a -> b -> c -> d -> e -> f -> g):
+#   (a) throwaway-guard consult   — FIRST, fail-closed BEFORE any destruction
+#   (b) confirmation gate         — pause 300s unless clean_slate_confirm=force
+#   (c) Service_Discovery         — file-mediated (generated inventory), §4
+#   (d) per-service clean-slate   — child run + halt-before-fabric
+#   (e) Fabric_Teardown           — terraform destroy platform-foundation + gateway
+#   (f) Reboot_Teardown_Step      — SDN-absence verify / opt-in reboot / no-false-clean
+#   (g) Verification_Gate         — three-way (pct list + tf state list + SDN absence)
+#
+# NO secret value ever lives here; the fabric destroy credential is resolved at
+# run time from cluster.env (no_log) and referenced by name only.
+
+# ============================================================ #
+# STEP (a) — Throwaway-cluster authorization guard consult      #
+# (Task 3(a); Req 6.1, 6.2, 6.3 / Property 1).                  #
+# ------------------------------------------------------------ #
+# These THREE tasks run FIRST in the role — BEFORE the           #
+# confirmation pause, discovery, and every destroy — so a        #
+# REFUSED decision halts before ANY prompt, child clean-slate,   #
+# terraform destroy, gateway teardown, or reboot. All three are  #
+# gated `when: agent_live_run` (truthy only when                 #
+# AGENT_LIVE_AUTHORIZED is armed), so an ORDINARY operator run    #
+# (interlock unset) SKIPS them entirely and keeps the pause-      #
+# confirm path byte-for-byte unchanged (Req 6.2). FAIL-CLOSED:    #
+# the consult never fails the task itself (failed_when: false) —  #
+# the rc is the signal, and the assert HALTS unless the guard     #
+# AUTHORIZED (rc == 0), naming the guard's own non-secret reason  #
+# (Req 6.1, 6.3). `--service platform` scopes the                 #
+# AGENT_LIVE_AUTHORIZED_SERVICES grant to this feature.           #
+# ============================================================ #
+
+- name: "Clean-Slate | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python }}"
+      - "{{ platform_throwaway_guard }}"
+      - --service
+      - platform
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ platform_throwaway_allowlist }}"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (platform_cs_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | Refuse the reset unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "platform_cs_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live platform clean-slate REFUSED by the throwaway-cluster guard:
+      {{ (platform_cs_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      Nothing was destroyed — no service clean-slate ran, no Terraform state was
+      modified, and no host was rebooted. Arm the run only against a throwaway
+      cluster listed in throwaway-clusters.yml with AGENT_LIVE_AUTHORIZED set.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live platform clean-slate."
+  when: agent_live_run | default(false) | bool
+
+# ============================================================ #
+# STEP (b) — Confirmation gate (Task 3(b); Req 5.1, 5.2, 5.3 /  #
+# Property 3).                                                   #
+# ------------------------------------------------------------ #
+# The platform clean-slate is DESTRUCTIVE and tears down the      #
+# WHOLE platform prerequisites layer: the services on the fabric  #
+# (via each one's OWN clean-slate), the SDN fabric itself, and    #
+# the host L3 gateway. Before any of that we require an            #
+# affirmative confirmation UNLESS the operator already asserted    #
+# intent with clean_slate_confirm=force:                           #
+#   * clean_slate_confirm == 'force'  -> skip the prompt (5.3).    #
+#   * otherwise -> pause reads a typed line and only an            #
+#     affirmative 'yes'/'y' proceeds; anything else aborts         #
+#     destroying NOTHING and returns non-zero (5.1, 5.2).          #
+# Positioned AFTER the guard but BEFORE discovery/destroy, so a    #
+# declined prompt has touched nothing.                            #
+#                                                                  #
+# WHY prompt-only, NOT `pause: seconds:` (the bug this fixes):     #
+# `ansible.builtin.pause` has two mutually-exclusive modes. With   #
+# `seconds:` set it is a TIMED pause: it prints the prompt but     #
+# does NOT read a typed line into `user_input`, and the only       #
+# interactions honored are Ctrl+C-then-C (continue early, leaving  #
+# `user_input` EMPTY) / Ctrl+C-then-A (abort). So a `seconds:`     #
+# prompt that says "type 'yes'" can NEVER be confirmed by typing   #
+# yes — the typed text is discarded, `user_input` stays empty, and #
+# the resolve step below reads it as non-affirmative and aborts    #
+# (the operator-reported defect). Confirmation input is captured   #
+# ONLY in prompt-only mode (no `seconds:`), so we use that. A      #
+# bounded wall-clock limit, if ever wanted, must wrap the whole    #
+# play in a shell `timeout`, NOT `pause: seconds:` — it cannot     #
+# both bound AND read a typed line. The non-interactive path       #
+# (CI/agent) is `-e clean_slate_confirm=force`, which skips the    #
+# prompt entirely and is unaffected by this. (The same latent      #
+# `pause: seconds:` shape exists in svc07_clean_slate, but the     #
+# platform teardown always invokes that child with                 #
+# clean_slate_confirm=force, so its interactive path is never hit  #
+# here; fixing svc07's own interactive prompt is a separate scope.)#
+# ============================================================ #
+
+- name: "Clean-Slate | Prompt for explicit typed confirmation (skipped on force)"
+  ansible.builtin.pause:
+    # prompt-only (NO `seconds:`) so the typed line is captured into
+    # `user_input` — see the WHY note above. A `seconds:` timeout would silently
+    # discard the typed 'yes' and make interactive confirmation impossible.
+    prompt: >-
+      DESTRUCTIVE platform clean-slate requested. This tears the WHOLE platform
+      prerequisites layer down: it invokes each discovered service's OWN
+      clean-slate (destroying its guests + per-service state), then destroys the
+      platform-foundation SDN fabric (zone, VNet p20, subnet, applier), then
+      tears down the host L3 gateway config. Type 'yes' to proceed, anything
+      else (or an empty line) to abort
+  register: platform_cs_prompt
+  when: (clean_slate_confirm | default('')) != 'force'
+
+# Decide affirmation. On force, no prompt ran -> proceed. Otherwise the typed
+# response must be an affirmative ('yes'/'y', case-insensitive, trimmed);
+# anything else — including an empty line — is a non-affirmative abort (Req 5.2).
+- name: "Clean-Slate | Resolve whether the reset is confirmed"
+  ansible.builtin.set_fact:
+    platform_clean_slate_confirmed: >-
+      {{ (clean_slate_confirm | default('')) == 'force'
+         or ((platform_cs_prompt.user_input | default('') | trim | lower) in ['yes', 'y']) }}
+
+# A non-affirmative / absent response aborts the reset, destroying nothing, with
+# a non-zero exit (Req 5.2). This runs before any discovery or delegated
+# destroy, so no state was touched.
+- name: "Clean-Slate | Abort with non-zero exit when not confirmed (destroys nothing, Req 5.2)"
+  ansible.builtin.fail:
+    msg: >-
+      Platform clean-slate ABORTED — confirmation was not given (received a
+      non-affirmative or empty response). No service clean-slate ran, no
+      Terraform state was modified, and no host was touched. Re-run and type
+      'yes' at the prompt, or pass -e clean_slate_confirm=force to skip the
+      prompt.
+  when: not (platform_clean_slate_confirmed | bool)
+
+# ============================================================ #
+# STEP (c) — Service_Discovery, file-mediated (Task 4; Req 2.3, #
+# 2.5, 1.3 / Property 6).                                        #
+# ------------------------------------------------------------ #
+# Determine which catalog services have guests on the shared      #
+# fabric using ONLY file-mediated evidence (integration-          #
+# boundaries.md §4): a service is PRESENT iff its                 #
+# generated_inventory file exists (the Terraform->Ansible handoff #
+# writes it on a successful apply). We `stat` each catalog entry's #
+# generated_inventory and keep the present ones. registry_status  #
+# .py is consulted and INFO-logged FOR CONTEXT ONLY — the         #
+# authoritative presence signal is the generated-inventory file,  #
+# so discovery is not coupled to registry contents. NO .tfstate   #
+# parsing and NO pct/pvesh host enumeration happen here (those     #
+# pct/pvesh calls appear only later, in the gate, to CONFIRM       #
+# absence of already-known VMIDs). Gated on the teardown scope:    #
+# `fabric-only` SKIPS the service steps (the fabric teardown still #
+# fails closed if a discovered guest is attached).                #
+# ============================================================ #
+
+- name: "Clean-Slate | Stat each catalog service's generated inventory (file-mediated presence)"
+  ansible.builtin.stat:
+    path: "{{ platform_repo_root }}/{{ item.generated_inventory }}"
+  loop: "{{ platform_clean_slate_services }}"
+  loop_control:
+    label: "{{ item.service }}"
+  register: platform_cs_inventory_stat
+  when: (clean_slate_scope | default('all')) != 'fabric-only'
+
+- name: "Clean-Slate | Build the discovered-services set (entries whose generated inventory exists)"
+  ansible.builtin.set_fact:
+    platform_clean_slate_discovered: >-
+      {{ platform_cs_inventory_stat.results
+         | default([])
+         | selectattr('stat.exists', 'defined')
+         | selectattr('stat.exists')
+         | map(attribute='item')
+         | list }}
+  when: (clean_slate_scope | default('all')) != 'fabric-only'
+
+# Context-only served-VLAN state from the existing registry emitter (the same
+# one platform_gateway uses). INFO-logged for operator context; NOT the
+# presence signal. Offline JSON command; reads projects.yaml only.
+- name: "Clean-Slate | Emit the registry served-VLAN sets for CONTEXT (registry_status.py)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python }}"
+      - "{{ platform_clean_slate_registry_status }}"
+      - --json
+  args:
+    chdir: "{{ platform_repo_root }}"
+  environment:
+    PYTHONPATH: "{{ platform_clean_slate_registry_scripts_dir }}"
+  register: platform_cs_vlan_status
+  changed_when: false
+  when: (clean_slate_scope | default('all')) != 'fabric-only'
+
+- name: "Clean-Slate | INFO — discovered services + registry served-VLAN context"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: discovered services on the fabric (file-mediated):
+      {{ platform_clean_slate_discovered | default([]) | map(attribute='service') | list }}
+      — registry served-VLAN context:
+      {{ (platform_cs_vlan_status.stdout | default('{}') | from_json) }}.
+  when: (clean_slate_scope | default('all')) != 'fabric-only'
+
+# ============================================================ #
+# STEP (d) — per-service Service_Clean_Slate + halt-before-     #
+# fabric (Task 5; Req 2.1, 2.2, 2.4 / Properties 2, 6).         #
+# ------------------------------------------------------------ #
+# For each discovered service, invoke that service's OWN          #
+# clean-slate as a child `ansible-playbook` run (the orchestrator #
+# /configurator child-run seam, integration-boundaries.md §4).    #
+# BOUNDARY INVARIANT (Req 2.1, 2.2 / Property 6): the platform     #
+# role NEVER runs `pct destroy` on a service guest and NEVER runs  #
+# `terraform destroy`/`state rm` against a service's per-service   #
+# TF root — the child run's OWN svc07_clean_slate (-> terraform_   #
+# clean_slate) does that, owning the service's state. A single     #
+# clean_slate_confirm=force is passed because the human already    #
+# confirmed the whole platform teardown in step (b); the child's   #
+# OWN guard still gates its agent path (the interlock is            #
+# propagated). A child non-zero exit is caught by the play's        #
+# clean-slate rescue. Gated on scope (`fabric-only` skips this).    #
+# ============================================================ #
+
+# Fail-closed BEFORE the child run: each service's OWN clean-slate runs `pct`
+# ON THE NODE over SSH and fail-closes without the Proxmox host address (SVC-07:
+# svc07_proxmox_host). The platform teardown holds that address as
+# platform_clean_slate_proxmox_host and threads it into every child run under
+# the name THAT child expects (item.proxmox_host_var), so the child no longer
+# fail-closes for want of it. Assert the address here, before any child runs, so
+# a reset requested without it halts having destroyed nothing (the live Task
+# 15.1 defect: the child fail-closed and the teardown could never reach fabric).
+- name: "Clean-Slate | Assert the Proxmox host SSH address was supplied (before the child clean-slate run)"
+  ansible.builtin.assert:
+    that:
+      - "platform_clean_slate_proxmox_host is defined"
+      - "(platform_clean_slate_proxmox_host | trim | length) > 0"
+    fail_msg: >-
+      Each discovered service's OWN clean-slate runs host-scoped `pct` commands
+      on the Proxmox node over SSH and fail-closes without the Proxmox host
+      address, which the platform teardown threads into every child run. Supply
+      the real Proxmox LAN IP with
+      -e platform_clean_slate_proxmox_host=<real-proxmox-lan-ip>. No service
+      clean-slate has run and the fabric has NOT been touched.
+    success_msg: "Proxmox host SSH address supplied for the child clean-slate runs."
+  when: (clean_slate_scope | default('all')) != 'fabric-only'
+
+- name: "Clean-Slate | Invoke each discovered service's OWN clean-slate (child run)"
+  ansible.builtin.command:
+    # Base argv is the child clean-slate contract (clean_slate=true /
+    # clean_slate_confirm=force / cluster_env_file). When the catalog row names a
+    # proxmox_host_var (SVC-07: svc07_proxmox_host), append the platform's
+    # resolved Proxmox host address under THAT name so the child — which runs
+    # `pct` on the node and fail-closes without it — receives it. A row that
+    # omits proxmox_host_var is threaded without the host arg (only services
+    # whose child needs it set it).
+    argv: >-
+      {{ [platform_venv_python | dirname ~ '/ansible-playbook',
+          '-i', platform_localhost_inventory,
+          item.bootstrap_playbook,
+          '-e', 'clean_slate=true',
+          '-e', 'clean_slate_confirm=force',
+          '-e', 'cluster_env_file=' ~ cluster_env_file]
+         + (['-e', item.proxmox_host_var ~ '=' ~ platform_clean_slate_proxmox_host]
+            if (item.proxmox_host_var is defined
+                and (item.proxmox_host_var | trim | length) > 0)
+            else []) }}
+  args:
+    chdir: "{{ platform_repo_root }}"
+  loop: "{{ platform_clean_slate_discovered | default([]) }}"
+  loop_control:
+    label: "{{ item.service }}"
+  register: platform_cs_service_runs
+  changed_when: "'changed=0' not in (platform_cs_service_runs.stdout | default(''))"
+  environment:
+    # Propagate the armed interlock to the child so its OWN guard consult sees it.
+    AGENT_LIVE_AUTHORIZED: "{{ lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') }}"
+    AGENT_LIVE_AUTHORIZED_SERVICES: "{{ lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED_SERVICES', default='') }}"
+  when: (clean_slate_scope | default('all')) != 'fabric-only'
+
+# --- Halt-before-fabric (Req 2.4) ------------------------------------------- #
+# BEFORE touching the fabric, verify each discovered service reached empty,
+# reusing the same signals the gate uses (its VMIDs absent from `pct list`, its
+# state root empty). If any service still has a guest or state entry, HALT
+# naming the service + its survivors; the VNet/bridge is NOT destroyed with a
+# guest attached. The Proxmox host address was already asserted before the child
+# runs above; re-assert it fail-closed here (idempotent) before this host-scoped
+# `pct` check so the invariant holds even if the child loop was empty.
+
+- name: "Clean-Slate | Re-assert the Proxmox host SSH address was supplied (before the pct check)"
+  ansible.builtin.assert:
+    that:
+      - "platform_clean_slate_proxmox_host is defined"
+      - "(platform_clean_slate_proxmox_host | trim | length) > 0"
+    fail_msg: >-
+      The platform clean-slate runs host-scoped `pct`/`ip link`/reboot commands
+      on the Proxmox node over SSH, against the Proxmox-host inventory
+      ({{ platform_clean_slate_proxmox_inventory }}). Supply the real Proxmox LAN
+      IP with -e platform_clean_slate_proxmox_host=<real-proxmox-lan-ip>. The
+      fabric has NOT been touched.
+    success_msg: "Proxmox host SSH address supplied for the host-scoped teardown steps."
+  when: (clean_slate_scope | default('all')) != 'fabric-only'
+
+# `pct list` on the host (child ad-hoc `ansible` command against the Proxmox-host
+# inventory) — used here to CONFIRM absence of the already-known service VMIDs
+# before the fabric teardown, not to enumerate unknown hosts. rc tolerated; the
+# survivor set is parsed from stdout.
+- name: "Clean-Slate | Halt-before-fabric — list guests on the host (pct list)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pct list"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_prefabric_pct_list
+  changed_when: false
+  failed_when: false
+  when: (clean_slate_scope | default('all')) != 'fabric-only'
+
+# For each discovered service, compute the VMIDs still present AND the state
+# addresses still present, so a non-empty service HALTS before the fabric. The
+# `terraform state list` runs on the control node (state lives there).
+- name: "Clean-Slate | Halt-before-fabric — list each discovered service's Terraform state"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+  args:
+    chdir: "{{ platform_repo_root }}/{{ item.verify_tf_root }}"
+  loop: "{{ platform_clean_slate_discovered | default([]) }}"
+  loop_control:
+    label: "{{ item.service }}"
+  register: platform_cs_prefabric_state
+  changed_when: false
+  failed_when: false
+  when: (clean_slate_scope | default('all')) != 'fabric-only'
+
+# Build the per-service survivor map: {service, surviving_vmids, surviving_state}.
+# `surviving_state` is the REAL-RESOURCE definition (Fix 1): the state lines that
+# do NOT match ANY of the row's `state_ignore_patterns` — so the inert
+# module-internal `terraform_data.input_guards` anchors the proxmox-compute
+# module owns are TOLERATED (the child clean-slate's destroy contract removes the
+# real container resources, not those anchors), while a REAL surviving
+# container/vm/sdn resource line still counts as a survivor and HALTS before the
+# fabric. Judging by "zero state lines" (the pre-fix behaviour) wrongly saw the
+# inert anchors as survivors — this is the corrected definition.
+- name: "Clean-Slate | Halt-before-fabric — compute per-service survivors (real resources only)"
+  ansible.builtin.set_fact:
+    platform_cs_prefabric_survivors: >-
+      {{ platform_cs_prefabric_survivors | default([]) + [{
+           'service': item.0.service,
+           'surviving_vmids': (item.0.verify_vmids | map('string')
+             | select('in', (platform_cs_prefabric_pct_list.stdout | default(''))) | list),
+           'surviving_state': ((item.1.stdout | default('')).splitlines()
+             | map('trim') | select()
+             | reject('regex', (item.0.state_ignore_patterns | default([]) | map('regex_escape') | join('|')) or '(?!)')
+             | list),
+         }] }}
+  loop: >-
+    {{ platform_clean_slate_discovered | default([])
+       | zip(platform_cs_prefabric_state.results | default([])) | list }}
+  loop_control:
+    label: "{{ item.0.service }}"
+  when:
+    - (clean_slate_scope | default('all')) != 'fabric-only'
+    - (platform_clean_slate_discovered | default([]) | length) > 0
+
+# HALT naming any service that did not reach empty; the fabric is NOT touched.
+- name: "Clean-Slate | Halt-before-fabric — assert every discovered service reached empty (Req 2.4)"
+  ansible.builtin.assert:
+    that:
+      - "(platform_cs_prefabric_survivors | default([]) | selectattr('surviving_vmids') | list | length) == 0"
+      - "(platform_cs_prefabric_survivors | default([]) | selectattr('surviving_state') | list | length) == 0"
+    fail_msg: >-
+      A discovered service did NOT reach an empty baseline, so the platform
+      fabric will NOT be destroyed with a guest still attached (Req 2.4).
+      Survivors:
+      {{ platform_cs_prefabric_survivors | default([])
+         | selectattr('surviving_vmids') | list
+         + (platform_cs_prefabric_survivors | default([]) | selectattr('surviving_state') | list) }}.
+      Re-run that service's OWN clean-slate until it is empty, then re-run the
+      platform clean-slate.
+    success_msg: "All discovered services reached empty; safe to tear down the fabric."
+  when: (clean_slate_scope | default('all')) != 'fabric-only'
+
+# ============================================================ #
+# STEP (e) — Fabric_Teardown: SDN objects THEN host gateway     #
+# (Task 6; Req 3.1, 3.2, 3.3, 3.4, 3.5 / Property 2).           #
+# ------------------------------------------------------------ #
+# (1) Resolve the destroy credential from cluster.env via         #
+#     cluster_env.py (no_log); HALT naming the missing param if   #
+#     the terraform@pve token/endpoint/node is unresolvable,       #
+#     BEFORE any fabric mutation (Req 3.4).                        #
+# (2) Scoped `terraform destroy` of platform-foundation (zone,     #
+#     VNet p20, subnet, applier) with TF_VAR_proxmox_* in the      #
+#     child env (no_log); idempotent on already-empty state        #
+#     (Req 3.5); on attached-guest failure surface non-zero naming #
+#     the blocker (Req 3.3).                                       #
+# (3) Host L3 gateway teardown by REUSING the sdn_gateway          #
+#     decommission branch — the sdn-gateway.yml child play with    #
+#     VLAN 20 in the decommissioned set and the served set empty.  #
+# SDN-destroy BEFORE gateway-teardown is deliberate (reverse-of-   #
+# bring-up: the gateway binds .1 to p20, so the bridge goes first).#
+# ============================================================ #
+
+# (1) Resolve the destroy credential from cluster.env (no_log — the JSON stdout
+# carries the API token by key), the same helper platform_api / svc07 use.
+- name: "Clean-Slate | Resolve cluster env for the fabric destroy credential ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python }}"
+      - "{{ platform_clean_slate_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_env_resolve
+  changed_when: false
+  no_log: true
+
+- name: "Clean-Slate | Capture the resolved TF_VAR_* mapping (no_log)"
+  ansible.builtin.set_fact:
+    platform_cs_tfvars: "{{ platform_cs_env_resolve.stdout | from_json }}"
+  no_log: true
+
+- name: "Clean-Slate | Bind the resolved Proxmox endpoint + terraform@pve token + node (no_log)"
+  ansible.builtin.set_fact:
+    platform_cs_proxmox_endpoint: "{{ platform_cs_tfvars['TF_VAR_proxmox_endpoint'] | default('') }}"
+    platform_cs_proxmox_api_token: "{{ platform_cs_tfvars['TF_VAR_proxmox_api_token'] | default('') }}"
+    platform_cs_proxmox_node_name: "{{ platform_cs_tfvars['TF_VAR_proxmox_node_name'] | default('') }}"
+  no_log: true
+
+# Non-secret presence flags so the assert reads bools, never the token value.
+- name: "Clean-Slate | Compute whether the destroy credential resolved (presence only)"
+  ansible.builtin.set_fact:
+    platform_cs_endpoint_present: "{{ (platform_cs_proxmox_endpoint | trim | length) > 0 }}"
+    platform_cs_token_present: "{{ (platform_cs_proxmox_api_token | trim | length) > 0 }}"
+    platform_cs_node_present: "{{ (platform_cs_proxmox_node_name | trim | length) > 0 }}"
+
+# Fail-closed credential precondition (Req 3.4) — PRECEDES any fabric mutation.
+- name: "Clean-Slate | Assert the fabric destroy credential is resolvable (before any fabric mutation)"
+  ansible.builtin.assert:
+    that:
+      - "platform_cs_endpoint_present | bool"
+      - "platform_cs_token_present | bool"
+      - "platform_cs_node_present | bool"
+    fail_msg: >-
+      The fabric `terraform destroy` credential is not resolvable from
+      {{ cluster_env_file }}. Missing:
+      {{ (['PROXMOX_API_ENDPOINT'] if not (platform_cs_endpoint_present | bool) else [])
+         + (['PROXMOX_API_TOKEN'] if not (platform_cs_token_present | bool) else [])
+         + (['PROXMOX_NODE_NAME'] if not (platform_cs_node_present | bool) else []) }}.
+      Supply it in cluster.env. No fabric resource has been destroyed.
+    success_msg: "Fabric destroy credential resolved; proceeding to the SDN teardown."
+
+# terraform init before destroy (mirrors platform_api). The platform-foundation
+# root's backend is initialised with -reconfigure; a gitignored
+# local_backend_override.tf may already exist from a prior local apply and is
+# reused as-is (we do not touch it here). no_log — the child env carries the API
+# token.
+- name: "Clean-Slate | terraform init (platform-foundation, before destroy)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+  args:
+    chdir: "{{ platform_repo_root }}/{{ platform_clean_slate_foundation_root }}"
+  environment: "{{ platform_clean_slate_tf_env }}"
+  register: platform_cs_tf_init
+  changed_when: true
+  no_log: true
+
+# (2) Scoped `terraform destroy` of the platform-foundation SDN objects. no_log —
+# the child env carries TF_VAR_proxmox_api_token. Idempotent: an already-empty
+# state destroys nothing and reports changed=false. failed_when is left DEFAULT
+# (rc != 0) so a destroy failure (e.g. a guest still attached to the VNet)
+# surfaces non-zero and is caught by the branch rescue — never masked (Req 3.3,
+# 3.5). The subsequent debug names the likely blocker for the operator.
+- name: "Clean-Slate | terraform destroy (platform-foundation SDN fabric, scoped)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - destroy
+      - -input=false
+      - -auto-approve
+  args:
+    chdir: "{{ platform_repo_root }}/{{ platform_clean_slate_foundation_root }}"
+  environment: "{{ platform_clean_slate_tf_env }}"
+  register: platform_cs_tf_destroy
+  # A converged re-run prints "0 added, 0 changed, 0 destroyed" -> changed=false
+  # (idempotent, Req 3.5); any non-zero destroy -> changed=true.
+  changed_when: "'0 added, 0 changed, 0 destroyed' not in (platform_cs_tf_destroy.stdout | default(''))"
+  no_log: true
+
+- name: "Clean-Slate | INFO — SDN fabric terraform destroy completed"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: platform-foundation SDN fabric `terraform destroy` completed
+      (idempotent — an already-empty state destroys nothing). If a future run
+      fails here with a VNet-in-use / attached-guest error, a service guest is
+      still on {{ platform_clean_slate_sdn_vnet_id }} — run that service's OWN
+      clean-slate first (the halt-before-fabric check above names it).
+
+# (3) Host L3 gateway teardown — REUSE the sdn_gateway decommission branch via
+# the sdn-gateway.yml child play (the same play platform_gateway drives). VLAN 20
+# moves into the decommissioned set and the served set is empty, so the role's
+# teardown.yml removes the .1-on-p20 stanza, the scoped pve-firewall ALLOW rule,
+# and the VLAN-20 egress masquerade. A non-zero child exit fails this task -> the
+# branch rescue. NOT no_log — no secret is passed (non-secret topology values).
+# The Proxmox host address was already asserted present in step (d); on a
+# `fabric-only` run assert it here too before this first host-scoped step.
+- name: "Clean-Slate | Assert the Proxmox host SSH address (fabric-only path, before gateway teardown)"
+  ansible.builtin.assert:
+    that:
+      - "platform_clean_slate_proxmox_host is defined"
+      - "(platform_clean_slate_proxmox_host | trim | length) > 0"
+    fail_msg: >-
+      The host L3 gateway teardown runs on the Proxmox node over SSH. Supply the
+      real Proxmox LAN IP with -e platform_clean_slate_proxmox_host=<real-proxmox
+      -lan-ip>. The SDN fabric has been destroyed but the host gateway config was
+      NOT touched.
+    success_msg: "Proxmox host SSH address supplied for the gateway teardown."
+  when: (clean_slate_scope | default('all')) == 'fabric-only'
+
+- name: "Clean-Slate | Tear down the host L3 gateway (sdn-gateway.yml child play, VLAN 20 decommissioned)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible-playbook"
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - "{{ platform_clean_slate_gateway_playbook }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - --extra-vars
+      - "sdn_gateway_admin_source_cidr={{ platform_clean_slate_admin_source_cidr }}"
+      - --extra-vars
+      - "sdn_gateway_active_vlan_ids={{ [] | to_json }}"
+      - --extra-vars
+      - "sdn_gateway_decommissioned_vlan_ids={{ [platform_clean_slate_shared_vlan_id] | to_json }}"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_gateway_teardown
+  changed_when: "'changed=0' not in (platform_cs_gateway_teardown.stdout | default(''))"
+
+- name: "Clean-Slate | INFO — host L3 gateway teardown outcome"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: host L3 gateway teardown for VLAN {{ platform_clean_slate_shared_vlan_id }}
+      completed (sdn_gateway decommission branch — removed the
+      .1-on-{{ platform_clean_slate_sdn_vnet_id }} stanza, the scoped pve-firewall
+      ALLOW rule, and the VLAN-20 egress masquerade; idempotent on already-absent
+      config).
+
+# ============================================================ #
+# STEP (f) — Reboot_Teardown_Step: clear the stuck SDN zone      #
+# (Task 7; Req 4.1, 4.2, 4.3, 4.4, 4.5, 5.4 / Property 4).       #
+# ------------------------------------------------------------ #
+# `terraform destroy` + gateway teardown do NOT reliably remove   #
+# the SDN zone/bridge — a live run found the zone/bridge can       #
+# persist in an ERROR state until the host re-reads its generated  #
+# interfaces.d (a reboot / network-config reload). So:             #
+#   (1) SDN-absence verify — never assume destroy sufficed.        #
+#   (2) present + reboot opt-in -> WARN + reboot + wait-for-return.#
+#   (3) present + NO opt-in -> fail naming the survivor (no        #
+#       false-clean).                                              #
+#   (4) absent -> no-op.                                           #
+# On an agent run the reboot is ALSO under the step-(a) guard      #
+# (the guard already gated the whole role at the head), so it can  #
+# never reboot a shared/acceptance/production host (Req 4.4).      #
+# Host-scoped: uses platform_clean_slate_proxmox_host (asserted    #
+# present above).                                                  #
+# ============================================================ #
+
+# (1) SDN-absence verify — is p20 ACTUALLY gone? `ip link show p20` on the host
+# AND `pvesh get /cluster/sdn/vnets` show no p20. rc/stderr tolerated; presence
+# is parsed from stdout. Both via a child ad-hoc `ansible` command against the
+# Proxmox-host inventory (same idiom as the pct check).
+- name: "Clean-Slate | SDN-absence verify — is the p20 bridge still present on the host? (ip link)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "ip link show {{ platform_clean_slate_sdn_vnet_id }}"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_iplink
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | SDN-absence verify — does pvesh still show the p20 VNet?"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pvesh get /cluster/sdn/vnets"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_pvesh_vnets
+  changed_when: false
+  failed_when: false
+
+# The bridge/zone is "present" if EITHER signal shows p20 as a REAL entry.
+#
+# CRITICAL — do NOT naively substring-match the VNet id against the whole stdout:
+# when `ip link show p20` runs on a host where p20 is ABSENT, `ip` fails and the
+# ad-hoc `ansible` wrapper echoes its error line
+#   Device "p20" does not exist.
+# into the OUTER command's stdout. A bare `'p20' in stdout` then matches that
+# ERROR TEXT and reports the bridge as PRESENT — a false positive that makes the
+# gate see a surviving p20 on an already-clean host, forcing an endless reboot
+# loop that can never go green (diagnosed live: the gate reported "surviving SDN
+# object p20" on a freshly-rebooted host where `ip link show p20` returned
+# "Device does not exist"). So we match p20 ONLY as a real presence signal and
+# explicitly reject the not-exist message:
+#   * ip link: PRESENT iff stdout matches an actual link line for the device
+#     (`(: |^)p20:` — the `<idx>: p20:` format) AND stdout does NOT contain the
+#     "does not exist" message.
+#   * pvesh:   PRESENT iff stdout mentions the VNet id (empty SDN prints nothing,
+#     so this only fires on a real VNet listing) AND does NOT contain "does not
+#     exist".
+# Fail-closed on a genuinely UNREACHABLE host (SSH/connection failure) — an
+# ad-hoc run that could not reach the host reads as "present" (unknown ->
+# not-clean) so a connectivity blip is never mistaken for a clean baseline. An
+# unreachable ad-hoc emits "UNREACHABLE" / "Failed to connect" (NOT the tidy
+# "does not exist" line), which is how we tell the two apart.
+# Compute per-signal booleans in separate, readable facts (avoids a single deeply
+# nested Jinja expression). `_iplink_out` / `_pvesh_out` are the raw ad-hoc
+# stdouts; `_iplink_shows` / `_pvesh_shows` are the REAL-presence signals;
+# `_iplink_unreach` / `_pvesh_unreach` flag a genuine connection failure.
+- name: "Clean-Slate | Bind the SDN-absence probe stdouts"
+  ansible.builtin.set_fact:
+    platform_cs_iplink_out: "{{ (platform_cs_iplink | default({})).stdout | default('') }}"
+    platform_cs_pvesh_out: "{{ (platform_cs_pvesh_vnets | default({})).stdout | default('') }}"
+
+- name: "Clean-Slate | Compute whether the SDN zone/bridge is still present"
+  ansible.builtin.set_fact:
+    platform_cs_sdn_present: >-
+      {{ (platform_cs_iplink_out is search('(^|: )' ~ platform_clean_slate_sdn_vnet_id ~ ':')
+          and 'does not exist' not in platform_cs_iplink_out)
+         or (platform_clean_slate_sdn_vnet_id in platform_cs_pvesh_out
+             and 'does not exist' not in platform_cs_pvesh_out)
+         or (('UNREACHABLE' in platform_cs_iplink_out or 'Failed to connect' in platform_cs_iplink_out)
+             and ('UNREACHABLE' in platform_cs_pvesh_out or 'Failed to connect' in platform_cs_pvesh_out)) }}
+
+# (2) present + reboot opt-in -> WARN + reboot + wait-for-return. The child
+# ad-hoc `ansible.builtin.reboot` handles the disconnect + wait-for-return.
+- name: "Clean-Slate | WARN — a reboot to clear the stuck SDN zone disrupts a SHARED host"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: the SDN zone/bridge {{ platform_clean_slate_sdn_vnet_id }} survived
+      `terraform destroy` and platform_clean_slate_reboot is set — REBOOTING the
+      Proxmox host to force it to re-read interfaces.d. This DISRUPTS every guest
+      on this shared host, not just the platform prerequisites. (On an agent run
+      the step-(a) throwaway guard already restricted this to a throwaway
+      cluster.)
+  when:
+    - platform_cs_sdn_present | bool
+    - platform_clean_slate_reboot | default(false) | bool
+
+- name: "Clean-Slate | Reboot the Proxmox host to clear the stuck SDN zone (opt-in only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -b
+      - -m
+      - ansible.builtin.reboot
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_reboot
+  changed_when: platform_cs_reboot.rc == 0
+  when:
+    - platform_cs_sdn_present | bool
+    - platform_clean_slate_reboot | default(false) | bool
+
+# (3) present + NO opt-in -> fail naming the survivor (NO false-clean, Req 4.3).
+- name: "Clean-Slate | Halt on a surviving SDN zone without the reboot opt-in (no false-clean, Req 4.3)"
+  ansible.builtin.fail:
+    msg: >-
+      The SDN zone/bridge {{ platform_clean_slate_sdn_vnet_id }} SURVIVED
+      `terraform destroy` and the reboot opt-in was NOT supplied, so the baseline
+      is NOT clean and will NOT be reported clean. `terraform destroy` alone can
+      leave the SDN zone/bridge in an ERROR state until the host re-reads
+      interfaces.d. Re-run with -e platform_clean_slate_reboot=true to let the
+      clean-slate reboot the host (WARNING: disrupts a shared host), or reboot /
+      reload the host networking manually, then re-run the clean-slate.
+  when:
+    - platform_cs_sdn_present | bool
+    - not (platform_clean_slate_reboot | default(false) | bool)
+
+# (4) absent (or rebooted) -> INFO the decision and proceed to the gate (Req 5.4).
+- name: "Clean-Slate | INFO — reboot/SDN-absence decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: reboot decision:
+      {{ 'REBOOT TAKEN — the SDN zone survived and platform_clean_slate_reboot was set'
+         if (platform_cs_sdn_present | bool) and (platform_clean_slate_reboot | default(false) | bool)
+         else 'SKIPPED — SDN zone/bridge already absent, no reboot needed' }}.
+
+# ============================================================ #
+# STEP (g) — Verification_Gate, three-way (Task 8; Req 7.1,     #
+# 7.2, 7.3, 7.4, 7.5 / Property 5).                             #
+# ------------------------------------------------------------ #
+# Three checks then a single assert that ALL survivor sets are    #
+# empty; on any survivor exit non-zero naming EVERY survivor +    #
+# remedy (Req 7.4); success only when all zero (Req 7.5).         #
+#   (1) `pct list` scoped to the discovered services' VMIDs.      #
+#   (2) `terraform state list` for EACH discovered service TF     #
+#       root AND platform-foundation.                             #
+#   (3) SDN absence — p20 gone (ip link + pvesh).                 #
+# Mirrors svc07_clean_slate's two-way gate, extended to three.    #
+# ============================================================ #
+
+# (1) pct list — surviving discovered-service VMIDs on the host.
+- name: "Clean-Slate | GATE — list any surviving service containers on the host (pct list)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pct list"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_gate_pct_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | GATE — compute surviving service container VMIDs"
+  ansible.builtin.set_fact:
+    platform_cs_surviving_vmids: >-
+      {{ platform_clean_slate_discovered | default([])
+         | map(attribute='verify_vmids') | flatten | map('string')
+         | select('in', (platform_cs_gate_pct_list.stdout | default('')))
+         | list }}
+
+# (2) terraform state list — for each discovered service TF root AND
+# platform-foundation. state lives on the control node.
+- name: "Clean-Slate | GATE — list Terraform state for each discovered service root"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+  args:
+    chdir: "{{ platform_repo_root }}/{{ item.verify_tf_root }}"
+  loop: "{{ platform_clean_slate_discovered | default([]) }}"
+  loop_control:
+    label: "{{ item.service }}"
+  register: platform_cs_gate_service_state
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | GATE — list Terraform state for platform-foundation"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+  args:
+    chdir: "{{ platform_repo_root }}/{{ platform_clean_slate_foundation_root }}"
+  register: platform_cs_gate_foundation_state
+  changed_when: false
+  failed_when: false
+
+# Aggregate surviving state addresses using the REAL-RESOURCE definition (Fix 1):
+# a state line counts as a survivor ONLY if it does NOT match a tolerated inert
+# module-internal anchor pattern. Per-source patterns:
+#   * each discovered service root -> that catalog row's `state_ignore_patterns`
+#     (SVC-07: terraform_data.input_guards — the proxmox-compute anchors);
+#   * platform-foundation -> `platform_clean_slate_foundation_state_ignore_patterns`
+#     (terraform_data.registry_watch — the foundation's own replace-trigger
+#     sentinel), applied for consistency so the gate never flags that inert
+#     anchor once the real SDN objects are gone.
+# A REAL surviving container/vm/sdn resource line in EITHER source still trips
+# the gate; only the enumerated inert `terraform_data.*` anchors are tolerated.
+# This does NOT weaken the §5 boundary — the platform still never removes any
+# state; it only refines what "the service's / foundation's real resources are
+# gone" means, matching each root's actual destroy contract.
+
+# (2a) Per-service surviving REAL-resource state addresses (inert anchors filtered).
+- name: "Clean-Slate | GATE — compute surviving service-root state (real resources only)"
+  ansible.builtin.set_fact:
+    platform_cs_surviving_service_state: >-
+      {{ platform_cs_surviving_service_state | default([]) +
+         ((item.1.stdout | default('')).splitlines()
+           | map('trim') | select()
+           | reject('regex', (item.0.state_ignore_patterns | default([]) | map('regex_escape') | join('|')) or '(?!)')
+           | list) }}
+  loop: >-
+    {{ platform_clean_slate_discovered | default([])
+       | zip(platform_cs_gate_service_state.results | default([])) | list }}
+  loop_control:
+    label: "{{ item.0.service }}"
+  when: (platform_clean_slate_discovered | default([]) | length) > 0
+
+# (2b) platform-foundation surviving REAL-resource state addresses (its own inert
+# registry_watch anchor filtered).
+- name: "Clean-Slate | GATE — compute surviving platform-foundation state (real SDN resources only)"
+  ansible.builtin.set_fact:
+    platform_cs_surviving_foundation_state: >-
+      {{ (platform_cs_gate_foundation_state.stdout | default('')).splitlines()
+         | map('trim') | select()
+         | reject('regex', (platform_clean_slate_foundation_state_ignore_patterns
+                            | default([]) | map('regex_escape') | join('|')) or '(?!)')
+         | list }}
+
+# (2c) Aggregate both sources into the single survivor set the gate asserts on.
+- name: "Clean-Slate | GATE — compute surviving Terraform state addresses (service roots + platform-foundation)"
+  ansible.builtin.set_fact:
+    platform_cs_surviving_state_addrs: >-
+      {{ (platform_cs_surviving_service_state | default([]))
+         + (platform_cs_surviving_foundation_state | default([])) }}
+
+# (3) SDN absence — reuse the presence signal computed in step (f), recomputed
+# post-reboot so the gate observes the CURRENT network state.
+- name: "Clean-Slate | GATE — re-verify the p20 bridge is absent on the host (ip link)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "ip link show {{ platform_clean_slate_sdn_vnet_id }}"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_gate_iplink
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | GATE — re-verify pvesh shows no p20 VNet"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pvesh get /cluster/sdn/vnets"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_gate_pvesh
+  changed_when: false
+  failed_when: false
+
+# Uses the SAME precise presence logic as step (f) — match p20 as a REAL entry
+# (an actual `ip link` line, or a pvesh VNet listing) and explicitly reject the
+# "Device \"p20\" does not exist" error text, which otherwise substring-matches
+# "p20" and reports a false survivor on an already-clean host (the endless-reboot
+# false positive diagnosed live). Per-signal stdouts bound first for readability.
+- name: "Clean-Slate | GATE — bind the SDN-absence re-probe stdouts"
+  ansible.builtin.set_fact:
+    platform_cs_gate_iplink_out: "{{ (platform_cs_gate_iplink | default({})).stdout | default('') }}"
+    platform_cs_gate_pvesh_out: "{{ (platform_cs_gate_pvesh | default({})).stdout | default('') }}"
+
+- name: "Clean-Slate | GATE — compute the surviving SDN object (p20), if any"
+  ansible.builtin.set_fact:
+    platform_cs_surviving_sdn: >-
+      {{ [platform_clean_slate_sdn_vnet_id]
+         if ((platform_cs_gate_iplink_out is search('(^|: )' ~ platform_clean_slate_sdn_vnet_id ~ ':')
+              and 'does not exist' not in platform_cs_gate_iplink_out)
+             or (platform_clean_slate_sdn_vnet_id in platform_cs_gate_pvesh_out
+                 and 'does not exist' not in platform_cs_gate_pvesh_out))
+         else [] }}
+
+# Final gate (Req 7.4, 7.5): ALL THREE survivor sets MUST be empty. If any is
+# non-empty the run halts non-zero, naming every survivor by VMID, state
+# address, or SDN object, with the remedy.
+- name: "Clean-Slate | GATE — assert an empty baseline (0 guests, 0 state, no SDN), Req 7.4/7.5"
+  ansible.builtin.assert:
+    that:
+      - "(platform_cs_surviving_vmids | length) == 0"
+      - "(platform_cs_surviving_state_addrs | length) == 0"
+      - "(platform_cs_surviving_sdn | length) == 0"
+    fail_msg: >-
+      Platform clean-slate did NOT reach an empty baseline. Surviving service
+      container(s): {{ platform_cs_surviving_vmids | join(', ') | default('none', true) }};
+      surviving Terraform state address(es):
+      {{ platform_cs_surviving_state_addrs | join(', ') | default('none', true) }};
+      surviving SDN object(s):
+      {{ platform_cs_surviving_sdn | join(', ') | default('none', true) }}.
+      Investigate on the Proxmox host / in Terraform state (a surviving SDN
+      object usually means a host reboot is still needed — re-run with
+      -e platform_clean_slate_reboot=true) and re-run the clean-slate until all
+      three are empty before re-provisioning.
+    success_msg: >-
+      Platform clean-slate complete — zero discovered-service containers on the
+      host, zero Terraform state addresses (service roots + platform-foundation),
+      and no surviving SDN object.
+
+- name: "Clean-Slate | Report the platform prerequisites baseline is empty"
+  ansible.builtin.debug:
+    msg: >-
+      Platform prerequisites Clean-Slate complete: discovered services
+      clean-slated (or already absent), the platform-foundation SDN fabric
+      destroyed, the host L3 gateway config torn down, and the SDN zone/bridge
+      absent. The baseline is empty; a fresh from-scratch bring-up
+      (platform-bootstrap.yml without -e clean_slate=true) can now run.

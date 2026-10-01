@@ -1,0 +1,19 @@
+# Stub inventory for the `common` role's offline dry-run smoke test
+# (spec lxc-docker-base-template, task 4.2, requirement 7.2; design Testing
+# Strategy Tier 1).
+#
+# This inventory exists ONLY to give `ansible-playbook --syntax-check` and
+# `--check` a target to bind the role against — it performs NO host mutation.
+# It points at the loopback host with a local connection so no SSH, no remote
+# host, and no real infrastructure is ever touched. The conventional Ansible
+# role `tests/` layout (tests/inventory + tests/test.yml) is used.
+#
+# `--check` against this local host WILL evaluate tasks; some (apt installs,
+# docker daemon/Compose probe) may report errors on the authoring host because
+# it has no Docker apt repo, may lack apt privileges, and runs no docker daemon.
+# Per requirement 7.2 the goal is to confirm task WIRING / syntax / module
+# resolution, not to converge this host — so `--syntax-check` is the hard gate
+# and `--check` is best-effort wiring confirmation. The role's own bake/LXC
+# guards (`failed_when: false` on the systemd + Compose-probe tasks) keep such
+# environmental errors from being role defects.
+localhost ansible_connection=local

@@ -1,0 +1,36 @@
+---
+# SDN VLAN gateway/firewall playbook (feature: sdn-vlan-gateway-reachability,
+# design C7; ADR-0004). Binds the host-level `sdn_gateway` role to the Proxmox
+# node(s), configuring — OUTSIDE Terraform/SDN — the L3 gateway sub-interface
+# (vmbr0.<vlan>), net.ipv4.ip_forward, and the isolation-preserving pve-firewall
+# rules for every served VLAN. Bind-only: NO task logic lives here — all logic
+# is in roles/sdn_gateway (structure.md host-level-role exception).
+#
+# Targets the STATIC, hand-maintained inventory ansible/inventory/proxmox-hosts.yml
+# (the Proxmox host is not a Terraform guest, so it has no generated inventory).
+#
+# The active/decommissioned VLAN sets come from the registry desired-state view
+# via the Python emitter (one reader of truth — Ansible never re-parses
+# projects.yaml). Operator invocation:
+#
+#   # 1. Emit the desired-state VLAN sets to a vars file (offline, reads the registry only):
+#   PYTHONPATH=infra/platform-foundation/scripts \
+#     ~/venv/devinfra/bin/python \
+#     infra/platform-foundation/scripts/registry_status.py --json \
+#     --out /tmp/vlan-status.json
+#
+#   # 2. Run the gateway role, feeding it the emitter output plus the admin source CIDR:
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/proxmox-hosts.yml \
+#     ansible/playbooks/sdn-gateway.yml \
+#     --extra-vars "@/tmp/vlan-status.json" \
+#     --extra-vars "sdn_gateway_admin_source_cidr=<dev-net-cidr>"
+#
+# To serve a project VLAN (100+) off-host, add it explicitly (opt-in, never a
+# blanket route — Requirement 6.6):
+#   --extra-vars "sdn_gateway_served_project_vlan_ids=[100]"
+- name: Configure Proxmox host as L3 gateway + firewall for served SDN VLANs
+  hosts: proxmox
+  become: true
+  roles:
+    - role: sdn_gateway

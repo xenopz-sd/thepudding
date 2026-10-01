@@ -1,0 +1,53 @@
+---
+# already_configured.yml — Task 5.5 fixture playbook (spec: svc-07-secrets-manager)
+#
+# Applies the REAL `openbao_install` role (unmodified) against localhost to prove
+# the Requirement 13.1/13.2 idempotency guarantee: when the pinned OpenBao
+# version is already running AND the config is already rendered — the
+# "already-configured" state — a run reports changed=0 and every install/
+# bring-up task is skipped.
+#
+# HOW THE "ALREADY-CONFIGURED" STATE IS SIMULATED (two independent halves):
+#
+#   1. Pinned version already running — the role probes the container with
+#      `community.docker.docker_container_info`. This playbook prepends
+#      `library/` (this fixture dir) to the module search path, so the offline
+#      stub `library/docker_container_info.py` SHADOWS the real module and
+#      reports the pinned image (openbao_image) already running. That drives the
+#      role's `set_fact` to compute `openbao_already_at_pinned_version = True`,
+#      gating off every bring-up task (`when: not openbao_already_at_pinned_version`).
+#      No Docker daemon and no real container are required.
+#
+#   2. Config already rendered — the pytest runner invokes this playbook TWICE
+#      against the SAME temp dirs: a first NORMAL run renders `config.hcl` and
+#      creates the config/TLS dirs, then a second `--check` run. Because the
+#      config-templating tasks (intentionally NOT gated by the version fact —
+#      the template module is idempotent by nature) already produced identical
+#      content in the first run, they are no-ops in the second run. Only the
+#      SECOND (check) run's recap is asserted to be changed=0.
+#
+# The role is exercised in the UNSEALER role so NO secret value (the primary's
+# seal `transit` token) is ever needed or templated — consistent with the
+# no-secret-in-fixtures steering rule. The idempotency machinery under test (the
+# version-probe fact + the gated bring-up) is identical for both roles.
+#
+# `openbao_config_dir` and `openbao_tls_host_dir` are overridden by the runner
+# to writable temp dirs so the role never touches real system paths
+# (`/openbao/config`, `/etc/openbao/tls`).
+
+- name: openbao_install check-mode idempotency (already-configured state)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  # The role's config-dir / config.hcl tasks set `owner: root` / `group: root`.
+  # `become: true` lets them succeed so the priming run establishes the
+  # already-configured state and the check run is a genuine no-op. The pytest
+  # runner only invokes this playbook where privilege escalation actually works
+  # (running as root, or passwordless sudo); otherwise it SKIPS cleanly. In CI —
+  # where these roles run as root — become is a no-op-but-permitted and the test
+  # runs for real.
+  become: true
+  vars:
+    openbao_role: "unsealer"
+  roles:
+    - role: openbao_install

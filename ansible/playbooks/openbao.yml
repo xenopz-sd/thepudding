@@ -1,0 +1,157 @@
+---
+# OpenBao provisioning playbook (feature: terraform-ansible-handoff, design C5;
+# ordered two-play structure added by fix-openbao-unsealer-bootstrap, design C1).
+#
+# TWO ORDERED PLAYS, unsealer-first:
+#   Play 1 — hosts: openbao-unsealer  (install + init)  → Transit-inits the unsealer
+#   Play 2 — hosts: openbao           (install + init + onboard) → primary Raft bootstrap
+#
+# WHY TWO PLAYS (not a single combined `hosts: openbao:openbao-unsealer` play):
+#   Ansible runs a play task-by-task across all its hosts, so a single combined
+#   play could execute the primary's "6.2-STEP-0" bootstrap read BEFORE the
+#   unsealer's Transit-engine init finished — the unsealer mints/holds the seal key
+#   the primary's seal "transit" stanza depends on. An explicit ordered two-play
+#   structure makes "unsealer first, then primary" a STRUCTURAL guarantee: play 1
+#   fully completes (install + Transit init on the unsealer) before play 2 begins
+#   (install + Raft init/bootstrap on the primary). The `openbao_role: unsealer`
+#   selector for play 1's host is set as a PLAY VAR on play 1 (below), NOT via
+#   ansible/group_vars/openbao-unsealer.yml: a group_vars file at the ansible/ root
+#   is not on Ansible's auto-load path for this playbook+inventory layout (Ansible
+#   only auto-loads group_vars adjacent to the inventory file or adjacent to the
+#   playbook, and this playbook lives under ansible/playbooks/ while the inventory
+#   lives under ansible/inventory/), so it would resolve to None and fall through
+#   to the "primary" default on the unsealer. A play var is deterministic and
+#   independent of group_vars placement and group-name sanitization, and makes the
+#   `when: openbao_role == "unsealer"` Transit-init tasks reachable.
+#
+# Bind-only: NO role/task logic here (it lives in the roles). Tag map matches the
+# SVC-07 INSTALL-RUNBOOK §2 invocations — a single `--tags "install,init"` run now
+# installs + Transit-inits the unsealer FIRST, then installs + Raft-bootstraps the
+# primary:
+#   ~/venv/devinfra/bin/ansible-playbook -i <generated-inventory> \
+#     ansible/playbooks/openbao.yml --tags "install,init"
+#   ~/venv/devinfra/bin/ansible-playbook -i <generated-inventory> \
+#     ansible/playbooks/openbao.yml --tags onboard --extra-vars "project_slug=<slug>"
+
+# --- Play 1: the Transit unsealer, FIRST (install + init/Transit-engine init) ---
+# CONVERGE-THEN-UNSEAL SEAM: Play 1 is expressed as a `tasks:` section (not a
+# plain `roles:` list) so a `meta: flush_handlers` can sit BETWEEN the install
+# and init/unseal roles. A plain `roles:` list cannot interleave a flush — Ansible
+# flushes handlers only at the roles/tasks/end-of-play boundaries, so a
+# `Restart openbao` handler queued by openbao_install would otherwise fire at
+# END OF PLAY, i.e. AFTER openbao_init_unseal has already unsealed the Shamir-
+# sealed unsealer, re-sealing it (bug: fix-svc07-unsealer-reseal-on-handler-restart).
+# `import_role` (static) preserves the `install`/`init` tag mapping exactly as the
+# `roles:` form did, so the runbook's `--tags "install,init"` invocation is intact.
+- name: Provision OpenBao unsealer (install, Transit-engine init)
+  hosts: openbao-unsealer
+  become: true
+  vars:
+    openbao_role: unsealer
+  tasks:
+    - name: Install OpenBao unsealer (Docker/Compose stack, TLS, config)
+      ansible.builtin.import_role:
+        name: openbao_install
+      tags: ["install"]
+
+    # Flush any Restart openbao handler queued by openbao_install's first-run
+    # config/cert/chown tasks NOW — while the unsealer is still uninitialised/
+    # sealed — so the container recreate happens BEFORE the init/unseal below,
+    # making the unseal the LAST operation that touches the Shamir-sealed
+    # unsealer. Without this, the handler flushes at end-of-play (after unseal)
+    # and re-seals it (bug: fix-svc07-unsealer-reseal-on-handler-restart).
+    #
+    # `tags: ["always"]` IS REQUIRED, not cosmetic. The orchestrator
+    # (svc-07-bootstrap.yml Task 8.2) invokes this play with
+    # `--tags "install,init"`. Under a `--tags` filter Ansible SKIPS any task
+    # that carries no matching tag — and an UNTAGGED `meta: flush_handlers` is
+    # filtered out, so the seam never runs mid-play and the `Restart openbao`
+    # handler falls back to flushing at END OF PLAY, i.e. AFTER
+    # openbao_init_unseal has already init/unseal/mint-ed the unsealer. That
+    # end-of-play `docker_compose_v2 recreate: always` then destroys the
+    # just-unsealed container and boots a fresh SEALED one. Tagging the seam
+    # `always` makes it run under `--tags "install,init"` so the flush actually
+    # happens BETWEEN install and init/unseal.
+    # CO-ROOT-CAUSES (both must hold): (1) this flush-tag — so the seam runs at
+    # all under `--tags` — and (2) the openbao_install volume-ownership ordering
+    # (fix-svc07-unsealer-volume-ownership-recreate) — so the post-up chown does
+    # not itself notify a late `Restart openbao`. Neither alone is sufficient.
+    - name: Flush openbao_install handlers before init/unseal (converge-then-unseal)
+      meta: flush_handlers
+      tags: ["always"]
+
+    - name: Initialise + unseal + Transit-init the OpenBao unsealer
+      ansible.builtin.import_role:
+        name: openbao_init_unseal
+      tags: ["init"]
+
+# --- Play 2: the primary, SECOND (install + Raft init/bootstrap + onboard) ------
+# CONVERGE-THEN-BOOTSTRAP SEAM: Play 2 is expressed as a `tasks:` section (not a
+# plain `roles:` list) so a `meta: flush_handlers` can sit BETWEEN the install
+# and init/unseal roles — the primary analogue of Play 1's unsealer seam
+# (fix-svc07-unsealer-reseal-on-handler-restart), applied here as Fix B
+# (fix-svc07-primary-recreate-churn). During openbao_install the primary's
+# first-run tasks — the config.hcl template (it embeds the freshly-minted
+# bootstrap Transit token, so it re-renders every fresh run) and the MOCK-TLS
+# cert generate/install tasks (they regenerate on a fresh host) — each
+# `notify: Restart openbao`, whose handler runs
+# `community.docker.docker_compose_v2 ... recreate: always` (a full container
+# destroy + recreate). WITHOUT a seam those handlers flush at END OF PLAY 2 —
+# i.e. AFTER openbao_init_unseal has already Raft-bootstrapped the primary and
+# it is healthy — so `recreate: always` DESTROYS the healthy primary. That
+# recreate is slow to settle (>150s live) and outlasts the installer's Phase-4
+# deadline, so Phase 4 times out on a churning container even though the seal
+# chain is fine (the end-of-play recreate is NOT harmless for the health gate,
+# despite the primary's `seal "transit"` auto-unseal). The seam flushes those
+# handlers BETWEEN install and init (converge-then-bootstrap), so the config /
+# MOCK-TLS recreate happens EARLY, the container is stable by the time
+# openbao_init_unseal bootstraps it, and NOTHING recreates the primary after it
+# is healthy. Fix A's Phase-4 `docker exec ... bao status` gate then finds a
+# stable, healthy primary and the installer exits 0. The preservation guard
+# (test_preserve_primary_play_role_order_and_role_var) was updated to assert
+# this new `tasks:`+import_role structure and the seam.
+# `import_role` (static) preserves the `install`/`init`/`onboard` tag mapping
+# exactly as the `roles:` form did, so the runbook's `--tags "install,init"`
+# and `--tags onboard` invocations are intact.
+- name: Provision OpenBao primary (install, init/unseal/bootstrap, project onboard)
+  hosts: openbao
+  become: true
+  vars:
+    openbao_role: primary
+  tasks:
+    - name: Install OpenBao primary (Docker/Compose stack, TLS, config.hcl)
+      ansible.builtin.import_role:
+        name: openbao_install
+      tags: ["install"]
+
+    # Flush any Restart openbao handler queued by openbao_install's first-run
+    # config.hcl-template + MOCK-TLS cert tasks NOW — while the primary is
+    # freshly installed but BEFORE init/unseal/bootstrap — so the container
+    # recreate happens EARLY and NOTHING recreates the primary after it is
+    # bootstrapped and healthy. Without this, the handler flushes at END OF
+    # PLAY (after bootstrap) and the `docker_compose_v2 recreate: always`
+    # destroys the healthy primary; the slow recreate then outlasts the
+    # installer's Phase-4 deadline.
+    #
+    # `tags: ["always"]` IS REQUIRED, not cosmetic — identical rationale to
+    # Play 1's unsealer seam. The orchestrator (svc-07-bootstrap.yml Task 8.4)
+    # invokes this play with `--tags "install,init"`. Under a `--tags` filter
+    # Ansible SKIPS any task that carries no matching tag — and an UNTAGGED
+    # `meta: flush_handlers` is filtered out, so the seam never runs mid-play
+    # and the `Restart openbao` handler falls back to flushing at END OF PLAY,
+    # defeating the fix. Tagging the seam `always` makes it run under
+    # `--tags "install,init"` so the flush actually happens BETWEEN install and
+    # init/unseal.
+    - name: Flush openbao_install handlers before init/unseal (converge-then-bootstrap)
+      meta: flush_handlers
+      tags: ["always"]
+
+    - name: Initialise + unseal + Raft-bootstrap the OpenBao primary
+      ansible.builtin.import_role:
+        name: openbao_init_unseal
+      tags: ["init"]
+
+    - name: Onboard the project into the OpenBao primary
+      ansible.builtin.import_role:
+        name: openbao_project_onboard
+      tags: ["onboard"]

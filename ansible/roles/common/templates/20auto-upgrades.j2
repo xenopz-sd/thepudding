@@ -1,0 +1,9 @@
+{{ ansible_managed | comment }}
+// Periodic apt configuration for unattended-upgrades, managed by the `common`
+// role (spec task 3.1). This is the standard 20auto-upgrades enablement: refresh
+// package lists daily and run the unattended-upgrade step. It schedules apt work
+// only — no kernel/sysctl changes — so it is safe in an unprivileged LXC.
+//
+// SECRET-FREE: contains no secret material (requirement 1.5 / P3).
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";

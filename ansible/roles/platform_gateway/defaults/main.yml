@@ -1,0 +1,50 @@
+---
+# defaults/main.yml — platform_gateway (Platform Prerequisites Bootstrap —
+# host-layer SDN gateway phase, run AFTER the api bucket's SDN fabric apply).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/. Design ref:
+# "Component 4b: platform_gateway". Split out of platform_host_prep by Fix A
+# (phase reorder, ADR-0010) so the gateway runs after the api bucket creates the
+# SDN VNet bridge p<vlan> it binds .1 to. Only this role's phase-specific knobs
+# live here. NO secret value ever lives here.
+
+# --- Host target (Req 3.5) ---------------------------------------------------
+# The Proxmox host address the gateway child run targets (ansible_host override
+# for the static proxmox-hosts.yml inventory). Sourced from cluster.env
+# PROXMOX_HOST_LAN_IP — the shared platform_preflight role resolves it into the
+# play fact `platform_host_lan_ip`; consume that, fall back to a
+# PROXMOX_HOST_LAN_IP env lookup, else empty (empty fails closed downstream in
+# the sdn_gateway role's own preflight rather than targeting a bogus host).
+platform_gateway_host: >-
+  {{ platform_host_lan_ip
+     | default(lookup('ansible.builtin.env', 'PROXMOX_HOST_LAN_IP', default='')) }}
+
+# --- Gateway child run (Task 6.2, Req 3.3/3.5) -------------------------------
+# The scoped admin source network permitted to reach served VLANs, passed
+# straight through to the sdn_gateway role as sdn_gateway_admin_source_cidr.
+# Sourced from cluster.env ADMIN_SOURCE_CIDR. The sdn_gateway role's own
+# preflight fails closed on an empty CIDR (it refuses to write a wide-open
+# rule), so we do not re-assert it here — we surface its failure. The shared
+# platform_preflight role resolves ADMIN_SOURCE_CIDR into the play fact
+# `platform_admin_source_cidr`; prefer it, fall back to an env lookup, else
+# empty.
+platform_gateway_admin_source_cidr: >-
+  {{ platform_admin_source_cidr
+     | default(lookup('ansible.builtin.env', 'ADMIN_SOURCE_CIDR', default='')) }}
+
+# The child sdn-gateway.yml play + the Proxmox-host inventory it binds to. Reused
+# EXACTLY as documented (ansible/playbooks/sdn-gateway.yml binds the sdn_gateway
+# role to `hosts: proxmox`, `become: true` against ansible/inventory/
+# proxmox-hosts.yml). We pass `ansible_host`, the admin CIDR, and the
+# registry-derived active/decommissioned VLAN sets via --extra-vars.
+platform_gateway_playbook: "ansible/playbooks/sdn-gateway.yml"
+platform_gateway_proxmox_inventory: "ansible/inventory/proxmox-hosts.yml"
+
+# The registry desired-state emitter (the one reader of truth for the served
+# project-VLAN set — design "Served-VLAN set source"). Run first as an offline
+# JSON command; its {active_vlan_ids, decommissioned_vlan_ids} output is fed to
+# the gateway child run. VLAN 20 is served unconditionally by the role's own
+# default (sdn_gateway_shared_vlan_id: 20), so at minimum the shared VLAN is
+# served even with an empty registry.
+platform_gateway_registry_status: "infra/platform-foundation/scripts/registry_status.py"
+platform_gateway_registry_scripts_dir: "infra/platform-foundation/scripts"

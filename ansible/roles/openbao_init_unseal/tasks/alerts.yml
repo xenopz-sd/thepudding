@@ -1,0 +1,99 @@
+---
+# tasks/alerts.yml — openbao_init_unseal / TASK 10.2
+#
+# Alertmanager alerts (Prometheus + Loki) + the 30-min escalation route that
+# SVC-07 CONTRIBUTES to the shared SVC-17/18 observability stack. INCLUDED FROM
+# tasks/main.yml at the "EXTENSION POINT — Task 10.2 (alerting)" marker, gated on
+# `openbao_role == "primary"` (the fragments are rendered once, from the primary
+# host) and `openbao_alerts_enabled`.
+#
+# WHY HERE (not in the root-token window): like task 10.1's scrape fragment (and
+# unlike the §7.x engine/auth/audit steps), rendering alerting-rule / route files
+# needs NO Root_Token and no live OpenBao API call — they are pure host-file
+# template renders. They therefore run OUTSIDE the bootstrap window and are NOT
+# gated on `openbao_already_initialized`: the rule/route files are reconciled on
+# every run so they stay present/correct even on an already-initialised primary
+# (the template module is idempotent, Req 13).
+#
+# WHAT THIS TASK DOES (and, deliberately, does NOT do):
+#   * It RENDERS three drop-in fragments SVC-07 owns onto directories the SVC-17
+#     Prometheus (rule_files), the SVC-18 Loki ruler, and the SVC-17 Alertmanager
+#     (config include/merge) load — the SVC-07 CONTRIBUTION to the shared stack,
+#     mirroring how task 10.1 contributes the scrape fragment and task 7.2 the
+#     Promtail fragment:
+#       - prometheus-openbao-alerts.yml.j2  -> OpenBaoSealed (critical, Req 10.4),
+#         OpenBaoUnsealerUnreachable (critical, Req 10.5), OpenBaoLeaseCountHigh
+#         (warning, Req 10.6). Auto-resolve is inherent to Prometheus alerting.
+#       - loki-openbao-audit-rule.yml.j2    -> OpenBaoAuditFailure (critical,
+#         Req 10.7): a LogQL rule firing within 1 min of an audit-write-failure
+#         log line. DISTINCT from the snapshot-failure marker (task 11.1).
+#       - alertmanager-openbao-route.yml.j2 -> primary routing to the platform-ops
+#         receiver (Req 10.4) + the 30-min unacknowledged escalation to the
+#         SECONDARY on-call receiver (Req 10.9).
+#   * It does NOT stand up Prometheus/Alertmanager/Loki (SVC-17/18 are separate
+#     catalog services) and does NOT own the scrape config (that is task 10.1).
+#   * It does NOT implement the snapshot-failure alert — that is task 11.1's own
+#     Loki alert keyed on OPENBAO_SNAPSHOT_FAILURE; this task's audit rule is a
+#     SEPARATE alert whose LogQL excludes that marker so the two never conflate.
+#
+# NO secret value is templated: expressions, thresholds, durations, severities,
+# receiver NAMES, and routing labels are all non-secret config.
+
+- name: "10.2 — Ensure the alerting rule/route directories exist on the primary"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ openbao_prometheus_alerts_rule_dir }}"
+    - "{{ openbao_loki_audit_rule_dir }}"
+    - "{{ openbao_alertmanager_route_dir }}"
+  when: openbao_alerts_enabled | bool
+
+- name: "10.2 — Render the Prometheus alerting rules (OpenBaoSealed/UnsealerUnreachable/LeaseCountHigh, Req 10.4/10.5/10.6)"
+  ansible.builtin.template:
+    src: "prometheus-openbao-alerts.yml.j2"
+    dest: "{{ openbao_prometheus_alerts_rule_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: openbao_alerts_enabled | bool
+
+- name: "10.2 — Render the Loki audit-failure ruler rule (OpenBaoAuditFailure within 1 min, Req 10.7)"
+  ansible.builtin.template:
+    src: "loki-openbao-audit-rule.yml.j2"
+    dest: "{{ openbao_loki_audit_rule_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: openbao_alerts_enabled | bool
+
+- name: "10.2 — Render the Alertmanager route + 30-min escalation to the secondary on-call receiver (Req 10.4/10.9)"
+  ansible.builtin.template:
+    src: "alertmanager-openbao-route.yml.j2"
+    dest: "{{ openbao_alertmanager_route_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: openbao_alerts_enabled | bool
+
+- name: "10.2 — Report §10.2 completion (four alerts + escalation route wired)"
+  ansible.builtin.debug:
+    msg: >-
+      §10.2 ready — SVC-07 contributed its alerting fragments:
+      Prometheus rules '{{ openbao_prometheus_alerts_rule_file }}'
+      (OpenBaoSealed critical > {{ openbao_alert_sealed_for }},
+      OpenBaoUnsealerUnreachable critical > {{ openbao_alert_unsealer_unreachable_for }},
+      OpenBaoLeaseCountHigh warning > threshold
+      {{ openbao_alert_lease_count_threshold }} for {{ openbao_alert_lease_count_for }});
+      Loki rule '{{ openbao_loki_audit_rule_file }}' (OpenBaoAuditFailure critical,
+      fires within 1 min of an audit-write-failure log line — distinct from the
+      OPENBAO_SNAPSHOT_FAILURE alert); Alertmanager route
+      '{{ openbao_alertmanager_route_file }}' routing to
+      '{{ openbao_alertmanager_primary_receiver }}' with a
+      {{ openbao_alertmanager_escalation_after }} unacknowledged escalation to
+      '{{ openbao_alertmanager_secondary_receiver }}' (Req 10.9). Auto-resolve on
+      the three metric alerts is inherent to Prometheus alerting.
+  when: openbao_alerts_enabled | bool

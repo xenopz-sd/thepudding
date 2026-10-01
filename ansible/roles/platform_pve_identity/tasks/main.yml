@@ -1,0 +1,419 @@
+---
+# tasks/main.yml — platform_pve_identity (Platform Prerequisites Bootstrap —
+# host bucket, OPT-IN PVE identity creation).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/ (requirements.md,
+# design.md, tasks.md). Design ref: "Component 3: platform_pve_identity".
+# Implements SPEC TASK 5.1 (role + user + ACL) and SPEC TASK 5.2 (token mint +
+# 0600 persist + force opt-in). Requirements 2.1–2.6 / Property 2.
+#
+# ============================================================================ #
+# GATING (Req 2.1): the ENTIRE role no-ops unless the operator opted in via     #
+# `-e bootstrap_pve_identity=true`. While the flag is false the host bucket     #
+# neither requires nor reads an Admin_Bootstrap_Credential. The gate is applied #
+# once, on the whole-role block below, so every task inherits it.               #
+#                                                                               #
+# EXECUTION MODEL (design "Key implementation reality"): the bpg/proxmox        #
+# Terraform provider authenticates AS the terraform@pve token, so it cannot     #
+# create that token (chicken-and-egg). PVE role/user/token management is        #
+# `pveum`, the native PVE CLI, run ON THE PROXMOX HOST over SSH via             #
+# `delegate_to: {{ platform_pve_identity_host }}` as root@pam. This keeps the   #
+# single highest-privilege action on the host and never entangles it with the  #
+# Terraform state.                                                              #
+#                                                                               #
+# ADMIN CREDENTIAL RECONCILIATION (Req 2.4, 2.5): the design speaks of an       #
+# Admin_Bootstrap_Credential. When `pveum` runs LOCALLY ON THE PVE HOST AS      #
+# root@pam, the node's root already holds full PVE admin rights — so "having    #
+# root SSH to the host" IS the admin capability, and pveum needs NO separate    #
+# admin password/token. We therefore do NOT pass a Proxmox admin secret to      #
+# pveum. We DO honour Req 2.5 (fail closed if an admin context is unavailable)  #
+# by asserting, before any mutation, that (a) the operator opted in AND (b) the #
+# host is resolvable and reachable as root. cluster.env's                       #
+# PROXMOX_ADMIN_PASSWORD / PROXMOX_ADMIN_TOKEN remain the documented,           #
+# bootstrap-only carrier the preflight validates is PRESENT when the operator   #
+# chooses to supply it — they are resolved no_log and NEVER persisted or        #
+# echoed. Whether or not that value is set, the actual admin capability used is #
+# root-on-host; the role never falls back to a lower-privilege path.            #
+#                                                                               #
+# SECRET HYGIENE (Req 2.3, 2.4 / Property 2, security-standards.md): every task #
+# that could surface the Admin_Bootstrap_Credential OR the minted token value   #
+# is no_log:true. The minted token is written ONLY to the 0600 cluster.env,     #
+# never to stdout/stderr/log. INFO decision logs name the token id only, never  #
+# the secret ("value not shown").                                               #
+# ============================================================================ #
+
+- name: "PVE identity | opt-in bootstrap of terraform@pve role + user + token"
+  # Req 2.1 — the whole role is gated on the opt-in flag; default OFF.
+  when: bootstrap_pve_identity | default(false) | bool
+  # Run every command in this block on the Proxmox host over SSH as root@pam
+  # (the admin context). run_once because the identity is cluster-wide, created
+  # exactly once regardless of how many hosts are in scope.
+  delegate_to: "{{ platform_pve_identity_host }}"
+  run_once: true
+  vars:
+    # The orchestrator play loads ONLY localhost.yml, so the delegate target
+    # (the Proxmox host IP) is NOT a known inventory host. Without an explicit
+    # connection, Ansible would inherit localhost's `connection: local` and run
+    # `pveum` ON THE CONTROL NODE (where it does not exist -> ENOENT). Force a
+    # real SSH connection so the delegated `pveum` argv runs ON THE HOST as
+    # root@pam. `delegate_to` already supplies the target address; do NOT also
+    # set `ansible_host` here (that produced a malformed target and an
+    # "invalid characters" SSH failure).
+    ansible_connection: ssh
+    ansible_user: "{{ platform_pve_identity_ssh_user }}"
+  block:
+
+    # -------------------------------------------------------------------- #
+    # Req 2.5 — fail closed if the admin context is unavailable. The admin #
+    # capability is root-on-the-host (see the header reconciliation note); #
+    # we require the host address to be resolved (not empty / not the      #
+    # committed placeholder). Reachability-as-root then surfaces naturally #
+    # on the first delegated pveum command (a connection failure fails the #
+    # block -> the bucket rescue). We never fall back to a lower-privilege #
+    # path. This assert carries no secret, so it is not no_log.            #
+    # -------------------------------------------------------------------- #
+    - name: "PVE identity | Assert an admin context (root-on-host) is available (Req 2.5)"
+      ansible.builtin.assert:
+        that:
+          - "platform_pve_identity_host | default('') | length > 0"
+          - "'<' not in platform_pve_identity_host"
+        fail_msg: >-
+          PVE identity bootstrap was requested (-e bootstrap_pve_identity=true)
+          but no Proxmox host address is resolvable. The admin context for the
+          identity bootstrap is root SSH on the Proxmox host — set
+          PROXMOX_HOST_LAN_IP in {{ cluster_env_file }} (see cluster.env.example)
+          so the orchestrator can reach the host as root@pam. The role does not
+          fall back to a lower-privilege path (Req 2.5).
+        success_msg: >-
+          Admin context available: root-on-host at {{ platform_pve_identity_host }}
+          (pveum runs as root@pam; no separate admin secret is required).
+
+    # ================================================================== #
+    # SPEC TASK 5.1 — role + user + ACL (idempotent, list-then-act).     #
+    # Req 2.1, 2.2, 2.6 / Property 2.                                    #
+    # ================================================================== #
+
+    # List existing PVE roles once. `pveum role list` mutates nothing and is
+    # check-mode-safe. --output-format json so we can test membership exactly.
+    - name: "PVE identity | List PVE roles (detect the custom role)"
+      ansible.builtin.command:
+        argv:
+          - "{{ platform_pve_identity_pveum_bin }}"
+          - role
+          - list
+          - --output-format
+          - json
+      register: platform_pve_identity_role_list
+      changed_when: false
+
+    # Parse the role ids present on the cluster. Non-secret.
+    - name: "PVE identity | Bind the set of existing role ids"
+      ansible.builtin.set_fact:
+        platform_pve_identity_existing_roles: >-
+          {{ (platform_pve_identity_role_list.stdout | from_json)
+             | map(attribute='roleid') | list }}
+      changed_when: false
+
+    # ADD the custom role with the least-privilege set when ABSENT. Never grants
+    # Administrator (Req 2.2). --privs is the documented terraform@pve set from
+    # defaults. changed_when: true because a successful add IS a change.
+    - name: "PVE identity | Add least-privilege role {{ platform_pve_identity_role_id }} (absent -> create)"
+      ansible.builtin.command:
+        argv:
+          - "{{ platform_pve_identity_pveum_bin }}"
+          - role
+          - add
+          - "{{ platform_pve_identity_role_id }}"
+          - --privs
+          - "{{ platform_pve_identity_privs | trim }}"
+      when: platform_pve_identity_role_id not in platform_pve_identity_existing_roles
+      register: platform_pve_identity_role_added
+      changed_when: platform_pve_identity_role_added.rc == 0
+
+    # RECONCILE the privilege set when the role already EXISTS — `role modify`
+    # sets the role's privileges to exactly this set, so a drifted role is
+    # brought back to the least-privilege definition (idempotent reconciliation,
+    # Req 2.6). Non-secret (the privs are public identifiers).
+    - name: "PVE identity | Reconcile privileges on role {{ platform_pve_identity_role_id }} (present -> modify)"
+      ansible.builtin.command:
+        argv:
+          - "{{ platform_pve_identity_pveum_bin }}"
+          - role
+          - modify
+          - "{{ platform_pve_identity_role_id }}"
+          - --privs
+          - "{{ platform_pve_identity_privs | trim }}"
+      when: platform_pve_identity_role_id in platform_pve_identity_existing_roles
+      register: platform_pve_identity_role_modified
+      # `role modify` is not natively idempotent-reporting; we treat a
+      # reconciliation as changed only if the run actually altered the set is
+      # not distinguishable from stdout, so report changed on rc==0 to be
+      # honest that we (re)asserted the privileges.
+      changed_when: platform_pve_identity_role_modified.rc == 0
+
+    # List existing PVE users once (detect terraform@pve). Non-secret.
+    - name: "PVE identity | List PVE users (detect the service account)"
+      ansible.builtin.command:
+        argv:
+          - "{{ platform_pve_identity_pveum_bin }}"
+          - user
+          - list
+          - --output-format
+          - json
+      register: platform_pve_identity_user_list
+      changed_when: false
+
+    - name: "PVE identity | Bind the set of existing user ids"
+      ansible.builtin.set_fact:
+        platform_pve_identity_existing_users: >-
+          {{ (platform_pve_identity_user_list.stdout | from_json)
+             | map(attribute='userid') | list }}
+      changed_when: false
+
+    # ADD the terraform@pve user when ABSENT (idempotent, Req 2.6). Non-secret —
+    # this creates the identity, not a credential.
+    - name: "PVE identity | Ensure user {{ platform_pve_identity_user }} exists (absent -> create)"
+      ansible.builtin.command:
+        argv:
+          - "{{ platform_pve_identity_pveum_bin }}"
+          - user
+          - add
+          - "{{ platform_pve_identity_user }}"
+      when: platform_pve_identity_user not in platform_pve_identity_existing_users
+      register: platform_pve_identity_user_added
+      changed_when: platform_pve_identity_user_added.rc == 0
+
+    # Bind the role to the user at the root ACL path `/`. `pveum aclmod` is
+    # idempotent (re-adding an existing ACL entry is a no-op on the cluster),
+    # but it always reports success, so we cannot cheaply detect no-change from
+    # stdout. Read the current ACL first to keep changed_when honest.
+    - name: "PVE identity | Read current ACLs (detect the role binding at /)"
+      ansible.builtin.command:
+        argv:
+          - "{{ platform_pve_identity_pveum_bin }}"
+          - acl
+          - list
+          - --output-format
+          - json
+      register: platform_pve_identity_acl_list
+      changed_when: false
+
+    - name: "PVE identity | Bind whether the role is already ACL'd to the user at /"
+      ansible.builtin.set_fact:
+        platform_pve_identity_acl_present: >-
+          {{ (platform_pve_identity_acl_list.stdout | from_json)
+             | selectattr('path', 'equalto', '/')
+             | selectattr('ugid', 'equalto', platform_pve_identity_user)
+             | selectattr('roleid', 'equalto', platform_pve_identity_role_id)
+             | list | length > 0 }}
+      changed_when: false
+
+    - name: "PVE identity | Ensure ACL binds role to {{ platform_pve_identity_user }} at / (absent -> aclmod)"
+      ansible.builtin.command:
+        argv:
+          - "{{ platform_pve_identity_pveum_bin }}"
+          - aclmod
+          - /
+          - -user
+          - "{{ platform_pve_identity_user }}"
+          - -role
+          - "{{ platform_pve_identity_role_id }}"
+      when: not platform_pve_identity_acl_present
+      register: platform_pve_identity_acl_added
+      changed_when: platform_pve_identity_acl_added.rc == 0
+
+    # ================================================================== #
+    # SPEC TASK 5.2 — token mint + 0600 persist (+ force opt-in).        #
+    # Req 2.3, 2.4, 2.6 / Property 2.                                    #
+    # ================================================================== #
+
+    # List the user's existing API tokens once (detect the configured token id).
+    # Non-secret: `token list` shows token ids, NOT the secret values. PVE never
+    # re-emits an existing token's secret, so this is the ONLY way to know
+    # whether a mint is needed.
+    - name: "PVE identity | List {{ platform_pve_identity_user }} API tokens (detect token id)"
+      ansible.builtin.command:
+        argv:
+          - "{{ platform_pve_identity_pveum_bin }}"
+          - user
+          - token
+          - list
+          - "{{ platform_pve_identity_user }}"
+          - --output-format
+          - json
+      register: platform_pve_identity_token_list
+      changed_when: false
+
+    - name: "PVE identity | Bind whether the configured token id already exists"
+      ansible.builtin.set_fact:
+        platform_pve_identity_token_exists: >-
+          {{ (platform_pve_identity_token_list.stdout | from_json)
+             | map(attribute='tokenid') | select('equalto', platform_pve_identity_token_id)
+             | list | length > 0 }}
+      changed_when: false
+
+    # ---------------------------------------------------------------- #
+    # MINT PATH (Req 2.3): mint when the token id is ABSENT, OR when    #
+    # the operator opted into a deliberate rotation via                #
+    # `-e bootstrap_pve_token_force=true`. PVE will not re-emit an      #
+    # existing token's secret, so for the force path we remove-then-add #
+    # to obtain a fresh one-time secret.                               #
+    # ---------------------------------------------------------------- #
+    - name: "PVE identity | Mint terraform@pve token (absent, or force-rotate)"
+      when: >-
+        (not platform_pve_identity_token_exists)
+        or (bootstrap_pve_token_force | default(false) | bool)
+      block:
+
+        # FORCE-ROTATE only: remove the existing token first so `token add`
+        # can re-emit a fresh one-time secret (PVE refuses to add a duplicate
+        # id and never re-reveals the old secret). no_log — although a remove
+        # prints only the id, keep the whole rotation path hygienic.
+        - name: "PVE identity | Force-rotate: remove existing token {{ platform_pve_identity_token_id }} first (no_log)"
+          ansible.builtin.command:
+            argv:
+              - "{{ platform_pve_identity_pveum_bin }}"
+              - user
+              - token
+              - remove
+              - "{{ platform_pve_identity_user }}"
+              - "{{ platform_pve_identity_token_id }}"
+          when: platform_pve_identity_token_exists and (bootstrap_pve_token_force | default(false) | bool)
+          register: platform_pve_identity_token_removed
+          changed_when: platform_pve_identity_token_removed.rc == 0
+          no_log: true
+
+        # Mint the token. --privsep 0 so the token inherits the user's full
+        # privileges (the terraform@pve role ACL) rather than a separate,
+        # empty token-privilege set. --output-format json so we can parse the
+        # one-time secret `value` deterministically. no_log:true — the JSON
+        # output CARRIES the one-time secret.
+        - name: "PVE identity | Add API token {{ platform_pve_identity_token_id }} (--privsep 0, capture, no_log)"
+          ansible.builtin.command:
+            argv:
+              - "{{ platform_pve_identity_pveum_bin }}"
+              - user
+              - token
+              - add
+              - "{{ platform_pve_identity_user }}"
+              - "{{ platform_pve_identity_token_id }}"
+              - --privsep
+              - "0"
+              - --output-format
+              - json
+          register: platform_pve_identity_token_add
+          changed_when: platform_pve_identity_token_add.rc == 0
+          no_log: true
+
+        # Parse the one-time secret `value` out of the JSON output and compose
+        # the full API token string `terraform@pve!<id>=<uuid>` (the exact form
+        # cluster.env / the bpg provider consume). no_log:true — binds the
+        # secret in memory. changed_when:false — a pure parse, not a mutation.
+        - name: "PVE identity | Compose the full API token string (no_log)"
+          ansible.builtin.set_fact:
+            # `<user>!<token-id>=<uuid>` — the exact form cluster.env / the bpg
+            # provider consume. The `.value` is the one-time secret uuid.
+            platform_pve_identity_secret_uuid: "{{ (platform_pve_identity_token_add.stdout | from_json).value }}"
+            platform_pve_identity_full_token: >-
+              {{ platform_pve_identity_user }}!{{ platform_pve_identity_token_id
+              }}={{ (platform_pve_identity_token_add.stdout | from_json).value }}
+          no_log: true
+          changed_when: false
+
+        # Guard that a non-empty secret was actually captured — a token add that
+        # reported success but yielded an empty value must never write a blank
+        # credential. no_log so the value is never surfaced by the assert.
+        - name: "PVE identity | Assert the one-time token secret was captured (no_log)"
+          ansible.builtin.assert:
+            that:
+              - "platform_pve_identity_secret_uuid is defined"
+              - "(platform_pve_identity_secret_uuid | length) > 0"
+            fail_msg: >-
+              The terraform@pve token was minted but its one-time secret could
+              not be parsed from the pveum output. The value is NOT echoed.
+              Re-run with -e bootstrap_pve_token_force=true to rotate to a fresh
+              token, or create it manually on the host.
+            success_msg: "terraform@pve token secret captured (value not shown)."
+          no_log: true
+
+        # Persist the composed token to cluster.env at 0600 as PROXMOX_API_TOKEN
+        # (Req 2.3), mirroring svc07_bootstrap's OPENBAO_ADMIN_TOKEN persist.
+        # lineinfile create+regexp updates an existing entry or appends a new
+        # one, so a re-run reconciles rather than duplicates. no_log — the line
+        # carries the secret. A write failure is caught and re-raised WITHOUT
+        # echoing the value.
+        - name: "PVE identity | Persist PROXMOX_API_TOKEN to {{ cluster_env_file }} at 0600 (Req 2.3, no_log)"
+          block:
+            - name: "PVE identity | Write/update PROXMOX_API_TOKEN (no_log)"
+              ansible.builtin.lineinfile:
+                path: "{{ platform_pve_identity_env_path }}"
+                regexp: "^\\s*PROXMOX_API_TOKEN\\s*="
+                line: "PROXMOX_API_TOKEN={{ platform_pve_identity_full_token }}"
+                create: true
+                mode: "0600"
+              # Persist runs on the control node (the cluster.env lives in the
+              # repo checkout there), NOT on the Proxmox host. The enclosing
+              # block sets `ansible_connection: ssh` for the host `pveum`
+              # commands; override it back to `local` here so delegating to
+              # localhost uses a local connection instead of trying to SSH to
+              # localhost (which fails UNREACHABLE).
+              delegate_to: localhost
+              vars:
+                ansible_connection: local
+              no_log: true
+
+            # Enforce mode 0600 explicitly (Req 2.3). lineinfile's `mode:` is
+            # only reliably applied when it CREATES the file; on an already-
+            # existing cluster.env it may leave the prior mode intact, so we
+            # assert 0600 here regardless. Non-secret (touches mode only), so
+            # NOT no_log — but it names no value.
+            - name: "PVE identity | Enforce 0600 on {{ cluster_env_file }} (Req 2.3)"
+              ansible.builtin.file:
+                path: "{{ platform_pve_identity_env_path }}"
+                mode: "0600"
+              delegate_to: localhost
+              vars:
+                ansible_connection: local
+          rescue:
+            - name: "PVE identity | Halt — minted token could not be persisted (no value echoed)"
+              ansible.builtin.fail:
+                msg: >-
+                  The terraform@pve token was minted, but writing
+                  PROXMOX_API_TOKEN to {{ cluster_env_file }} failed — the
+                  credential could not be persisted. The token value is NOT
+                  echoed. Fix the file permissions/path and re-run with
+                  -e bootstrap_pve_token_force=true to rotate to a fresh token.
+
+        # INFO decision log (composition-wiring.md): name the token id and the
+        # action, NEVER the secret. Not no_log — it deliberately carries no
+        # secret value.
+        - name: "PVE identity | INFO — token minted + persisted (value not shown)"
+          ansible.builtin.debug:
+            msg: >-
+              PVE identity: minted terraform@pve token id
+              '{{ platform_pve_identity_token_id }}'
+              (value not shown), persisted to {{ cluster_env_file }} at 0600
+              as PROXMOX_API_TOKEN.
+
+        # Scrub the composed token from memory now it is persisted — it must not
+        # linger as a fact. no_log.
+        - name: "PVE identity | Scrub the composed token fact from memory (no_log)"
+          ansible.builtin.set_fact:
+            platform_pve_identity_full_token: ""
+          no_log: true
+          changed_when: false
+
+    # ---------------------------------------------------------------- #
+    # NO-OP PATH (Req 2.6): the token id EXISTS and force is false ->   #
+    # mint nothing (PVE won't re-emit the secret). Report the existing  #
+    # id via an INFO log; carries no secret, so not no_log.             #
+    # ---------------------------------------------------------------- #
+    - name: "PVE identity | INFO — token already exists, minting nothing (Req 2.6)"
+      ansible.builtin.debug:
+        msg: >-
+          PVE identity: terraform@pve token '{{ platform_pve_identity_token_id }}'
+          already exists (value not shown); mint skipped. Pass
+          -e bootstrap_pve_token_force=true to rotate it to a fresh secret.
+      when: >-
+        platform_pve_identity_token_exists
+        and not (bootstrap_pve_token_force | default(false) | bool)

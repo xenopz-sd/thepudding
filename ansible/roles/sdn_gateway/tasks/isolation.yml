@@ -1,0 +1,92 @@
+---
+# tasks/isolation.yml — sdn_gateway (spec task 9, C5)
+#
+# Ensures the STANDING isolation DENY rules on the Proxmox host via `pve-firewall`
+# (nftables-based, written through `sudo pvesh`). These are the isolation FLOOR —
+# routing establishes reachability, the firewall establishes PERMISSION — and are
+# NOT per-VLAN teardown-able; they remain in force regardless of which VLANs are
+# served or torn down:
+#
+#   - DENY any path from a served/project VLAN or the shared-services VLAN to the
+#     management VLAN ({{ sdn_gateway_management_vlan_id }}) — enforcing that
+#     VLAN 10 stays unreachable from project/shared VLANs (Req 2.2, SEC.1,
+#     security-standards.md, domain-rules.md §2).
+#   - DENY cross-project VLAN-to-VLAN traffic — a served project VLAN must not
+#     gain a path to another project's VLAN as a side effect of being made
+#     reachable (Req 2.3, integration-boundaries.md §6).
+#
+# Each rule is check-then-change (added only when its managed comment tag is
+# absent) so a second run is changed=0 (Req 6.5). A failed rule write is a hard
+# failure (no `failed_when: false`) so the isolation floor is never believed to
+# be present when it is not. NO secret material is read or echoed here.
+
+# Read the current cluster firewall rules once, so both DENY rules below are
+# added only when absent. `pvesh get` mutates nothing and is check-mode-safe.
+- name: "Isolation | Read current cluster firewall rules"
+  ansible.builtin.command:
+    cmd: sudo pvesh get /cluster/firewall/rules --output-format json
+  register: sdn_gateway_iso_rules_raw
+  changed_when: false
+  check_mode: false
+
+- name: "Isolation | Compute the existing rule-comment set"
+  ansible.builtin.set_fact:
+    sdn_gateway_iso_comments: >-
+      {{ sdn_gateway_iso_rules_raw.stdout | from_json
+         | map(attribute='comment', default='') | list }}
+    sdn_gateway_iso_deny_mgmt_comment: >-
+      sdn_gateway: DENY any -> management VLAN {{ sdn_gateway_management_vlan_id }} (managed)
+    sdn_gateway_iso_deny_xproj_comment: "sdn_gateway: DENY cross-project VLAN -> VLAN (managed)"
+
+# --- DENY -> management VLAN (10) --------------------------------------------
+# Any source -> the management VLAN's /24 is DROPped. Placed as a standing rule;
+# the management VLAN must never be reachable from a served/project/shared VLAN.
+- name: Isolation - ensure DENY (pvesh) to management VLAN {{ sdn_gateway_management_vlan_id }}
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - pvesh
+      - create
+      - /cluster/firewall/rules
+      - "--enable=1"
+      - "--type=in"
+      - "--action=DROP"
+      - "--dest=10.0.{{ sdn_gateway_management_vlan_id }}.0/24"
+      - "--comment={{ sdn_gateway_iso_deny_mgmt_comment }}"
+  when: sdn_gateway_iso_deny_mgmt_comment not in sdn_gateway_iso_comments
+  register: sdn_gateway_iso_deny_mgmt
+  changed_when: sdn_gateway_iso_deny_mgmt.rc == 0
+  notify: Reload pve-firewall
+
+# --- DENY cross-project VLAN -> VLAN -----------------------------------------
+# Deny ROUTED (forward) traffic between per-project VLAN subnets. Per-project
+# VLANs are 100+ and address as 10.0.<vlan_id>.0/24 (NET-00 §3), so the whole
+# per-project space sits inside 10.0.128.0/17 (VLAN 128–254) plus 10.0.100.0/22
+# .. — rather than enumerate that irregular range, we DROP forward traffic within
+# the project supernet `{{ sdn_gateway_project_vlan_supernet }}` (default the
+# lower-half project range). This is a `forward`-type rule so it targets
+# guest<->guest ROUTED traffic only; it does NOT touch:
+#   - the admin -> served-VLAN ALLOW (an `in`-type rule to the host), nor
+#   - the shared-services VLAN (20, 10.0.20.0/24) — which is OUTSIDE the project
+#     supernet and remains the sanctioned cross-project meeting point (Req 6 /
+#     integration-boundaries.md §6). The management VLAN is denied by its own
+#     rule above.
+# A project VLAN thus never gains a path to another project's VLAN as a side
+# effect of being made reachable (Req 2.3).
+- name: "Isolation | Ensure DENY cross-project VLAN -> VLAN (pvesh)"
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - pvesh
+      - create
+      - /cluster/firewall/rules
+      - "--enable=1"
+      - "--type=forward"
+      - "--action=DROP"
+      - "--source={{ sdn_gateway_project_vlan_supernet }}"
+      - "--dest={{ sdn_gateway_project_vlan_supernet }}"
+      - "--comment={{ sdn_gateway_iso_deny_xproj_comment }}"
+  when: sdn_gateway_iso_deny_xproj_comment not in sdn_gateway_iso_comments
+  register: sdn_gateway_iso_deny_xproj
+  changed_when: sdn_gateway_iso_deny_xproj.rc == 0
+  notify: Reload pve-firewall

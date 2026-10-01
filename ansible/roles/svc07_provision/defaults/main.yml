@@ -1,0 +1,59 @@
+---
+# defaults/main.yml — svc07_provision (SVC-07 installer — Phase 2: Provision)
+#
+# Phase-2 phase-specific defaults (spec task 4.2), moved VERBATIM from the
+# play-level vars of svc-07-bootstrap.yml (svc07_tf_root, svc07_tf_env — lazy,
+# referencing Phase-1 facts). Cross-phase constants (svc07_repo_root,
+# svc07_generated_inventory, svc07_guest_ips, VMIDs 1070/1071,
+# svc07_autodetect_sentinel, svc07_proxmox_validate_certs) stay as play-level
+# vars on svc-07-bootstrap.yml and are read from the play (design.md "Data
+# Models"). NO secret value ever lives here; svc07_tf_env is evaluated lazily
+# and every consumer sets no_log:true.
+
+# The SVC-07 Terraform root (absolute, so the child `terraform` process runs
+# in it regardless of the play's cwd) and the same root as a repo-relative
+# path (for generate_inventory.py --root, which the generator resolves from
+# the repo root it is chdir'd into).
+svc07_tf_root: "{{ svc07_repo_root }}/infra/projects/svc-07-secrets-manager"
+# Environment passed to the child `terraform` init/apply processes. The
+# Proxmox endpoint/token travel here as TF_VAR_* (never on the command line);
+# every task using this env sets no_log:true (Req 4.4 note, 8.8). Evaluated
+# lazily against the Phase-1 resolved facts.
+# TF_VAR_proxmox_endpoint uses the CANONICAL BASE (fix-cluster-env-endpoint-path):
+# svc07_proxmox_endpoint_base is a Phase-1 set_fact (see the Preflight
+# normalize task). svc07_tf_env is evaluated LAZILY, and every consumer of it
+# runs in Phase 2 (terraform init/apply), strictly after Phase 1 has set the
+# base fact — so the reference resolves to the normalized base. The
+# default(svc07_proxmox_endpoint) fallback keeps it well-defined if the base
+# fact is somehow absent, and default('') guards a fully-unbound value.
+# TF_VAR_proxmox_insecure is DERIVED from the same svc07_proxmox_validate_certs
+# toggle Phase-1 Preflight's uri tasks use as their validate_certs
+# (fix-cluster-env-endpoint-path, TLS half). ONE operator toggle now governs
+# BOTH the preflight reachability checks AND the bpg/proxmox provider's TLS
+# verification, so the two can never drift: insecure == NOT validate_certs.
+# This is the same lesson as the endpoint — a Terraform provider connection
+# setting must be derived from the same cluster config preflight uses, not
+# left to a separate, un-passed default. Terraform accepts the strings
+# "true"/"false" for a bool TF_VAR, and `| lower` yields exactly those.
+# TF_VAR_operator_ssh_public_keys is the (c) SSH-KEY member of the same
+# connection-settings-from-cluster-config family (fix-cluster-env-endpoint-path:
+# (a) endpoint path, (b) TLS verification, (c) SSH public key for guest
+# reachability). It is a Terraform list(string), so it MUST be valid JSON
+# (e.g. ["ssh-ed25519 AAAA... comment"]); the operator supplies a PATH to a
+# PUBLIC key file (PROXMOX_SSH_PUBLIC_KEY_FILE), the Phase-1 read task below
+# reads + JSON-encodes it into svc07_operator_ssh_public_keys_json, and this
+# entry passes that verbatim. PUBLIC key only — never a private key. Absent =>
+# svc07_operator_ssh_public_keys_json defaults to "[]" => Terraform's
+# `dynamic user_account` block is omitted => strict no-op (guests provision
+# but are SSH-unreachable, the documented default). It ONLY takes effect at
+# guest CREATION — an already-created guest must be clean-slate re-provisioned
+# for a newly-supplied key to land (see the forthcoming state-warning/
+# reprovision spec). Evaluated LAZILY like the rest of svc07_tf_env: every
+# consumer runs in Phase 2, strictly after the Phase-1 read task has set the
+# fact, so the reference resolves to the encoded list.
+svc07_tf_env:
+  TF_VAR_proxmox_endpoint: >-
+    {{ svc07_proxmox_endpoint_base | default(svc07_proxmox_endpoint) | default('') }}
+  TF_VAR_proxmox_api_token: "{{ svc07_proxmox_api_token | default('') }}"
+  TF_VAR_proxmox_insecure: "{{ (not (svc07_proxmox_validate_certs | bool)) | lower }}"
+  TF_VAR_operator_ssh_public_keys: "{{ svc07_operator_ssh_public_keys_json | default('[]') }}"

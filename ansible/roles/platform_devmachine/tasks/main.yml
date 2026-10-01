@@ -1,0 +1,219 @@
+---
+# tasks/main.yml — platform_devmachine (Platform Prerequisites Bootstrap —
+# devmachine bucket, emit by default / apply after GO).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/ (requirements.md,
+# design.md, tasks.md). Design ref: "Component 6: platform_devmachine".
+# Source of the emitted commands: TESTING.md sections
+#   (b) "The developer adds one static route" and
+#   (c) "One-time SSH client config".
+#
+# Runs on the DEVELOPER'S WORKSTATION (hosts: localhost, connection: local).
+# NO throwaway guard here — this bucket mutates only the workstation, never the
+# shared/throwaway/production cluster (Req 7.4).
+#
+# Two modes:
+#   * EMIT (DEFAULT, mutates nothing): compose from the resolved cluster.env the
+#     exact `sudo ip route add 10.0.<vlan>.0/24 via <proxmox-lan-ip>` command(s)
+#     for the served VLAN subnet(s), the ifupdown persistence snippet, and the
+#     `~/.ssh/config` identity-pin block, then print them ALL via a single
+#     `ansible.builtin.debug` with every placeholder RESOLVED — directly
+#     runnable / shareable (Req 5.1, 5.4).
+#   * APPLY (opt-in, `when: devmachine_apply | default(false) | bool`): add the
+#     route(s) (idempotent — an already-present route is not an error), write
+#     the persistence file, and ensure the ssh_config block via blockinfile
+#     (Req 5.2, 5.3). A step failing (e.g. no sudo) surfaces the OS error and
+#     leaves the rest documented (Req 5.5).
+
+# ------------------------------------------------------------------ #
+# Resolve cluster.env INDEPENDENTLY (the devmachine bucket runs         #
+# standalone under bootstrap_scope=devmachine, so it does not rely on   #
+# preflight binding facts). Mirrors the svc07_clean_slate independent   #
+# resolve. no_log — the helper's JSON stdout carries the API token by   #
+# key even though this bucket consumes only non-secret values from it.  #
+# ------------------------------------------------------------------ #
+- name: "DevMachine | Resolve cluster env ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python }}"
+      - "{{ platform_devmachine_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_devmachine_env_resolve
+  changed_when: false
+  no_log: true
+
+- name: "DevMachine | Bind the resolved devmachine parameters"
+  ansible.builtin.set_fact:
+    # The `via` gateway — the Proxmox host LAN IP (Req 5.1). Mandatory for this
+    # bucket: without it the route command is meaningless, so fail closed below.
+    platform_devmachine_lan_ip: >-
+      {{ (platform_devmachine_env_resolve.stdout | from_json).get('TF_VAR_proxmox_host_lan_ip', '') }}
+    # Served VLAN ids: cluster.env comma-list when present, else the default
+    # (20). Split + trim + drop empties into a clean list of VLAN id strings.
+    platform_devmachine_served_vlans: >-
+      {{ ((platform_devmachine_env_resolve.stdout | from_json).get('TF_VAR_platform_served_vlan_ids',
+          platform_devmachine_served_vlan_default) | string
+          | split(',') | map('trim') | select | list) }}
+    # SSH identity file for the ~/.ssh/config pin: cluster.env value when
+    # present, else the documented default. A path (public key), never a secret.
+    platform_devmachine_ssh_identity: >-
+      {{ (platform_devmachine_env_resolve.stdout | from_json).get('TF_VAR_operator_ssh_public_key_file', '')
+         or platform_devmachine_ssh_identity_default }}
+
+- name: "DevMachine | Fail closed when the Proxmox host LAN IP is unresolved"
+  ansible.builtin.fail:
+    msg: >-
+      PROXMOX_HOST_LAN_IP is not set in {{ cluster_env_file }} — the devmachine
+      bucket needs it as the `via` gateway for the static route
+      (`ip route add 10.0.<vlan>.0/24 via <proxmox-lan-ip>`). Add
+      PROXMOX_HOST_LAN_IP=<your Proxmox host LAN IP> to {{ cluster_env_file }}
+      (see cluster.env.example) and re-run.
+  when: (platform_devmachine_lan_ip | trim) | length == 0
+
+# A real newline character as a fact — Jinja string literals do NOT interpret
+# `\n` as a newline, so join/compose steps use this to build multi-line content.
+- name: "DevMachine | Bind a literal newline helper"
+  ansible.builtin.set_fact:
+    platform_devmachine_nl: "{{ '\n' }}"
+
+# Compose the per-VLAN artefacts ONCE, reused by both emit and apply so the two
+# modes can never drift: the exact route command, the persistence stanza (a list
+# of lines, joined with a real newline), and the subnet — one entry per served
+# VLAN. Built with a stdlib-only loop (no extra collection needed).
+- name: "DevMachine | Build the structured per-VLAN artefact list"
+  ansible.builtin.set_fact:
+    platform_devmachine_artefacts: >-
+      {{ platform_devmachine_artefacts | default([]) + [{
+           'vlan': item,
+           'subnet': '10.0.' ~ item ~ '.0/24',
+           'route_cmd': 'sudo ip route add 10.0.' ~ item ~ '.0/24 via '
+                        ~ platform_devmachine_lan_ip,
+           'persist_file': platform_devmachine_persist_dir
+                           ~ '/sdn-route-' ~ item ~ '.cfg',
+           'persist_lines': [
+             'iface ' ~ platform_devmachine_iface ~ ' inet manual',
+             '    up   ip route add 10.0.' ~ item ~ '.0/24 via ' ~ platform_devmachine_lan_ip,
+             '    down ip route del 10.0.' ~ item ~ '.0/24 via ' ~ platform_devmachine_lan_ip
+           ]
+         }] }}
+  loop: "{{ platform_devmachine_served_vlans }}"
+
+# The ~/.ssh/config identity-pin block, exactly as TESTING.md section (c): a
+# wildcard Host 10.0.* block (covers VLAN 20 + every project VLAN per NET-00)
+# and a Host <proxmox-lan-ip> block for the host over the LAN. Composed once and
+# reused by both modes.
+- name: "DevMachine | Compose the ~/.ssh/config identity-pin block"
+  ansible.builtin.set_fact:
+    platform_devmachine_ssh_block: |
+      # All SDN guests (VLAN 20 shared services + every project VLAN 100+):
+      # 10.0.<vlan>.0/24 per NET-00, so 10.0.0.0/16 covers them all in one block.
+      Host 10.0.*
+          User root
+          IdentitiesOnly yes
+          IdentityFile {{ platform_devmachine_ssh_identity }}
+
+      # The Proxmox host itself (reached over the LAN, not via 10.0.*):
+      Host {{ platform_devmachine_lan_ip }}
+          User root
+          IdentitiesOnly yes
+          IdentityFile {{ platform_devmachine_ssh_identity }}
+
+# ------------------------------------------------------------------ #
+# EMIT mode — DEFAULT, mutates nothing. NOT gated on devmachine_apply. #
+# One debug (msg list) with every placeholder RESOLVED so the operator #
+# can copy/paste or share the commands directly (Req 5.1, 5.4).        #
+# ------------------------------------------------------------------ #
+# Build the human-facing persistence sub-lines once: for each VLAN, the target
+# drop-in path followed by its indented stanza lines. Kept out of the debug
+# expression so the msg list stays readable.
+- name: "DevMachine | Compose the persistence display lines"
+  ansible.builtin.set_fact:
+    platform_devmachine_persist_display: >-
+      {{ platform_devmachine_persist_display | default([])
+         + ['sudo tee ' ~ item.persist_file ~ " <<'EOF'"]
+         + item.persist_lines
+         + ['EOF', ''] }}
+  loop: "{{ platform_devmachine_artefacts }}"
+  loop_control:
+    label: "{{ item.persist_file }}"
+
+- name: "DevMachine | EMIT — runnable route + persistence + ssh_config (mutates nothing)"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        ['=== Developer workstation reachability (EMIT mode — nothing was changed) ==='] +
+        ['Run these on YOUR OWN machine to reach the served VLAN(s) '
+         ~ (platform_devmachine_served_vlans | join(', ')) ~ ' via Proxmox host '
+         ~ platform_devmachine_lan_ip ~ ':'] +
+        ['', '--- (b) Add the static route (per served VLAN): ---'] +
+        (platform_devmachine_artefacts | map(attribute='route_cmd') | list) +
+        ['', '--- (b) Make it persistent (ifupdown / /etc/network/interfaces.d — '
+         'set platform_devmachine_iface to your LAN interface): ---'] +
+        platform_devmachine_persist_display +
+        ['--- (c) One-time ~/.ssh/config identity pin '
+         '(append to ' ~ platform_devmachine_ssh_config_path ~ '): ---'] +
+        (platform_devmachine_ssh_block | split(platform_devmachine_nl))
+      }}
+
+# ------------------------------------------------------------------ #
+# APPLY mode — OPT-IN. Every mutating task below is gated              #
+# `when: devmachine_apply | default(false) | bool`. A failing step     #
+# (e.g. no sudo) surfaces the OS error; the emitted commands above     #
+# remain the documented fallback (Req 5.2, 5.3, 5.5).                  #
+# ------------------------------------------------------------------ #
+
+- name: "DevMachine | APPLY — add the static route(s) (idempotent)"
+  ansible.builtin.command:
+    argv:
+      - ip
+      - route
+      - add
+      - "{{ item.subnet }}"
+      - via
+      - "{{ platform_devmachine_lan_ip }}"
+  become: true
+  loop: "{{ platform_devmachine_artefacts }}"
+  loop_control:
+    label: "{{ item.subnet }} via {{ platform_devmachine_lan_ip }}"
+  register: platform_devmachine_route_add
+  # An already-present route is NOT an error (idempotent): the kernel returns
+  # "RTNETLINK answers: File exists". Any OTHER non-zero rc (e.g. no sudo) still
+  # fails, surfacing the real OS error (Req 5.5).
+  failed_when:
+    - platform_devmachine_route_add.rc != 0
+    - "'File exists' not in (platform_devmachine_route_add.stderr | default(''))"
+  # Changed only when the route was actually added (rc 0), not on the
+  # already-present no-op.
+  changed_when: platform_devmachine_route_add.rc == 0
+  when: devmachine_apply | default(false) | bool
+
+- name: "DevMachine | APPLY — ensure the persistence drop-in directory"
+  ansible.builtin.file:
+    path: "{{ platform_devmachine_persist_dir }}"
+    state: directory
+    mode: "0755"
+  become: true
+  when: devmachine_apply | default(false) | bool
+
+- name: "DevMachine | APPLY — write the ifupdown persistence stanza(s) (idempotent)"
+  ansible.builtin.copy:
+    dest: "{{ item.persist_file }}"
+    content: "{{ (item.persist_lines | join(platform_devmachine_nl)) ~ platform_devmachine_nl }}"
+    mode: "0644"
+  become: true
+  loop: "{{ platform_devmachine_artefacts }}"
+  loop_control:
+    label: "{{ item.persist_file }}"
+  when: devmachine_apply | default(false) | bool
+
+- name: "DevMachine | APPLY — ensure the ~/.ssh/config identity-pin block (idempotent)"
+  ansible.builtin.blockinfile:
+    path: "{{ platform_devmachine_ssh_config_path }}"
+    block: "{{ platform_devmachine_ssh_block }}"
+    marker: "{{ platform_devmachine_ssh_config_marker }}"
+    create: true
+    mode: "0600"
+  when: devmachine_apply | default(false) | bool

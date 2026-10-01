@@ -1,0 +1,101 @@
+---
+# tasks/backup.yml — openbao_install / TASK 11.1
+#
+# Nightly OpenBao Raft snapshot job (exit-code/non-empty gate + PBS hand-off).
+# INCLUDED FROM tasks/main.yml at the "EXTENSION POINT — Task 11.1" marker,
+# gated there on `openbao_role == "primary"` and `openbao_backup_enabled`.
+# The job runs ONLY on the PRIMARY — it holds the sealed Raft store.
+#
+# WHAT THIS FILE DEPLOYS (design.md "Error Handling (snapshot rows)"; Req 11.1,
+# 11.2, 11.3, 11.5, 11.6, FD.6):
+#   1. the snapshot directory + a root-only backup env dir on the primary host;
+#   2. the templated snapshot script at openbao_backup_script_path, which:
+#      - runs `bao operator raft snapshot save` via docker exec (ONLINE — OpenBao
+#        keeps serving, Req 11.6),
+#      - GATES the PBS hand-off on rc == 0 AND a non-empty file (Req 11.1),
+#      - on failure aborts the transfer, logs with the affected date, and emits
+#        the Loki-alertable OPENBAO_SNAPSHOT_FAILURE line (Req 11.2/11.5/FD.6),
+#      - keeps >= 7 nightly snapshots in PBS and locally (Req 11.3);
+#   3. a systemd service + timer firing nightly at 02:00 UTC (Req 11.1), enabled.
+#
+# NO SECRET IS TEMPLATED OR LOGGED. The scoped snapshot token
+# (sys/storage/raft/snapshot) is read at runtime from the root-only file
+# openbao_backup_token_file (Agent-rendered / operator-supplied, gitignored);
+# the PBS credential from the root-only EnvironmentFile openbao_backup_env_file.
+# Both are referenced by PATH / ENV-VAR-NAME only. This file writes NEITHER value
+# — it only ensures the directories exist with tight perms; provisioning the
+# token/credential CONTENT is a runtime (Agent/operator) concern, never Ansible.
+#
+# IDEMPOTENCY: every task is a file/template/systemd reconcile, so a re-run is a
+# no-op reporting changed=0 once converged (Req 13 spirit).
+
+- name: "11.1 — Ensure the snapshot output directory exists (root-only, 0700)"
+  ansible.builtin.file:
+    path: "{{ openbao_backup_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: "11.1 — Ensure the backup credential/config directory exists (root-only, 0700)"
+  ansible.builtin.file:
+    path: "{{ openbao_backup_env_file | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: "11.1 — Render the nightly Raft snapshot script (gate rc==0 AND non-empty, Req 11.1)"
+  ansible.builtin.template:
+    src: "openbao-snapshot.sh.j2"
+    dest: "{{ openbao_backup_script_path }}"
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: "11.1 — Render the snapshot systemd service unit (oneshot, root, EnvironmentFile)"
+  ansible.builtin.template:
+    src: "openbao-raft-snapshot.service.j2"
+    dest: "{{ openbao_backup_systemd_dir }}/{{ openbao_backup_service_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd for snapshot units
+
+- name: "11.1 — Render the snapshot systemd timer unit (02:00 UTC nightly, Req 11.1)"
+  ansible.builtin.template:
+    src: "openbao-raft-snapshot.timer.j2"
+    dest: "{{ openbao_backup_systemd_dir }}/{{ openbao_backup_service_name }}.timer"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd for snapshot units
+
+# Flush the daemon-reload handler now so the timer below can be enabled/started
+# against the freshly-rendered unit definitions in the same run.
+- name: "11.1 — Flush handlers so systemd sees the new snapshot units"
+  ansible.builtin.meta: flush_handlers
+
+- name: "11.1 — Enable + start the nightly snapshot timer (02:00 UTC, Req 11.1)"
+  ansible.builtin.systemd:
+    name: "{{ openbao_backup_service_name }}.timer"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: "11.1 — Report the nightly snapshot job wiring"
+  ansible.builtin.debug:
+    msg: >-
+      Nightly OpenBao Raft snapshot wired on the primary — timer
+      {{ openbao_backup_service_name }}.timer at {{ openbao_backup_oncalendar }},
+      script {{ openbao_backup_script_path }} runs
+      `bao operator raft snapshot save` via docker exec against
+      {{ openbao_backup_container_name }} (online — OpenBao keeps serving,
+      Req 11.6), GATES the PBS hand-off on rc==0 AND a non-empty file (Req 11.1),
+      and on failure aborts the transfer, logs with the affected date, and emits
+      the {{ openbao_backup_failure_marker }} line for the Loki alert within
+      15 min (Req 11.2/11.5/FD.6). PBS + local retention keep-daily=
+      {{ openbao_backup_pbs_keep_daily }}/{{ openbao_backup_local_keep_daily }}
+      (>= 7, Req 11.3). Scoped token + PBS credential are read at runtime from
+      never-committed sources ({{ openbao_backup_token_file }},
+      {{ openbao_backup_env_file }}); no secret is templated or logged.

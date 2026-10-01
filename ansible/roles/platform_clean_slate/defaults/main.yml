@@ -1,0 +1,166 @@
+---
+# defaults/main.yml — platform_clean_slate (platform prerequisites — clean-slate branch)
+#
+# Phase-specific defaults for the platform prerequisites tear-DOWN branch. The
+# cross-role constants (clean_slate, clean_slate_confirm, clean_slate_scope,
+# platform_clean_slate_reboot, cluster_env_file, platform_repo_root,
+# platform_venv_python, platform_throwaway_guard, platform_throwaway_allowlist,
+# agent_live_run) stay as play-level vars on platform-bootstrap.yml — see
+# design.md "Data Models" + Component 2. NO secret value ever lives here; the
+# fabric destroy credential is resolved at run time from cluster.env (no_log)
+# and referenced by name only.
+
+# --- Service_Discovery catalog (design "Data Models", step (c)) -------------- #
+# The catalog of services whose OWN clean-slate the platform teardown knows how
+# to orchestrate. A service is considered PRESENT ON THE FABRIC iff its
+# `generated_inventory` file exists (the file-mediated Terraform->Ansible
+# handoff evidence — integration-boundaries.md §4). The platform role NEVER
+# reaches into a service's per-service Terraform state or `pct destroy`s a
+# service guest (Property 6); each row's `bootstrap_playbook` is invoked as a
+# child clean-slate run so per-service state stays authoritative and isolated.
+# TODAY this list has exactly one member (SVC-07). A future service that ships a
+# compliant clean-slate is picked up by adding ONE row here — the role logic is
+# unchanged. `verify_vmids`/`verify_tf_root` feed the halt-before-fabric check
+# and the three-way verification gate (they CONFIRM absence of the already-known
+# VMIDs/state, never enumerate unknown hosts).
+#
+# `proxmox_host_var` names the `-e` variable THAT SERVICE'S OWN clean-slate
+# expects to carry the Proxmox host SSH address (the LAN IP its child
+# clean-slate uses to run `pct` ON THE NODE, fail-closing if unset). The
+# platform teardown already holds this address as
+# `platform_clean_slate_proxmox_host` (asserted fail-closed for its own
+# host-scoped steps) and threads it into each child run under the name THAT
+# child expects, so the child no longer fail-closes for want of the host
+# address. For SVC-07 the child's clean-slate consumes `svc07_proxmox_host`. A
+# future service adds its own row INCLUDING its host-var name here (e.g.
+# `proxmox_host_var: svcNN_proxmox_host`); a row that omits it is threaded
+# without the host argument (only rows whose child needs it set it).
+#
+# --- `state_ignore_patterns` (the halt-before-fabric + gate "emptiness"
+#     definition — the Fix-1 refinement) ------------------------------------- #
+# A discovered service is judged EMPTY by whether its REAL, destroyable
+# resources are gone — NOT by whether `terraform state list` prints zero lines.
+# The shared `proxmox-compute` module carries an INERT bookkeeping anchor per
+# instance — `terraform_data.input_guards` (infra/modules/proxmox-compute/
+# preconditions.tf): a triggerless precondition resource with NO Proxmox object
+# behind it. The child clean-slate's OWN destroy contract removes the real
+# CONTAINER resources (`proxmox_virtual_environment_container.*`) and reconciles
+# to "zero container resources"; the module's `terraform_data.input_guards`
+# anchors REAPPEAR on the next apply and are not something the service can (or
+# should) `state rm`. Judging emptiness by "zero state lines" therefore wrongly
+# treats those inert anchors as survivors and halts fail-closed before the
+# fabric teardown (the live Task 15.1 finding).
+#
+# `state_ignore_patterns` lists substrings that mark a `terraform state list`
+# line as a TOLERATED inert module-internal anchor. A service's `surviving_state`
+# counts only lines that do NOT match ANY of these patterns — i.e. only REAL
+# resource addresses (a surviving container/vm/sdn resource STILL trips the
+# gate; an inert `terraform_data.input_guards` line does not). This keeps the
+# §5 boundary intact — the platform still NEVER `state rm`s a service's state;
+# it only refines what "the service's real resources are gone" means to match
+# the child's actual destroy contract.
+platform_clean_slate_services:
+  - service: svc07
+    bootstrap_playbook: ansible/playbooks/svc-07-bootstrap.yml
+    generated_inventory: ansible/inventory/svc-07-secrets-manager.generated.yml
+    verify_vmids: [1070, 1071]
+    verify_tf_root: infra/projects/svc-07-secrets-manager
+    proxmox_host_var: svc07_proxmox_host
+    # Inert proxmox-compute anchors (one per module instance: module.primary /
+    # module.unsealer) with no real Proxmox object — tolerated, not survivors.
+    # The real destroyable resources are the two
+    # `proxmox_virtual_environment_container.*` addresses under those module
+    # paths, which the child clean-slate removes.
+    state_ignore_patterns:
+      - terraform_data.input_guards
+
+# --- Fabric_Teardown target (design "Data Models", step (e)) ----------------- #
+# The ONLY Terraform root this role destroys directly. Service TF roots are
+# NEVER a `terraform destroy` chdir for this role (Property 6).
+platform_clean_slate_foundation_root: infra/platform-foundation
+
+# --- platform-foundation inert-anchor tolerance (Fix-1 refinement) ----------- #
+# The gate's platform-foundation state check applies the SAME tolerate-inert-
+# anchors logic as the per-service check, for consistency: after the SDN
+# `terraform destroy` removes the REAL SDN objects (zone, VNet p20, subnet,
+# applier), the foundation root's OWN inert bookkeeping anchor
+# `terraform_data.registry_watch` (infra/platform-foundation/sdn.tf — a
+# replace-trigger sentinel with no infrastructure side effect of its own)
+# remains in state and is NOT a survivor. Only a REAL SDN resource line trips
+# the gate. This is the platform's own state, so the pattern list is the
+# platform's own to reason about — kept narrow to the single known inert anchor.
+platform_clean_slate_foundation_state_ignore_patterns:
+  - terraform_data.registry_watch
+
+# --- Inventories + child playbooks the role drives --------------------------- #
+# localhost inventory for the child service-bootstrap clean-slate runs (step d);
+# the Proxmox-host inventory for the host-scoped `pct`/`ip link`/reboot child
+# runs (steps f, g); the gateway child play reused for the host L3 gateway
+# teardown (step e, sdn_gateway decommission branch).
+platform_localhost_inventory: ansible/inventory/localhost.yml
+platform_clean_slate_proxmox_inventory: ansible/inventory/proxmox-hosts.yml
+platform_clean_slate_gateway_playbook: ansible/playbooks/sdn-gateway.yml
+
+# --- SDN objects / VLAN the fabric teardown + SDN-absence check target ------- #
+# `p20` is the shared-services VNet bridge; VLAN 20 is the shared-services VLAN.
+platform_clean_slate_sdn_vnet_id: p20
+platform_clean_slate_shared_vlan_id: 20
+
+# --- Proxmox host SSH address for the host-scoped steps (f, g) --------------- #
+# The `pct list`/`ip link show p20`/reboot child runs execute ON THE NODE, so
+# they target the Proxmox-host inventory whose ansible_host is a committed
+# PLACEHOLDER (mirrors svc07_proxmox_host) — NOT a real IP. The operator MUST
+# supply the real LAN IP at run time with
+# `-e platform_clean_slate_proxmox_host=<real-proxmox-lan-ip>`. Unset by
+# default; any host-scoped step FAILS CLOSED naming this var if a reset is
+# requested without it, before any host mutation. Not needed on the normal
+# bring-up path.
+platform_clean_slate_proxmox_host: ""
+
+# --- Fabric destroy credential + Terraform env (step (e)) -------------------- #
+# The helper that resolves + validates cluster.env into the canonical TF_VAR_*
+# mapping (single source of truth for parsing/alias-resolution; reused from the
+# SVC-07 installer and platform_api). Invoked via the project venv python. Its
+# JSON stdout carries the API token by key, so the tasks reading it are no_log.
+platform_clean_slate_cluster_env_helper: scripts/installer/cluster_env.py
+
+# TLS verification toggle for the bpg/proxmox provider on the fabric
+# `terraform destroy`. Mirrors platform_api_proxmox_validate_certs: OFF by
+# default so a self-signed test-cluster cert does not break the destroy;
+# override to true where the cluster presents a trusted cert:
+#   -e platform_clean_slate_proxmox_validate_certs=true
+platform_clean_slate_proxmox_validate_certs: false
+
+# Environment passed to the child `terraform` init/destroy processes for the
+# platform-foundation root. The Proxmox endpoint/token travel here as TF_VAR_*
+# (never on the command line); every task using this env sets no_log:true
+# (security-standards.md). Evaluated LAZILY against the credential facts bound in
+# tasks/main.yml (platform_cs_proxmox_endpoint / platform_cs_proxmox_api_token),
+# so the references resolve after those facts are set. Mirrors
+# platform_api_tf_env exactly so the apply/destroy credential handling cannot
+# drift.
+platform_clean_slate_tf_env:
+  TF_VAR_proxmox_endpoint: "{{ platform_cs_proxmox_endpoint | default('') }}"
+  TF_VAR_proxmox_api_token: "{{ platform_cs_proxmox_api_token | default('') }}"
+  TF_VAR_proxmox_insecure: "{{ (not (platform_clean_slate_proxmox_validate_certs | bool)) | lower }}"
+
+# --- Registry served-VLAN context emitter (step (c)) ------------------------- #
+# The registry desired-state emitter (the one reader of truth for the served
+# project-VLAN set — reused from platform_gateway). Consulted for CONTEXT ONLY
+# in Service_Discovery; the authoritative presence signal is the
+# generated-inventory file, never the registry contents.
+platform_clean_slate_registry_status: infra/platform-foundation/scripts/registry_status.py
+platform_clean_slate_registry_scripts_dir: infra/platform-foundation/scripts
+
+# --- Host L3 gateway teardown input (step (e), gateway child run) ------------ #
+# The scoped admin source network passed straight through to the sdn_gateway
+# role as sdn_gateway_admin_source_cidr. The teardown branch (decommissioned
+# VLAN 20, empty served set) removes the gateway stanza + rules regardless of
+# this value, but the sdn_gateway role's own preflight reads it; sourced from
+# cluster.env ADMIN_SOURCE_CIDR via the shared platform_preflight fact, falling
+# back to an env lookup, else a benign loopback host so the teardown never
+# writes a wide-open rule. Mirrors platform_gateway_admin_source_cidr.
+platform_clean_slate_admin_source_cidr: >-
+  {{ platform_admin_source_cidr
+     | default(lookup('ansible.builtin.env', 'ADMIN_SOURCE_CIDR', default=''))
+     | default('127.0.0.1/32', true) }}

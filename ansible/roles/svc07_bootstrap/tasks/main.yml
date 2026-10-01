@@ -1,0 +1,403 @@
+---
+# tasks/main.yml — svc07_bootstrap (SVC-07 installer — Phase 3: Bootstrap)
+#
+# Phase-3 tasks moved VERBATIM from svc-07-bootstrap.yml (spec task 5.1). This is
+# a behavior-preserving extraction, not a rewrite. See design.md
+# "Role 3: svc07_bootstrap".
+#
+# NOTE (spec task 5.2, DONE): the Task 8.4 primary-bootstrap child run below is
+# no_log:true — secret hygiene restored. The child stdout carries the revealed
+# Admin_Token, so it must never regress to no_log:false. The only remaining
+# no_log:false tasks in this role are non-secret debug probes (rc / stdout
+# length / TOKEN= marker presence) that print no secret value. Inline debug
+# probes are consolidated into tasks/debug_probes.yml in task 7.1.
+#
+# ---- Phase 3: Host Hardening & Ordered Bootstrap (secret bridging) ----
+# Tasks 8.1 (common baseline), 8.2 (DELEGATED unsealer bootstrap — a single
+# child openbao.yml run whose openbao_init_unseal role owns the guarded,
+# readiness-aware init/unseal/Transit/seal-policy/mint/revoke — plus the
+# Bootstrap_Transit_Token Handoff_File capture), 8.4 (primary bootstrap +
+# drift guard + admin-token persistence). The former hand-rolled Task 8.3
+# (raw `docker exec` seal-policy/mint/revoke) was folded into the role
+# (refactor svc07-unsealer-bootstrap-delegation).
+
+# ============================================================ #
+# Phase-3 delegation model (refactor svc07-unsealer-bootstrap-  #
+# delegation): the orchestrator no longer hand-rolls the        #
+# unsealer's `docker exec bao ...` init/unseal/policy/mint/      #
+# revoke. The openbao_init_unseal role now OWNS a guarded,       #
+# idempotent, readiness-aware unsealer bootstrap                 #
+# (tasks/unsealer_bootstrap.yml), so Task 8.2 delegates to a     #
+# single child openbao.yml run exactly as Task 8.4 already does  #
+# for the primary. Consequently the former "Bind Phase-3        #
+# orchestration facts" set_fact (svc07_unsealer_host /           #
+# _primary_host / _unsealer_container / _primary_container /     #
+# svc07_bao_bin / _bao_tls_flag / _unsealer_key_shares /         #
+# _threshold) is DELETED — every one of those facts was read     #
+# only by the now-removed hand-rolled tasks (the Shamir counts   #
+# moved to the role's defaults as openbao_unsealer_key_*), and   #
+# the remaining tasks (8.1 common.yml, 8.4 primary, Phase 4      #
+# health poll) address their targets by hard-coded argv / IP,    #
+# not those facts.                                               #
+# ============================================================ #
+
+# ============================================================ #
+# Task 8.1 — Common baseline child run (Req 5.1).               #
+# ------------------------------------------------------------ #
+# Child `ansible-playbook common.yml` against the generated     #
+# inventory so Docker CE + Compose (+ hardened baseline) are     #
+# installed on BOTH guests before any OpenBao stack starts.      #
+# Run as a child process (design "delegation mechanism") so the  #
+# configurator play targets the freshly-generated inventory as   #
+# its own `-i`, preserving the orchestrator/configurator seam.   #
+# A non-zero exit fails the task -> this phase's rescue (Req 1.7).#
+# ============================================================ #
+- name: "Bootstrap | Task 8.1 — common baseline (Docker + Compose) on both guests"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc07_generated_inventory }}"
+      - ansible/playbooks/common.yml
+  args:
+    chdir: "{{ svc07_repo_root }}"
+  register: svc07_common_run
+  changed_when: "'changed=0' not in (svc07_common_run.stdout | default(''))"
+
+# ============================================================ #
+# Task 8.2 — Delegated unsealer bootstrap (Req 2.1, 4.1).        #
+# ------------------------------------------------------------ #
+# A SINGLE child openbao.yml run (Play 1, `--limit               #
+# openbao-unsealer`, `--tags install,init`) now performs the     #
+# ENTIRE unsealer bootstrap by delegating to the                 #
+# openbao_init_unseal role's guarded, idempotent, readiness-     #
+# aware tasks/unsealer_bootstrap.yml: Compose up -> `bao status` #
+# readiness wait -> operator init (Shamir) -> threshold unseal   #
+# -> Transit engine -> openbao-seal scoped policy -> mint the    #
+# periodic Bootstrap_Transit_Token -> revoke the unsealer root.  #
+# This REPLACES the former hand-rolled `docker exec bao ...`     #
+# init/unseal/policy/mint/revoke tasks (which had no readiness    #
+# guard — bug #7). The role fixes bug #7 and the sibling post-    #
+# unseal races structurally, by construction, not by adding one  #
+# more `until:` loop to orchestrator code.                       #
+#                                                                #
+# We pass `-e openbao_mint_seal_token=true` so the role mints     #
+# the seal token, and `-e openbao_dev_expose_secrets=true` +      #
+# `-e openbao_seal_token_handoff_path=...` so it writes the       #
+# minted token to the mode-0600 Handoff_File on THIS control node #
+# (the child run originates on localhost too). The orchestrator   #
+# then reads it back across the child-process boundary in the     #
+# capture tasks below (Component 4). no_log:true — the child       #
+# stdout may carry the revealed token. changed_when keys off      #
+# 'changed=0' NOT being present in the child recap, matching the  #
+# other child-run tasks. A child non-zero exit -> this phase's    #
+# rescue (Req 1.7).                                              #
+# ============================================================ #
+- name: "Bootstrap | Task 8.2 — unsealer bootstrap (openbao.yml, unsealer only, guarded/delegated)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc07_generated_inventory }}"
+      - ansible/playbooks/openbao.yml
+      - --tags
+      - install,init
+      - --limit
+      - openbao-unsealer
+      - -e
+      - openbao_tls_self_signed=true
+      - -e
+      - openbao_mint_seal_token=true
+      - -e
+      - openbao_dev_expose_secrets=true
+      - -e
+      - "openbao_seal_token_handoff_path={{ svc07_seal_token_handoff_path }}"
+  args:
+    chdir: "{{ svc07_repo_root }}"
+  register: svc07_unsealer_bootstrap
+  changed_when: "'changed=0' not in (svc07_unsealer_bootstrap.stdout | default(''))"
+  no_log: true
+
+# ============================================================ #
+# Task 8.2 (capture) — Bootstrap_Transit_Token handoff, consumer #
+# side (Component 4; Req 5.3, 6.1, 6.4).                        #
+# ------------------------------------------------------------ #
+# The role (a CHILD process) minted the seal token; a fact set    #
+# there does not propagate back here, so it hands off via the     #
+# 0600 Handoff_File. We: stat it (tolerating absence on the       #
+# already-initialised re-run path, where the role skips the mint  #
+# and writes NO file), slurp+b64decode+trim it into an in-memory  #
+# no_log fact, then delete it immediately after capture.          #
+#                                                                #
+# FRESH vs RE-RUN (Req 6.3, 6.4):                                 #
+#  * FRESH bootstrap: the role minted + wrote the file. We must   #
+#    capture a non-empty token; a missing/empty file after a mint #
+#    was requested is a fail-closed condition (Req 6.4) — never   #
+#    bridge an empty seal token.                                  #
+#  * RE-RUN (unsealer Already_Initialised): the role skips the    #
+#    mint and writes no file. We do NOT fail; svc07_bootstrap_    #
+#    transit_token stays unset/empty so Task 8.4's existing       #
+#    "Resolve the transit token" fallback picks up the operator-  #
+#    supplied ambient OPENBAO_BOOTSTRAP_TRANSIT_TOKEN (Req 6.3).  #
+# We cannot read the child's Already_Initialised decision (its    #
+# stdout is no_log), so we distinguish the two cases by the       #
+# PRESENCE of the Handoff_File: present => fresh mint => capture  #
+# + fail-closed-if-empty; absent => re-run => fall back silently. #
+# ============================================================ #
+- name: "Bootstrap | Stat the Bootstrap_Transit_Token Handoff_File (present => fresh mint)"
+  ansible.builtin.stat:
+    path: "{{ svc07_seal_token_handoff_path }}"
+  register: svc07_seal_token_handoff_stat
+  changed_when: false
+
+- name: "Bootstrap | Capture the Bootstrap_Transit_Token from the Handoff_File (fresh mint only)"
+  when: svc07_seal_token_handoff_stat.stat.exists
+  block:
+    # Read the 0600 handoff file the role wrote on this control node.
+    # no_log — the slurped content is the seal token (base64-wrapped by
+    # slurp).
+    - name: "Bootstrap | Read the Bootstrap_Transit_Token Handoff_File (no_log)"
+      ansible.builtin.slurp:
+        src: "{{ svc07_seal_token_handoff_path }}"
+      register: svc07_seal_token_slurp
+      no_log: true
+
+    # Bind the decoded+trimmed token in memory. b64decode reverses slurp's
+    # own base64; trim strips the trailing newline `copy` added. no_log.
+    - name: "Bootstrap | Bind the Bootstrap_Transit_Token in memory (no_log)"
+      ansible.builtin.set_fact:
+        svc07_bootstrap_transit_token: "{{ (svc07_seal_token_slurp.content | b64decode) | trim }}"
+      no_log: true
+      changed_when: false
+
+    # Delete the Handoff_File IMMEDIATELY after binding — the token lives
+    # on disk only for the moment between the two child runs (Req 5.3).
+    - name: "Bootstrap | Delete the Handoff_File immediately after capture (no_log)"
+      ansible.builtin.file:
+        path: "{{ svc07_seal_token_handoff_path }}"
+        state: absent
+      no_log: true
+
+    # Fail closed (Req 6.4): a mint was requested (Task 8.2 always passes
+    # openbao_mint_seal_token=true) and the file was PRESENT, so it MUST
+    # carry a non-empty token — never bridge an empty seal token to the
+    # primary. no_log so the value is never surfaced by the assert.
+    - name: "Bootstrap | Fail closed if the fresh-mint Handoff_File was empty (Req 6.4, no_log)"
+      ansible.builtin.assert:
+        that:
+          - "svc07_bootstrap_transit_token is defined"
+          - "(svc07_bootstrap_transit_token | length) > 0"
+        fail_msg: >-
+          The unsealer bootstrap wrote a Bootstrap_Transit_Token Handoff_File
+          but it was empty. Refusing to bridge an empty seal token to the
+          primary (Req 6.4). Run the Clean_Slate_Reset (-e clean_slate=true)
+          and re-run the installer for a clean from-scratch bootstrap.
+        success_msg: "Bootstrap_Transit_Token captured from the Handoff_File (value not logged)."
+      no_log: true
+
+# ============================================================ #
+# Task 8.4 — Primary bootstrap, drift guard, admin-token         #
+# persistence (Req 5.7, 5.8, 5.9, 5.10, 5.11, 8.8).             #
+# ------------------------------------------------------------ #
+# Child openbao.yml against the `openbao` group --tags           #
+# install,init with the Bootstrap_Transit_Token bridged in as    #
+# OPENBAO_BOOTSTRAP_TRANSIT_TOKEN, openbao_mint_admin_token=true, #
+# and openbao_dev_expose_secrets=true (the dev-only opt-in that   #
+# reveals the minted Admin_Token for this single homelab run so   #
+# the installer can capture it — security-standards.md; design    #
+# Open Risks). The child play reuses the openbao_init_unseal      #
+# role's own Raft init + auto-unseal-wait + platform-admin mint,  #
+# so the installer does NOT reimplement any bao init logic here.  #
+#                                                                #
+# openbao_mock_edge_network=true is also passed to create the
+# placeholder Traefik `edge` network for this Traefik-less Day-0
+# bring-up (SVC-09 not deployed): the primary Compose stack declares
+# `edge` as an external network and would otherwise fail with
+# "network edge declared as external, but could not be found". It is a
+# permanent, off-by-default opt-in dev stand-in (mock-stand-ins.md)
+# that provides NO routing.
+#                                                                #
+# Drift guard (Req 5.11): the role's init guard SKIPS the         #
+# one-time bootstrap when the primary already reports             #
+# initialized:true — so no Admin_Token is minted/revealed. We     #
+# detect that (no TOKEN= line in the child stdout) and HALT,      #
+# directing the operator to the Clean_Slate_Reset.                #
+#                                                                #
+# Secret handling: OPENBAO_BOOTSTRAP_TRANSIT_TOKEN is passed in   #
+# the child ENV (no_log). The revealed TOKEN=<value> line lands   #
+# in the child's captured stdout; the whole run task is no_log so #
+# it never reaches this run's log, and the parse/persist tasks    #
+# are no_log so the value is written ONLY to the 0600 env file.   #
+# ============================================================ #
+
+# On a re-run where the unsealer was already initialised, the seal token
+# is NOT in memory (the role skipped the mint and wrote no Handoff_File,
+# so Task 8.2's capture left svc07_bootstrap_transit_token unset). The
+# primary child run then relies on the operator-supplied
+# OPENBAO_BOOTSTRAP_TRANSIT_TOKEN already in the environment (runbook
+# re-run path). Bind the child env token to
+# the in-memory value when we have one, else fall back to the ambient env
+# var so a re-run still works. no_log — carries the token.
+- name: "Bootstrap | Resolve the transit token for the primary child env (no_log)"
+  ansible.builtin.set_fact:
+    svc07_primary_transit_token: >-
+      {{ svc07_bootstrap_transit_token
+         if (svc07_bootstrap_transit_token is defined and (svc07_bootstrap_transit_token | length > 0))
+         else lookup('ansible.builtin.env', 'OPENBAO_BOOTSTRAP_TRANSIT_TOKEN', default='') }}
+  no_log: true
+  changed_when: false
+
+# Fail closed if no transit token is available for the primary — never
+# run the primary bring-up with an empty seal token (mirrors the role's
+# 6.2-STEP-0 fail-closed assert). Names the env var, never a value.
+- name: "Bootstrap | Assert a Bootstrap_Transit_Token is available for the primary (no_log)"
+  ansible.builtin.assert:
+    that:
+      - "svc07_primary_transit_token | length > 0"
+    fail_msg: >-
+      No Bootstrap_Transit_Token is available for the primary bring-up.
+      On a fresh install the delegated unsealer bootstrap (Task 8.2, the
+      openbao_init_unseal role's mint) produces it via the Handoff_File;
+      on a re-run against an already-initialised unsealer, supply it via the
+      never-committed environment variable OPENBAO_BOOTSTRAP_TRANSIT_TOKEN
+      before re-running.
+    success_msg: "Bootstrap_Transit_Token available for the primary (value not logged)."
+  no_log: true
+
+# Task 8.4 — child openbao.yml run for the primary. The transit token is
+# bridged into the child ENVIRONMENT (never the command line); the mint +
+# dev-expose flags are non-secret -e vars. no_log:true because the child's
+# captured stdout carries the revealed Admin_Token (TOKEN=<value>) and the
+# env carries the transit token. failed_when default (rc != 0) -> a child
+# failure is caught by this phase's rescue (Req 1.7).
+- name: "Bootstrap | Task 8.4 — primary bootstrap (openbao.yml install,init + mint, no_log)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc07_generated_inventory }}"
+      - ansible/playbooks/openbao.yml
+      - --tags
+      - install,init
+      - --limit
+      - openbao
+      - -e
+      - openbao_tls_self_signed=true
+      - -e
+      - openbao_mock_edge_network=true
+      - -e
+      - openbao_mint_admin_token=true
+      - -e
+      - openbao_dev_expose_secrets=true
+  args:
+    chdir: "{{ svc07_repo_root }}"
+  environment:
+    OPENBAO_BOOTSTRAP_TRANSIT_TOKEN: "{{ svc07_primary_transit_token }}"
+  register: svc07_primary_bootstrap
+  changed_when: "'changed=0' not in (svc07_primary_bootstrap.stdout | default(''))"
+  # Secret hygiene (Req 3.1–3.4, design "Phase-3 primary bootstrap — secret
+  # hygiene fix"): this task is no_log:true because the child's captured stdout
+  # carries the revealed Admin_Token (TOKEN=<value>) and the child env carries
+  # the transit token. The only sanctioned way to inspect the child stdout is
+  # the off-by-default svc07_debug_instrumentation opt-in, which routes it to a
+  # 0600 gitignored artifact (that task is itself no_log:true). Never regress
+  # this to no_log:false.
+  no_log: true
+
+# DEV-ONLY debug instrumentation (svc07_debug_instrumentation), consolidated
+# (spec task 7.1, design "Debug-Instrumentation Model"): the two Phase-3 probes
+# for the Task 8.4 child run — (a) the secret-bearing child stdout+stderr 0600
+# gitignored log write (no_log:true) and (b) the non-secret rc/length/TOKEN=
+# marker summary (no_log:false) — are moved OUT of this functional bootstrap
+# loop into tasks/debug_probes.yml and imported ONCE here, guarded by the
+# off-by-default flag. Positioned immediately AFTER the Task 8.4 register
+# (svc07_primary_bootstrap) and BEFORE the drift guard, so the probe log is
+# available for diagnosis. import_tasks is STATIC — same variable scope, so the
+# probes can read svc07_primary_bootstrap; the single guard below applies to
+# every task in the imported file. A normal run (flag=false, the committed
+# default) never reaches these probes at all.
+- name: "Bootstrap | DEV-DEBUG — Phase-3 probes for the Task 8.4 child run (guarded include)"
+  ansible.builtin.import_tasks: debug_probes.yml
+  when: svc07_debug_instrumentation | default(false) | bool
+
+# Drift guard (Req 5.11): the role mints + reveals the Admin_Token only
+# inside the fresh bootstrap window (initialized:false). If the primary
+# was already initialised, the role SKIPS the mint and the reveal task
+# prints no `TOKEN=` line — detect that and HALT, directing to the
+# Clean_Slate_Reset. We test the (no_log-registered) child stdout for the
+# reveal marker; this task is no_log so the stdout scan never surfaces a
+# secret. `initialized=True` / `SKIPPING init` in the child output is the
+# same drift signal.
+- name: "Bootstrap | Drift guard — require the primary ran a fresh bootstrap (Req 5.11, no_log)"
+  ansible.builtin.assert:
+    that:
+      - "'TOKEN=' in (svc07_primary_bootstrap.stdout | default(''))"
+    fail_msg: >-
+      The primary reported it was already initialised, so the one-time
+      bootstrap (and the platform-admin token mint) was SKIPPED — a
+      surviving container or data volume. No Admin_Token was minted. Run
+      the Clean_Slate_Reset first (-e clean_slate=true), then re-run this
+      installer for a true from-scratch bootstrap (Req 5.11).
+    success_msg: "Primary ran a fresh bootstrap and minted the Admin_Token."
+  no_log: true
+
+# Parse the revealed Admin_Token out of the child stdout. The role's
+# reveal task prints `TOKEN=<value>` on its own segment of the debug msg;
+# extract the token with a regex over the captured stdout. no_log so the
+# captured value never reaches this run's log. This is the ONLY place the
+# value is handled, and it flows straight into the 0600 write below.
+- name: "Bootstrap | Capture the revealed Admin_Token from the child output (no_log)"
+  ansible.builtin.set_fact:
+    svc07_admin_token: "{{ svc07_primary_bootstrap.stdout | regex_search('TOKEN=([^\\s\"]+)', '\\1') | first }}"
+  no_log: true
+  changed_when: false
+
+# Guard that a non-empty token was actually parsed — a reveal-marker
+# present but empty capture would otherwise write a blank credential.
+- name: "Bootstrap | Assert the Admin_Token was captured (no_log)"
+  ansible.builtin.assert:
+    that:
+      - "svc07_admin_token is defined"
+      - "svc07_admin_token | length > 0"
+    fail_msg: >-
+      The primary bootstrap reported a minted token, but its value could
+      not be parsed from the child output. Re-run the Clean_Slate_Reset
+      and the installer; do not proceed without a captured Admin_Token.
+    success_msg: "Admin_Token captured (value not logged)."
+  no_log: true
+
+# Persist OPENBAO_ADMIN_TOKEN into the selected Cluster_Env_File at mode
+# 0600 (Req 5.8). lineinfile create+regexp updates an existing entry or
+# appends a new one, so a re-run reconciles rather than duplicates. The
+# file is gitignored (cluster*.env). no_log — the line carries the token.
+# A write failure is caught here and re-raised as a "credential could not
+# be persisted" halt WITHOUT echoing the value (Req 5.9).
+- name: "Bootstrap | Persist OPENBAO_ADMIN_TOKEN to the Cluster_Env_File at 0600 (Req 5.8, no_log)"
+  block:
+    - name: "Bootstrap | Write/update OPENBAO_ADMIN_TOKEN (no_log) in {{ cluster_env_file }}"
+      ansible.builtin.lineinfile:
+        path: "{{ svc07_repo_root }}/{{ cluster_env_file }}"
+        regexp: "^\\s*OPENBAO_ADMIN_TOKEN\\s*="
+        line: "OPENBAO_ADMIN_TOKEN={{ svc07_admin_token }}"
+        create: true
+        mode: "0600"
+      no_log: true
+  rescue:
+    - name: "Bootstrap | Halt — Admin_Token could not be persisted (no value echoed)"
+      ansible.builtin.fail:
+        msg: >-
+          The platform-admin token was minted, but writing OPENBAO_ADMIN_TOKEN
+          to {{ cluster_env_file }} failed — the credential could not be
+          persisted. The token value is NOT echoed. Fix the file
+          permissions/path and re-run the Clean_Slate_Reset + installer
+          (Req 5.9).
+
+# Scrub the Admin_Token fact from memory now it is persisted to the 0600
+# env file — it should not linger as a fact for Phase 4.
+- name: "Bootstrap | Scrub the Admin_Token + transit-token facts from memory (no_log)"
+  ansible.builtin.set_fact:
+    svc07_admin_token: ""
+    svc07_primary_transit_token: ""
+    svc07_bootstrap_transit_token: ""
+  no_log: true
+  changed_when: false

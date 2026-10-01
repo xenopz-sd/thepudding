@@ -1,0 +1,200 @@
+---
+# defaults/main.yml — openbao_project_onboard
+#
+# Variable set for the openbao_project_onboard role (SVC-07 Secrets Manager,
+# task 9.1). This role performs PER-PROJECT onboarding on the PRIMARY OpenBao
+# instance: for one project slug it creates the isolation triple
+#   (1) policy-<slug>            — CRUD+list on exactly the five KV v2 sub-paths
+#   (2) auth/jwt/role/<slug>-ci  — the CI login role bound to that project
+#   (3) secret/data/<slug>/      — the KV path exists
+# and is IDEMPOTENT: a second run for the same slug is a byte-identical no-op
+# that touches no secret version and reports changed=0 (Req 1.5, 13.4).
+#
+# NO secret value ever lives here. This role writes an ACL policy, a jwt role,
+# and ensures a KV path — none of which is a secret. It authenticates with a
+# PLATFORM-ADMIN token (NOT the Root_Token, which is revoked after bootstrap),
+# supplied at runtime from an operator-controlled, never-committed environment
+# variable via an `env` lookup — never a committed literal, never a vars-file
+# value. The var below carries only the ENV VAR NAME (see
+# openbao_admin_token_env_var), and every task that carries that token sets
+# `no_log: "{{ openbao_no_log }}"` — hidden by default (openbao_no_log defaults
+# to true; the DEV-ONLY openbao_dev_expose_secrets opt-in below flips it).
+
+# =============================================================================
+# The project this run onboards (read READ-ONLY from projects.yaml)
+# =============================================================================
+# project_slug is the authoritative identifier recorded in projects.yaml by the
+# network-foundation onboarding flow. This role READS it (as this variable,
+# passed by the caller) and NEVER writes, extends, or re-derives the registry
+# (design.md: "projects.yaml relationship — READ-ONLY here"). It is left
+# intentionally UNDEFINED here so a run without an explicit slug fails loudly
+# rather than silently onboarding a wrong/empty project.
+# project_slug: "<slug>"        # REQUIRED — supplied by the caller, no default.
+
+# --- Optional: validate the slug exists in projects.yaml (READ-ONLY) ---------
+# When true, tasks/main.yml parses projects.yaml and asserts project_slug is a
+# recorded slug before writing anything — a defence against onboarding a typo'd
+# or not-yet-registered project. This is a READ; the registry is never written.
+# The default path points at the platform-foundation registry (structure.md:
+# projects.yaml lives at the platform-foundation level).
+#
+# Anchoring: the onboard play (ansible/playbooks/openbao.yml) sits TWO levels
+# below the repo root, so `playbook_dir` is `<repo>/ansible/playbooks`. The
+# default therefore anchors TWO levels up (`../../`) to reach the repo-root
+# `infra/platform-foundation/projects.yaml`, matching the sibling roles driven
+# by the same playbooks: openbao_init_unseal uses `{{ playbook_dir }}/../../.env`
+# and terraform_clean_slate uses `playbook_dir | dirname | dirname`. A single
+# `../` would resolve to the non-existent `ansible/infra/platform-foundation/...`.
+openbao_validate_slug_in_registry: true
+openbao_projects_yaml_path: >-
+  {{ playbook_dir }}/../../infra/platform-foundation/projects.yaml
+
+# =============================================================================
+# Primary instance addressing + `bao` invocation (mirrors the sibling roles)
+# =============================================================================
+# The onboarding writes run via `docker exec` against the PRIMARY OpenBao
+# container (consistent with openbao_init_unseal's docker-exec approach), so
+# they use the server's own `bao` binary/version — no host bao install needed.
+openbao_primary_ip: "10.0.20.10"
+openbao_api_port: 8200
+openbao_primary_addr: "https://{{ openbao_primary_ip }}:{{ openbao_api_port }}"
+
+# The primary Compose container name (matches openbao_install / init_unseal).
+openbao_primary_container_name: "openbao-openbao-1"
+
+# Path to the `bao` CLI inside the running container.
+openbao_bao_bin: "bao"
+
+# Pass `-tls-skip-verify` to the PRIMARY `bao` docker-exec calls in
+# tasks/main.yml when the primary's TLS listener uses the self-signed MOCK cert
+# (openbao_install's openbao_tls_self_signed). Without it, every `bao` call that
+# hits the primary API over TLS fails cert verification (the root cause of the
+# "9.1 — List existing policies" onboard failure). The flag is spliced AFTER the
+# `bao` subcommand keyword and BEFORE positional args (bao rejects flags after
+# positionals). With a real SVC-08/EJBCA cert chaining to a trusted CA this is
+# false and bao verifies normally.
+#
+# SHARED-SYMBOL / SAME-VALUE-AS-SIBLING: this default is byte-for-byte identical
+# to the sibling openbao_init_unseal.openbao_primary_tls_skip_verify default
+# (both derive from openbao_tls_self_signed). It lives in THIS role's own
+# defaults on purpose: the onboard role runs as its own `--tags onboard` play and
+# is not guaranteed to share a play with openbao_init_unseal, so it cannot rely
+# on inheriting the sibling's default. Because both resolve the SAME expression,
+# this is agreement (the two roles concur without a shared group_vars file), not
+# a divergent second definition (bugfix.md Req 3.5; design.md "Fix Implementation").
+openbao_primary_tls_skip_verify: "{{ openbao_tls_self_signed | default(false) | bool }}"
+
+# =============================================================================
+# DEV-ONLY secret exposure opt-in (security-standards.md "Secrets handling")
+# =============================================================================
+# DEV-ONLY secret exposure opt-in (security-standards.md "Secrets handling").
+# Default FALSE -> openbao_no_log is TRUE -> every token/secret-bearing task keeps
+# `no_log`, so secrets never leak to output. This is the NON-NEGOTIABLE default for
+# acceptance/production. A developer debugging a throwaway cluster MAY expose the
+# censored output for a SINGLE run with `-e openbao_dev_expose_secrets=true`
+# (ephemeral tokens only) — never committed, never in CI/acceptance/production.
+openbao_dev_expose_secrets: false
+# Resolved no_log value applied to every secret-bearing task via
+# `no_log: "{{ openbao_no_log }}"`. Hidden by default; exposed only on the
+# explicit dev opt-in above.
+openbao_no_log: "{{ not (openbao_dev_expose_secrets | bool) }}"
+
+# =============================================================================
+# Platform-admin authentication (day-2; NOT the Root_Token)
+# =============================================================================
+# The Root_Token is revoked after bootstrap (openbao_init_unseal task 6.2,
+# Security AC 1), so this day-2 role authenticates with a PLATFORM-ADMIN token.
+# That token is supplied at runtime from an operator-controlled, NEVER-COMMITTED
+# environment variable (a gitignored .env for a homelab run, or a GitLab CI/CD
+# protected+masked variable for a pipeline run) via an `env` lookup. The var
+# below carries only the ENV VAR NAME; the token value is never defaulted,
+# never written to a vars file, and every task carrying it sets
+# `no_log: "{{ openbao_no_log }}"` (hidden by default; dev opt-in via
+# openbao_dev_expose_secrets).
+openbao_admin_token_env_var: "OPENBAO_ADMIN_TOKEN"
+
+# =============================================================================
+# KV v2 mount + the five per-project sub-paths (Req 1.2, 1.3)
+# =============================================================================
+# The single KV v2 engine is mounted at `secret/` (openbao_init_unseal task 7.1,
+# Req 1.1). policy-<slug> grants create/read/update/delete/list on EXACTLY these
+# five KV v2 sub-paths for the slug — the full set KV v2 splits an operation
+# across — and NOTHING outside them (Req 1.3). The list is fixed by KV v2's API
+# shape; do not add a sixth entry or a wildcard above the slug.
+openbao_kv_mount: "secret"
+openbao_project_kv_subpaths:
+  - "data"
+  - "metadata"
+  - "delete"
+  - "undelete"
+  - "destroy"
+
+# The capability set granted on each of the five sub-paths (Req 1.2). Exactly
+# create/read/update/delete/list — the full CRUD+list a project's own tooling
+# needs on its KV tree, and no more (no `sudo`, no `deny`).
+openbao_project_policy_capabilities:
+  - "create"
+  - "read"
+  - "update"
+  - "delete"
+  - "list"
+
+# The policy name written to sys/policies/acl/<name>. `policy-<slug>` per the
+# design's Object shapes table.
+openbao_project_policy_name: "policy-{{ project_slug }}"
+
+# =============================================================================
+# jwt CI login role — auth/jwt/role/<slug>-ci (Req 4.2, 4.7)
+# =============================================================================
+# The per-project GitLab-CI login role. The jwt auth METHOD (bound_issuer +
+# oidc_discovery_url) is configured once at bootstrap (openbao_init_unseal task
+# 7.2, Req 4.1); THIS role creates the per-project ROLE bound to that method.
+#
+# Contract (design.md Object shapes table row "JWT role"; Req 4.2, 4.7):
+#   * role_type          = "jwt"
+#   * bound_audiences    = the platform audience (shared with the method config)
+#   * bound_claims       = { project_path: <repo path> } (+ optional ref_type/ref)
+#   * token_ttl          <= 3600 seconds
+#   * token_max_ttl      <= 3600 seconds
+#   * token_policies     = [ policy-<slug> ]
+#   * NOT renewable      (token_renewable = false)
+#   * user_claim         = a stable subject claim
+openbao_jwt_mount_path: "jwt"
+openbao_project_jwt_role_name: "{{ project_slug }}-ci"
+
+# The platform audience the CI token must carry (bound_audiences). Kept in sync
+# with openbao_init_unseal's `openbao_jwt_bound_audience`; a real deployment
+# overrides this per-environment. Non-secret placeholder.
+openbao_jwt_bound_audience: "https://openbao.platform.example.test"
+
+# The GitLab repo/group path this project's CI is bound to (bound_claims
+# project_path, Req 4.7). Non-secret; supplied by the caller per project. A
+# sensible default is derived from the slug, but a real onboarding sets the
+# exact `<group>/<repo>` path. This is the CLAIM value a presented CI ID token
+# must match for a login to succeed.
+project_gitlab_path: "{{ project_slug }}"
+
+# The subject claim OpenBao maps to the token's entity. `project_path` is the
+# stable per-project GitLab claim; using it as the user_claim ties each issued
+# token's identity to the bound project.
+openbao_project_jwt_user_claim: "project_path"
+
+# --- token_ttl / token_max_ttl — BOTH must be <= 3600 (Req 4.2) --------------
+# A CI job token is short-lived and non-renewable: it must expire well within an
+# hour and cannot be extended. Kept at 3600s (the ceiling) by default; a caller
+# may lower it but the assert in tasks/main.yml refuses any value > 3600.
+openbao_project_jwt_token_ttl: 3600
+openbao_project_jwt_token_max_ttl: 3600
+openbao_project_jwt_token_ttl_ceiling: 3600
+
+# renewable=false (Req 4.2): a CI token is issued fresh per job, never renewed.
+openbao_project_jwt_token_renewable: false
+
+# --- Optional ref_type / ref bound_claims (Req 4.7) --------------------------
+# When set, the role additionally binds the GitLab `ref_type` (e.g. "branch" or
+# "tag") and/or `ref` (e.g. "main") claims, so a CI token is only accepted from
+# the intended branch/tag. Left empty by default (bind only project_path); when
+# a caller supplies either, tasks/main.yml adds it to bound_claims AND verifies
+# the stored role reflects it. These are non-secret claim values.
+openbao_project_jwt_bound_ref_type: ""
+openbao_project_jwt_bound_ref: ""

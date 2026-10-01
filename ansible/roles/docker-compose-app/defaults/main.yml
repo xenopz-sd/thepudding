@@ -1,0 +1,58 @@
+---
+# defaults/main.yml — docker-compose-app (generic)
+#
+# The shared, generic role every service extends (PF §9, structure.md).
+# It templates a `compose.yaml` + `.env` from a service-supplied variable set
+# and reconciles the stack declaratively via community.docker.docker_compose_v2
+# (NOT a shell `docker compose up`, per PF §9 idempotency rule).
+#
+# A calling role (e.g. openbao_install) provides the variable set below; this
+# role owns NO service-specific knowledge and NO secret value. Secrets are
+# never templated here — a running service fetches its own secrets from OpenBao
+# via the Agent at container-start time (integration-boundaries §2). Any
+# variable listed in `dca_env` is a NON-secret config value or a reference-by-
+# name; a real credential value must never be passed in.
+
+# --- Identity ---
+# Short stack name; also the directory the compose.yaml/.env are written to and
+# the Compose project name used for reconciliation.
+dca_app_name: ""
+
+# --- Where the stack files are written on the target host ---
+dca_base_dir: "/opt/compose"
+dca_stack_dir: "{{ dca_base_dir }}/{{ dca_app_name }}"
+
+# --- Compose services ---
+# List of service definitions. Each item is a dict shaped like a compose
+# service, e.g.:
+#   - name: openbao
+#     image: "openbao/openbao:2.4"
+#     command: "server -config=/openbao/config/config.hcl"
+#     restart: "unless-stopped"
+#     cap_add: ["IPC_LOCK"]
+#     runtime_options: ["--memory-swappiness=0"]   # rendered as `runtime:`? no — see template note
+#     volumes:
+#       - "openbao-data:/openbao/data"
+#     env_keys: ["OPENBAO_API_ADDR", "..."]          # keys pulled from the .env
+#     labels:
+#       - "traefik.enable=true"
+#     networks: ["edge"]
+dca_services: []
+
+# --- Named volumes declared at the top level of the compose file ---
+dca_volumes: []
+
+# --- External / pre-existing networks to attach (e.g. Traefik's edge net) ---
+dca_networks: []
+
+# --- .env contents: a flat mapping of KEY -> value.
+# Every value here is NON-secret (config only). composition-wiring.md: each var
+# the entrypoint reads is listed explicitly; the caller is expected to have
+# already applied `${VAR:-default}` semantics when building this mapping.
+dca_env: {}
+
+# --- Reconciliation behaviour ---
+# "present" brings the stack up (docker_compose_v2 state: present); the caller's
+# handler flips this to force a recreate/restart when config changes.
+dca_state: "present"
+dca_recreate: "auto"    # auto | always | never

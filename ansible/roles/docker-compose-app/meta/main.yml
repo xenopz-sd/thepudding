@@ -1,0 +1,26 @@
+---
+# meta/main.yml — docker-compose-app (generic)
+galaxy_info:
+  role_name: docker_compose_app
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Generic role that templates a compose.yaml and .env from a service-supplied
+    Jinja2 variable set and reconciles the stack declaratively via
+    community.docker.docker_compose_v2. The shared role every service extends
+    (PF §9, structure.md); owns no service-specific knowledge and no secret.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - docker
+    - compose
+    - platform
+
+dependencies: []

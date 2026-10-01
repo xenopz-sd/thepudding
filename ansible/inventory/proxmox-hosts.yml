@@ -1,0 +1,31 @@
+# Static inventory for the Proxmox host(s) themselves — the L3 gateway/firewall
+# target (ADR-0004). This file is HAND-MAINTAINED, NOT generated: the Proxmox
+# node is not a Terraform guest, so it is represented nowhere in the generated
+# per-service inventories (ansible/inventory/*.generated.yml) and is never merged
+# with them. It is committed to the repo (unlike the generated inventories, which
+# the .gitignore glob ansible/inventory/*.generated.yml deliberately excludes).
+# It carries NO secret: connection is over SSH as an admin user; host/IP/user only.
+#
+# ansible_host is the PLACEHOLDER `<proxmox-lan-ip>` on purpose — no real IP is
+# committed to the repo. Ansible cannot connect to that literal: a run against this
+# file as-is fails immediately with "hostname contains invalid characters" (the
+# angle brackets are invalid in a hostname). Supply the real Proxmox LAN IP at run
+# time WITHOUT editing this file, by overriding ansible_host on the command line:
+#
+#     ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/proxmox-hosts.yml \
+#       ansible/playbooks/sdn-gateway.yml \
+#       --extra-vars "ansible_host=<real-proxmox-lan-ip>" \
+#       ... (other --extra-vars)
+#
+# ssh_user is `root` and auth is KEY-BASED (no password prompt). Before the first
+# run, install your public key on the host once with
+# `ssh-copy-id root@<real-proxmox-lan-ip>` (prompts for the root password that one
+# time) or the run fails with "Permission denied (publickey,password)".
+#
+# See TESTING.md -> "SDN VLAN reachability" for the full command and the matching
+# sdn_gateway_admin_source_cidr (your own computer's network CIDR).
+proxmox:
+  hosts:
+    shrimp:
+      ansible_host: <proxmox-lan-ip>   # placeholder; override via --extra-vars ansible_host=<real-ip> at run time
+      ansible_user: root

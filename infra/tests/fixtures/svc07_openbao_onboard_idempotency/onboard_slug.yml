@@ -1,0 +1,43 @@
+---
+# onboard_slug.yml — Task 9.2 fixture playbook (spec: svc-07-secrets-manager)
+#
+# Applies the REAL `openbao_project_onboard` role (unmodified) against localhost
+# to prove the Requirement 1.5 / 13.4 idempotency guarantee: a re-run for an
+# already-onboarded slug is a byte-identical no-op that touches no secret
+# version and reports changed=0.
+#
+# HOW "ALREADY-ONBOARDED" IS ESTABLISHED
+# --------------------------------------
+# Unlike the openbao_install (5.5) and openbao_init_unseal (6.3) idempotency
+# fixtures — whose guards read a stub/collection and so run OFFLINE — this role's
+# writes are check-then-write against a LIVE `bao` via `docker exec` on the
+# primary container. There is no offline stand-in for a live `bao`, so the pytest
+# runner (test_svc07_openbao_onboard_contract.py::TestOpenBaoProjectOnboardIdempotency)
+# is `requires_infra`-gated on the SAME OPENBAO_TEST_* env-var contract as the
+# task-7.4 engine contract test, and drives this playbook TWICE against the LIVE
+# throwaway OpenBao: a first NORMAL run onboards the disposable ctest slug (which
+# legitimately changes), then a second `--check` run — which must be a full
+# no-op. Only the second (check) run's recap is asserted changed=0; the runner
+# additionally asserts the stored policy body is byte-identical and the KV
+# metadata current_version is unchanged, then tears the slug down.
+#
+# AUTH / SECRETS
+# --------------
+# The role authenticates with a PLATFORM-ADMIN token read from the never-committed
+# `OPENBAO_ADMIN_TOKEN` env var (its default `openbao_admin_token_env_var`). The
+# runner sets that env var to the OPENBAO_TEST_TOKEN value for the child process,
+# so nothing is templated or committed here. No secret VALUE is written by this
+# role or this fixture — it writes an ACL policy, a jwt role, and ensures a KV
+# path (none of which is a secret).
+#
+# The disposable ctest slug is NOT recorded in projects.yaml, so registry
+# validation is disabled by the runner (`-e openbao_validate_slug_in_registry=false`).
+# The primary container name defaults to the role's `openbao_primary_container_name`;
+# override it via `-e` if the live throwaway instance uses a different name.
+
+- name: openbao_project_onboard check-mode idempotency (already-onboarded slug)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    - role: openbao_project_onboard

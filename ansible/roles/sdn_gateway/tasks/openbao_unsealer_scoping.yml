@@ -1,0 +1,137 @@
+---
+# tasks/openbao_unsealer_scoping.yml — sdn_gateway
+# (spec openbao-unsealer-firewall-scoping; ADR-0007 rev 2)
+#
+# Runs ONCE (included from tasks/main.yml, gated on
+# `sdn_gateway_openbao_unsealer_scoping_enabled`, default FALSE). Realises the
+# SVC-07 requirement that ONLY the primary may reach the Transit unsealer's seal
+# API on `:{{ sdn_gateway_openbao_unsealer_seal_port }}`; every other VLAN-20
+# source is denied at the firewall (Req 1, Req 2; SVC-07 Req 6.4 / Security AC 6;
+# security-standards.md network segmentation).
+#
+# ENFORCEMENT POINT (corrected after a live re-test — ADR-0007 rev 2): the primary
+# and unsealer are both on VLAN 20 / the SAME SDN VNet bridge `p20`. Traffic
+# between two guests on the same bridge is switched at Layer 2 and NEVER traverses
+# the Proxmox host's firewall chains, so a CLUSTER-level `type=in` rule cannot
+# filter it. The stock `pve-firewall` filters a guest's traffic only when the
+# firewall is enabled on that guest's OWN NIC (`firewall=1`, set in the SVC-07
+# Terraform root on the unsealer's network_interface), and the rules then live at
+# the GUEST scope: `/nodes/<node>/lxc/<vmid>/firewall/rules`. These rules are
+# therefore written at that guest scope, NOT `/cluster/firewall/rules`.
+#
+# Two rules, written with the SAME `pvesh` check-then-change + managed-comment
+# idiom as configure.yml/isolation.yml:
+#   - ALLOW  in tcp  primary -> unsealer :8200   (the sanctioned seal path)
+#   - DROP   in tcp  any     -> unsealer :8200   (everything else)
+# Created DROP-first then ALLOW-second because `pvesh create` ignores `--pos` and
+# always prepends at pos 0 (verified live) — so creating the ALLOW last leaves it
+# ABOVE the DROP, and Proxmox (top-to-bottom) permits the primary and drops the
+# rest (Req 2.2). Each write is a HARD failure on error (no `failed_when: false`)
+# so an opening/deny is never believed present when absent (Req 1.3, NFR-2). Both
+# gated on absence of their managed comment so a second converge is changed=0
+# (Req 1.2, NFR-1).
+#
+# The target guest is identified by `sdn_gateway_openbao_unsealer_node` +
+# `sdn_gateway_openbao_unsealer_vmid`. These carry NO default (empty) and come
+# from the Terraform-generated Ansible inventory (the SVC-07 root emits the real,
+# provider-assigned vmid + node_name via `inventory_hosts`); we FAIL CLOSED below
+# if either is unset rather than write rules to the wrong guest.
+#
+# ENFORCEMENT NOTE: these rules only take effect once (a) the unsealer NIC
+# firewall is enabled (Terraform `firewall = true`) AND (b) `pve-firewall` is
+# ENABLED (`/cluster/firewall/options enable=1`). Both are deliberate operator
+# steps — see ADR-0007 and the SVC-07 install runbook. Until then these rules are
+# inert.
+#
+# NO secret material is read, templated, or echoed here.
+
+# Fail CLOSED if the target guest (node + vmid) is not identified — do NOT guess a
+# guest or write to the wrong firewall path.
+- name: "OpenBao unsealer scoping | Assert the unsealer node + vmid are set (fail closed)"
+  ansible.builtin.assert:
+    that:
+      - sdn_gateway_openbao_unsealer_node is string
+      - (sdn_gateway_openbao_unsealer_node | trim) | length > 0
+      - sdn_gateway_openbao_unsealer_vmid is not none
+      - (sdn_gateway_openbao_unsealer_vmid | string | trim) | length > 0
+    fail_msg: >-
+      sdn_gateway_openbao_unsealer_node / sdn_gateway_openbao_unsealer_vmid is
+      unset. Refusing to write unsealer firewall rules without knowing which
+      guest to scope (they must identify the unsealer LXC's Proxmox node + VMID).
+      These come from the Terraform-generated inventory (the SVC-07 root's
+      inventory_hosts output carries the real vmid + node_name) — pass them via
+      --extra-vars or from the inventory host facts, never a hardcoded guess.
+    success_msg: "Unsealer guest identified (node + vmid set); scoping rules will target its guest firewall."
+    quiet: true
+
+# The guest-scoped firewall rules path for the unsealer LXC. Computed once so both
+# the read and the writes below target the SAME guest scope.
+- name: "OpenBao unsealer scoping | Compute the unsealer guest firewall rules path + comment tags"
+  ansible.builtin.set_fact:
+    sdn_gateway_ob_rules_path: >-
+      /nodes/{{ sdn_gateway_openbao_unsealer_node }}/lxc/{{ sdn_gateway_openbao_unsealer_vmid }}/firewall/rules
+    sdn_gateway_ob_allow_comment: "sdn_gateway: ALLOW openbao primary -> unsealer 8200 (managed)"
+    sdn_gateway_ob_deny_comment: "sdn_gateway: DENY non-primary -> unsealer 8200 (managed)"
+
+# Read the unsealer guest's current firewall rules once so both rules below are
+# added only when absent. `pvesh get` mutates nothing and is check-mode-safe.
+- name: "OpenBao unsealer scoping | Read the unsealer guest's current firewall rules"
+  ansible.builtin.command:
+    cmd: "sudo pvesh get {{ sdn_gateway_ob_rules_path }} --output-format json"
+  register: sdn_gateway_ob_rules_raw
+  changed_when: false
+  check_mode: false
+
+- name: "OpenBao unsealer scoping | Compute the existing rule-comment set"
+  ansible.builtin.set_fact:
+    sdn_gateway_ob_comments: >-
+      {{ sdn_gateway_ob_rules_raw.stdout | from_json
+         | map(attribute='comment', default='') | list }}
+
+# --- 1. DROP any other source -> unsealer :8200 (created FIRST) --------------
+# Everything that is NOT the primary is denied to the seal port. Created first so
+# that, after the ALLOW is prepended above it, this ends up BELOW the ALLOW.
+# Written at the GUEST scope. Hard-fail on write error.
+- name: "OpenBao unsealer scoping | Ensure DROP non-primary -> unsealer :8200 (guest scope, check-then-change)"
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - pvesh
+      - create
+      - "{{ sdn_gateway_ob_rules_path }}"
+      - "--enable=1"
+      - "--type=in"
+      - "--action=DROP"
+      - "--proto=tcp"
+      - "--dest={{ sdn_gateway_openbao_unsealer_ip }}"
+      - "--dport={{ sdn_gateway_openbao_unsealer_seal_port }}"
+      - "--comment={{ sdn_gateway_ob_deny_comment }}"
+  when: sdn_gateway_ob_deny_comment not in sdn_gateway_ob_comments
+  register: sdn_gateway_ob_deny_create
+  changed_when: sdn_gateway_ob_deny_create.rc == 0
+  notify: Reload pve-firewall
+
+# --- 2. ALLOW primary -> unsealer :8200 (created SECOND, lands on top) -------
+# Scoped to the single primary source IP -> the single unsealer dest IP on the
+# seal port only — never a blanket allow. Created AFTER the DROP so `pvesh`
+# prepends it above the DROP, giving the correct ALLOW-above-DROP evaluation
+# order. Written at the GUEST scope. Hard-fail on write error.
+- name: "OpenBao unsealer scoping | Ensure ALLOW primary -> unsealer :8200 (guest scope, check-then-change)"
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - pvesh
+      - create
+      - "{{ sdn_gateway_ob_rules_path }}"
+      - "--enable=1"
+      - "--type=in"
+      - "--action=ACCEPT"
+      - "--proto=tcp"
+      - "--source={{ sdn_gateway_openbao_primary_ip }}"
+      - "--dest={{ sdn_gateway_openbao_unsealer_ip }}"
+      - "--dport={{ sdn_gateway_openbao_unsealer_seal_port }}"
+      - "--comment={{ sdn_gateway_ob_allow_comment }}"
+  when: sdn_gateway_ob_allow_comment not in sdn_gateway_ob_comments
+  register: sdn_gateway_ob_allow_create
+  changed_when: sdn_gateway_ob_allow_create.rc == 0
+  notify: Reload pve-firewall

@@ -1,0 +1,103 @@
+{#
+  templates/compose.yaml.j2 — docker-compose-app (generic)
+
+  Renders a compose.yaml from the service-supplied `dca_services` /
+  `dca_volumes` / `dca_networks` variable set. Owns no service-specific
+  knowledge. NO secret value is ever rendered here: `env_file` points at the
+  sibling `.env` (non-secret config only), and runtime secrets are fetched from
+  OpenBao by the Agent at container start (integration-boundaries §2).
+
+  Notes:
+    - `ports:` is NOT emitted by default. Web-facing services register with
+      Traefik via labels (PF FR-7 / integration-boundaries §1); a host port for
+      LAN/public ingress would violate that boundary. A service MAY set an
+      explicit `ports:` list ONLY for the documented exception of a PRIVATE,
+      VLAN-bound port that is NOT LAN/Traefik ingress — bind it to the guest's
+      VLAN IP (e.g. "10.0.20.11:8200:8200"), never 0.0.0.0. The sole current use
+      is the SVC-07 Transit UNSEALER, whose seal API must be reachable by the
+      primary OpenBao over VLAN 20 (a different LXC) — see openbao_install's
+      unsealer stack. This does not open a Traefik/LAN ingress path (no 0.0.0.0
+      bind, no host-wide exposure), so it does not violate FR-7; it is the
+      private cross-LXC seal path FR-7 never governed.
+    - `runtime_options` (e.g. --memory-swappiness=0) are container-create flags
+      that Compose does not model as first-class keys; they are carried under
+      the service's `x-runtime-options` extension field for documentation and,
+      where supported, mapped onto `mem_swappiness`.
+#}
+# MANAGED BY ANSIBLE (docker-compose-app) — DO NOT EDIT BY HAND.
+# Stack: {{ dca_app_name }}
+---
+name: {{ dca_app_name }}
+
+services:
+{% for svc in dca_services %}
+  {{ svc.name }}:
+    image: "{{ svc.image }}"
+{% if svc.command is defined %}
+    command: {{ svc.command | to_json }}
+{% endif %}
+    restart: "{{ svc.restart | default('unless-stopped') }}"
+{% if svc.ports is defined and svc.ports | length > 0 %}
+    # Opt-in ONLY: a private VLAN-bound port (NOT Traefik/LAN ingress). Bind to
+    # the guest VLAN IP, never 0.0.0.0. See the header note + PF FR-7 exception.
+    ports:
+{% for port in svc.ports %}
+      - "{{ port }}"
+{% endfor %}
+{% endif %}
+{% if svc.cap_add is defined and svc.cap_add | length > 0 %}
+    cap_add:
+{% for cap in svc.cap_add %}
+      - {{ cap }}
+{% endfor %}
+{% endif %}
+{% if svc.mem_swappiness is defined %}
+    mem_swappiness: {{ svc.mem_swappiness }}
+{% endif %}
+{% if svc.env_file | default(true) %}
+    env_file:
+      - .env
+{% endif %}
+{% if svc.volumes is defined and svc.volumes | length > 0 %}
+    volumes:
+{% for vol in svc.volumes %}
+      - "{{ vol }}"
+{% endfor %}
+{% endif %}
+{% if svc.networks is defined and svc.networks | length > 0 %}
+    networks:
+{% for net in svc.networks %}
+      - {{ net }}
+{% endfor %}
+{% endif %}
+{% if svc.labels is defined and svc.labels | length > 0 %}
+    labels:
+{% for label in svc.labels %}
+      - "{{ label }}"
+{% endfor %}
+{% endif %}
+{% if svc.runtime_options is defined and svc.runtime_options | length > 0 %}
+    # runtime container-create flags (not first-class Compose keys):
+    x-runtime-options:
+{% for opt in svc.runtime_options %}
+      - "{{ opt }}"
+{% endfor %}
+{% endif %}
+{% endfor %}
+
+{% if dca_volumes | length > 0 %}
+volumes:
+{% for vol in dca_volumes %}
+  {{ vol }}:
+{% endfor %}
+{% endif %}
+
+{% if dca_networks | length > 0 %}
+networks:
+{% for net in dca_networks %}
+  {{ net.name }}:
+{% if net.external | default(false) %}
+    external: true
+{% endif %}
+{% endfor %}
+{% endif %}

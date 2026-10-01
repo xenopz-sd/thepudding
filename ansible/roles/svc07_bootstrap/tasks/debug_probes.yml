@@ -1,0 +1,58 @@
+---
+# tasks/debug_probes.yml — svc07_bootstrap (SVC-07 installer — Phase 3 debug probes)
+#
+# Consolidated DEV-ONLY debug instrumentation for the Phase-3 primary bootstrap
+# (Task 8.4 child run). Moved VERBATIM out of tasks/main.yml (spec task 7.1,
+# design.md "Debug-Instrumentation Model (plan item 4)"): the functional
+# bootstrap loop in main.yml no longer carries any inline
+# svc07_debug_instrumentation-gated task. This file is imported ONCE from
+# tasks/main.yml with a single guard —
+#   ansible.builtin.import_tasks: debug_probes.yml
+#   when: svc07_debug_instrumentation | default(false) | bool
+# — positioned immediately AFTER the Task 8.4 register (svc07_primary_bootstrap)
+# and BEFORE the drift guard, so the probe log is available for diagnosis.
+#
+# import_tasks is STATIC: these tasks run in the same variable scope as main.yml,
+# so the Task-8.4 registered result (svc07_primary_bootstrap) remains accessible
+# here. The guard on the import applies cleanly to every task in this file, so
+# the tasks below carry NO redundant per-task `when:` — a normal run
+# (svc07_debug_instrumentation=false, the committed default) never reaches this
+# file at all.
+#
+# Secret safety (design "Debug-Instrumentation Model"):
+#  * The secret-bearing child stdout+stderr log write is no_log:true, mode 0600,
+#    gitignored (.svc07-*.log) — it CONTAINS THE REVEALED ADMIN_TOKEN.
+#  * The non-secret rc / stdout-length / TOKEN=-marker summary is no_log:false
+#    (prints no secret value) so the operator can read it in the run log.
+
+# DEV-ONLY debug (svc07_debug_instrumentation): persist the child run's
+# FULL stdout+stderr to a gitignored 0600 file on the CONTROL NODE so the
+# operator can inspect exactly what the primary bootstrap emitted. THIS
+# FILE CONTAINS THE REVEALED ADMIN_TOKEN (and the child env), so this task
+# is itself no_log:true (content must not echo to the run log) and the
+# file is 0600 + gitignored (.svc07-*.log). It is a dev-only,
+# secret-bearing artifact — the operator MUST delete it after debugging.
+- name: "Bootstrap | DEV-DEBUG — write Task 8.4 child stdout+stderr to gitignored 0600 log (no_log)"
+  ansible.builtin.copy:
+    dest: "{{ svc07_repo_root }}/.svc07-task84-child.log"
+    mode: "0600"
+    content: |
+      === Task 8.4 child run — rc={{ svc07_primary_bootstrap.rc | default('n/a') }} ===
+      --- STDOUT ---
+      {{ svc07_primary_bootstrap.stdout | default('') }}
+      --- STDERR ---
+      {{ svc07_primary_bootstrap.stderr | default('') }}
+  no_log: true
+
+# DEV-ONLY debug (svc07_debug_instrumentation): print ONLY non-secret
+# metadata about the child run — rc, stdout length, and whether the
+# reveal marker 'TOKEN=' is present (boolean). It deliberately does NOT
+# print the stdout itself, so no_log:false is safe and the operator can
+# see the summary in the normal run log.
+- name: "Bootstrap | DEV-DEBUG — print Task 8.4 child rc + stdout length + TOKEN= presence (no secret)"
+  ansible.builtin.debug:
+    msg:
+      - "task_8_4_rc={{ svc07_primary_bootstrap.rc | default('n/a') }}"
+      - "task_8_4_stdout_length={{ svc07_primary_bootstrap.stdout | default('') | length }}"
+      - "task_8_4_has_TOKEN_marker={{ 'TOKEN=' in (svc07_primary_bootstrap.stdout | default('')) }}"
+  no_log: false

@@ -1,0 +1,43 @@
+---
+# defaults/main.yml — svc07_preflight (SVC-07 installer — Phase 1: Preflight)
+#
+# Phase-1 phase-specific defaults (spec task 3.2), moved VERBATIM from the
+# play-level vars: block of svc-07-bootstrap.yml. Cross-phase constants
+# (cluster_env_file, svc07_repo_root, svc07_venv_python, etc.) stay as
+# play-level vars on svc-07-bootstrap.yml (see design.md "Data Models") — the
+# role reads them from the play. NO secret value ever lives here.
+
+# The pure-logic env helper (task 6.2 delegates parse/validate to it).
+svc07_cluster_env_helper: scripts/installer/cluster_env.py
+
+# Sentinel emitted by cluster_env.py for an unset optional datastore var —
+# kept in sync with AUTODETECT in scripts/installer/cluster_env.py (Req 2.6,
+# 3.5). A resolved datastore equal to this triggers node-storage auto-detect.
+svc07_autodetect_sentinel: "__AUTODETECT__"
+
+# Homelab Proxmox commonly presents a self-signed API cert; default to not
+# validating so preflight reachability does not fail on cert trust. Override
+# to true where the cluster presents a trusted cert:
+#   -e svc07_proxmox_validate_certs=true
+# This single toggle governs BOTH consumers (fix-cluster-env-endpoint-path,
+# TLS half): the Phase-1 Preflight uri tasks read it directly as their
+# validate_certs, and svc07_tf_env derives TF_VAR_proxmox_insecure from it
+# (insecure == NOT validate_certs) so the bpg/proxmox provider's TLS
+# verification cannot drift from what preflight already tolerated.
+svc07_proxmox_validate_certs: false
+
+# Ansible collections the installer's CONFIGURATOR child runs rely on
+# (pinned in ansible/requirements.yml). Preflight asserts each is installed
+# (Req 3.7) so a missing collection fails fast, not mid-bootstrap.
+svc07_required_collections:
+  - community.docker
+  - community.general
+  - ansible.posix
+  - community.crypto
+
+# Project venv binaries the installer + its child runs invoke by absolute
+# path (Req 3.7). Their absence is a named, fail-fast preflight error.
+svc07_required_venv_binaries:
+  - "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+  - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+  - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-galaxy"

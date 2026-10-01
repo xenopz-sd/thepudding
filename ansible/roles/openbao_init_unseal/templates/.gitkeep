@@ -1,0 +1,6 @@
+# templates/ — openbao_init_unseal
+#
+# Placeholder so the standard role skeleton carries a templates/ directory.
+# Task 6.1 templates no files. Task 6.2 (primary init/bootstrap) and task 7.x
+# (engine/auth/audit) will add templates here — e.g. a policy HCL or an audit
+# device config — without introducing a new directory mid-feature.

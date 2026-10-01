@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+.hypothesis/
+.pytest_cache/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan*
+crash.log
+# Local backend override for solo/offline apply (never commit — see
+# infra/projects/<slug>/INSTALL-RUNBOOK.md "Initialize the state backend").
+*_override.tf
+
+# Ansible
+# Generated Ansible inventories — rendered by ansible/inventory/generate_inventory.py
+# from `terraform output -json`. Never hand-edited, never committed.
+ansible/inventory/*.generated.yml
+
+# Local env / secrets (never commit)
+*.env
+.env
+*.tfvars
+
+# SVC-07 installer cluster env files — hold the Proxmox API token and the
+# written OPENBAO_ADMIN_TOKEN (Developer B Day-0 bootstrap). Listed explicitly
+# for clarity even though *.env above already matches them; the committed
+# template cluster.env.example is deliberately NOT ignored.
+cluster.env
+cluster.dev.env
+cluster.acc.env
+cluster.prod.env
+!cluster.env.example
+
+# Agent throwaway-cluster live-test env source — holds a real THROWAWAY Proxmox
+# token; gitignored. Note `*.env` above matches only names ENDING in `.env`, so
+# `.env.throwaway` (ends in `.throwaway`) is NOT covered by it and must be listed
+# explicitly. The committed template .env.throwaway.example is NOT ignored.
+.env.throwaway
+!.env.throwaway.example
+
+# SVC-07 unsealer-bootstrap-delegation: transient mode-0600 Handoff_File the
+# openbao_init_unseal role writes the minted Bootstrap_Transit_Token into so the
+# svc-07-bootstrap.yml orchestrator can read it across the child-process boundary,
+# then deletes immediately. A leading-dot file at the repo root is NOT matched by
+# *.env / .env above, so it is listed explicitly. Never committed.
+.svc07-seal-token.handoff
+
+# SVC-07 DEV-ONLY diagnostic instrumentation log (svc07_debug_instrumentation).
+# The Task 8.4 child-stdout probe writes the primary bootstrap's FULL stdout to
+# .svc07-task84-child.log, which CONTAINS THE REVEALED ADMIN_TOKEN. Mode 0600,
+# dev-only, deleted by the operator after debugging. A leading-dot file at the
+# repo root is NOT matched by *.env / .env above, so it is listed explicitly.
+# Never committed.
+.svc07-*.log

@@ -1,0 +1,94 @@
+---
+# Baseline hardening, timezone, and unattended-upgrades for the `common` role
+# (spec task 3.1, requirements 1.1 + 1.5, PF §9, security-standards.md).
+#
+# SECRET-FREE (requirement 1.5 / P3): no task, variable, or template here carries
+# any secret material — these are generic, project-agnostic baseline knobs.
+# Runtime secrets arrive only via the OpenBao Agent at container-start.
+#
+# IDEMPOTENT (requirement 1.3 / PF FR-9): every task uses a proper Ansible module
+# with correct change reporting, so a converged host reports changed=0 on a
+# second run. No raw shell is used where a module exists.
+#
+# UNPRIVILEGED-LXC SAFE: this baseline deliberately avoids kernel/sysctl mutation
+# and any host-level tuning that fails or is meaningless inside an unprivileged
+# LXC (the platform default per tech.md) or during a Proxmox template bake. It is
+# a conservative Debian 12 baseline: timezone, apt hygiene, and
+# unattended-upgrades only.
+
+# --- Timezone ---------------------------------------------------------------
+# Set the system timezone idempotently to `common_timezone` (default Etc/UTC).
+# community.general.timezone reports changed correctly (only when the current
+# zone differs) and works in an unprivileged LXC — it writes /etc/localtime and
+# /etc/timezone without needing to touch the host clock hardware.
+- name: Set system timezone
+  community.general.timezone:
+    name: "{{ common_timezone }}"
+
+# --- APT hygiene ------------------------------------------------------------
+# Refresh the apt cache if it is stale, so subsequent package tasks (this file's
+# unattended-upgrades install, and task 3.2's Docker install) see current
+# metadata. `cache_valid_time` keeps this idempotent within a run window — it is
+# a no-op (changed=0) when the cache was updated recently, avoiding a needless
+# network hit and a spurious change on every converged run.
+- name: Update apt cache (bounded, idempotent within cache window)
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  changed_when: false
+
+# --- Unattended-upgrades ----------------------------------------------------
+# security-standards.md: "Unattended-upgrades are baked into the Ansible `common`
+# role and applied to every host by default" (PF §9). Gated on
+# `common_unattended_enabled` (default true) so a host with a deliberately
+# managed patch cadence can opt out.
+#
+# state: present (never `latest`, per PF §9 / FR-9): we pin behaviour to the
+# distro-provided package and never float it to the newest available version.
+- name: Install unattended-upgrades
+  when: common_unattended_enabled | bool
+  ansible.builtin.apt:
+    name:
+      - unattended-upgrades
+      - apt-listchanges
+    state: present
+
+# Enable the periodic apt configuration that actually drives unattended-upgrades.
+# A template is used (not a raw copy of a package default) so the enablement is
+# explicit and idempotent: the file only changes when its rendered content
+# changes. This installs the standard 20auto-upgrades knobs
+# (Update-Package-Lists + Unattended-Upgrade = "1"), which is the conservative,
+# LXC-safe way to turn the service on — it schedules apt work, not kernel/sysctl
+# changes.
+- name: Enable periodic unattended-upgrades (20auto-upgrades)
+  when: common_unattended_enabled | bool
+  ansible.builtin.template:
+    src: 20auto-upgrades.j2
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+# Ensure the unattended-upgrades service is enabled so the timer/service is
+# active across reboots. `service` is idempotent (changed only when the enabled
+# state actually flips). We do NOT force `state: started` here: in an
+# unprivileged LXC or a template-bake context systemd may not be managing units
+# the same way as on a full host, so enabling (persisting the intent) is the
+# conservative, portable choice; the apt.systemd.daily timer runs it on boot.
+- name: Enable the unattended-upgrades service
+  when: common_unattended_enabled | bool
+  ansible.builtin.systemd_service:
+    name: unattended-upgrades
+    enabled: true
+  # An unprivileged LXC / bake environment may not expose a running systemd to
+  # manage; enabling is best-effort and must never fail the baseline. If systemd
+  # is unavailable the 20auto-upgrades config + apt-daily timer still drives it.
+  failed_when: false
+  changed_when: false
+
+# --- SEAM: Docker CE + Compose-plugin install (spec task 3.2) ----------------
+# Task 3.2 adds the single Docker-install implementation for the platform here
+# (or as an included tasks/docker.yml), using `common_docker_version_pin` with
+# `state: present` (never `latest`). Task 3.3 adds the
+# community.docker.docker_compose_v2 verification. Do NOT implement Docker in
+# this file — it is the baseline-only portion.

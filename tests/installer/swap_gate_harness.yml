@@ -1,0 +1,118 @@
+---
+# swap_gate_harness.yml — OFFLINE test harness for the SVC-07 installer's
+# Terraform backend swap-gate (svc-07-bootstrap.yml Phase 2, Task 7.1).
+#
+# Spec: .kiro/specs/svc-07-automated-installer/ (design.md "Testing Strategy" §2,
+# Req 4.2). Exercised by tests/installer/test_swap_gate.py.
+#
+# WHY A HARNESS PLAY (not a live run of svc-07-bootstrap.yml)
+# ----------------------------------------------------------
+# The swap-gate decision now lives in the svc07_provision ROLE
+# (ansible/roles/svc07_provision/tasks/main.yml) — moved there when
+# svc-07-bootstrap.yml was thinned to a ~150-line orchestrator of five
+# import_role calls (svc07-installer-simplification). Running the real installer
+# end-to-end still first executes Phase 1 (Proxmox API reachability/auth, P20
+# bridge, datastore auto-detect) — all of which need a LIVE cluster, making the
+# check non-offline. The swap-gate itself, however, is
+# a self-contained, PURELY-LOCAL decision: it slurps the Cluster_Env_File, tests
+# for the presence of the three GitLab CI state-backend keys (CI_API_V4_URL,
+# CI_PROJECT_ID, CI_JOB_TOKEN), sets svc07_use_gitlab_backend accordingly, logs
+# an INFO line naming the chosen backend, and (for the LOCAL branch) ensures the
+# gitignored local_backend_override.tf is present. None of that touches Proxmox
+# or Terraform state.
+#
+# This harness reproduces THAT decision chain VERBATIM from the provision role so
+# it can be driven offline against a stub env file. The companion test
+# (test_swap_gate.py::test_harness_logic_matches_playbook) is a drift guard that
+# asserts the svc07_provision role still carries the same decision expression, so
+# the harness cannot silently diverge from the code it stands in for.
+#
+# The gate itself makes NO real change we care about here beyond writing/removing
+# the override file; the harness points svc07_tf_root at a WRITABLE temp dir
+# (passed via -e swc07_tf_root=...) so it never mutates the real Terraform root.
+- name: SVC-07 backend swap-gate — offline harness
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # The Cluster_Env_File under test and the (temp) Terraform root the LOCAL
+    # branch writes local_backend_override.tf into. Both supplied by the test
+    # via -e. svc07_repo_root anchors the slurp path exactly as the real play
+    # (which joins svc07_repo_root ~ '/' ~ cluster_env_file).
+    svc07_repo_root: "{{ playbook_dir }}"
+    cluster_env_file: cluster.env
+    svc07_tf_root: "{{ playbook_dir }}"
+  tasks:
+    # ---- BEGIN swap-gate decision chain (verbatim from svc-07-bootstrap.yml) ----
+    - name: "Provisioning | Read the cluster env file to detect the state-backend signal"
+      ansible.builtin.slurp:
+        src: "{{ svc07_repo_root }}/{{ cluster_env_file }}"
+      register: svc07_env_slurp
+      no_log: true
+
+    - name: "Provisioning | Reduce the env file to KEY=VALUE lines"
+      ansible.builtin.set_fact:
+        svc07_env_pairs: >-
+          {{ (svc07_env_slurp.content | b64decode).splitlines()
+             | map('trim')
+             | reject('match', '^\s*#')
+             | select('search', '=')
+             | list }}
+      no_log: true
+
+    - name: "Provisioning | Extract the set of env keys (names only, no values)"
+      ansible.builtin.set_fact:
+        svc07_env_keys: >-
+          {{ svc07_env_pairs
+             | map('regex_replace', '^\s*([^=]+?)\s*=.*$', '\1')
+             | list }}
+
+    - name: "Provisioning | Decide the Terraform backend (swap gate)"
+      ansible.builtin.set_fact:
+        svc07_use_gitlab_backend: >-
+          {{ ('CI_API_V4_URL' in svc07_env_keys)
+             and ('CI_PROJECT_ID' in svc07_env_keys)
+             and ('CI_JOB_TOKEN' in svc07_env_keys) }}
+
+    - name: "Provisioning | Log the Terraform backend selection (INFO)"
+      ansible.builtin.debug:
+        msg: >-
+          INFO: Terraform backend:
+          {{ 'GitLab HTTP state (svc-07-secrets-manager) — the Cluster_Env_File '
+             ~ 'configures the GitLab CI state-backend variables'
+             if (svc07_use_gitlab_backend | bool)
+             else 'LOCAL (local_backend_override.tf) — the Cluster_Env_File does not '
+                  ~ 'configure the GitLab HTTP backend (solo/offline Developer-B default)' }}
+
+    - name: "Provisioning | Ensure local_backend_override.tf is present (local backend)"
+      ansible.builtin.copy:
+        dest: "{{ svc07_tf_root }}/local_backend_override.tf"
+        mode: "0644"
+        content: |
+          # Local, gitignored state backend for a solo/offline apply — overrides the
+          # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+          terraform {
+            backend "local" {}
+          }
+      when: not (svc07_use_gitlab_backend | bool)
+
+    - name: "Provisioning | Remove any local_backend_override.tf (GitLab HTTP backend)"
+      ansible.builtin.file:
+        path: "{{ svc07_tf_root }}/local_backend_override.tf"
+        state: absent
+      when: svc07_use_gitlab_backend | bool
+    # ---- END swap-gate decision chain -----------------------------------------
+
+    # Emit the resolved decision + the override-file presence as a single
+    # machine-parseable line the test asserts on (keeps the test independent of
+    # ansible's human-readable recap formatting).
+    - name: "Harness | Stat the override file after the gate"
+      ansible.builtin.stat:
+        path: "{{ svc07_tf_root }}/local_backend_override.tf"
+      register: svc07_override_stat
+
+    - name: "Harness | Emit the machine-parseable gate result"
+      ansible.builtin.debug:
+        msg: >-
+          SWAP_GATE_RESULT use_gitlab_backend={{ svc07_use_gitlab_backend | bool }}
+          override_present={{ svc07_override_stat.stat.exists }}

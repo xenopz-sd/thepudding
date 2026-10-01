@@ -1,0 +1,482 @@
+---
+# tasks/main.yml — openbao_project_onboard  (SVC-07, TASK 9.1)
+#
+# PER-PROJECT onboarding on the PRIMARY OpenBao instance. For one project slug
+# (read READ-ONLY from projects.yaml) create the isolation triple and be
+# IDEMPOTENT (a re-run for the same slug is a byte-identical no-op that touches
+# no secret version and reports changed=0 — Req 1.5, 13.4):
+#
+#   (1) policy-<slug>            — CRUD+list on EXACTLY the five KV v2 sub-paths
+#                                  secret/{data,metadata,delete,undelete,destroy}/
+#                                  <slug>/*  and NOTHING outside them (Req 1.2, 1.3)
+#   (2) auth/jwt/role/<slug>-ci  — bound project_path + bound_audiences,
+#                                  token_ttl/max_ttl <= 3600, renewable=false,
+#                                  token_policies=[policy-<slug>], optional
+#                                  ref_type/ref (Req 4.2, 4.7)
+#   (3) secret/data/<slug>/      — the KV path exists (Req 1.6)
+#
+# AUTH: a PLATFORM-ADMIN token (NOT the Root_Token — it is revoked after
+# bootstrap, Security AC 1). Supplied at runtime from an operator-controlled,
+# NEVER-COMMITTED env var (a gitignored .env or a GitLab CI/CD protected+masked
+# variable) via an `env` lookup. Passed to every `bao` call as
+# `-e BAO_TOKEN={{ openbao_admin_token }}` on the docker exec, with
+# `no_log: "{{ openbao_no_log }}"` — hidden by DEFAULT (openbao_no_log resolves to
+# true when the DEV-ONLY openbao_dev_expose_secrets opt-in is off, which is the
+# NON-NEGOTIABLE acceptance/production posture). A developer debugging a throwaway
+# cluster MAY reveal the censored output for a SINGLE run with
+# `-e openbao_dev_expose_secrets=true` (ephemeral tokens only) — never committed,
+# never in CI/acceptance/production. Mirrors the sibling openbao_init_unseal role.
+#
+# TLS: every `bao` docker-exec call below CONDITIONALLY splices `-tls-skip-verify`
+# — gated on openbao_primary_tls_skip_verify (see defaults/main.yml), which
+# derives from the install-time openbao_tls_self_signed toggle. This mirrors the
+# sibling openbao_init_unseal role exactly: against the self-signed MOCK cert the
+# flag lets `bao` reach the primary API (otherwise the FIRST `bao` call fails
+# x509 cert verification); with a real trusted-CA cert the toggle is false and
+# `bao` verifies normally. The flag is built as the splice-list form
+# `[...prefix, '<subcommand>'] + (['-tls-skip-verify'] if ... else []) + [...positionals]`
+# so it lands AFTER the last `bao` subcommand keyword and BEFORE any positional
+# argument (bao rejects flags after positionals). Only the `bao`-invoking command
+# tasks carry this; the `docker cp` and template/slurp/set_fact/assert/debug tasks
+# do no TLS handshake and are unchanged.
+#
+# IDEMPOTENCY: check-then-write. One `bao policy list -format=json` read decides
+# whether policy-<slug> needs writing; one `bao secrets list -format=json` read
+# decides whether the KV path metadata needs creating; the jwt-role write reads
+# the stored role and only writes when absent or DIFFERENT. Ensuring the KV path
+# uses `kv metadata put` (metadata-only), which never creates or overwrites a
+# secret VERSION, so it touches no secret data on first run or re-run.
+#
+# NO secret value is templated, echoed, or defaulted anywhere in this role.
+
+# ============================================================================
+# STEP 0 — Validate inputs (slug present; optionally recorded in projects.yaml)
+# ============================================================================
+
+- name: "9.1 — Assert project_slug is supplied"
+  ansible.builtin.assert:
+    that:
+      - project_slug is defined
+      - project_slug | string | length > 0
+    fail_msg: >-
+      project_slug is required. Supply the slug to onboard (read-only from
+      projects.yaml) as an extra-var or play var — this role never picks one.
+    success_msg: "Onboarding OpenBao project slug '{{ project_slug }}'."
+    quiet: true
+
+# READ-ONLY validation that the slug is a recorded project. This PARSES
+# projects.yaml and asserts the slug is present — it NEVER writes the registry
+# (design.md: projects.yaml relationship — READ-ONLY here). Skipped when
+# openbao_validate_slug_in_registry is false (e.g. a test fixture without the
+# registry on disk).
+- name: "9.1 — Read projects.yaml (READ-ONLY) to validate the slug is registered"
+  ansible.builtin.slurp:
+    src: "{{ openbao_projects_yaml_path }}"
+  register: openbao_projects_yaml_raw
+  # `projects.yaml` is a CONTROL-NODE repo artifact (it lives in the checkout at
+  # {{ playbook_dir }}/../../infra/platform-foundation/projects.yaml and is NOT copied
+  # to the guest). slurp runs on the play's target host by default, so without this
+  # delegation it looks for the control-node path ON THE PRIMARY LXC and fails
+  # "File not found" even when the slug is registered. Delegate the READ to the
+  # control node so the registry is read where it actually exists. `playbook_dir`
+  # already resolves on the control node, so openbao_projects_yaml_path is correct
+  # once the read runs there. (The other slurp in this role — /tmp/<policy>.hcl — is
+  # deliberately host-local: that file is templated onto the guest earlier this run.)
+  delegate_to: localhost
+  # become: false — delegated READ on the CONTROL NODE runs as the invoking user;
+  # inheriting the play's become:true makes it sudo on the control node and fail
+  # with 'sudo: a password is required' (same fix as the clean-slate state-rm).
+  become: false
+  check_mode: false          # read even under --check so validation can run
+  changed_when: false        # a read never reports a change
+  when: openbao_validate_slug_in_registry | bool
+
+- name: "9.1 — Parse the registered slugs from projects.yaml (READ-ONLY)"
+  ansible.builtin.set_fact:
+    openbao_registered_slugs: >-
+      {{ (openbao_projects_yaml_raw.content | b64decode | from_yaml).projects
+         | map(attribute='slug') | list }}
+  changed_when: false
+  when: openbao_validate_slug_in_registry | bool
+
+- name: "9.1 — Assert project_slug is a recorded project (never writes the registry)"
+  ansible.builtin.assert:
+    that:
+      - project_slug in openbao_registered_slugs
+    fail_msg: >-
+      project_slug '{{ project_slug }}' is not recorded in
+      {{ openbao_projects_yaml_path }}. Onboard the project into the VLAN-ID
+      registry first (NET-00 onboarding MR flow) — this role reads the registry
+      READ-ONLY and never adds a slug to it.
+    success_msg: "project_slug '{{ project_slug }}' is a recorded project (registry unchanged)."
+    quiet: true
+  when: openbao_validate_slug_in_registry | bool
+
+# ============================================================================
+# STEP 1 — Resolve + assert the platform-admin token (never committed)
+# ============================================================================
+# Read the platform-admin token from its never-committed env var. Fail closed if
+# absent — never proceed with an empty token, never fall back to the Root_Token
+# (revoked) or a committed value.
+- name: "9.1 — Resolve the platform-admin token from its env var (never committed)"
+  ansible.builtin.set_fact:
+    openbao_admin_token: >-
+      {{ lookup('ansible.builtin.env', openbao_admin_token_env_var, default='') }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+- name: "9.1 — Assert the platform-admin token was supplied (fail closed)"
+  ansible.builtin.assert:
+    that:
+      - openbao_admin_token | length > 0
+    fail_msg: >-
+      No platform-admin token found. Supply it via the never-committed
+      environment variable '{{ openbao_admin_token_env_var }}' (a gitignored
+      .env or a GitLab CI/CD protected+masked variable). This day-2 role does
+      NOT use the Root_Token (revoked after bootstrap). It is never defaulted or
+      committed.
+    success_msg: "platform-admin token supplied via {{ openbao_admin_token_env_var }} (value not logged)."
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+
+# ============================================================================
+# STEP 2 — Validate the jwt-role TTL ceiling BEFORE any write (Req 4.2)
+# ============================================================================
+# token_ttl and token_max_ttl must BOTH be <= 3600. Assert up front so a
+# misconfiguration fails before touching OpenBao.
+- name: "9.1 — Assert jwt token_ttl and token_max_ttl are both <= {{ openbao_project_jwt_token_ttl_ceiling }}s (Req 4.2)"
+  ansible.builtin.assert:
+    that:
+      - (openbao_project_jwt_token_ttl | int) > 0
+      - (openbao_project_jwt_token_ttl | int) <= (openbao_project_jwt_token_ttl_ceiling | int)
+      - (openbao_project_jwt_token_max_ttl | int) > 0
+      - (openbao_project_jwt_token_max_ttl | int) <= (openbao_project_jwt_token_ttl_ceiling | int)
+      - not (openbao_project_jwt_token_renewable | bool)
+    fail_msg: >-
+      jwt role '{{ openbao_project_jwt_role_name }}' must have token_ttl and
+      token_max_ttl both in (0, {{ openbao_project_jwt_token_ttl_ceiling }}] and
+      renewable=false (Req 4.2). Got token_ttl={{ openbao_project_jwt_token_ttl }},
+      token_max_ttl={{ openbao_project_jwt_token_max_ttl }},
+      renewable={{ openbao_project_jwt_token_renewable }}.
+    success_msg: "jwt TTL ceiling satisfied (both <= {{ openbao_project_jwt_token_ttl_ceiling }}s, non-renewable)."
+    quiet: true
+
+# ============================================================================
+# STEP 3 — policy-<slug>  (check-then-write, Req 1.2, 1.3, 1.5, 13.4)
+# ============================================================================
+# Render the policy HCL locally so its byte content is deterministic, read the
+# live policy back, and write ONLY when absent or different. A re-run for the
+# same slug leaves the policy document byte-identical -> no write -> changed=0.
+
+- name: "9.1 — Render the policy-<slug> HCL onto the control/primary host"
+  ansible.builtin.template:
+    src: "policy-slug.hcl.j2"
+    dest: "/tmp/{{ openbao_project_policy_name }}.hcl"
+    owner: root
+    group: root
+    mode: "0640"
+  register: openbao_policy_render
+  # Rendering to a tmp file is not the source-of-truth change; the `bao policy
+  # write` below is. Templating is idempotent (same vars -> same bytes), so this
+  # only reports changed when the rendered content actually differs.
+
+- name: "9.1 — List existing policies (check-then-write, no change)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `policy list` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'policy', 'list']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_policy_list
+  no_log: "{{ openbao_no_log }}"   # exec env carries the platform-admin token
+  check_mode: false
+  changed_when: false
+
+- name: "9.1 — Read the live policy-<slug> body when it already exists"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `policy read` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'policy', 'read']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json', openbao_project_policy_name] }}
+  register: openbao_policy_read
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+  when: >-
+    openbao_project_policy_name in (openbao_policy_list.stdout | default('[]') | from_json)
+
+- name: "9.1 — Read the rendered policy body from the tmp file (for byte compare)"
+  ansible.builtin.slurp:
+    src: "/tmp/{{ openbao_project_policy_name }}.hcl"
+  register: openbao_policy_rendered_raw
+  check_mode: false
+  changed_when: false
+
+- name: "9.1 — Decide whether policy-<slug> must be (re)written"
+  ansible.builtin.set_fact:
+    # Write when the policy is ABSENT, or PRESENT but its stored body differs
+    # from the freshly-rendered body (compared with whitespace normalised so a
+    # cosmetic reformat does not force a needless write). A byte-identical
+    # existing policy -> no write -> changed=0 on a re-run (Req 1.5, 13.4).
+    openbao_policy_needs_write: >-
+      {{ (openbao_project_policy_name not in
+          (openbao_policy_list.stdout | default('[]') | from_json))
+         or ((openbao_policy_read.stdout | default('{}') | from_json).policy
+             | default('') | regex_replace('\s+', ' ') | trim)
+            != ((openbao_policy_rendered_raw.content | b64decode)
+                | regex_replace('\s+', ' ') | trim) }}
+  no_log: "{{ openbao_no_log }}"   # openbao_policy_read derives from a token exec
+  changed_when: false
+
+- name: "9.1 — Copy the rendered policy into the primary container (only when writing)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - cp
+      - "/tmp/{{ openbao_project_policy_name }}.hcl"
+      - "{{ openbao_primary_container_name }}:/tmp/{{ openbao_project_policy_name }}.hcl"
+  changed_when: true
+  when: openbao_policy_needs_write | bool
+
+- name: "9.1 — Write policy-<slug> (CRUD+list on the five KV sub-paths only, Req 1.2/1.3)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `policy write` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'policy', 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + [openbao_project_policy_name,
+            '/tmp/' ~ openbao_project_policy_name ~ '.hcl'] }}
+  register: openbao_policy_write
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_policy_write.rc == 0
+  when: openbao_policy_needs_write | bool
+
+- name: "9.1 — Report the policy-<slug> decision"
+  ansible.builtin.debug:
+    msg: >-
+      policy-{{ project_slug }}:
+      {{ 'written (absent or changed)' if openbao_policy_needs_write | bool
+         else 'already present and byte-identical — no change (Req 1.5, 13.4)' }}.
+
+# ============================================================================
+# STEP 4 — auth/jwt/role/<slug>-ci  (check-then-write, Req 4.2, 4.7)
+# ============================================================================
+# Build the bound_claims (project_path always; ref_type/ref when supplied),
+# read the stored role, and write ONLY when absent or when any contract field
+# differs. A re-run with the same inputs -> no write -> changed=0.
+
+- name: "9.1 — Build the jwt role bound_claims (project_path + optional ref_type/ref)"
+  ansible.builtin.set_fact:
+    openbao_jwt_bound_claims: >-
+      {{ {'project_path': project_gitlab_path}
+         | combine({'ref_type': openbao_project_jwt_bound_ref_type}
+                   if (openbao_project_jwt_bound_ref_type | length > 0) else {})
+         | combine({'ref': openbao_project_jwt_bound_ref}
+                   if (openbao_project_jwt_bound_ref | length > 0) else {}) }}
+  changed_when: false
+
+- name: "9.1 — Read the stored jwt role '<slug>-ci' when it already exists"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the bare `read` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'read']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json',
+            'auth/' ~ openbao_jwt_mount_path ~ '/role/' ~ openbao_project_jwt_role_name] }}
+  register: openbao_jwt_role_read
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+  failed_when: false           # a missing role returns non-zero — that's "absent"
+
+- name: "9.1 — Decide whether the jwt role must be (re)written"
+  ansible.builtin.set_fact:
+    # Parse the stored role data (empty dict when the read failed / role absent),
+    # then require a write when absent OR when any contract field diverges from
+    # the desired value. TTLs are compared as integers (OpenBao stores seconds).
+    openbao_jwt_role_stored: >-
+      {{ (openbao_jwt_role_read.stdout | default('') | trim | from_json).data | default({})
+         if (openbao_jwt_role_read.stdout | default('') | trim | length > 0)
+         else {} }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+- name: "9.1 — Compute the jwt-role write decision"
+  ansible.builtin.set_fact:
+    openbao_jwt_role_needs_write: >-
+      {{ (openbao_jwt_role_stored | length == 0)
+         or ((openbao_jwt_role_stored.token_ttl | default(-1) | int)
+             != (openbao_project_jwt_token_ttl | int))
+         or ((openbao_jwt_role_stored.token_max_ttl | default(-1) | int)
+             != (openbao_project_jwt_token_max_ttl | int))
+         or ((openbao_jwt_role_stored.token_explicit_max_ttl | default(0) | int)
+             > (openbao_project_jwt_token_ttl_ceiling | int))
+         or ((openbao_jwt_role_stored.token_policies | default([]) | sort)
+             != ([openbao_project_policy_name] | sort))
+         or ((openbao_jwt_role_stored.bound_audiences | default([]) | sort)
+             != ([openbao_jwt_bound_audience] | sort))
+         or ((openbao_jwt_role_stored.bound_claims | default({}))
+             != openbao_jwt_bound_claims)
+         or ((openbao_jwt_role_stored.user_claim | default(''))
+             != openbao_project_jwt_user_claim) }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+- name: "9.1 — Write auth/jwt/role/<slug>-ci (bound, <=3600s, non-renewable, Req 4.2/4.7)"
+  ansible.builtin.command:
+    # `docker exec -i` is REQUIRED: the request body is fed via `stdin`
+    # (`bao write <path> -` reads a JSON object from stdin). `docker exec`
+    # forwards the parent process's stdin into the container ONLY with `-i`;
+    # without it the container's `bao` sees an EMPTY stdin and OpenBao 400s.
+    # JSON-on-stdin (not `key=value` positionals) is required because
+    # `bound_claims` is a map[string]interface{} field — the `key=value` form
+    # delivers it as a string and OpenBao rejects it with a 400. Mirrors the
+    # sibling openbao_init_unseal policy-write stdin idiom.
+    # `-tls-skip-verify` goes after `write`, before the `-` stdin positional
+    # (bao rejects flags after positionals).
+    argv: >-
+      {{ ['docker', 'exec', '-i', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['auth/' ~ openbao_jwt_mount_path ~ '/role/' ~ openbao_project_jwt_role_name,
+            '-'] }}
+    stdin: >-
+      {{ {'role_type': 'jwt',
+          'user_claim': openbao_project_jwt_user_claim,
+          'bound_audiences': [openbao_jwt_bound_audience],
+          'bound_claims': openbao_jwt_bound_claims,
+          'token_policies': [openbao_project_policy_name],
+          'token_ttl': (openbao_project_jwt_token_ttl | int),
+          'token_max_ttl': (openbao_project_jwt_token_max_ttl | int),
+          'token_explicit_max_ttl': (openbao_project_jwt_token_max_ttl | int),
+          'token_type': 'service'} | to_json }}
+  register: openbao_jwt_role_write
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_jwt_role_write.rc == 0
+  when: openbao_jwt_role_needs_write | bool
+
+# Re-read the stored role AFTER a write and verify ref_type/ref (when supplied)
+# landed in bound_claims — Req 4.7's explicit "verify ref_type/ref when a
+# bound_claims entry is present" check.
+- name: "9.1 — Re-read the jwt role after write (verify bound_claims)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the bare `read` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'read']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json',
+            'auth/' ~ openbao_jwt_mount_path ~ '/role/' ~ openbao_project_jwt_role_name] }}
+  register: openbao_jwt_role_verify
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+  when: openbao_jwt_role_needs_write | bool
+
+- name: "9.1 — Assert the stored jwt role honours the bound_claims + TTL contract (Req 4.2, 4.7)"
+  ansible.builtin.assert:
+    that:
+      - (openbao_jwt_role_verify.stdout | from_json).data.token_ttl | int <= (openbao_project_jwt_token_ttl_ceiling | int)
+      - (openbao_jwt_role_verify.stdout | from_json).data.token_max_ttl | int <= (openbao_project_jwt_token_ttl_ceiling | int)
+      - (openbao_jwt_role_verify.stdout | from_json).data.bound_claims == openbao_jwt_bound_claims
+      - openbao_project_policy_name in ((openbao_jwt_role_verify.stdout | from_json).data.token_policies | default([]))
+      # ref_type / ref, when supplied, must be present in the stored bound_claims (Req 4.7)
+      - >-
+        (openbao_project_jwt_bound_ref_type | length == 0)
+        or ((openbao_jwt_role_verify.stdout | from_json).data.bound_claims.ref_type | default(''))
+           == openbao_project_jwt_bound_ref_type
+      - >-
+        (openbao_project_jwt_bound_ref | length == 0)
+        or ((openbao_jwt_role_verify.stdout | from_json).data.bound_claims.ref | default(''))
+           == openbao_project_jwt_bound_ref
+    fail_msg: >-
+      Stored jwt role '{{ openbao_project_jwt_role_name }}' does not honour the
+      Req 4.2/4.7 contract (TTL <= {{ openbao_project_jwt_token_ttl_ceiling }}s,
+      bound_claims match including any ref_type/ref, token_policies contains
+      {{ openbao_project_policy_name }}).
+    success_msg: "jwt role '{{ openbao_project_jwt_role_name }}' verified (Req 4.2, 4.7)."
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+  when: openbao_jwt_role_needs_write | bool
+
+- name: "9.1 — Report the jwt-role decision"
+  ansible.builtin.debug:
+    msg: >-
+      auth/jwt/role/{{ openbao_project_jwt_role_name }}:
+      {{ 'written (absent or changed)' if openbao_jwt_role_needs_write | bool
+         else 'already present and matching — no change (Req 1.5, 13.4)' }}.
+
+# ============================================================================
+# STEP 5 — Ensure the KV path secret/data/<slug>/ exists (Req 1.6)
+# ============================================================================
+# "Ensure the KV path exists" without overwriting any secret VERSION: use
+# `kv metadata put` (metadata-only) on the slug prefix. Writing metadata neither
+# creates nor bumps a secret version, so it touches no secret data on first run
+# or re-run (Req 1.5, 13.4). Check first: if the metadata already exists, skip.
+# `secret/metadata/<slug>` is the KV v2 metadata endpoint for the project prefix.
+
+- name: "9.1 — Check whether the KV metadata for the slug prefix already exists"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `kv metadata get` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'kv', 'metadata', 'get']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json', openbao_kv_mount ~ '/' ~ project_slug] }}
+  register: openbao_kv_metadata_get
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+  failed_when: false           # a missing path returns non-zero — that's "absent"
+
+- name: "9.1 — Ensure the KV path secret/data/<slug>/ exists (metadata-only, no secret version, Req 1.6)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `kv metadata put` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'kv', 'metadata', 'put']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-max-versions=' ~ (openbao_kv_max_versions | default(10)),
+            openbao_kv_mount ~ '/' ~ project_slug] }}
+  register: openbao_kv_metadata_put
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_kv_metadata_put.rc == 0
+  # Only create when absent, so a re-run is a no-op that reports changed=0 and,
+  # by using metadata (not data), never touches a secret version even on create.
+  when: openbao_kv_metadata_get.rc != 0
+
+- name: "9.1 — Report the KV-path decision"
+  ansible.builtin.debug:
+    msg: >-
+      {{ openbao_kv_mount }}/data/{{ project_slug }}/:
+      {{ 'metadata created (path now exists)' if openbao_kv_metadata_get.rc != 0
+         else 'already exists — no change, no secret version touched (Req 1.5, 13.4)' }}.
+
+# ============================================================================
+# STEP 6 — Scrub the platform-admin token fact from memory
+# ============================================================================
+- name: "9.1 — Scrub the platform-admin token fact from memory"
+  ansible.builtin.set_fact:
+    openbao_admin_token: ""
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+- name: "9.1 — Report onboarding completion for '{{ project_slug }}'"
+  ansible.builtin.debug:
+    msg: >-
+      Onboarded project '{{ project_slug }}' — policy-{{ project_slug }}
+      (CRUD+list on the five KV sub-paths only), auth/jwt/role/
+      {{ openbao_project_jwt_role_name }} (bound project_path
+      '{{ project_gitlab_path }}'{{ ', ref_type ' ~ openbao_project_jwt_bound_ref_type
+         if openbao_project_jwt_bound_ref_type | length > 0 else '' }}{{
+         ', ref ' ~ openbao_project_jwt_bound_ref
+         if openbao_project_jwt_bound_ref | length > 0 else '' }}, token_ttl <=
+      {{ openbao_project_jwt_token_ttl_ceiling }}s, renewable=false,
+      token_policies=[policy-{{ project_slug }}]), and KV path
+      {{ openbao_kv_mount }}/data/{{ project_slug }}/. projects.yaml was read
+      READ-ONLY and never modified.

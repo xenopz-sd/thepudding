@@ -1,0 +1,54 @@
+---
+# defaults/main.yml — platform_devmachine (Platform Prerequisites Bootstrap —
+# devmachine bucket, emit by default / apply after GO).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/. Design ref:
+# "Component 6: platform_devmachine". Implemented in SPEC TASK 8.1.
+#
+# Phase-specific defaults for the devmachine bucket role. Cross-bucket constants
+# (cluster_env_file, platform_repo_root, platform_venv_python,
+# platform_selected_buckets, devmachine_apply, ...) stay as play-level vars on
+# platform-bootstrap.yml (see design.md "Data Models") — the role reads them
+# from the play. NO secret value ever lives here (the devmachine bucket handles
+# no secret — only a public routing gateway and a PUBLIC ssh identity file
+# path).
+
+# The pure-logic env helper the resolve task delegates parse/alias/validate to
+# (Req 5.4, 6.2). Same helper the other buckets use — cluster_env.py is the
+# single source of truth for parsing + alias-resolution and is a shared symbol
+# across the installers. The devmachine role resolves cluster.env INDEPENDENTLY
+# (it does not depend on preflight binding facts) so it runs standalone under
+# `bootstrap_scope=devmachine`.
+platform_devmachine_cluster_env_helper: scripts/installer/cluster_env.py
+
+# Default served VLAN when PLATFORM_SERVED_VLAN_IDS is absent from cluster.env
+# (Req 5.1). VLAN 20 is the shared-services VLAN (domain-rules.md §1); every
+# platform install needs reachability to it. The cluster.env value, when present,
+# is a comma-list (e.g. "20,100") split into a list by the resolve task.
+platform_devmachine_served_vlan_default: "20"
+
+# Fallback SSH identity file for the ~/.ssh/config identity-pin block when
+# PROXMOX_SSH_PUBLIC_KEY_FILE is absent from cluster.env. Only the PUBLIC half is
+# needed at this path (the agent supplies the private half) — see TESTING.md
+# section (c). This is a path, never a key value.
+platform_devmachine_ssh_identity_default: "~/.ssh/git.xenopz.com_id_ed25519"
+
+# --- APPLY-mode targets (used only when devmachine_apply=true) ---
+
+# Persistence drop-in path written in apply mode (the ifupdown /
+# /etc/network/interfaces.d form from TESTING.md section (b)). Per-VLAN filename
+# `sdn-route-<vlan>.cfg` is composed in tasks/main.yml.
+platform_devmachine_persist_dir: /etc/network/interfaces.d
+
+# The interface the persistence stanza attaches its up/down route hooks to. On a
+# workstation this is the LAN interface that carries the default route; the
+# operator overrides it with -e platform_devmachine_iface=<iface> when the guess
+# is wrong. Left as a documented placeholder so the emitted/written stanza is
+# explicit rather than silently wrong.
+platform_devmachine_iface: eth0
+
+# ~/.ssh/config identity-pin block markers + target file (Req 5.3). blockinfile
+# manages ONLY the region between these markers, so re-runs are idempotent and a
+# hand-edited ssh_config is preserved outside them.
+platform_devmachine_ssh_config_path: "{{ ansible_env.HOME }}/.ssh/config"
+platform_devmachine_ssh_config_marker: "# {mark} ANSIBLE MANAGED BLOCK — platform_devmachine SDN ssh identity pin"

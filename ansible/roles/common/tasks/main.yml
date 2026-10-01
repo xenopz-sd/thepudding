@@ -1,0 +1,35 @@
+---
+# Task entry point for the `common` role.
+#
+# The `common` role is the PF §9 host-baseline (hardening, timezone,
+# unattended-upgrades) AND the single source of truth for the Docker CE +
+# Compose-plugin install/pin. Task work is split into included files by concern,
+# per standard Ansible role structure:
+#
+#   - baseline.yml  (spec task 3.1, IMPLEMENTED)  — hardening, timezone,
+#                     unattended-upgrades. Conservative, unprivileged-LXC-safe,
+#                     idempotent, secret-free.
+#   - docker.yml    (spec task 3.2, IMPLEMENTED)   — Docker CE + Compose-plugin
+#                     install/pin (state: present, never latest). At its end it
+#                     includes compose_verify.yml.
+#   - compose_verify.yml (spec task 3.3, IMPLEMENTED) — verifies the Compose v2
+#                     plugin is usable via community.docker.docker_compose_v2
+#                     conventions (no shell `docker compose up`), included from
+#                     docker.yml. A check-mode, resource-free, changed=0 probe,
+#                     guarded to never hard-fail during a daemon-less bake.
+#
+# Ordering matters: the baseline runs first (it refreshes the apt cache and lays
+# down the hardened base), then the Docker install/verify slots in behind it.
+
+- name: Apply baseline (hardening, timezone, unattended-upgrades)
+  ansible.builtin.include_tasks: baseline.yml
+
+# Docker CE + Compose-plugin install/pin — the single platform implementation
+# (spec task 3.2). Slots in behind the baseline (which refreshes the apt cache
+# and lays down the hardened base) per the ordering above.
+- name: Install and pin Docker CE + the Compose plugin (single source of truth)
+  ansible.builtin.include_tasks: docker.yml
+
+# Compose-plugin verification (spec task 3.3) is included at the END of
+# docker.yml (compose_verify.yml), so it runs right after the install/pin. No
+# separate include is needed here.

@@ -1,0 +1,21 @@
+---
+# Galaxy metadata for the `terraform_clean_slate` role
+# (spec terraform-clean-slate-reset).
+#
+# A DESTRUCTIVE, opt-in, per-guest clean-slate reset: `pct destroy` a
+# Terraform-provisioned Proxmox guest + `terraform state rm` its resource, so a
+# normal `terraform apply` recreates it fresh. Runs against the Proxmox host (for
+# `pct`); the Terraform state op is delegated to localhost. Keeps the guests'
+# `prevent_destroy` seatbelt intact by routing around it out-of-band.
+#
+# Collection pins live in ansible/requirements.yml, not here.
+galaxy_info:
+  role_name: terraform_clean_slate
+  author: Developer Services Platform
+  description: >-
+    Canonical clean-slate reset (pct destroy + terraform state rm) for a
+    Terraform-provisioned Proxmox guest. Opt-in, loud, fail-closed, mandatory
+    per-guest confirm token.
+  license: proprietary
+  min_ansible_version: "2.15"
+dependencies: []

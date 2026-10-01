@@ -1,0 +1,370 @@
+---
+# defaults/main.yml — openbao_install
+#
+# Variable set for the openbao_install role (SVC-07 Secrets Manager).
+# Matches the "Ansible variable sets" section of the SVC-07 design.md.
+#
+# NOTE: no secret value ever lives here. The seal "transit" token
+# (Bootstrap_Transit_Token) is NOT a variable — it is supplied by an
+# operator-controlled external source (a local gitignored .env or a GitLab
+# CI/CD protected+masked variable) at bootstrap time and rendered into the
+# primary config.hcl via `openbao_transit_token`, then rotated into KV and the
+# external copy removed (design.md: Init/unseal/bootstrap sequence, task 6.2).
+
+# --- Image (pinned minor, pulled through Zot SVC-14) ---
+openbao_image: "openbao/openbao:2.4"
+
+# --- Filesystem layout inside the container ---
+openbao_config_dir: "/openbao/config"
+openbao_data_dir: "/openbao/data"
+openbao_tls_dir: "/openbao/tls"
+
+# --- Container user (uid/gid) that OpenBao runs as inside the image ---
+# The openbao/openbao image runs the server as the unprivileged `openbao` user
+# (uid 100, gid 1000 in openbao/openbao:2.4). The rendered config dir + config.hcl
+# are bind-mounted READ-ONLY (:ro) into the container; the image entrypoint drops
+# to this user before `bao server`, so the host-side files MUST be owned by this
+# uid/gid or the openbao user cannot read them and startup fails with
+# `error loading configuration from /openbao/config: ... permission denied`.
+# Owning them by this uid/gid (keeping the restrictive 0750 dir / 0640 file modes,
+# so the primary's seal-token-bearing config.hcl is NOT world-readable) also makes
+# the entrypoint's `chown` a no-op (uid already matches), so no writable mount is
+# needed. See fix recorded in the fix-openbao-unsealer-bootstrap validation.
+openbao_container_uid: "100"
+openbao_container_gid: "1000"
+
+# --- Listener / TLS ---
+# tls_disable is hard-wired to false in the template (Req 6.1); these vars
+# select where the cert/key material lives and where it is sourced from.
+# openbao_tls_cert_source: "svc08" (EJBCA, preferred) | "letsencrypt" (fallback)
+openbao_tls_cert_source: "svc08"
+openbao_tls_cert_file: "{{ openbao_tls_dir }}/cert.pem"
+openbao_tls_key_file: "{{ openbao_tls_dir }}/key.pem"
+openbao_listener_address: "0.0.0.0:8200"
+
+# --- OPT-IN mock-EJBCA self-signed TLS cert (tasks/tls_self_signed.yml) --------
+# Production TLS material is issued by SVC-08 (EJBCA) and dropped into
+# openbao_tls_host_dir by an external process; the openbao_install role only
+# references it by path (openbao_tls_cert_file / openbao_tls_key_file). SVC-08 is
+# NOT built yet, so for a homelab / bootstrap bring-up this switch lets the role
+# generate a SELF-SIGNED cert on-host as a MOCK stand-in for the EJBCA-issued cert,
+# so OpenBao can start and be validated now. Production drops the real EJBCA cert
+# at the same path — nothing in OpenBao changes. Default is FALSE: production
+# expects SVC-08/EJBCA, and this must be an explicit opt-in (e.g.
+# `-e openbao_tls_self_signed=true`); NOT for production. This is a PERMANENT,
+# selectable dev/debug/learning stand-in (kept for isolating EJBCA-vs-OpenBao
+# issues even after SVC-08 exists), NOT transitional debt to delete — see
+# .kiro/steering/mock-stand-ins.md for the catalogue + coexistence caveat.
+openbao_tls_self_signed: false
+# Subject Alternative Names baked into the mock cert — a faithful stand-in for
+# what EJBCA would issue, so BOTH OpenBao's own :8200 listener AND the internal
+# Traefik->OpenBao hop validate the cert. Overridable. DNS covers both node
+# hostnames (NET-00 convention), localhost, and the Traefik host rule; IP covers
+# the primary/unsealer VLAN-20 addresses and loopback.
+openbao_tls_self_signed_sans:
+  - "DNS:{{ openbao_node_id }}"
+  - "DNS:{{ openbao_unsealer_node_id }}"
+  - "DNS:localhost"
+  - "DNS:openbao.{{ platform_domain }}"
+  - "IP:{{ openbao_primary_ip }}"
+  - "IP:{{ openbao_unsealer_ip }}"
+  - "IP:127.0.0.1"
+# Common Name for the mock cert (EJBCA would set the service FQDN here).
+openbao_tls_self_signed_cn: "openbao.{{ platform_domain }}"
+# Validity window in days. ~825 days is a homelab-reasonable, browser-sane span
+# (the historical max most clients accept for a leaf cert).
+openbao_tls_self_signed_valid_days: 825
+
+# --- Storage (Raft integrated storage) ---
+openbao_storage_path: "{{ openbao_data_dir }}"
+
+# --- KV v2 engine (consumed by later init/onboard roles; carried here so the
+#     whole variable set lives in one place per design.md) ---
+openbao_kv_max_versions: 10
+
+# --- Telemetry (Prometheus) — retention must be >= 1 minute (Req 10.1) ---
+openbao_telemetry_retention: "24h"
+# Expose /v1/sys/metrics WITHOUT an OpenBao token so Prometheus (SVC-17) can
+# scrape it with no stored bearer token (Req 10.2). Rendered into the primary's
+# telemetry stanza as `unauthenticated_metrics_access = <true|false>`. Kept true
+# because the metrics endpoint carries only operational counters (no secrets) and
+# the primary's :8200 is reachable only over the internal VLAN-20 path (Req 6.4).
+# Set false and supply a scrape bearer_token_file (see the prometheus scrape
+# fragment) if a deployment wants authenticated scrapes instead.
+openbao_telemetry_unauthenticated_metrics: true
+
+# --- Transit auto-unseal (seal "transit" stanza on the PRIMARY only) ---
+openbao_unsealer_addr: "https://10.0.20.11:8200"
+openbao_transit_key_name: "openbao-unseal"
+openbao_transit_mount_path: "transit/"
+
+# The primary's seal "transit" TOKEN. This IS a secret and is NEVER committed or
+# defaulted to a literal. It resolves at runtime from the operator-supplied,
+# never-committed environment variable named below (a sourced gitignored .env for
+# a homelab bootstrap, or a GitLab CI/CD protected+masked variable for a
+# pipeline) via an `env` lookup — the SAME variable and discipline the
+# openbao_init_unseal primary-bootstrap flow uses (openbao_bootstrap_token_env_var).
+# Resolving it HERE lets the plain openbao_install role pass render config.hcl on
+# the primary WITHOUT crashing on an undefined var; the openbao_init_unseal
+# task-6.2 flow still re-invokes openbao_install with an explicit
+# openbao_transit_token override, which takes precedence. If the env var is unset
+# the lookup yields '' and the primary config-template task fails closed with a
+# clear message (see tasks/main.yml) rather than rendering an empty seal stanza.
+# Every task that renders it sets no_log: true.
+openbao_bootstrap_token_env_var: "OPENBAO_BOOTSTRAP_TRANSIT_TOKEN"
+openbao_transit_token: "{{ lookup('ansible.builtin.env', openbao_bootstrap_token_env_var, default='') }}"
+
+# --- Primary node identity / cluster addressing ---
+openbao_primary_ip: "10.0.20.10"
+openbao_api_port: 8200
+openbao_cluster_port: 8201
+openbao_node_id: "svc07-20-01"
+openbao_api_addr: "https://{{ openbao_primary_ip }}:{{ openbao_api_port }}"
+openbao_cluster_addr: "https://{{ openbao_primary_ip }}:{{ openbao_cluster_port }}"
+
+# --- Unsealer node identity (Transit-only instance) ---
+openbao_unsealer_ip: "10.0.20.11"
+openbao_unsealer_node_id: "svc07-unsealer-20-01"
+openbao_unsealer_api_addr: "https://{{ openbao_unsealer_ip }}:{{ openbao_api_port }}"
+openbao_unsealer_cluster_addr: "https://{{ openbao_unsealer_ip }}:{{ openbao_cluster_port }}"
+
+# --- Role behaviour switch ---
+# Which config.hcl to render for the current host. One of: "primary" | "unsealer".
+# The primary renders the full seal "transit" + telemetry config; the unsealer
+# renders a Transit-only config with NO seal stanza (design.md: config.hcl shape).
+openbao_role: "primary"
+
+# =============================================================================
+# Task 5.2 — Compose stack variable set (rendered via docker-compose-app)
+# =============================================================================
+# openbao_install builds a service-specific variable set and passes it into the
+# generic `docker-compose-app` role, which templates compose.yaml + .env and
+# reconciles the stack. NO secret value lives here — the seal token and TLS key
+# are runtime-injected/mounted and referenced by name/path only (never a
+# literal). composition-wiring.md: every OPENBAO_* config var the entrypoint/
+# config reads is listed explicitly in the environment (.env) block below with
+# a `${VAR:-default}` empty/default form.
+
+# --- Platform domain used for the primary's Traefik host rule (placeholder) ---
+# Real value is supplied per-environment; this is a non-secret placeholder only.
+platform_domain: "platform.example.test"
+
+# --- Traefik shared edge network the primary attaches to (SVC-09) ---
+openbao_traefik_network: "edge"
+
+# --- MOCK edge network (opt-in dev/debug/learning stand-in for SVC-09/Traefik) ---
+# The primary's Compose stack attaches to the `openbao_traefik_network` (`edge`)
+# as an EXTERNAL network, normally created & owned by Traefik (SVC-09). Until
+# Traefik is deployed, that network does not exist and `docker compose up` fails
+# with `network edge declared as external, but could not be found`.
+#
+# This flag is a DEVELOPMENT STAND-IN, exactly like openbao_tls_self_signed for
+# the SVC-08/EJBCA cert: opt-in, DEFAULT FALSE (production expects the real
+# Traefik-owned network). When true, the role `docker network create`s a
+# placeholder `edge` bridge if absent so the stack can come up and the container
+# can attach and carry its (dormant) Traefik labels. IMPORTANT — what it does
+# NOT provide: any ROUTING. It is only an L2 bridge with no Traefik process
+# attached, so it carries NO external ingress; OpenBao is reachable only on its
+# internal VLAN-20 address until real Traefik is deployed. See
+# .kiro/steering/mock-stand-ins.md for the full catalogue + the "do not enable a
+# mock alongside the real service on the same host" caveat. This is a PERMANENT,
+# selectable affordance (kept for isolating issues even after SVC-09 exists), NOT
+# transitional debt to remove.
+openbao_mock_edge_network: false
+
+# --- Compose stack names / directories (one per LXC role) ---
+openbao_stack_name: "openbao"
+openbao_unsealer_stack_name: "openbao-unsealer"
+
+# --- Idempotency: version-check guard (task 5.3) --------------------------------
+# The install role checks for an already-running OpenBao container at the pinned
+# image (openbao_image) BEFORE templating/bringing up the Compose stack, so a
+# second run against an already-installed host is a no-op that reports changed=0
+# (Req 13.1, 13.2). docker_compose_v2 names containers `<project>-<service>-1`;
+# the project is the stack name and the service is the role-appropriate service
+# name below. These are overridable if a caller pins a custom container_name.
+openbao_primary_container_name: "{{ openbao_stack_name }}-openbao-1"
+openbao_unsealer_container_name: "{{ openbao_unsealer_stack_name }}-openbao-unsealer-1"
+
+# --- Named volumes (Raft data, audit log, TLS material) ---
+openbao_data_volume: "openbao-data"
+openbao_audit_volume: "openbao-audit"
+openbao_audit_dir: "/openbao/audit"
+# Declarative audit device (OpenBao 2.4): audit devices can NO LONGER be enabled
+# via the API/`bao audit enable` (removed after CVE-2025-54997 — RCE via API
+# audit config). They MUST be declared in the config file's `audit "file"` stanza,
+# created at startup/SIGHUP. These drive that stanza in config.hcl.j2 (primary).
+openbao_audit_device_path: "file"
+openbao_audit_log_file: "{{ openbao_audit_dir }}/openbao_audit.log"
+openbao_audit_log_format: "json"
+# TLS material is a host bind-mount (issued by SVC-08 EJBCA / Let's Encrypt
+# fallback) mounted read-only into the container; referenced by path, never a
+# key literal.
+openbao_tls_host_dir: "/etc/openbao/tls"
+
+# --- Logging: OpenBao logs to stdout at INFO (composition-wiring.md) ---
+openbao_log_level: "info"
+openbao_log_format: "json"
+
+# --- OPENBAO_* environment passthrough (composition-wiring env block) ---------
+# Each value uses the `${VAR:-default}` form so the variable is always present
+# in the container (empty string at worst), never a KeyError. These are all
+# NON-secret config values. The seal token is NOT here — it is injected into the
+# rendered config.hcl at bootstrap and referenced by the config file, not the
+# .env. The primary and unsealer share the config-file convention below.
+openbao_env_primary:
+  # Where the OpenBao entrypoint reads its config from.
+  OPENBAO_CONFIG_DIR: "${OPENBAO_CONFIG_DIR:-/openbao/config}"
+  # API/cluster addresses the server advertises (composition-wiring passthrough).
+  OPENBAO_API_ADDR: "${OPENBAO_API_ADDR:-https://10.0.20.10:8200}"
+  OPENBAO_CLUSTER_ADDR: "${OPENBAO_CLUSTER_ADDR:-https://10.0.20.10:8201}"
+  # Log to stdout at INFO in JSON (composition-wiring.md logging rule).
+  OPENBAO_LOG_LEVEL: "${OPENBAO_LOG_LEVEL:-info}"
+  OPENBAO_LOG_FORMAT: "${OPENBAO_LOG_FORMAT:-json}"
+  # Raft storage + audit paths (referenced by path, mounted as volumes).
+  OPENBAO_RAFT_PATH: "${OPENBAO_RAFT_PATH:-/openbao/data}"
+  OPENBAO_AUDIT_DIR: "${OPENBAO_AUDIT_DIR:-/openbao/audit}"
+  # Telemetry retention (Req 10.1, >= 1 min).
+  OPENBAO_TELEMETRY_RETENTION: "${OPENBAO_TELEMETRY_RETENTION:-24h}"
+  # Transit unsealer address the seal stanza points at (Req 5.2).
+  OPENBAO_SEAL_TRANSIT_ADDRESS: "${OPENBAO_SEAL_TRANSIT_ADDRESS:-https://10.0.20.11:8200}"
+
+openbao_env_unsealer:
+  OPENBAO_CONFIG_DIR: "${OPENBAO_CONFIG_DIR:-/openbao/config}"
+  OPENBAO_API_ADDR: "${OPENBAO_API_ADDR:-https://10.0.20.11:8200}"
+  OPENBAO_CLUSTER_ADDR: "${OPENBAO_CLUSTER_ADDR:-https://10.0.20.11:8201}"
+  OPENBAO_LOG_LEVEL: "${OPENBAO_LOG_LEVEL:-info}"
+  OPENBAO_LOG_FORMAT: "${OPENBAO_LOG_FORMAT:-json}"
+  OPENBAO_RAFT_PATH: "${OPENBAO_RAFT_PATH:-/openbao/data}"
+
+# =============================================================================
+# Task 11.1 — Nightly Raft snapshot job (exit-code/non-empty gate + PBS hand-off)
+# =============================================================================
+# These vars drive the backup section (tasks/backup.yml + templates/
+# openbao-snapshot.sh.j2 + the systemd service/timer templates). The job runs
+# ONLY on the PRIMARY (it holds the sealed Raft store); the whole section is
+# gated on `openbao_role == "primary"` in tasks/backup.yml.
+#
+# WHAT THE JOB DOES (design.md "Error Handling (snapshot rows)"; Req 11.1/11.2/
+# 11.3/11.5/11.6, FD.6):
+#   * a systemd timer fires nightly at 02:00 UTC and runs the snapshot script;
+#   * the script runs `bao operator raft snapshot save <file>` via `docker exec`
+#     against the primary container (same convention as the init/onboard roles),
+#     which is ONLINE / non-blocking — OpenBao keeps serving read/write during
+#     the snapshot (Req 11.6; the p99-within-500ms guarantee is VERIFIED by the
+#     task-12.4/12.5 integration/degraded tests, not implemented here);
+#   * it GATES the PBS hand-off on BOTH `rc == 0` AND a non-empty snapshot file
+#     (`stat` size > 0) — Req 11.1;
+#   * on a non-zero exit OR an empty file it does NOT transfer to PBS, logs the
+#     failure WITH the affected UTC date, and emits a single structured
+#     failure log line that Promtail ships to Loki so the task-10.2 alert rule
+#     fires within 15 min (Req 11.2, 11.5, FD.6). The alert RULE itself is
+#     task 10.2; here we only emit the alertable line and reference it.
+#
+# NO SECRET VALUE LIVES HERE (security-standards.md — this IS the secrets
+# manager). The snapshot needs a scoped OpenBao token that can call
+# sys/storage/raft/snapshot; that token is supplied at runtime from a
+# never-committed source (an OpenBao Agent-rendered token file, or a gitignored
+# env/token file), referenced by PATH/ENV-VAR-NAME only, never a literal. The
+# PBS repository password / credential is likewise supplied from a
+# never-committed source and referenced by env-var name only. Every task that
+# carries such a credential sets `no_log: true`; the script reads them from a
+# root-only file / the systemd unit's EnvironmentFile at runtime.
+
+# --- Whether to install the nightly snapshot job (primary only) --------------
+openbao_backup_enabled: true
+
+# --- Schedule: 02:00 UTC nightly (Req 11.1) ----------------------------------
+# systemd OnCalendar expression. `*-*-* 02:00:00 UTC` = every day at 02:00 UTC.
+# The explicit UTC suffix pins the timezone regardless of host localtime so the
+# "02:00 UTC" contract holds on a host set to any local zone.
+openbao_backup_oncalendar: "*-*-* 02:00:00 UTC"
+# Persistent=true so a missed run (host asleep/off at 02:00) fires on next boot
+# rather than silently skipping a night's backup.
+openbao_backup_persistent: true
+
+# --- Snapshot file layout on the primary host --------------------------------
+# The snapshot is written to a host directory that is itself a PBS backup source
+# (or from which proxmox-backup-client reads). One file per run, named with the
+# UTC date so the failure log can identify the affected date and PBS keeps a
+# dated series.
+openbao_backup_dir: "/var/backups/openbao"
+# Snapshot filename pattern. `%(date)s` is substituted by the script with the
+# run's UTC date (YYYY-MM-DD); kept as a shell-expanded value in the script so
+# the affected date is derivable from the filename.
+openbao_backup_file_basename: "openbao-raft"
+# The path INSIDE the primary container that `bao operator raft snapshot save`
+# writes to before the script copies it out to openbao_backup_dir. Uses the
+# already-mounted data dir's parent so no new mount is needed.
+openbao_backup_container_tmp: "/openbao/data/.snapshot.tmp"
+
+# --- The primary container the snapshot runs against (docker exec) -----------
+# Matches openbao_install's default (`<stack>-<service>-1`); kept in sync so the
+# script targets the same container the install role brought up.
+openbao_backup_container_name: "{{ openbao_primary_container_name }}"
+openbao_backup_bao_bin: "bao"
+
+# --- Scoped snapshot token SOURCE (never committed) --------------------------
+# `bao operator raft snapshot save` requires a token authorized for
+# sys/storage/raft/snapshot (read). It is NOT stored here. At runtime the script
+# reads it from a root-only token FILE on the primary (rendered by the OpenBao
+# Agent sidecar / operator-supplied, gitignored), referenced by PATH only. The
+# file path is non-secret; its contents are the secret and are never logged.
+# The systemd unit passes BAO_TOKEN into the container exec from this file.
+openbao_backup_token_file: "/etc/openbao/snapshot-token"
+# The OpenBao API address the snapshot token authenticates against (the local
+# primary). Non-secret.
+openbao_backup_bao_addr: "https://127.0.0.1:8200"
+
+# --- PBS hand-off (SVC-32) — placeholders, PBS specifics documented ----------
+# SVC-32 (Proxmox Backup Server) is a separate service; here we implement the
+# GATE + the hand-off INVOCATION with placeholder endpoint vars. The PBS client
+# repository spec + the credential are supplied from a never-committed source at
+# runtime (env-var NAMES below, resolved from the systemd EnvironmentFile), never
+# a literal. When PBS is not yet wired, openbao_backup_pbs_enabled=false makes
+# the script keep the local dated snapshot (still gated) and skip the transfer.
+openbao_backup_pbs_enabled: false
+# proxmox-backup-client repository spec, e.g. "user@pbs!token@pbs-host:datastore".
+# NON-secret identifier placeholder; override per-environment.
+openbao_backup_pbs_repository: "backup@pbs!openbao@svc32-20-01.platform.internal:openbao"
+# The PBS backup "namespace"/backup-id label the snapshot is stored under.
+openbao_backup_pbs_backup_id: "svc07-openbao"
+# ENV VAR NAME (not value) the PBS repository password / API-token secret is
+# read from at runtime by proxmox-backup-client (PBS_PASSWORD). Never defaulted
+# to a value, never committed. Supplied via the systemd unit's EnvironmentFile
+# from a never-committed source.
+openbao_backup_pbs_password_env_var: "PBS_PASSWORD"
+# EnvironmentFile the systemd service loads (root-only, gitignored / operator- or
+# Agent-supplied). Carries PBS_PASSWORD and any other never-committed runtime
+# credential. Referenced by path only; its contents are never logged.
+openbao_backup_env_file: "/etc/openbao/backup.env"
+
+# --- PBS retention: keep >= 7 nightly snapshots (Req 11.3) -------------------
+# proxmox-backup-client prune keep-daily count. Must be >= 7 (Req 11.3). The
+# script passes this to `proxmox-backup-client prune --keep-daily`, and the PBS
+# datastore prune policy should mirror it. Guarded in the script so a value < 7
+# is refused rather than silently under-retaining.
+openbao_backup_pbs_keep_daily: 7
+# Local dated-snapshot retention (nights) kept on the primary host itself,
+# independent of PBS. Also >= 7 so a PBS outage still leaves >= 7 local copies.
+openbao_backup_local_keep_daily: 7
+
+# --- Loki-alertable failure log line (Req 11.2, 11.5, FD.6) ------------------
+# On failure the script writes ONE structured line (logger/stderr + a host log
+# file) that Promtail ships to Loki, carrying the job name, the failure
+# reason, and the affected UTC date/timestamp so the task-10.2 alert rule fires
+# within 15 min. These fields are non-secret.
+openbao_backup_job_name: "openbao-raft-snapshot"
+# The host log file the failure line is appended to (in addition to journald),
+# so a Promtail tail can pick it up even before/independent of journald shipping.
+openbao_backup_log_file: "{{ openbao_backup_dir }}/snapshot.log"
+# The literal token every failure line starts with so the Loki alert rule can
+# match it unambiguously. Referenced by the task-10.2 alert rule.
+openbao_backup_failure_marker: "OPENBAO_SNAPSHOT_FAILURE"
+# The success marker (INFO) emitted on a clean gated hand-off, for completeness.
+openbao_backup_success_marker: "OPENBAO_SNAPSHOT_OK"
+
+# --- Where the rendered script + unit files land on the primary host ---------
+openbao_backup_script_path: "/usr/local/sbin/openbao-raft-snapshot.sh"
+openbao_backup_service_name: "openbao-raft-snapshot"
+openbao_backup_systemd_dir: "/etc/systemd/system"

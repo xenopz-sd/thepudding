@@ -1,0 +1,295 @@
+---
+# tasks/main.yml — platform_api (Platform Prerequisites Bootstrap —
+# api bucket, SDN VLAN fabric via the platform-foundation Terraform root).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/ (requirements.md,
+# design.md, tasks.md). Design ref: "Component 5: platform_api". Implemented
+# in SPEC TASK 7.1 (Req 4.1, 4.2, 4.3, 4.4).
+#
+# WHAT THIS ROLE DOES — a child-process `terraform apply` of the EXISTING
+# platform-foundation Terraform root (SDN VLAN zone + shared VLAN-20 VNet +
+# subnet + applier). It REUSES that root unchanged (design "Reuse, don't
+# rebuild"); it never declares or modifies any Terraform. The three ordered
+# steps mirror the SVC-07 svc07_provision child-run idiom:
+#   1. Token precondition (Req 4.2, Property 4 ordering) — resolve the
+#      terraform@pve token from cluster.env; if ABSENT, HALT naming the host
+#      bucket, BEFORE the backend init / apply. This assert precedes the apply.
+#   2. Backend swap-gate (Req 4.3) — GitLab HTTP backend init when the three CI
+#      keys are present, else a gitignored local_backend_override.tf + local
+#      `terraform init -reconfigure`. One INFO decision log names the choice.
+#   3. `terraform apply -auto-approve` (Req 4.1, 4.3, 4.4) — Proxmox creds via
+#      TF_VAR_proxmox_* in the child environment (no_log — the env carries the
+#      token). failed_when default (rc != 0) so an apply failure surfaces
+#      non-zero, never masked. Idempotent (a second apply is "no changes").
+#
+# Cross-bucket constants (cluster_env_file, platform_repo_root,
+# platform_venv_python) come from the play-level vars on
+# ansible/playbooks/platform-bootstrap.yml; this role's phase-specific vars
+# (platform_api_tf_root, platform_api_cluster_env_helper, platform_api_tf_env,
+# ...) live in defaults/main.yml. NO secret value ever lives in this file — the
+# token is resolved no_log and only ever travels through platform_api_tf_env.
+
+# ============================================================ #
+# Step 1 — terraform@pve token precondition (Req 4.2,          #
+# Property 4). This resolve + assert PRECEDES the backend init  #
+# and the apply, so an api-alone run without a resolvable token #
+# HALTS naming the host bucket before ANY Terraform runs and    #
+# before any Proxmox resource is touched.                       #
+# ------------------------------------------------------------ #
+# cluster_env.py is the single source of truth for parsing +    #
+# alias-resolution (reused from the SVC-07 installer). It emits  #
+# the canonical TF_VAR_* mapping as JSON on stdout, exiting      #
+# non-zero for a missing file / missing mandatory var — so a     #
+# missing PROXMOX_API_TOKEN surfaces via its own stderr, and     #
+# the explicit assert below adds the host-bucket remedy. no_log  #
+# because the resolved JSON carries the API-token value.         #
+# ============================================================ #
+- name: "Api | Resolve + validate the cluster env file ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python }}"
+      - "{{ platform_api_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_api_env_resolve
+  changed_when: false
+  no_log: true
+
+# Parse the helper's JSON stdout into a fact. no_log — the mapping carries
+# TF_VAR_proxmox_api_token.
+- name: "Api | Capture the resolved TF_VAR_* mapping"
+  ansible.builtin.set_fact:
+    platform_api_tfvars: "{{ platform_api_env_resolve.stdout | from_json }}"
+  no_log: true
+
+# Bind the endpoint (non-secret) and the token (secret) to named facts the
+# child terraform env references lazily. Kept in one no_log task so the
+# token-bearing fact is isolated. The endpoint fact is read freely below.
+- name: "Api | Bind the resolved Proxmox endpoint + terraform@pve token"
+  ansible.builtin.set_fact:
+    platform_api_proxmox_endpoint: "{{ platform_api_tfvars['TF_VAR_proxmox_endpoint'] | default('') }}"
+    platform_api_proxmox_api_token: "{{ platform_api_tfvars['TF_VAR_proxmox_api_token'] | default('') }}"
+  no_log: true
+
+# Non-secret presence flag: true only when a non-empty token resolved. This
+# lets the assert below fail closed WITHOUT the token value ever appearing in
+# the assert's fail_msg (the assert reads this bool, not the token).
+- name: "Api | Compute whether a terraform@pve token resolved (presence only)"
+  ansible.builtin.set_fact:
+    platform_api_token_present: "{{ (platform_api_proxmox_api_token | trim | length) > 0 }}"
+
+# Fail-closed token precondition (Req 4.2, Property 4). PRECEDES the backend
+# init + apply — an api-alone run with no resolvable terraform@pve token halts
+# here naming the host bucket's PVE-identity step, before any Terraform runs.
+- name: "Api | Assert a terraform@pve token is resolvable (before any apply)"
+  ansible.builtin.assert:
+    that:
+      - "platform_api_token_present | bool"
+    fail_msg: >-
+      no terraform@pve token; run the host bucket's PVE-identity step first
+      (-e bootstrap_pve_identity=true) or supply PROXMOX_API_TOKEN in
+      cluster.env. Refusing to run `terraform apply`, so no SDN resource is
+      created (Req 4.2).
+    success_msg: "terraform@pve token resolved; proceeding to the SDN fabric apply."
+
+# ============================================================ #
+# Step 2 — Terraform backend swap-gate (Req 4.3), mirroring the #
+# svc07_provision gate + the platform-foundation README         #
+# "Apply (Tier-2)" two-option flow:                             #
+#   * Option B — GitLab HTTP state — WHEN all three CI keys      #
+#     (CI_API_V4_URL + CI_PROJECT_ID + CI_JOB_TOKEN) are present #
+#     in the env file (state name `platform-foundation`).        #
+#   * Option A — LOCAL backend (solo/offline default) — else,    #
+#     by writing the gitignored local_backend_override.tf into   #
+#     the platform-foundation root and `terraform init           #
+#     -reconfigure`.                                             #
+# One INFO decision log records the chosen backend + reason      #
+# (composition-wiring.md dependency-type logging).              #
+# ============================================================ #
+
+# Read the raw env file (no_log — it carries the API token) and test ONLY for
+# the presence of the three GitLab CI state-backend keys, so no value is
+# surfaced. Same technique as the svc07_provision gate.
+- name: "Api | Read the cluster env file to detect the state-backend signal"
+  ansible.builtin.slurp:
+    src: "{{ platform_repo_root }}/{{ cluster_env_file }}"
+  register: platform_api_env_slurp
+  no_log: true
+
+# Reduce the raw file to non-comment KEY=VALUE lines. no_log — a value carries
+# the API token.
+- name: "Api | Reduce the env file to KEY=VALUE lines"
+  ansible.builtin.set_fact:
+    platform_api_env_pairs: >-
+      {{ (platform_api_env_slurp.content | b64decode).splitlines()
+         | map('trim')
+         | reject('match', '^\s*#')
+         | select('search', '=')
+         | list }}
+  no_log: true
+
+# Extract the KEY set (names only, values discarded) — the backend decision is
+# made from key presence alone, so this fact carries no secret value.
+- name: "Api | Extract the set of env keys (names only, no values)"
+  ansible.builtin.set_fact:
+    platform_api_env_keys: >-
+      {{ platform_api_env_pairs
+         | map('regex_replace', '^\s*([^=]+?)\s*=.*$', '\1')
+         | list }}
+
+# The GitLab HTTP backend is "configured" only when ALL three CI
+# state-backend variables are present as keys.
+- name: "Api | Decide the Terraform backend (swap gate)"
+  ansible.builtin.set_fact:
+    platform_api_use_gitlab_backend: >-
+      {{ ('CI_API_V4_URL' in platform_api_env_keys)
+         and ('CI_PROJECT_ID' in platform_api_env_keys)
+         and ('CI_JOB_TOKEN' in platform_api_env_keys) }}
+
+# When GitLab is selected, extract the three CI state-backend VALUES so the
+# partial backend "http" can be initialized via -backend-config. no_log —
+# CI_JOB_TOKEN is a credential. Build a key->value map by zipping the key list
+# with a value list; the value regex strips surrounding whitespace and one
+# layer of matching double quotes. Skipped entirely for the local backend.
+- name: "Api | Extract GitLab CI state-backend values (GitLab backend only)"
+  ansible.builtin.set_fact:
+    platform_api_env_ci_values: >-
+      {{ dict(platform_api_env_keys | zip(
+           platform_api_env_pairs
+           | map('regex_replace', '^[^=]+=\s*(.*?)\s*$', '\1')
+           | map('regex_replace', '^"(.*)"$', '\1')
+           | list
+         )) }}
+  when: platform_api_use_gitlab_backend | bool
+  no_log: true
+
+# Canonical GitLab state address for THIS root's state name
+# (`platform-foundation`, versions.tf) + the job token. no_log — carries the
+# job token.
+- name: "Api | Derive the GitLab state address + job token (GitLab backend only)"
+  ansible.builtin.set_fact:
+    platform_api_gitlab_state_address: >-
+      {{ platform_api_env_ci_values['CI_API_V4_URL'] }}/projects/{{
+         platform_api_env_ci_values['CI_PROJECT_ID'] }}/terraform/state/platform-foundation
+    platform_api_ci_job_token: "{{ platform_api_env_ci_values['CI_JOB_TOKEN'] }}"
+  when: platform_api_use_gitlab_backend | bool
+  no_log: true
+
+# INFO-level swap-gate decision log (composition-wiring.md): make the chosen
+# backend and the reason visible in the run output, never silent.
+- name: "Api | Log the Terraform backend selection (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Terraform backend:
+      {{ 'GitLab HTTP state (platform-foundation) — the cluster env file '
+         ~ 'configures the GitLab CI state-backend variables'
+         if (platform_api_use_gitlab_backend | bool)
+         else 'LOCAL (local_backend_override.tf) — the cluster env file does not '
+              ~ 'configure the GitLab HTTP backend (solo/offline default)' }}
+
+# LOCAL backend path: ensure the gitignored local_backend_override.tf is
+# present so Terraform merges backend "local" {} over the partial http block
+# (platform-foundation README "Option A"). Idempotent. Only when NOT GitLab.
+- name: "Api | Ensure local_backend_override.tf is present (local backend)"
+  ansible.builtin.copy:
+    dest: "{{ platform_repo_root }}/{{ platform_api_tf_root }}/local_backend_override.tf"
+    mode: "0644"
+    content: |
+      # Local, gitignored state backend for a solo/offline apply — overrides the
+      # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+      terraform {
+        backend "local" {}
+      }
+  when: not (platform_api_use_gitlab_backend | bool)
+
+# GitLab backend path: the local override must NOT be present, or Terraform
+# would merge the local backend over the http one. Remove it if a prior local
+# run left it behind (idempotent — absent is fine).
+- name: "Api | Remove any local_backend_override.tf (GitLab HTTP backend)"
+  ansible.builtin.file:
+    path: "{{ platform_repo_root }}/{{ platform_api_tf_root }}/local_backend_override.tf"
+    state: absent
+  when: platform_api_use_gitlab_backend | bool
+
+# terraform init. LOCAL backend: -reconfigure so a switch from a prior
+# -backend=false / http init selects the local backend cleanly
+# (platform-foundation README "Option A"). no_log — the child env carries the
+# API token.
+- name: "Api | terraform init (local backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+  args:
+    chdir: "{{ platform_repo_root }}/{{ platform_api_tf_root }}"
+  environment: "{{ platform_api_tf_env }}"
+  register: platform_api_tf_init_local
+  changed_when: true
+  when: not (platform_api_use_gitlab_backend | bool)
+  no_log: true
+
+# terraform init. GitLab HTTP backend: the -backend-config flags derive the
+# partial backend "http" from the CI_* values (state name platform-foundation),
+# mirroring the README "Option B" / svc07_provision GitLab init. no_log — the
+# flags carry CI_JOB_TOKEN and the child env carries the API token.
+- name: "Api | terraform init (GitLab HTTP backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+      - "-backend-config=address={{ platform_api_gitlab_state_address }}"
+      - "-backend-config=lock_address={{ platform_api_gitlab_state_address }}/lock"
+      - "-backend-config=unlock_address={{ platform_api_gitlab_state_address }}/lock"
+      - -backend-config=username=gitlab-ci-token
+      - "-backend-config=password={{ platform_api_ci_job_token }}"
+      - -backend-config=lock_method=POST
+      - -backend-config=unlock_method=DELETE
+      - -backend-config=retry_wait_min=5
+  args:
+    chdir: "{{ platform_repo_root }}/{{ platform_api_tf_root }}"
+  environment: "{{ platform_api_tf_env }}"
+  register: platform_api_tf_init_gitlab
+  changed_when: true
+  when: platform_api_use_gitlab_backend | bool
+  no_log: true
+
+# ============================================================ #
+# Step 3 — non-interactive `terraform apply` of the SDN fabric  #
+# (Req 4.1, 4.3, 4.4).                                          #
+# ------------------------------------------------------------ #
+# The Proxmox endpoint/token/insecure travel via TF_VAR_* in the #
+# child environment (no_log), never on the command line. The     #
+# sdn_zone_* vars keep their working defaults (vmbr0 / vlanzone) #
+# — this root's minimal apply is just `terraform apply` with no  #
+# -var (platform-foundation README "Apply"), so none are passed  #
+# unless a cluster.env override is introduced later. failed_when #
+# is left DEFAULT (rc != 0) so an apply failure surfaces         #
+# non-zero and is caught by the api bucket's rescue — never       #
+# masked as success (Req 4.3). changed_when parses the           #
+# terraform summary so a converged re-run reports changed=false  #
+# (idempotent, Req 4.4).                                         #
+# ============================================================ #
+- name: "Api | terraform apply (SDN VLAN fabric, non-interactive)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - apply
+      - -input=false
+      - -auto-approve
+  args:
+    chdir: "{{ platform_repo_root }}/{{ platform_api_tf_root }}"
+  environment: "{{ platform_api_tf_env }}"
+  register: platform_api_tf_apply
+  # A converged re-run prints "0 added, 0 changed, 0 destroyed" -> changed=false
+  # (idempotent, Req 4.4); any non-zero add/change/destroy -> changed=true.
+  changed_when: "'0 added, 0 changed, 0 destroyed' not in platform_api_tf_apply.stdout"
+  # no_log — the child env carries TF_VAR_proxmox_api_token
+  # (security-standards.md). failed_when left default (rc != 0) so an apply
+  # failure surfaces non-zero and is caught by the api bucket rescue (Req 4.3).
+  no_log: true

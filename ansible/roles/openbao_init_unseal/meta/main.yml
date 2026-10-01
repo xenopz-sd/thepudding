@@ -1,0 +1,35 @@
+---
+# meta/main.yml — openbao_init_unseal
+galaxy_info:
+  role_name: openbao_init_unseal
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    One-time initialisation and auto-unseal wiring for OpenBao (SVC-07). Guards
+    every init step with a check-safe `bao status` read so a re-run against an
+    already-initialised instance is a no-op (Req 13.3). Owns the FULL bootstrap
+    of BOTH instances: the unsealer's readiness-guarded Raft `operator init` +
+    threshold unseal + Transit-engine setup + openbao-seal scoped policy +
+    periodic seal-token mint + root revoke (tasks/unsealer_bootstrap.yml), and
+    the primary's Raft init / root-token bootstrap-then-revoke + token rotation
+    (tasks/primary_bootstrap.yml). The engine/auth/audit bootstrap (task 7.x)
+    extends primary_bootstrap.yml at its marked extension point.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - openbao
+    - secrets
+    - unseal
+    - svc07
+
+# No cross-role dependencies. This role runs after openbao_install has templated
+# config.hcl and brought up the Compose stack; the ordering is expressed in the
+# playbook, not as a hard meta dependency here.
+dependencies: []

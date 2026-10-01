@@ -1,0 +1,37 @@
+---
+# Galaxy metadata for the `common` host-baseline role.
+#
+# `common` is the PF §9 baseline (hardening, timezone, unattended-upgrades) and
+# the single source of truth for the Docker CE + Compose-plugin install/pin. It
+# is a peer of the `docker-compose-app` role — a host-baseline role rather than a
+# Compose stack — which is the structure.md-sanctioned host-level exception.
+#
+# This file is the role skeleton's galaxy meta only (spec task 2.1). Baseline and
+# Docker tasks are implemented in task 3.x; role defaults are filled in task 2.2.
+galaxy_info:
+  role_name: common
+  author: Developer Services Platform
+  description: >-
+    Host-baseline role: hardening, timezone, and unattended-upgrades, plus the
+    single Docker CE + Compose-plugin install/pin source of truth for the
+    platform. Installed per host at provision time on the stock debian-12-standard
+    template; idempotent (a re-run against a converged host is a changed=0 no-op).
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - baseline
+    - hardening
+    - docker
+    - compose
+    - proxmox
+
+# Role dependencies are declared here in a later task if needed; the
+# community.docker collection pin lives in ansible/requirements.yml, not here.
+dependencies: []

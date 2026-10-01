@@ -1,0 +1,120 @@
+{#
+  templates/config.hcl.j2 — PRIMARY OpenBao config (svc07-20-01, 10.0.20.10)
+
+  Rendered by openbao_install when openbao_role == "primary".
+  Contract asserted by the task 5.4 config-validation tests (design.md
+  "config.hcl shape (primary)"):
+    - listener "tcp" with tls_disable = false, no plaintext listener  (Req 6.1)
+    - storage "raft" at /openbao/data, node_id = svc07-20-01           (Req 11)
+    - seal "transit" -> https://10.0.20.11:8200, key_name/mount_path   (Req 5.2)
+    - telemetry prometheus_retention_time >= 1 minute                  (Req 10.1)
+    - telemetry unauthenticated_metrics_access lets Prometheus (SVC-17)
+      scrape /v1/sys/metrics WITHOUT a stored bearer token             (Req 10.2)
+    - api_addr / cluster_addr
+
+  No secret value is templated literally. The seal token comes from the
+  runtime-injected `openbao_transit_token` (operator-supplied external source
+  at bootstrap; never a committed or real-looking value).
+#}
+# MANAGED BY ANSIBLE (openbao_install) — DO NOT EDIT BY HAND.
+# Primary OpenBao instance: {{ openbao_node_id }}
+
+ui = true
+
+# No memory locking (ADR-0006 / OpenBao mlock-removal RFC:
+# https://openbao.org/community/rfcs/mlock-removal/). Raft-only OpenBao must NOT
+# mlock — mlockall() faults the whole bbolt-mmap'd DB into RAM, risking an
+# OOM-kill. The IPC_LOCK capability that enabled mlock is removed from the
+# container; this makes the "no mlock" intent explicit (it previously defaulted
+# ON because disable_mlock was unset).
+disable_mlock = true
+
+# Single TLS listener; no plaintext listener is defined (Req 6.1).
+# TLS material source: {{ openbao_tls_cert_source }} (svc08 EJBCA, or letsencrypt fallback).
+listener "tcp" {
+  address       = "{{ openbao_listener_address }}"
+  tls_disable   = false
+  tls_cert_file = "{{ openbao_tls_cert_file }}"
+  tls_key_file  = "{{ openbao_tls_key_file }}"
+
+  # unauthenticated_metrics_access is a LISTENER-level telemetry parameter (a
+  # `telemetry {}` sub-block of `listener "tcp"`), NOT a top-level `telemetry`
+  # field — OpenBao/Vault only accept it here. Placing it in the top-level
+  # telemetry stanza makes OpenBao log `unknown or unsupported field
+  # unauthenticated_metrics_access` and SILENTLY IGNORE it, leaving
+  # /v1/sys/metrics authenticated despite the intent (Req 10.2).
+  #
+  # = true exposes /v1/sys/metrics WITHOUT an OpenBao token (Req 10.2). Deliberate,
+  # minimal metrics-access choice: OpenBao's metrics endpoint requires auth by
+  # default, so a Prometheus (SVC-17) scrape would otherwise need a stored scoped
+  # read token (a secret on the Prometheus side). Accepted because the metrics
+  # endpoint carries only operational counters/gauges (no secret material) AND the
+  # primary's :8200 is reachable only over the internal VLAN-20 path
+  # (firewall-refused from project VLANs; never Traefik-exposed for the metrics
+  # route) per Req 6.4 / Security AC 6 — so no external caller can reach the
+  # unauthenticated metrics. The alternative (a scoped metrics read token in a
+  # scrape `bearer_token_file`) is documented in the prometheus scrape fragment;
+  # flip this to false and supply that token file for authenticated scrapes.
+  # `openbao_core_unsealed` is exposed even while SEALED (Req 10.8 / FD.7).
+  telemetry {
+    unauthenticated_metrics_access = {{ openbao_telemetry_unauthenticated_metrics | lower }}
+  }
+}
+
+# Raft integrated storage on local-zfs, snapshotted nightly to PBS (Req 11).
+storage "raft" {
+  path    = "{{ openbao_storage_path }}"
+  node_id = "{{ openbao_node_id }}"
+}
+
+# Transit auto-unseal against the seal-only unsealer LXC (Req 5.2, 5.4).
+# The token carries encrypt/decrypt only and is injected at runtime.
+seal "transit" {
+  address    = "{{ openbao_unsealer_addr }}"
+  token      = "{{ openbao_transit_token }}"
+  key_name   = "{{ openbao_transit_key_name }}"
+  mount_path = "{{ openbao_transit_mount_path }}"
+{% if openbao_tls_self_signed | default(false) | bool %}
+  # tls_skip_verify: the primary's SEAL CLIENT connects to the unsealer's API
+  # over TLS to wrap/unwrap its seal key. While the unsealer presents the MOCK
+  # self-signed cert (openbao_tls_self_signed), that cert chains to no known CA,
+  # so the seal client would fail with `x509: certificate signed by unknown
+  # authority` and the primary would crash-loop at startup. Skip verification
+  # for the seal path ONLY while the mock cert is in use. Dropped automatically
+  # once SVC-08/EJBCA issues the unsealer a trusted-CA cert (flag defaults false).
+  # This is the SEAL-path analogue of the `-tls-skip-verify` CLI flag the role's
+  # docker-exec bao calls use, and of the mock-cert stand-in in
+  # .kiro/steering/mock-stand-ins.md.
+  tls_skip_verify = "true"
+{% endif %}
+}
+
+# Top-level telemetry: metric aggregation/retention only (Req 10.1). The
+# unauthenticated metrics ACCESS toggle is a LISTENER parameter and lives in the
+# `listener "tcp"` telemetry sub-block above — NOT here (OpenBao rejects it as an
+# unknown field in the top-level stanza).
+telemetry {
+  prometheus_retention_time = "{{ openbao_telemetry_retention }}"
+  disable_hostname          = true
+}
+
+# Declarative file audit device (Req 7.1). OpenBao 2.4 REMOVED API-driven audit
+# enablement (`bao audit enable` returns `400: cannot enable audit device via API;
+# use declarative, config-based audit device management instead`) after
+# CVE-2025-54997 (RCE via API audit config). The device is therefore declared
+# HERE and created by OpenBao at startup/SIGHUP. One JSON object per line to the
+# mounted audit volume; OpenBao's file audit device is fail-closed by default (a
+# write failure blocks the operation; the last audit device cannot be disabled) —
+# not relaxed here (no log_raw). Path label "{{ openbao_audit_device_path }}"
+# mirrors the former API mount path so downstream (Promtail glob, alerts) is
+# unchanged.
+audit "file" "{{ openbao_audit_device_path }}" {
+  description = "SVC-07 primary file audit device (fail-closed, JSON per line)."
+  options = {
+    file_path = "{{ openbao_audit_log_file }}"
+    format    = "{{ openbao_audit_log_format }}"
+  }
+}
+
+api_addr     = "{{ openbao_api_addr }}"
+cluster_addr = "{{ openbao_cluster_addr }}"

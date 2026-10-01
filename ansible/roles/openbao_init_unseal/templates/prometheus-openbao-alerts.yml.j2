@@ -1,0 +1,110 @@
+{#
+  templates/prometheus-openbao-alerts.yml.j2 — Prometheus ALERTING-RULE
+  fragment SVC-07 contributes TO the shared SVC-17 observability stack.
+
+  Rendered by task 10.2 (tasks/alerts.yml, §10.2) into a Prometheus rule-file
+  directory ({{ openbao_prometheus_alerts_rule_file }}) that the SVC-17
+  Prometheus loads via `rule_files:`. SVC-17 (Prometheus/Alertmanager) is a
+  SEPARATE catalog service; a full Prometheus role may not exist yet, so this is
+  the alerting-rule CONTRIBUTION SVC-07 owns — mirroring how task 10.1 ships the
+  scrape fragment (prometheus-openbao.yml.j2) and task 7.2 ships the Promtail
+  fragment (promtail-openbao.yml.j2) rather than owning the collector.
+
+  This file declares the THREE metric-based alerts (Req 10.4, 10.5, 10.6):
+    * OpenBaoSealed            — critical; openbao_core_unsealed == 0 for > 2m;
+    * OpenBaoUnsealerUnreachable — critical; up{job=openbao_unsealer} == 0 > 2m;
+    * OpenBaoLeaseCountHigh    — warning; openbao_expire_num_leases > threshold
+                                 (default 1000, overridable) for > 5m.
+  AUTO-RESOLVE is inherent to Prometheus alerting: when an alert's `expr` stops
+  matching, Prometheus resolves it and Alertmanager sends a resolved
+  notification (Req 10.4/10.5/10.6 "resolve automatically") — no extra config.
+
+  The FOURTH alert, OpenBaoAuditFailure (Req 10.7), is Loki-derived and lives in
+  the SEPARATE Loki ruler fragment (loki-openbao-audit-rule.yml.j2) — an
+  audit-write failure is a LOG signal, not a Prometheus metric.
+
+  The 30-min unacknowledged escalation to the secondary on-call receiver
+  (Req 10.9) is an Alertmanager ROUTE concern and lives in the Alertmanager
+  route fragment (alertmanager-openbao-route.yml.j2).
+
+  NO secret value is templated here — metric names, thresholds, durations,
+  severities, and receiver-routing LABELS are all non-secret config.
+#}
+# MANAGED BY ANSIBLE (openbao_init_unseal / task 10.2) — DO NOT EDIT BY HAND.
+# Prometheus alerting rules contributed by SVC-07 (OpenBao) to SVC-17.
+# Metric-based alerts (Req 10.4, 10.5, 10.6). Auto-resolve is inherent to
+# Prometheus alerting (the alert clears when its `expr` stops matching).
+groups:
+  - name: "{{ openbao_prometheus_alert_group_name }}"
+    # Evaluate the OpenBao alert rules at this cadence. Kept <= the scrape
+    # interval so the `for:` windows below are honoured promptly.
+    interval: "{{ openbao_prometheus_alert_group_interval }}"
+    rules:
+      # --- OpenBaoSealed (critical) — Req 10.4 ----------------------------
+      # openbao_core_unsealed == 0 sustained for > 2m -> fire critical, routed
+      # to the platform operations receiver. Returns to 1 -> Prometheus resolves
+      # the alert automatically (inherent; the expr stops matching).
+      - alert: OpenBaoSealed
+        # expr emitted unquoted: OpenBao PromQL exprs can contain double quotes
+        # (label matchers), which would break a double-quoted YAML scalar. The
+        # exprs are plain YAML scalars with no leading indicator char, so they
+        # are valid unquoted.
+        expr: {{ openbao_alert_sealed_expr }}
+        for: "{{ openbao_alert_sealed_for }}"
+        labels:
+          severity: critical
+          service: openbao
+          # Routing label the Alertmanager route fragment keys off (Req 10.9).
+          receiver_team: "{{ openbao_alert_primary_team_label }}"
+        annotations:
+          summary: "OpenBao primary is sealed"
+          description: >-
+            openbao_core_unsealed has been 0 for more than
+            {{ openbao_alert_sealed_for }} — the primary OpenBao instance is
+            SEALED and cannot serve secrets. Auto-unseal against the Transit
+            unsealer has not succeeded. Investigate the unsealer and the primary
+            seal "transit" wiring.
+          runbook_url: "{{ openbao_alert_runbook_base }}#openbaosealed"
+
+      # --- OpenBaoUnsealerUnreachable (critical) — Req 10.5 ---------------
+      # up{job=openbao_unsealer} == 0 sustained for > 2m -> fire critical.
+      # Returns to up==1 -> auto-resolve (inherent).
+      - alert: OpenBaoUnsealerUnreachable
+        # unquoted — the expr contains double quotes (up{job="openbao_unsealer"}).
+        expr: {{ openbao_alert_unsealer_unreachable_expr }}
+        for: "{{ openbao_alert_unsealer_unreachable_for }}"
+        labels:
+          severity: critical
+          service: openbao
+          component: unsealer
+          receiver_team: "{{ openbao_alert_primary_team_label }}"
+        annotations:
+          summary: "OpenBao Transit unsealer is unreachable"
+          description: >-
+            The Prometheus scrape target job="openbao_unsealer" has reported
+            up==0 for more than {{ openbao_alert_unsealer_unreachable_for }}.
+            The Transit unsealer (svc07-unsealer-20-01) is unreachable; the
+            primary cannot auto-unseal if it restarts while this persists.
+          runbook_url: "{{ openbao_alert_runbook_base }}#openbaounsealerunreachable"
+
+      # --- OpenBaoLeaseCountHigh (warning) — Req 10.6 ---------------------
+      # openbao_expire_num_leases > threshold (default 1000, OVERRIDABLE via the
+      # var below — a rule-config change, no code change) sustained > 5m -> fire
+      # warning. Falls back to/below threshold -> auto-resolve (inherent).
+      - alert: OpenBaoLeaseCountHigh
+        expr: {{ openbao_alert_lease_count_expr }}
+        for: "{{ openbao_alert_lease_count_for }}"
+        labels:
+          severity: warning
+          service: openbao
+          receiver_team: "{{ openbao_alert_primary_team_label }}"
+        annotations:
+          summary: "OpenBao active lease count is high"
+          description: >-
+            openbao_expire_num_leases has exceeded the configured threshold of
+            {{ openbao_alert_lease_count_threshold }} for more than
+            {{ openbao_alert_lease_count_for }}. A runaway lease count can
+            indicate leaked or un-revoked dynamic credentials. The threshold is
+            {{ openbao_alert_lease_count_threshold }} (default 1000, overridable
+            via openbao_alert_lease_count_threshold — a rule-config change).
+          runbook_url: "{{ openbao_alert_runbook_base }}#openbaoleasecounthigh"

@@ -1,0 +1,164 @@
+---
+# tasks/configure.yml — sdn_gateway (spec task 9, C5)
+#
+# Runs ONCE PER SERVED VLAN (looped from tasks/main.yml with loop_var
+# `sdn_gateway_vlan_id`). It ensures, idempotently and via persistent mechanisms:
+#
+#   1. The host VLAN sub-interface `{{ sdn_gateway_bridge }}.{{ sdn_gateway_vlan_id }}`
+#      owning the gateway address `10.0.{{ sdn_gateway_vlan_id }}.1/24` exists via
+#      a PERSISTENT `/etc/network/interfaces.d/` stanza + a GUARDED bring-up
+#      (survives a reboot — a bare `ip link` would not). (Req 1.1, FD.5)
+#   2. A SCOPED `pve-firewall` ALLOW rule (source `sdn_gateway_admin_source_cidr`
+#      -> this VLAN's subnet on `sdn_gateway_allowed_ports` ONLY — never a blanket
+#      allow) is present, written via `sudo pvesh` (operator decision). (Req 2.1,
+#      2.5, SEC.2)
+#
+# Every mutating task is check-then-change / `state:`-driven so a second run is
+# changed=0 (Req 1.5, 6.5). A failed interface or rule write fails with a clear
+# error and does NOT leave a half-configured/half-open host — the interface
+# stanza is written first and validated before the firewall opening is added, and
+# each `pvesh` write is guarded (Req FD.5).
+#
+# NO secret material is read, templated, or echoed here.
+
+# --- 1. Persistent host L3 sub-interface (survives reboot) -------------------
+# Write the interfaces.d stanza first. `template` is check-then-change: it only
+# reports changed (and only notifies the reload handler) when the rendered
+# content differs, so a converged host is changed=0.
+- name: Ensure persistent L3 gateway address stanza for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.template:
+    src: interfaces.d-vlan-gateway.j2
+    dest: "/etc/network/interfaces.d/sdn-gw-{{ sdn_gateway_vlan_id }}.cfg"
+    owner: root
+    group: root
+    mode: "0644"
+    # NOTE: no `validate: ifup --no-act ...` guard here. `ifup --no-act` (the
+    # ifupdown2 dry-run) is broken on Proxmox's ifupdown2 (observed on
+    # 3.3.0-pmx12): it aborts with
+    #   "NetlinkListenerWithCache.link_add_vlan_dry_run() takes from 4 to 5
+    #    positional arguments but 6 were given"
+    # on ANY VLAN/bridge stanza, regardless of content, so it cannot be used as
+    # a pre-commit validator. The guarded-apply intent (FD.5 — never leave a
+    # half-open host) is preserved by the guarded `ip addr add` step below,
+    # which surfaces a genuine failure loudly instead of relying on the broken
+    # dry-run.
+  register: sdn_gateway_iface_stanza
+  notify: Reload host networking
+
+# Attach the gateway address to the SDN VNet bridge p<vlan> now (guarded), so
+# reachability works within this run without waiting for a reboot / ifreload.
+# The address lives on the EXISTING SDN-owned bridge `p{{ sdn_gateway_vlan_id }}`
+# (not a new vmbr0.<vlan> sub-interface) — that is the interface L2-adjacent to
+# the guests, so the host only answers them at .1 when the address sits here
+# (verified live; see the template header + ADR-0004 addendum).
+#
+# We first read the bridge's current addresses so this is check-then-change: the
+# `ip addr add` runs only when .1 is not already present, so a converged run is
+# changed=0. A genuine failure (e.g. the bridge does not exist because the SDN
+# applier has not run) is surfaced loudly rather than swallowed — this is the
+# guarded-apply that replaces the broken `ifup --no-act` validate (FD.5).
+- name: Read current addresses on the SDN VNet bridge p{{ sdn_gateway_vlan_id }}
+  ansible.builtin.command:
+    cmd: "ip -o -4 addr show dev p{{ sdn_gateway_vlan_id }}"
+  register: sdn_gateway_bridge_addrs
+  changed_when: false
+  check_mode: false
+  # If the bridge is genuinely missing, `ip` exits non-zero — surface it as a
+  # clear failure (the SDN applier must have created p<vlan> first).
+  failed_when:
+    - sdn_gateway_bridge_addrs.rc != 0
+    - "'does not exist' in (sdn_gateway_bridge_addrs.stderr | default(''))"
+
+# noqa: no-handler — deliberately NOT a handler. It runs once per served VLAN
+# inside the configure.yml loop and MUST attach the address immediately (mid-run)
+# so reachability to that VLAN works within this same converge, before any later
+# task depends on it. A handler would defer to a single end-of-play flush,
+# collapsing the per-VLAN ordering.
+- name: Attach the guarded gateway address to the SDN VNet bridge for VLAN {{ sdn_gateway_vlan_id }}  # noqa: no-handler
+  ansible.builtin.command:
+    cmd: "ip addr add 10.0.{{ sdn_gateway_vlan_id }}.1/24 dev p{{ sdn_gateway_vlan_id }}"
+  when: >-
+    ('10.0.' ~ sdn_gateway_vlan_id ~ '.1/24') not in
+    (sdn_gateway_bridge_addrs.stdout | default(''))
+  register: sdn_gateway_addr_add
+  changed_when: sdn_gateway_addr_add.rc == 0
+
+# Apply the scoped egress MASQUERADE now (guarded, idempotent) so the guests can
+# reach the internet (apt / Docker pulls) within this same run. The interfaces.d
+# post-up hook makes it reboot-persistent, but that only fires on ifreload/boot,
+# so we also add it live here. Scoped to internet-bound egress only (destination
+# NOT in the platform supernet), so inter-VLAN / guest->LAN-internal traffic is
+# never NAT'd and the isolation model + internal source-IP attribution are
+# preserved (ADR-0004 egress addendum).
+#
+# Check-then-change: `iptables -C` tests for the rule without mutating; the `-A`
+# add runs only when it is absent, so a converged run reports changed=0.
+- name: Check the egress masquerade presence for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.command:
+    cmd: >-
+      iptables -t nat -C POSTROUTING
+      -s 10.0.{{ sdn_gateway_vlan_id }}.0/24
+      ! -d {{ sdn_gateway_no_nat_dest_supernet }}
+      -o {{ sdn_gateway_egress_interface }} -j MASQUERADE
+  register: sdn_gateway_masq_check
+  changed_when: false
+  check_mode: false
+  failed_when: false   # rc != 0 simply means "rule absent" — drives the add below
+
+- name: Apply the guarded egress masquerade for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.command:
+    cmd: >-
+      iptables -t nat -A POSTROUTING
+      -s 10.0.{{ sdn_gateway_vlan_id }}.0/24
+      ! -d {{ sdn_gateway_no_nat_dest_supernet }}
+      -o {{ sdn_gateway_egress_interface }} -j MASQUERADE
+  when:
+    - sdn_gateway_enable_egress_nat | bool
+    - sdn_gateway_masq_check.rc != 0
+  register: sdn_gateway_masq_add
+  changed_when: sdn_gateway_masq_add.rc == 0
+
+# --- 2. Scoped pve-firewall ALLOW rule (check-then-change via pvesh) ---------
+# Read the current cluster firewall rules once so we only add the ALLOW rule when
+# it is absent (idempotent — no duplicate rule on a second run). `pvesh get`
+# mutates nothing and is check-mode-safe.
+- name: Read current cluster firewall rules for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.command:
+    cmd: sudo pvesh get /cluster/firewall/rules --output-format json
+  register: sdn_gateway_fw_rules_raw
+  changed_when: false
+  check_mode: false
+
+# The stable comment we key idempotency on — one ALLOW rule per served VLAN,
+# tagged so teardown.yml can find and remove exactly this rule.
+- name: Set the ALLOW-rule comment tag for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.set_fact:
+    sdn_gateway_allow_comment: "sdn_gateway: ALLOW admin -> VLAN {{ sdn_gateway_vlan_id }} (managed)"
+
+# Add the scoped ALLOW rule only if no rule with our comment tag already exists.
+# Source is the admin CIDR (asserted non-empty in main.yml — never blanket),
+# dest is this VLAN's /24, ports are the scoped allowed set. A failed write is a
+# hard failure (no `failed_when: false`) so we never believe an opening was
+# applied when it was not; because it is gated on absence, a converged run does
+# not re-run it (changed=0).
+- name: Ensure scoped ALLOW rule present (pvesh, check-then-change) for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - pvesh
+      - create
+      - /cluster/firewall/rules
+      - "--enable=1"
+      - "--type=in"
+      - "--action=ACCEPT"
+      - "--proto=tcp"
+      - "--source={{ sdn_gateway_admin_source_cidr }}"
+      - "--dest=10.0.{{ sdn_gateway_vlan_id }}.0/24"
+      - "--dport={{ sdn_gateway_allowed_ports | join(',') }}"
+      - "--comment={{ sdn_gateway_allow_comment }}"
+  when: >-
+    sdn_gateway_allow_comment not in
+    (sdn_gateway_fw_rules_raw.stdout | from_json | map(attribute='comment', default='') | list)
+  register: sdn_gateway_allow_create
+  changed_when: sdn_gateway_allow_create.rc == 0
+  notify: Reload pve-firewall

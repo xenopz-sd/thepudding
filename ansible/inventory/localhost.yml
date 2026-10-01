@@ -1,0 +1,23 @@
+# Localhost orchestrator inventory for the SVC-07 Day-0 installer.
+#
+# This is a minimal, HAND-MAINTAINED inventory (committed, carries no secret)
+# used by the orchestrator play ansible/playbooks/svc-07-bootstrap.yml, which
+# runs `hosts: localhost` in Ansible's Day-0 Workflow-Orchestrator role
+# (service-installer.md §2, integration-boundaries.md §4). The orchestrator
+# runs entirely on the control node: it drives Terraform, calls
+# generate_inventory.py, and reconciles known_hosts, then delegates all guest
+# CONFIGURATION to child `ansible-playbook` runs against the file-mediated
+# generated inventory (ansible/inventory/svc-07-secrets-manager.generated.yml).
+#
+# Usage:
+#     ~/venv/devinfra/bin/ansible-playbook \
+#       -i ansible/inventory/localhost.yml \
+#       ansible/playbooks/svc-07-bootstrap.yml \
+#       -e cluster_env_file=cluster.dev.env
+#
+# ansible_connection=local means Ansible runs tasks directly on the control
+# node without SSH — the orchestrator never SSHes anywhere itself.
+all:
+  hosts:
+    localhost:
+      ansible_connection: local

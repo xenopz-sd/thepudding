@@ -1,0 +1,548 @@
+---
+# tasks/primary_bootstrap.yml — openbao_init_unseal / TASK 6.2
+#
+# The CI-OPTIONAL Bootstrap_Transit_Token flow + the primary's one-time
+# `bao operator init` + Root_Token bootstrap + engine/auth window + revoke +
+# rotation of the token into KV + removal of the external copy.
+#
+# INCLUDED FROM tasks/main.yml at the "EXTENSION POINT — Task 6.2" marker, i.e.
+# AFTER the unsealer's Transit engine has been initialised (design's sequence).
+#
+# GATING (applied by the include's `when:` in main.yml, re-asserted here for the
+# steps that must never run twice):
+#   - openbao_role == "primary"
+#   - not openbao_already_initialized      (Req 13.3 — a re-run is a no-op)
+#
+# SECRETS DISCIPLINE (security-standards.md — this is the secrets manager):
+#   - The Bootstrap_Transit_Token, Root_Token, and recovery keys are NEVER
+#     committed, echoed to logs, or written to a vars file.
+#   - Every task that touches any of those values sets `no_log: "{{ openbao_no_log }}"`.
+#   - The bootstrap token is read from an operator-supplied environment variable
+#     (a gitignored .env OR a GitLab CI protected+masked variable) via an `env`
+#     lookup — never a literal, never a default value.
+#
+# ============================================================================
+# ORDERING CONTRACT FOR TASK 7.x  (READ THIS, task 7 implementer)
+# ----------------------------------------------------------------------------
+# This file opens a ROOT-TOKEN BOOTSTRAP WINDOW and closes it by revoking the
+# Root_Token. Task 7.x's engine/auth/audit enablement REQUIRES the Root_Token
+# and therefore MUST run INSIDE that window — i.e. AFTER
+# "6.2-STEP-4 (platform-admin policy written)" and BEFORE
+# "6.2-STEP-5 (Root_Token revoke)".
+#
+# The exact insertion point is the marker:
+#     "EXTENSION POINT — Task 7.x (engine/auth/audit) RUNS HERE, INSIDE the
+#      root-token window, BEFORE the revoke"
+# further down this file. Task 7.x adds ONE `ansible.builtin.include_tasks`
+# there (e.g. `engines_auth_audit.yml`) so this file stays navigable. The
+# Root_Token is available to that include as the (no_log) fact
+# `openbao_root_token` for the duration of the window and is scrubbed
+# immediately after the revoke. Do NOT move the revoke earlier, and do NOT
+# persist the Root_Token anywhere.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 6.2-STEP-0 — Resolve the Bootstrap_Transit_Token from its external source.
+# ----------------------------------------------------------------------------
+# Read the operator-supplied token from the environment variable named by
+# `openbao_bootstrap_token_env_var`. This is populated identically by BOTH
+# supported paths (a sourced gitignored .env, or a GitLab CI protected+masked
+# variable) — neither is hardcoded as the only source. `no_log: "{{ openbao_no_log }}"` so the
+# value is never rendered into the run log.
+- name: "6.2 — Resolve Bootstrap_Transit_Token from external source (env)"
+  ansible.builtin.set_fact:
+    openbao_bootstrap_token: >-
+      {{ lookup('ansible.builtin.env', openbao_bootstrap_token_env_var, default='') }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+# Fail CLOSED if no external source supplied the token — never proceed with an
+# empty seal token, and never fall back to a committed value. The message names
+# the env var, never a value.
+- name: "6.2 — Assert the Bootstrap_Transit_Token was supplied externally"
+  ansible.builtin.assert:
+    that:
+      - openbao_bootstrap_token | length > 0
+    fail_msg: >-
+      No Bootstrap_Transit_Token found. Supply it via the never-committed
+      environment variable '{{ openbao_bootstrap_token_env_var }}' — either a
+      local gitignored .env (homelab) or a GitLab CI/CD protected+masked
+      variable (pipeline). It is never stored in a vars file or committed.
+    success_msg: "Bootstrap_Transit_Token supplied via {{ openbao_bootstrap_token_env_var }} (value not logged)."
+    quiet: true
+  no_log: "{{ openbao_no_log }}"   # defence-in-depth: never let an assert diagnostic surface the token
+
+# ----------------------------------------------------------------------------
+# 6.2-STEP-1 — Wire the token into the primary's seal "transit" stanza.
+# ----------------------------------------------------------------------------
+# The primary config.hcl (with `token = "{{ openbao_transit_token }}"` in its
+# seal "transit" stanza) is TEMPLATE-OWNED by the openbao_install role, along
+# with all the vars it needs (openbao_storage_path, openbao_node_id, TLS paths,
+# telemetry, api/cluster addr). Rather than duplicate that template + its var
+# set here (which would drift), we RE-INVOKE openbao_install with the resolved
+# bootstrap token so it re-renders its own config.hcl with the seal token in
+# place. openbao_install's config.hcl templating is idempotent, and its
+# version-check guard skips the (already-running) compose bring-up — so this is
+# effectively "re-render config.hcl with the token" and nothing more.
+# `no_log: "{{ openbao_no_log }}"` because the render carries the token value.
+- name: "6.2 — Re-render primary config.hcl seal stanza with the bootstrap token"
+  ansible.builtin.include_role:
+    name: openbao_install
+  vars:
+    openbao_role: "primary"
+    openbao_transit_token: "{{ openbao_bootstrap_token }}"
+  no_log: "{{ openbao_no_log }}"
+
+# Ensure the freshly-rendered, seal-configured primary is running before init.
+- name: "6.2 — Flush handlers so the seal-configured primary is running"
+  ansible.builtin.meta: flush_handlers
+
+# ----------------------------------------------------------------------------
+# 6.2-STEP-2 — `bao operator init` on the primary (Raft), ONCE.
+# ----------------------------------------------------------------------------
+# Run via `docker exec` against the primary container (consistent with 6.1's
+# unsealer approach). With a `seal "transit"` config, `operator init` returns
+# recovery keys (not Shamir unseal keys) plus the initial Root_Token, as JSON.
+# The whole stdout carries secret material -> `no_log: "{{ openbao_no_log }}"`. Gated so it runs
+# exactly once (Req 13.3: skipped entirely when already initialised).
+- name: "6.2 — bao operator init on the primary (Raft, transit-sealed), once"
+  ansible.builtin.command:
+    # `-tls-skip-verify` is spliced AFTER the `operator init` subcommand and
+    # BEFORE positional flags (matching the unsealer idiom in tasks/main.yml)
+    # when the primary listener uses the self-signed MOCK cert.
+    argv: >-
+      {{ ['docker', 'exec',
+          openbao_primary_container_name, openbao_bao_bin, 'operator', 'init']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_init_raw
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_init_raw.rc == 0
+
+# Extract the Root_Token from the init JSON into a no_log fact for the bootstrap
+# window. Recovery keys are intentionally NOT persisted by this automation —
+# they are captured offline by the operator from the init output (design's
+# sequence: "Root_Token + recovery keys (captured once, offline)"). We only keep
+# the Root_Token in memory long enough to bootstrap + revoke it.
+- name: "6.2 — Capture the Root_Token from init output (in-memory, no_log)"
+  ansible.builtin.set_fact:
+    openbao_root_token: "{{ (openbao_init_raw.stdout | from_json).root_token }}"
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+# ----------------------------------------------------------------------------
+# 6.2-STEP-3 — Wait until the primary is initialized:true AND sealed:false.
+# ----------------------------------------------------------------------------
+# Auto-unseal via the Transit unsealer should bring the primary to sealed:false
+# within ~60s of init. We poll `bao status` INSIDE the primary container (via
+# `docker exec`, the same path 6.2-STEP-2's init and every other primary `bao`
+# call use) and proceed only once it reports both flags. This is the gate the
+# token-rotation step (6.2-STEP-6) is predicated on (Req 5.5).
+#
+# WHY `docker exec bao status` AND NOT `uri` against openbao_primary_addr:
+# the primary publishes NO host port (Traefik-labels-only, PF FR-7 — unlike the
+# unsealer, nothing off-host needs its raw :8200), so OpenBao listens ONLY on
+# the container network. An `ansible.builtin.uri` GET to https://10.0.20.10:8200
+# runs on the primary LXC HOST, where nothing listens on that address, so the
+# request never returns a parseable body (`.json` stays undefined) and the wait
+# times out even though the primary IS unsealed. `docker exec` runs inside the
+# container's own network namespace where :8200 is bound, matching the proven
+# path of the init/bootstrap/revoke tasks. `bao status -format=json` prints a
+# JSON status body on BOTH sealed (rc=2) and unsealed (rc=0), so we tolerate any
+# rc and parse the JSON. `-tls-skip-verify` is spliced in for the mock cert,
+# matching the init idiom.
+- name: "6.2 — Wait for primary initialized:true and sealed:false (auto-unseal)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec',
+          openbao_primary_container_name, openbao_bao_bin, 'status']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_primary_status
+  until:
+    - (openbao_primary_status.stdout | default('') | trim | regex_search('^\\s*[{[]')) is not none
+    - ((openbao_primary_status.stdout | from_json).initialized | default(false)) | bool
+    - not (((openbao_primary_status.stdout | from_json).sealed | default(true)) | bool)
+  retries: 12
+  delay: 5
+  changed_when: false
+  # `bao status` exits 2 when sealed / 1 on error — both are normal in-progress
+  # states while auto-unseal settles, not a task failure. We decide readiness
+  # purely from the parsed JSON in `until`/the assert below, never from rc.
+  failed_when: false
+
+- name: "6.2 — Assert the primary reached initialized:true and sealed:false"
+  ansible.builtin.assert:
+    that:
+      - (openbao_primary_status.stdout | default('') | trim | regex_search('^\\s*[{[]')) is not none
+      - ((openbao_primary_status.stdout | from_json).initialized | default(false)) | bool
+      - not (((openbao_primary_status.stdout | from_json).sealed | default(true)) | bool)
+    fail_msg: >-
+      Primary did not reach initialized:true + sealed:false within the
+      auto-unseal window. The Transit unsealer may be unreachable/sealed — the
+      Root_Token will NOT be revoked and the external token copy will NOT be
+      removed until the primary is confirmed live (Req 5.5). See the
+      OpenBaoSealed / OpenBaoUnsealerUnreachable degraded-mode paths.
+    quiet: true
+
+# ----------------------------------------------------------------------------
+# 6.2-STEP-4 — Bootstrap the platform-admin policy with the Root_Token.
+# ----------------------------------------------------------------------------
+# Render the platform-admin ACL to a tmp file inside the container and write it
+# via `bao policy write`, authenticating with the Root_Token passed as
+# BAO_TOKEN in the exec environment. `no_log: "{{ openbao_no_log }}"` (BAO_TOKEN is the root
+# token). The policy HCL itself carries no secret, but the command environment
+# does. This is the single break-glass policy (Security AC 2).
+# Stage the policy HCL OUTSIDE openbao_config_dir. That dir is bind-mounted into
+# the container and OpenBao loads EVERY file in it as server config, so a policy
+# .hcl left there crash-loops the server (`error loading configuration ...
+# platform-admin.hcl: permission denied`), which then fails the primary's
+# `operator init` (27th correction). openbao_policy_staging_dir (/etc/openbao) is
+# the host staging root and is NOT the config bind-mount.
+- name: "6.2 — Ensure the host policy-staging dir exists (NOT the config bind-mount)"
+  ansible.builtin.file:
+    path: "{{ openbao_policy_staging_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: "6.2 — Render the platform-admin policy HCL onto the primary host (staging dir)"
+  ansible.builtin.template:
+    src: "platform-admin.hcl.j2"
+    dest: "{{ openbao_policy_staging_dir }}/platform-admin.hcl"
+    owner: root
+    group: root
+    mode: "0640"
+
+- name: "6.2 — Copy the platform-admin policy into the primary container"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - cp
+      - "{{ openbao_policy_staging_dir }}/platform-admin.hcl"
+      - "{{ openbao_primary_container_name }}:/tmp/platform-admin.hcl"
+  changed_when: true
+
+- name: "6.2 — Write the platform-admin policy (Root_Token, Security AC 2)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `policy write` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'policy', 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + [openbao_platform_admin_policy_name, '/tmp/platform-admin.hcl'] }}
+  register: openbao_admin_policy_write
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_admin_policy_write.rc == 0
+
+# ----------------------------------------------------------------------------
+# 6.2-STEP-4b — Mint a short-lived KV-writer token BEFORE the revoke.
+# ----------------------------------------------------------------------------
+# The token rotation into KV (STEP-6) happens AFTER the Root_Token is revoked
+# (we keep the revoke last so the window is unambiguous). So while the
+# Root_Token still exists, mint a single-use, short-TTL, non-renewable token
+# scoped to a policy that can ONLY write the one transit-token KV path. This
+# token — not the Root_Token, and not a platform-admin token — performs the
+# STEP-6 write and is revoked immediately after. It is created via a policy
+# inline so no broad token outlives the window. `no_log: "{{ openbao_no_log }}"` (the token
+# value is in stdout).
+- name: "6.2 — Write a tightly-scoped KV-writer policy (transit-token path only)"
+  ansible.builtin.command:
+    # `docker exec -i` is REQUIRED: this is the ONLY bao call fed via `stdin`
+    # (`bao policy write <name> -` reads the policy HCL from stdin). `docker exec`
+    # forwards the parent process's stdin to the container ONLY with `-i`; without
+    # it the container's `bao` sees an EMPTY stdin and OpenBao rejects the request
+    # with `400: 'policy' parameter not supplied or empty` (verified live). The
+    # OTHER policy write (platform-admin) passes a FILE path, not stdin, so it does
+    # not need `-i`. `-tls-skip-verify` goes after `policy write`, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-i', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'policy', 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['svc07-transit-token-writer', '-'] }}
+    stdin: >-
+      path "{{ openbao_kv_mount }}/data/{{ openbao_transit_token_kv_path }}" {
+        capabilities = ["create", "update"]
+      }
+  register: openbao_kv_writer_policy
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_kv_writer_policy.rc == 0
+
+- name: "6.2 — Mint the short-lived, non-renewable KV-writer token"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `token create` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'token', 'create']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-policy=svc07-transit-token-writer', '-ttl=5m', '-use-limit=3',
+            '-renewable=false', '-orphan', '-format=json'] }}
+  register: openbao_kv_writer_raw
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_kv_writer_raw.rc == 0
+
+- name: "6.2 — Capture the KV-writer token into an in-memory no_log fact"
+  ansible.builtin.set_fact:
+    openbao_kv_writer_token: "{{ (openbao_kv_writer_raw.stdout | from_json).auth.client_token }}"
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+# 6.2-STEP-4c — OPT-IN: mint a platform-admin token (spec openbao-admin-token-bootstrap).
+# ----------------------------------------------------------------------------
+# OFF by default (openbao_mint_admin_token). PRODUCTION obtains a platform-admin
+# token via OIDC -> ZITADEL and NEVER mints a static one — so this whole block is
+# skipped there. In a homelab / ZITADEL-less bring-up the day-2 onboarding role
+# (openbao_project_onboard) needs a token bound to the platform-admin policy read
+# from OPENBAO_ADMIN_TOKEN, and there is otherwise no way to get one (the Root_Token
+# is revoked at STEP-5). When enabled, mint a REAL renewable token bound to the
+# EXISTING platform-admin policy — created from the live Root_Token but scoped to
+# platform-admin ONLY, NEVER root — here, inside the root-token window and BEFORE the
+# STEP-5 revoke. `no_log: "{{ openbao_no_log }}"` (the token value is in stdout);
+# the value is surfaced to the operator only under the explicit dev-expose opt-in.
+# CRITICAL: `-orphan`. Without it the new token is a CHILD of the minting token (the
+# Root_Token), so the STEP-5 `bao token revoke -self` on the Root_Token
+# CASCADE-REVOKES it moments after it is minted — the token then 403s on
+# lookup-self (verified live). `-orphan` makes it the root of its own token tree so
+# it survives the Root_Token revoke (same reason the KV-writer mint above uses it).
+- name: "6.2 — Mint the opt-in platform-admin token (homelab, bound to platform-admin policy)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after `token create`, before positionals (existing convention).
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'token', 'create']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-policy=' ~ openbao_platform_admin_policy_name,
+            '-ttl=' ~ openbao_admin_token_ttl, '-renewable=true', '-orphan', '-format=json'] }}
+  register: openbao_admin_token_raw
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_admin_token_raw.rc == 0
+  when: openbao_mint_admin_token | bool
+
+- name: "6.2 — Capture the platform-admin token into an in-memory no_log fact"
+  ansible.builtin.set_fact:
+    openbao_admin_token_value: "{{ (openbao_admin_token_raw.stdout | from_json).auth.client_token }}"
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+  when: openbao_mint_admin_token | bool
+
+# Surface for capture. The VALUE is shown ONLY under the explicit, per-run dev opt-in
+# (openbao_dev_expose_secrets); otherwise a value-free note. Storing it is the
+# operator's job (gitignored .env / CI protected var), as OPENBAO_ADMIN_TOKEN.
+- name: "6.2 — Reveal the platform-admin token for capture (dev-expose opt-in ONLY)"
+  ansible.builtin.debug:
+    msg: >-
+      Platform-admin token minted (bound to the '{{ openbao_platform_admin_policy_name }}'
+      policy, ttl {{ openbao_admin_token_ttl }}). Store it in your gitignored .env as
+      OPENBAO_ADMIN_TOKEN (or a GitLab protected+masked variable) — never committed.
+      TOKEN={{ openbao_admin_token_value }}
+  no_log: "{{ openbao_no_log }}"
+  when:
+    - openbao_mint_admin_token | bool
+    - openbao_dev_expose_secrets | bool
+
+- name: "6.2 — Report the platform-admin token was minted (value hidden — default)"
+  ansible.builtin.debug:
+    msg: >-
+      Platform-admin token minted and HIDDEN (openbao_no_log). Re-run with
+      `-e openbao_dev_expose_secrets=true` for a single run to reveal it, then store
+      it as OPENBAO_ADMIN_TOKEN in your gitignored .env. (Homelab opt-in; production
+      uses OIDC/ZITADEL and does not mint a static admin token.)
+  when:
+    - openbao_mint_admin_token | bool
+    - not (openbao_dev_expose_secrets | bool)
+
+# Scrub the minted token from memory so it does not linger as a fact for the rest of
+# the play (mirrors the Root_Token scrub after the revoke).
+- name: "6.2 — Scrub the platform-admin token fact from memory"
+  ansible.builtin.set_fact:
+    openbao_admin_token_value: ""
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+  when: openbao_mint_admin_token | bool
+
+# ============================================================================
+# EXTENSION POINT — Task 7.x (engine/auth/audit) RUNS HERE, INSIDE the
+# root-token window, BEFORE the revoke.
+# ----------------------------------------------------------------------------
+# Task 7.x MUST insert its work at THIS point, because every engine-enable /
+# auth-method / audit-device step needs the Root_Token (or a platform-admin
+# token minted from it) and the window closes at 6.2-STEP-5 below.
+#
+# Contract for the task 7.x include:
+#   * add exactly one `ansible.builtin.include_tasks: engines_auth_audit.yml`
+#     right here (keep this file navigable);
+#   * the Root_Token is available as the no_log fact `openbao_root_token`
+#     (pass it as `-e BAO_TOKEN={{ openbao_root_token }}` on each docker exec,
+#     with `no_log: "{{ openbao_no_log }}"`), or first mint a platform-admin token from it;
+#   * do NOT revoke the Root_Token (this file does that at 6.2-STEP-5), and do
+#     NOT persist it anywhere;
+#   * everything remains gated on primary + not-already-initialised via this
+#     file's include condition, so a re-run stays a no-op (Req 13.3).
+# ============================================================================
+
+# --- Task 7.x engine/auth/audit enablement — runs inside the root-token window ---
+# Exactly one include, per the ordering contract above. The included file
+# authenticates with the no_log fact `openbao_root_token` (as BAO_TOKEN), does
+# NOT revoke the Root_Token, and does NOT persist it. It inherits this file's
+# primary + not-already-initialised gating (a re-run never reaches here). Task
+# 7.1 populates its §7.1 secrets-engines section; 7.2/7.3 extend §7.2/§7.3.
+- name: "7.x — Enable secrets engines, auth methods, and the audit device"
+  ansible.builtin.include_tasks: engines_auth_audit.yml
+
+# ----------------------------------------------------------------------------
+# 6.2-STEP-5 — Revoke the Root_Token (closes the bootstrap window).
+# ----------------------------------------------------------------------------
+# `bao token revoke -self` destroys the Root_Token after it has been used once
+# to bootstrap the platform-admin policy and (task 7.x) the auth/engines. It is
+# never stored persistently anywhere (Security AC 1). `no_log: "{{ openbao_no_log }}"` (BAO_TOKEN
+# is the root token being revoked).
+- name: "6.2 — Revoke the Root_Token (bao token revoke -self, Security AC 1)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `token revoke` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'token', 'revoke']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-self'] }}
+  register: openbao_root_revoke
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_root_revoke.rc == 0
+
+# Scrub the Root_Token from memory immediately after revoke so it does not
+# linger as a fact for the rest of the play.
+- name: "6.2 — Scrub the Root_Token fact from memory after revoke"
+  ansible.builtin.set_fact:
+    openbao_root_token: ""
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+# ----------------------------------------------------------------------------
+# 6.2-STEP-6 — Rotate the Bootstrap_Transit_Token INTO KV (Req 5.5).
+# ----------------------------------------------------------------------------
+# Now that the primary is initialized:true + sealed:false (asserted at STEP-3)
+# and the Root_Token is revoked (STEP-5), write the token into KV at
+# secret/platform/svc07/transit-token so the OpenBao-held copy becomes the
+# source of truth. This write is authenticated with the tightly-scoped,
+# short-TTL, non-renewable KV-writer token minted at STEP-4b (inside the window,
+# while the Root_Token still existed) — NOT with the Root_Token and NOT with a
+# broad platform-admin token. That writer token can touch ONLY this one KV path
+# and is revoked immediately after the write (STEP-6b), so no broad credential
+# outlives the bootstrap.
+- name: "6.2 — Write the Bootstrap_Transit_Token into KV secret/platform/svc07/transit-token"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `kv put` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_kv_writer_token,
+          openbao_primary_container_name, openbao_bao_bin, 'kv', 'put']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + [openbao_kv_mount ~ '/' ~ openbao_transit_token_kv_path,
+            'token=' ~ openbao_bootstrap_token] }}
+  register: openbao_kv_rotate
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_kv_rotate.rc == 0
+
+- name: "6.2 — Revoke the short-lived KV-writer token now the rotation is done"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `token revoke` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_kv_writer_token,
+          openbao_primary_container_name, openbao_bao_bin, 'token', 'revoke']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-self'] }}
+  register: openbao_kv_writer_revoke
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_kv_writer_revoke.rc == 0
+
+- name: "6.2 — Scrub the KV-writer token from memory"
+  ansible.builtin.set_fact:
+    openbao_kv_writer_token: ""
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+# ----------------------------------------------------------------------------
+# 6.2-STEP-7 — Remove the EXTERNAL copy of the token (Req 5.5; Security AC 7).
+# ----------------------------------------------------------------------------
+# The KV-held copy is now live, so the external copy MUST be removed. The path
+# depends on the bootstrap source; auto-detect when configured "auto".
+- name: "6.2 — Determine the external-copy removal path (on the control node)"
+  # delegate_to: localhost — the homelab .env and the CI_* vars live on the
+  # CONTROL NODE, not the primary LXC. `is exists` must therefore test the .env
+  # on the control node; without delegation it tested the (absent) path on the
+  # primary and always fell through to `manual` (33rd correction).
+  ansible.builtin.set_fact:
+    openbao_bootstrap_source_resolved: >-
+      {{ openbao_bootstrap_external_source
+         if openbao_bootstrap_external_source != 'auto'
+         else ('dotenv'
+               if (openbao_bootstrap_dotenv_path is exists)
+               else ('gitlab'
+                     if (openbao_gitlab_project_id | length > 0
+                         and openbao_gitlab_api_url | length > 0)
+                     else 'manual')) }}
+  delegate_to: localhost
+  # become: false — this runs on the CONTROL NODE against the operator's own .env
+  # (owned by the invoking user); root is neither needed nor available without a
+  # password on localhost, so inheriting the play's become: true would fail with
+  # `sudo: a password is required` (34th correction).
+  become: false
+  changed_when: false
+
+# --- homelab path: strip the token line from the gitignored .env ---
+# lineinfile with a regexp removes ONLY the token assignment line, leaving the
+# rest of the .env intact. The .env is gitignored (repo .gitignore), so it was
+# never committed. `no_log: "{{ openbao_no_log }}"` (the matched line contains the value).
+- name: "6.2 — Remove the token line from the local gitignored .env (homelab)"
+  ansible.builtin.lineinfile:
+    path: "{{ openbao_bootstrap_dotenv_path }}"
+    regexp: "^\\s*(export\\s+)?{{ openbao_bootstrap_token_env_var }}\\s*="
+    state: absent
+  # delegate_to: localhost — the .env is on the control node (33rd correction).
+  delegate_to: localhost
+  become: false   # control-node file owned by the invoking user (34th correction)
+  no_log: "{{ openbao_no_log }}"
+  when: openbao_bootstrap_source_resolved == "dotenv"
+
+# --- pipeline path: delete the GitLab CI/CD protected+masked variable ---
+# The API call uses a CI/API token read from the environment at runtime (never
+# committed); the variable being deleted is the bootstrap token variable.
+# `no_log: "{{ openbao_no_log }}"` (the request header carries the API token).
+- name: "6.2 — Delete the GitLab CI/CD protected variable (pipeline)"
+  ansible.builtin.uri:
+    url: >-
+      {{ openbao_gitlab_api_url }}/projects/{{ openbao_gitlab_project_id }}/variables/{{ openbao_bootstrap_token_env_var }}
+    method: DELETE
+    headers:
+      PRIVATE-TOKEN: "{{ lookup('ansible.builtin.env', openbao_gitlab_token_env_var, default='') }}"
+    status_code: [204, 404]
+    validate_certs: true
+  # delegate_to: localhost — the CI_* API token/vars live on the control node.
+  delegate_to: localhost
+  become: false   # control-node API call as the invoking user (34th correction)
+  no_log: "{{ openbao_no_log }}"
+  when: openbao_bootstrap_source_resolved == "gitlab"
+
+# --- manual path: refuse to finish silently ---
+# If this role cannot reach the external source, it FAILS LOUDLY so the operator
+# removes the copy — the invariant (external copy removed once KV copy is live)
+# is never silently skipped (Security AC 7).
+- name: "6.2 — Fail loudly if the external copy cannot be auto-removed"
+  ansible.builtin.fail:
+    msg: >-
+      The Bootstrap_Transit_Token is now live in KV
+      ({{ openbao_kv_mount }}/{{ openbao_transit_token_kv_path }}), but this role
+      could not locate the external copy to remove it automatically. REMOVE IT
+      NOW: delete the '{{ openbao_bootstrap_token_env_var }}' entry from your
+      gitignored .env, or delete the GitLab CI/CD protected variable of that
+      name. The external copy must not outlive the KV copy (Req 5.5;
+      Security AC 7).
+  when: openbao_bootstrap_source_resolved == "manual"
+
+# ----------------------------------------------------------------------------
+# 6.2-STEP-8 — Scrub the bootstrap token fact from memory.
+# ----------------------------------------------------------------------------
+- name: "6.2 — Scrub the Bootstrap_Transit_Token fact from memory"
+  ansible.builtin.set_fact:
+    openbao_bootstrap_token: ""
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false

@@ -1,0 +1,40 @@
+---
+# defaults/main.yml — platform_preflight (Platform Prerequisites Bootstrap —
+# shared preflight, all buckets).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/. Design ref:
+# "Component 2: platform_preflight". Implemented in SPEC TASK 4.
+#
+# Phase-specific defaults for the shared preflight role. Cross-bucket constants
+# (cluster_env_file, platform_repo_root, platform_venv_python,
+# platform_selected_buckets, bootstrap_pve_identity, ...) stay as play-level
+# vars on platform-bootstrap.yml (see design.md "Data Models") — the role reads
+# them from the play. NO secret value ever lives here.
+
+# The pure-logic env helper the resolve task delegates parse/alias/validate to
+# (Req 1.4, 6.2). Same helper svc07_preflight uses — cluster_env.py is the
+# single source of truth for parsing + alias-resolution + mandatory-completeness
+# and is a shared symbol across both installers.
+platform_cluster_env_helper: scripts/installer/cluster_env.py
+
+# Local control-node prerequisites, reused (lighter) from the svc07_preflight
+# pattern. terraform must be on PATH (the api bucket child-runs it) and the
+# devinfra venv binaries the orchestrator + its child runs invoke by absolute
+# path must exist — their absence is a named, fail-fast preflight error (Req
+# 4.2 precondition tooling; dev-workflow.md Python Environment Invocation).
+platform_required_venv_binaries:
+  - "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+  - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+
+# --- Gateway-phase cross-bucket precondition (Fix A / ADR-0010, Req 1.5) -----
+# The shared SDN VNet bridge the host bucket's gateway phase binds .1 to. The
+# api bucket's terraform apply creates it. Preflight probes for it ONLY in the
+# narrow gap case ('host' selected but 'api' not) to fail closed before the
+# gateway runs against a missing bridge. VLAN 20 is the shared-services VLAN
+# (domain-rules.md §1), so the shared VNet is `p20`.
+platform_gateway_bridge: "p20"
+
+# The admin SSH user the delegated bridge probe runs as on the Proxmox host
+# (key-based auth, same connection profile as proxmox-hosts.yml / the host
+# bucket's pveam delegation).
+platform_preflight_ssh_user: root

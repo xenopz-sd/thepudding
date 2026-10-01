@@ -1,0 +1,22 @@
+---
+# defaults/main.yml — svc07_bootstrap (SVC-07 installer — Phase 3: Bootstrap)
+#
+# Phase-3 phase-specific defaults the role owns (spec task 5.3). This is a
+# behavior-preserving extraction: every variable the Phase-3 task body reads is
+# a CROSS-PHASE CONSTANT that, per design.md "Data Models", stays a play-level
+# `vars:` entry on svc-07-bootstrap.yml and is therefore NOT redefined here:
+#   * svc07_generated_inventory      — shared -i for every child run
+#   * svc07_repo_root                — shared chdir anchor
+#   * cluster_env_file               — shared, -e overridable
+#   * svc07_seal_token_handoff_path  — shared handoff-file bridge (0600)
+#   * svc07_debug_instrumentation    — shared dev-opt-in flag (OFF; never true)
+#
+# The Task 8.2 / 8.4 child-run flags (openbao_tls_self_signed,
+# openbao_mint_seal_token, openbao_mock_edge_network, openbao_mint_admin_token,
+# openbao_dev_expose_secrets, --tags install,init, --limit ...) are inline argv
+# LITERALS in tasks/main.yml, not role variables, so there is nothing to
+# parameterise here. NO secret value ever lives in a default — the seal/Transit/
+# Admin tokens are runtime-only, no_log, never a variable default.
+#
+# The role therefore owns no phase-specific defaults; this file is intentionally
+# empty of keys.

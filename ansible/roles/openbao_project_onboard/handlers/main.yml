@@ -1,0 +1,9 @@
+---
+# handlers/main.yml — openbao_project_onboard
+#
+# No handler is required by task 9.1: the policy write, the jwt-role write, and
+# the KV-path ensure are all reconciled inline via check-then-write `bao` calls
+# and need no service restart. This file is present as part of the standard role
+# skeleton for consistency with the sibling openbao_* roles.
+#
+# (intentionally empty)

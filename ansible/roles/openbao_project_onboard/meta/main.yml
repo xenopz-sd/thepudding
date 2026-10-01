@@ -1,0 +1,40 @@
+---
+# meta/main.yml — openbao_project_onboard
+galaxy_info:
+  role_name: openbao_project_onboard
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Per-project onboarding for OpenBao (SVC-07). For one project slug (read
+    READ-ONLY from projects.yaml) it creates the isolation triple — the
+    per-project ACL policy `policy-<slug>` granting create/read/update/delete/
+    list on exactly the five KV v2 sub-paths (secret/{data,metadata,delete,
+    undelete,destroy}/<slug>/*) and nothing outside them (Req 1.2, 1.3); the
+    GitLab-CI jwt login role `auth/jwt/role/<slug>-ci` (bound project_path,
+    bound_audiences, token_ttl/max_ttl <= 3600, renewable=false, token_policies
+    = [policy-<slug>], optional ref_type/ref) (Req 4.2, 4.7); and the KV path
+    secret/data/<slug>/. Every write is check-then-write against `bao policy
+    list` / `bao secrets list` so a re-run for the same slug is a byte-identical
+    no-op that touches no secret version and reports changed=0 (Req 1.5, 13.4).
+    Authenticates with a platform-admin token (NOT the revoked Root_Token),
+    supplied at runtime from a never-committed env var.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - openbao
+    - secrets
+    - onboarding
+    - svc07
+
+# No cross-role dependencies. This role runs day-2, after openbao_install +
+# openbao_init_unseal have brought up the primary, initialised/unsealed it, and
+# enabled the KV v2 + jwt method (tasks 5.x, 6.x, 7.x). The ordering is
+# expressed in the playbook, not as a hard meta dependency here.
+dependencies: []

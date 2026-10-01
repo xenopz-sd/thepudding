@@ -1,0 +1,44 @@
+---
+# Galaxy metadata for the `sdn_gateway` host-level role (spec
+# sdn-vlan-gateway-reachability, C5; ADR-0004).
+#
+# `sdn_gateway` configures the Proxmox host itself as the Layer-3 gateway +
+# firewall for served SDN VLANs (whose zone is Layer-2 only). It is a host-level
+# role — it mutates host networking (`/etc/network/interfaces.d/` VLAN
+# sub-interfaces, `net.ipv4.ip_forward`) and `pve-firewall` rules on the Proxmox
+# node, NOT a Compose stack. This is the `structure.md`-sanctioned host-level
+# exception (a service that genuinely needs host-level configuration beyond a
+# Compose stack), in the same spirit as the `common` baseline role.
+#
+# The host L3 gateway it configures is deliberately OUTSIDE the Terraform-managed
+# SDN — the recorded L2 (Terraform/SDN) / L3 (host-managed) seam of ADR-0004.
+#
+# Collection pins (ansible.posix for `sysctl`, community.general where used) live
+# in ansible/requirements.yml, NOT here — role meta keeps `dependencies: []`.
+galaxy_info:
+  role_name: sdn_gateway
+  author: Developer Services Platform
+  description: >-
+    Host-level role: configures the Proxmox host as the L3 gateway + firewall for
+    served SDN VLANs (whose zone is Layer-2 only). Owns the per-VLAN host
+    sub-interface (vmbr0.<vlan_id> -> 10.0.<vlan_id>.1/24), net.ipv4.ip_forward=1,
+    and the scoped pve-firewall ALLOW/DENY rules that preserve the isolation
+    model. Idempotent in both directions — configures active served VLANs and
+    tears down decommissioned ones. The host L3 gateway is deliberately outside
+    the Terraform-managed SDN (the ADR-0004 L2/L3 seam).
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+  galaxy_tags:
+    - proxmox
+    - sdn
+    - networking
+    - firewall
+    - gateway
+
+# No role dependencies. The ansible.posix collection (for `sysctl`) is pinned in
+# ansible/requirements.yml, not declared here.
+dependencies: []

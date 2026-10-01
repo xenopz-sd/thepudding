@@ -1,0 +1,386 @@
+---
+# tasks/main.yml — svc07_provision (SVC-07 installer — Phase 2: Provision)
+#
+# Phase-2 tasks moved here VERBATIM (spec task 4.1) from the "Phase 2 —
+# Infrastructure provisioning" block of svc-07-bootstrap.yml:
+#   - backend swap-gate (GitLab HTTP when all three CI keys present, else
+#     local_backend_override.tf) with its single INFO decision log,
+#   - terraform init / terraform apply (Proxmox creds via TF_VAR_* env, no_log),
+#   - generate_inventory.py + existence assert,
+#   - add_host of primary/unsealer,
+#   - ssh-keygen -R + ssh-keyscan -T 30 known_hosts reconciliation.
+# Sets svc07_use_gitlab_backend and writes the generated inventory at
+# {{ svc07_generated_inventory }}; a missing generated inventory HALTS before
+# Bootstrap. The per-phase block/rescue phase-naming stays in the play; the
+# role holds the tasks only. Cross-phase constants (svc07_repo_root,
+# svc07_generated_inventory, svc07_guest_ips, VMIDs 1070/1071,
+# svc07_autodetect_sentinel) are read from the play's vars. Phase-specific
+# svc07_tf_root / svc07_tf_env live in defaults/main.yml. See design.md
+# "Role 2: svc07_provision".
+
+# ============================================================ #
+# Task 7.1 — Terraform backend swap-gate selection (Req 4.2).   #
+# ------------------------------------------------------------ #
+# The SVC07_Terraform_Root declares a PARTIAL `backend "http"`   #
+# (GitLab-managed state). The swap gate chooses between:         #
+#   * the GitLab HTTP backend — WHEN the Cluster_Env_File        #
+#     configures it, i.e. it defines the GitLab CI state-backend #
+#     variables (CI_API_V4_URL, CI_PROJECT_ID, CI_JOB_TOKEN);    #
+#   * a credential-free LOCAL backend — otherwise (the solo /    #
+#     offline Developer-B default), by ensuring the gitignored   #
+#     `local_backend_override.tf` is present so Terraform merges  #
+#     the `backend "local" {}` override over the partial http    #
+#     block (INSTALL-RUNBOOK.md Option A).                       #
+# This is the installer's analogue of a real-vs-fake swap gate;  #
+# an INFO-level log line records which backend was selected and  #
+# why (composition-wiring.md dependency-type logging).          #
+# ============================================================ #
+
+# Detect whether the env file configures the GitLab HTTP backend.
+# We read the raw file (no_log — it carries the API token) and test
+# ONLY for the presence of the three GitLab CI state-backend keys, so
+# the token value is never surfaced. Reading the file directly (rather
+# than via cluster_env.py, which emits only TF_VAR_* Proxmox params)
+# is the one place the raw GitLab keys are observed.
+- name: "Provisioning | Read the cluster env file to detect the state-backend signal"
+  ansible.builtin.slurp:
+    src: "{{ svc07_repo_root }}/{{ cluster_env_file }}"
+  register: svc07_env_slurp
+  no_log: true
+
+# Reduce the raw file to the non-comment KEY=VALUE lines. no_log — a
+# value carries the API token. Kept as an intermediate the key-set and
+# (GitLab-only) value-map below both derive from.
+- name: "Provisioning | Reduce the env file to KEY=VALUE lines"
+  ansible.builtin.set_fact:
+    svc07_env_pairs: >-
+      {{ (svc07_env_slurp.content | b64decode).splitlines()
+         | map('trim')
+         | reject('match', '^\s*#')
+         | select('search', '=')
+         | list }}
+  no_log: true
+
+# The KEY set (names only, values discarded) — the backend decision is
+# made from key presence alone, so this fact carries no secret value.
+- name: "Provisioning | Extract the set of env keys (names only, no values)"
+  ansible.builtin.set_fact:
+    svc07_env_keys: >-
+      {{ svc07_env_pairs
+         | map('regex_replace', '^\s*([^=]+?)\s*=.*$', '\1')
+         | list }}
+
+# The GitLab HTTP backend is "configured" only when ALL three CI
+# state-backend variables are present as keys (the partial backend "http"
+# needs address/credentials derived from all three).
+- name: "Provisioning | Decide the Terraform backend (swap gate)"
+  ansible.builtin.set_fact:
+    svc07_use_gitlab_backend: >-
+      {{ ('CI_API_V4_URL' in svc07_env_keys)
+         and ('CI_PROJECT_ID' in svc07_env_keys)
+         and ('CI_JOB_TOKEN' in svc07_env_keys) }}
+
+# When the GitLab HTTP backend is selected, extract the three CI
+# state-backend VALUES (only these three keys) from the raw env so the
+# partial backend "http" can be initialized via -backend-config. no_log —
+# CI_JOB_TOKEN is a credential. Skipped entirely for the local backend.
+# Build a key->value map by zipping the key list with a value list. The
+# value regex strips surrounding whitespace and one layer of matching
+# double quotes (env files commonly quote values), so a quoted or
+# unquoted CI_JOB_TOKEN / URL resolves cleanly. no_log — CI_JOB_TOKEN is
+# a credential.
+- name: "Provisioning | Extract GitLab CI state-backend values (GitLab backend only)"
+  ansible.builtin.set_fact:
+    svc07_env_ci_values: >-
+      {{ dict(svc07_env_keys | zip(
+           svc07_env_pairs
+           | map('regex_replace', '^[^=]+=\s*(.*?)\s*$', '\1')
+           | map('regex_replace', '^"(.*)"$', '\1')
+           | list
+         )) }}
+  when: svc07_use_gitlab_backend | bool
+  no_log: true
+
+# Canonical GitLab state address for THIS root's state name (verbatim
+# `svc-07-secrets-manager`, versions.tf) and the job token, derived from
+# the extracted CI values. no_log — carries the job token.
+- name: "Provisioning | Derive the GitLab state address + job token (GitLab backend only)"
+  ansible.builtin.set_fact:
+    svc07_env_gitlab_state_address: >-
+      {{ svc07_env_ci_values['CI_API_V4_URL'] }}/projects/{{
+         svc07_env_ci_values['CI_PROJECT_ID'] }}/terraform/state/svc-07-secrets-manager
+    svc07_env_ci_job_token: "{{ svc07_env_ci_values['CI_JOB_TOKEN'] }}"
+  when: svc07_use_gitlab_backend | bool
+  no_log: true
+
+# INFO-level swap-gate decision log (composition-wiring.md): make the
+# chosen backend and the reason visible in the run output, never silent.
+- name: "Provisioning | Log the Terraform backend selection (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Terraform backend:
+      {{ 'GitLab HTTP state (svc-07-secrets-manager) — the Cluster_Env_File '
+         ~ 'configures the GitLab CI state-backend variables'
+         if (svc07_use_gitlab_backend | bool)
+         else 'LOCAL (local_backend_override.tf) — the Cluster_Env_File does not '
+              ~ 'configure the GitLab HTTP backend (solo/offline Developer-B default)' }}
+
+# LOCAL backend path: ensure the gitignored local_backend_override.tf is
+# present so Terraform merges backend "local" {} over the partial http
+# block. Idempotent — the file already exists in this root, but the
+# installer must guarantee it for a fresh clone (Req 4.2). Only written
+# when NOT using the GitLab backend.
+- name: "Provisioning | Ensure local_backend_override.tf is present (local backend)"
+  ansible.builtin.copy:
+    dest: "{{ svc07_tf_root }}/local_backend_override.tf"
+    mode: "0644"
+    content: |
+      # Local, gitignored state backend for a solo/offline apply — overrides the
+      # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+      terraform {
+        backend "local" {}
+      }
+  when: not (svc07_use_gitlab_backend | bool)
+
+# GitLab backend path: the local override must NOT be present, or
+# Terraform would merge the local backend over the http one. Remove it if
+# a previous local run left it behind (idempotent — absent is fine).
+- name: "Provisioning | Remove any local_backend_override.tf (GitLab HTTP backend)"
+  ansible.builtin.file:
+    path: "{{ svc07_tf_root }}/local_backend_override.tf"
+    state: absent
+  when: svc07_use_gitlab_backend | bool
+
+# terraform init. For the LOCAL backend we pass -reconfigure so a switch
+# from a prior -backend=false / http init selects the local backend
+# cleanly (INSTALL-RUNBOOK.md Option A). For the GitLab backend, the
+# concrete -backend-config flags are derived by the operator/CI from the
+# CI_* variables per the root README; here we run a reconfigure init that
+# picks up those variables from the child environment.
+- name: "Provisioning | terraform init (local backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+  args:
+    chdir: "{{ svc07_tf_root }}"
+  environment: "{{ svc07_tf_env }}"
+  register: svc07_tf_init_local
+  changed_when: true
+  when: not (svc07_use_gitlab_backend | bool)
+  no_log: true
+
+- name: "Provisioning | terraform init (GitLab HTTP backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+      - "-backend-config=address={{ svc07_env_gitlab_state_address }}"
+      - "-backend-config=lock_address={{ svc07_env_gitlab_state_address }}/lock"
+      - "-backend-config=unlock_address={{ svc07_env_gitlab_state_address }}/lock"
+      - -backend-config=username=gitlab-ci-token
+      - "-backend-config=password={{ svc07_env_ci_job_token }}"
+      - -backend-config=lock_method=POST
+      - -backend-config=unlock_method=DELETE
+      - -backend-config=retry_wait_min=5
+  args:
+    chdir: "{{ svc07_tf_root }}"
+  environment: "{{ svc07_tf_env }}"
+  register: svc07_tf_init_gitlab
+  changed_when: true
+  when: svc07_use_gitlab_backend | bool
+  no_log: true
+
+# ============================================================ #
+# Task 7.2 — guest-variable assembly + non-interactive apply    #
+# (Req 4.1, 4.3, 4.4, 4.10).                                    #
+# ------------------------------------------------------------ #
+# The Proxmox endpoint/token are passed via TF_VAR_* in the      #
+# child environment (no_log), never on the command line. The    #
+# guest placement/sizing vars go as explicit -var inputs. If any #
+# required guest var is absent/empty we HALT before apply,       #
+# creating no resource (Req 4.4). A non-zero apply halts and     #
+# does not proceed to Bootstrap (Req 4.10).                      #
+# ============================================================ #
+
+# Fail-fast guard (Req 4.4): every required guest var must be present and
+# non-empty BEFORE `terraform apply` runs, so a missing var creates no
+# Proxmox resource. node_name, template, and datastore come from the
+# resolved env facts (Phase 1); the two VMIDs are fixed by this installer.
+- name: "Provisioning | Assert all required guest variables are present (before apply)"
+  ansible.builtin.assert:
+    that:
+      - "svc07_proxmox_node_name is defined and (svc07_proxmox_node_name | trim | length > 0)"
+      - "svc07_openbao_template_file_id is defined and (svc07_openbao_template_file_id | trim | length > 0)"
+      - "svc07_openbao_datastore_id is defined and (svc07_openbao_datastore_id | trim | length > 0)"
+      - "svc07_openbao_datastore_id != svc07_autodetect_sentinel"
+      - "svc07_openbao_primary_vmid is defined"
+      - "svc07_openbao_unsealer_vmid is defined"
+    fail_msg: >-
+      A required guest variable is absent or empty; refusing to run
+      `terraform apply` so no Proxmox resource is created. Required:
+      proxmox_node_name, openbao_template_file_id, a resolved
+      openbao_datastore_id (not the auto-detect sentinel),
+      openbao_primary_vmid (1070), openbao_unsealer_vmid (1071).
+    success_msg: "All required guest variables are present; proceeding to terraform apply."
+
+- name: "Provisioning | terraform apply (non-interactive, auto-approve)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - apply
+      - -input=false
+      - -auto-approve
+      - "-var=proxmox_node_name={{ svc07_proxmox_node_name }}"
+      - "-var=openbao_primary_vmid={{ svc07_openbao_primary_vmid }}"
+      - "-var=openbao_unsealer_vmid={{ svc07_openbao_unsealer_vmid }}"
+      - "-var=openbao_template_file_id={{ svc07_openbao_template_file_id }}"
+      - "-var=openbao_datastore_id={{ svc07_openbao_datastore_id }}"
+  args:
+    chdir: "{{ svc07_tf_root }}"
+  environment: "{{ svc07_tf_env }}"
+  register: svc07_tf_apply
+  changed_when: "'0 added, 0 changed, 0 destroyed' not in svc07_tf_apply.stdout"
+  # A non-zero apply is a task failure -> caught by this phase's rescue,
+  # so the Bootstrap phase never runs (Req 4.10). no_log because the
+  # child env carries TF_VAR_proxmox_api_token (Req 8.8).
+  no_log: true
+
+# ============================================================ #
+# Task 7.3 — inventory generation + refresh handoff             #
+# (Req 4.5, 4.6, 4.7).                                          #
+# ------------------------------------------------------------ #
+# On a successful apply, render the Ansible inventory from the   #
+# Terraform outputs via generate_inventory.py (one-directional,  #
+# file-mediated handoff — integration-boundaries.md §4). A non-  #
+# zero exit OR a missing output file halts before Bootstrap,     #
+# leaving the guests in place (Req 4.7).                         #
+# ============================================================ #
+
+- name: "Provisioning | Generate the Ansible inventory from Terraform outputs"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc07_venv_python }}"
+      - ansible/inventory/generate_inventory.py
+      - --root
+      - infra/projects/svc-07-secrets-manager
+      - --out
+      - "{{ svc07_generated_inventory }}"
+  args:
+    chdir: "{{ svc07_repo_root }}"
+  register: svc07_gen_inventory
+  changed_when: true
+  # A non-zero exit fails the task -> rescue -> no Bootstrap (Req 4.7).
+
+# Guard the OTHER half of Req 4.7: the generator could in principle exit
+# 0 without the file existing. Assert the output file is present before
+# any Bootstrap step depends on it.
+- name: "Provisioning | Confirm the generated inventory file was written"
+  ansible.builtin.stat:
+    path: "{{ svc07_repo_root }}/{{ svc07_generated_inventory }}"
+  register: svc07_generated_inventory_stat
+
+- name: "Provisioning | Assert the generated inventory exists (else halt before Bootstrap)"
+  ansible.builtin.assert:
+    that:
+      - "svc07_generated_inventory_stat.stat.exists"
+    fail_msg: >-
+      generate_inventory.py did not produce
+      {{ svc07_generated_inventory }}; halting before the Bootstrap phase
+      and leaving the provisioned guests in place (Req 4.7).
+    success_msg: "Generated inventory present: {{ svc07_generated_inventory }}."
+
+# Process-boundary refresh (Req 4.6): the Bootstrap child ansible-playbook
+# runs read the freshly-written generated inventory as their own `-i`
+# argument, so the refresh is inherent to the process boundary. For any
+# orchestrator-local task that needs the hosts in THIS play's memory,
+# reconstruct the two groups with add_host from the generator's known,
+# non-secret output (hostnames/IPs are computed by NET-00, not secret).
+- name: "Provisioning | add_host the primary into the in-memory inventory"
+  ansible.builtin.add_host:
+    name: svc07-20-01
+    groups:
+      - openbao
+    ansible_host: "10.0.20.10"
+    ansible_user: root
+    ansible_connection: ssh
+  changed_when: false
+
+- name: "Provisioning | add_host the unsealer into the in-memory inventory"
+  ansible.builtin.add_host:
+    name: svc07-unsealer-20-01
+    groups:
+      - openbao-unsealer
+    ansible_host: "10.0.20.11"
+    ansible_user: root
+  changed_when: false
+
+# ============================================================ #
+# Task 7.4 — SSH known_hosts reconciliation (Req 4.8, 4.9).     #
+# ------------------------------------------------------------ #
+# Remove any STALE fingerprints for the two guest IPs (a fresh   #
+# LXC on a reused IP presents a new host key), then ssh-keyscan  #
+# each address with a per-address 30 s timeout and append the    #
+# current keys. A key that cannot be recorded within 30 s halts, #
+# naming the unreachable address (Req 4.9).                      #
+# ============================================================ #
+
+# Ensure ~/.ssh exists so known_hosts operations have a home.
+- name: "Provisioning | Ensure ~/.ssh exists (0700)"
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+
+# Remove stale fingerprints for both addresses. ssh-keygen -R rewrites
+# known_hosts removing every entry for the host; a missing known_hosts or
+# an absent entry is not an error (rc 0), so this is idempotent.
+- name: "Provisioning | Remove stale known_hosts fingerprints for the guest IPs"
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -R
+      - "{{ item }}"
+      - -f
+      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
+  loop: "{{ svc07_guest_ips }}"
+  register: svc07_knownhosts_purge
+  changed_when: "'updated' in (svc07_knownhosts_purge.stderr | default(''))"
+  failed_when: false
+
+# ssh-keyscan each address with a per-address 30 s timeout (Req 4.9). The
+# command's own -T bounds the connect, and the async/poll wrapper bounds
+# the whole task at 30 s so a hung scan cannot exceed the budget.
+- name: "Provisioning | ssh-keyscan the guest IPs (per-address 30s timeout)"
+  ansible.builtin.command:
+    argv:
+      - ssh-keyscan
+      - -T
+      - "30"
+      - "{{ item }}"
+  loop: "{{ svc07_guest_ips }}"
+  register: svc07_keyscan
+  changed_when: false
+  # A blank scan (no key recorded) or a non-zero rc means the address was
+  # unreachable within the timeout -> halt naming it (Req 4.9).
+  failed_when: >-
+    svc07_keyscan.rc != 0
+    or (svc07_keyscan.stdout | default('') | trim | length == 0)
+
+# Append the current keys to known_hosts. Each loop item carries the
+# scanned key(s) for one address in .stdout; write them so subsequent SSH
+# (the Bootstrap child runs) does not prompt for host-key verification.
+- name: "Provisioning | Append current host keys to known_hosts"
+  ansible.builtin.blockinfile:
+    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+    create: true
+    mode: "0600"
+    marker: "# {mark} SVC-07 installer host keys for {{ item.item }}"
+    block: "{{ item.stdout }}"
+  loop: "{{ svc07_keyscan.results }}"
+  loop_control:
+    label: "{{ item.item }}"

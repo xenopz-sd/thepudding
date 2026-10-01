@@ -1,0 +1,745 @@
+---
+# tasks/engines_auth_audit.yml — openbao_init_unseal / TASK 7.x
+#
+# Secrets-engine / auth-method / audit-device bootstrap. INCLUDED FROM
+# tasks/primary_bootstrap.yml at the marker:
+#     "EXTENSION POINT — Task 7.x (engine/auth/audit) RUNS HERE, INSIDE the
+#      root-token window, BEFORE the revoke"
+# i.e. AFTER 6.2-STEP-4b (platform-admin policy + KV-writer token minted) and
+# BEFORE 6.2-STEP-5 (Root_Token revoke). It therefore runs while the Root_Token
+# is still alive.
+#
+# GATING (inherited from the primary_bootstrap.yml include in main.yml, which is
+# itself gated on `openbao_role == "primary"` and `not
+# openbao_already_initialized`): a re-run against an already-initialised primary
+# never reaches this file, and every enable below is ADDITIONALLY check-then-do
+# against `bao secrets list -format=json`, so even if reached twice it is a
+# byte-identical no-op (Req 13 idempotency).
+#
+# AUTH CONTRACT (from the ordering contract in primary_bootstrap.yml):
+#   * the Root_Token is available as the no_log fact `openbao_root_token`;
+#     every `bao` call here authenticates by passing it as
+#     `-e BAO_TOKEN={{ openbao_root_token }}` on the `docker exec`, with
+#     `no_log: "{{ openbao_no_log }}"` (the exec environment carries the root token);
+#   * do NOT revoke the Root_Token here (primary_bootstrap.yml 6.2-STEP-5 does);
+#   * do NOT persist the Root_Token anywhere.
+#
+# SECRETS DISCIPLINE (security-standards.md — this IS the secrets manager):
+#   * the PostgreSQL `openbao` superuser password and the Garage admin secret
+#     key are SECRETS. They are resolved at runtime from operator-supplied,
+#     never-committed environment variables (a gitignored .env or a GitLab CI/CD
+#     protected+masked variable) via an `env` lookup — never a defaulted literal;
+#   * every task that carries such a credential into a `bao` write sets
+#     `no_log: "{{ openbao_no_log }}"`;
+#   * non-secret connection/endpoint config (PG host, Garage endpoint) are
+#     ordinary placeholder-defaulted vars and are not `no_log`.
+#
+# SECTION MAP (task 7.2 and 7.3 slot into their own marked sections below):
+#   §7.1  Secrets engines — KV v2 @ secret/, database (postgres), aws (Garage)
+#   §7.2  Auth methods (jwt/oidc) + file audit device + Promtail   [TASK 7.2]
+#   §7.3  Root-credential rotation wiring                          [TASK 7.3]
+
+# ============================================================================
+# §7.1 — SECRETS ENGINES (KV v2 + database + aws)                  [TASK 7.1]
+# ============================================================================
+# One `bao secrets list -format=json` read up front feeds every enable-if-absent
+# decision, so a re-run enables nothing that already exists (Req 13 idempotency).
+# OpenBao reports mounts with a trailing slash on the path key
+# (e.g. "secret/"), which the `<mount>/` lookups below account for.
+
+- name: "7.1 — List enabled secrets engines on the primary (check-then-enable)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `secrets list` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'secrets', 'list']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_primary_mounts
+  no_log: "{{ openbao_no_log }}"                 # exec env carries the Root_Token
+  check_mode: false
+  changed_when: false
+
+- name: "7.1 — Parse the enabled-engines mount map"
+  ansible.builtin.set_fact:
+    openbao_mount_map: "{{ openbao_primary_mounts.stdout | default('{}') | from_json }}"
+  no_log: "{{ openbao_no_log }}"                 # the mount map is derived from a no_log stdout
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# §7.1a — KV v2 @ secret/ with max_versions = 10 (Req 1.1, 1.4)
+# ---------------------------------------------------------------------------
+# Enable exactly one KV v2 engine at `secret/` if absent, then tune
+# max_versions = 10. The tune is idempotent (writing the same value changes
+# nothing), and enabling is gated on the mount being absent, so this is a no-op
+# on a re-run. NO secret in these writes, but BAO_TOKEN is the Root_Token, so
+# no_log: "{{ openbao_no_log }}" on the actual `bao` calls.
+
+- name: "7.1 — Enable the KV v2 secrets engine at '{{ openbao_kv_mount }}/' (if absent)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `secrets enable` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'secrets', 'enable']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-path=' ~ openbao_kv_mount, '-version=2', 'kv'] }}
+  register: openbao_kv_enable
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_kv_enable.rc == 0
+  when: >-
+    (openbao_mount_map.get(openbao_kv_mount ~ '/', none) is none)
+
+- name: "7.1 — Tune KV v2 max_versions = {{ openbao_kv_max_versions }} (Req 1.4, idempotent)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `write` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + [openbao_kv_mount ~ '/config',
+            'max_versions=' ~ openbao_kv_max_versions] }}
+  register: openbao_kv_tune
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_kv_tune.rc == 0
+
+# ---------------------------------------------------------------------------
+# §7.1b — database secrets engine (PostgreSQL) (Req 2.1, 2.2, 2.3)
+# ---------------------------------------------------------------------------
+# Enable the `database` engine (if absent). Then, ONLY when a PG host + the
+# `openbao` superuser password have been supplied (openbao_database_configure_
+# connection == true), write the connection config as the dedicated `openbao`
+# SUPERUSER. Per-project dynamic ROLES (database/roles/<slug>-<db>-rw) with the
+# 1h/24h TTLs and least-privilege creation_statements are created at ONBOARDING
+# (task 9.1, openbao_project_onboard); this task provides the engine + the
+# connection template + the TTL/creation-statement TEMPLATES (in defaults) those
+# roles instantiate.
+
+- name: "7.1 — Enable the database secrets engine at '{{ openbao_database_mount_path }}/' (if absent)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `secrets enable` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'secrets', 'enable']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-path=' ~ openbao_database_mount_path, 'database'] }}
+  register: openbao_database_enable
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_database_enable.rc == 0
+  when: >-
+    (openbao_mount_map.get(openbao_database_mount_path ~ '/', none) is none)
+
+# Resolve the `openbao` superuser password from its never-committed env var.
+# Empty when SVC-01 isn't wired yet — the connection write below is skipped in
+# that case (openbao_database_configure_connection stays false).
+- name: "7.1 — Resolve the PostgreSQL 'openbao' superuser password (env, never committed)"
+  ansible.builtin.set_fact:
+    openbao_database_superuser_password: >-
+      {{ lookup('ansible.builtin.env', openbao_database_superuser_password_env_var, default='') }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+  when: openbao_database_configure_connection | bool
+
+- name: "7.1 — Assert the DB superuser password was supplied when configuring the connection"
+  ansible.builtin.assert:
+    that:
+      - openbao_database_superuser_password | length > 0
+    fail_msg: >-
+      openbao_database_configure_connection is true but no PostgreSQL 'openbao'
+      superuser password was supplied. Set the never-committed env var
+      '{{ openbao_database_superuser_password_env_var }}' (a gitignored .env or a
+      GitLab CI/CD protected+masked variable). It is never defaulted or committed.
+    success_msg: "DB superuser password supplied via {{ openbao_database_superuser_password_env_var }} (value not logged)."
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+  when: openbao_database_configure_connection | bool
+
+# Write database/config/<conn> as the `openbao` superuser. The password is passed
+# as its OWN `password=` field (not embedded in connection_url), so OpenBao keeps
+# it out of the URL/audit trail. no_log: "{{ openbao_no_log }}" — this write carries the secret.
+- name: "7.1 — Configure database/config/{{ openbao_database_connection_name }} (openbao superuser, Req 2.1)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `write` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + [openbao_database_mount_path ~ '/config/' ~ openbao_database_connection_name,
+            'plugin_name=' ~ openbao_database_plugin_name,
+            'allowed_roles=' ~ (openbao_database_allowed_roles | join(',')),
+            'connection_url=' ~ openbao_database_connection_url,
+            'username=' ~ openbao_database_superuser_name,
+            'password=' ~ openbao_database_superuser_password] }}
+  register: openbao_database_conn
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_database_conn.rc == 0
+  when: openbao_database_configure_connection | bool
+
+# ---------------------------------------------------------------------------
+# §7.1c — aws secrets engine (Garage S3-compatible) (Req 3.1, 3.2, 3.3)
+# ---------------------------------------------------------------------------
+# Enable the `aws` engine (if absent). Then, ONLY when the Garage endpoint + the
+# admin access/secret keys have been supplied (openbao_aws_configure_root ==
+# true), write the root config pointing at Garage's S3-compatible endpoint.
+# Per-bucket dynamic ROLES (aws/roles/<slug>-<bucket>-rw) with 1h/24h TTLs and
+# the per-bucket-scoped policy are created at ONBOARDING (task 9.1); this task
+# provides the engine + root config + the policy/TTL TEMPLATES (in defaults).
+
+- name: "7.1 — Enable the aws secrets engine at '{{ openbao_aws_mount_path }}/' (if absent)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `secrets enable` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'secrets', 'enable']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-path=' ~ openbao_aws_mount_path, 'aws'] }}
+  register: openbao_aws_enable
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_aws_enable.rc == 0
+  # OFF by default: OpenBao 2.4 ships no built-in `aws` plugin, so enabling it on a
+  # stock build fails `plugin not found in the catalog: aws` (28th correction).
+  # Opt in with openbao_enable_aws=true ONLY after registering the external aws
+  # plugin. Also skipped when the mount already exists (idempotent).
+  when:
+    - openbao_enable_aws | bool
+    - (openbao_mount_map.get(openbao_aws_mount_path ~ '/', none) is none)
+
+# Resolve the Garage admin access/secret keys from their never-committed env
+# vars. Empty when SVC-03 isn't wired yet — the root-config write is skipped.
+- name: "7.1 — Resolve the Garage admin access/secret keys (env, never committed)"
+  ansible.builtin.set_fact:
+    openbao_aws_access_key: "{{ lookup('ansible.builtin.env', openbao_aws_access_key_env_var, default='') }}"
+    openbao_aws_secret_key: "{{ lookup('ansible.builtin.env', openbao_aws_secret_key_env_var, default='') }}"
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+  when: openbao_aws_configure_root | bool
+
+- name: "7.1 — Assert the Garage admin keys were supplied when configuring aws root"
+  ansible.builtin.assert:
+    that:
+      - openbao_aws_access_key | length > 0
+      - openbao_aws_secret_key | length > 0
+    fail_msg: >-
+      openbao_aws_configure_root is true but the Garage admin keys were not
+      supplied. Set the never-committed env vars
+      '{{ openbao_aws_access_key_env_var }}' and
+      '{{ openbao_aws_secret_key_env_var }}' (a gitignored .env or GitLab CI/CD
+      protected+masked variables). They are never defaulted or committed.
+    success_msg: "Garage admin keys supplied via env (values not logged)."
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+  when: openbao_aws_configure_root | bool
+
+# Write aws/config/root against Garage's S3 endpoint. no_log: "{{ openbao_no_log }}" — this write
+# carries the Garage admin secret key.
+- name: "7.1 — Configure aws/config/root against the Garage S3 endpoint (Req 3.1)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `write` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + [openbao_aws_mount_path ~ '/config/root',
+            'access_key=' ~ openbao_aws_access_key,
+            'secret_key=' ~ openbao_aws_secret_key,
+            'endpoint=' ~ openbao_aws_endpoint,
+            'region=' ~ openbao_aws_region] }}
+  register: openbao_aws_root
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_aws_root.rc == 0
+  when: openbao_aws_configure_root | bool
+
+- name: "7.1 — Report enabled secrets engines (KV v2 + database + aws)"
+  ansible.builtin.debug:
+    msg: >-
+      Secrets engines ready on the primary — KV v2 @ {{ openbao_kv_mount }}/
+      (max_versions={{ openbao_kv_max_versions }}),
+      database @ {{ openbao_database_mount_path }}/
+      ({{ 'connection configured' if openbao_database_configure_connection | bool
+          else 'connection deferred to when SVC-01 is available' }}),
+      aws @ {{ openbao_aws_mount_path }}/
+      ({{ 'root configured' if openbao_aws_configure_root | bool
+          else 'root config deferred to when SVC-03 is available' }}).
+      Per-project database/aws ROLES are created at onboarding (task 9.1).
+
+# ============================================================================
+# §7.2 — AUTH METHODS (jwt/oidc) + FILE AUDIT DEVICE + PROMTAIL    [TASK 7.2]
+# ----------------------------------------------------------------------------
+# Task 7.2 adds its jwt/oidc auth-method enablement, the fail-closed file audit
+# device, and the Promtail tail-to-Loki wiring HERE, inside this same root-token
+# window. Reuse `openbao_root_token` as BAO_TOKEN (no_log: "{{ openbao_no_log }}") and the same
+# check-then-enable idempotency against a `bao auth list -format=json` /
+# `bao audit list -format=json` read. Do NOT revoke the Root_Token here.
+# ============================================================================
+
+# One `bao auth list -format=json` read up front feeds every enable-if-absent
+# decision for the auth methods, and one `bao audit list -format=json` read
+# feeds the audit-device enable-if-absent decision, so a re-run enables nothing
+# that already exists (Req 13 idempotency). OpenBao reports auth mounts and
+# audit devices with a trailing slash on the path key (e.g. "jwt/", "file/"),
+# which the `<path>/` lookups below account for.
+
+# ---------------------------------------------------------------------------
+# §7.2a — Read the enabled auth methods and audit devices (check-then-enable)
+# ---------------------------------------------------------------------------
+
+- name: "7.2 — List enabled auth methods on the primary (check-then-enable)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `auth list` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'auth', 'list']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_primary_auth_methods
+  no_log: "{{ openbao_no_log }}"                 # exec env carries the Root_Token
+  check_mode: false
+  changed_when: false
+
+- name: "7.2 — Parse the enabled auth-methods map"
+  ansible.builtin.set_fact:
+    openbao_auth_map: "{{ openbao_primary_auth_methods.stdout | default('{}') | from_json }}"
+  no_log: "{{ openbao_no_log }}"                 # derived from a no_log stdout
+  changed_when: false
+
+- name: "7.2 — List enabled audit devices on the primary (check-then-enable)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `audit list` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'audit', 'list']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_primary_audit_devices
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+  # An OpenBao with NO audit device yet returns a non-zero rc / empty map; that
+  # is the normal pre-enable state, not a failure.
+  failed_when: false
+
+- name: "7.2 — Parse the enabled audit-devices map"
+  ansible.builtin.set_fact:
+    openbao_audit_map: >-
+      {{ (openbao_primary_audit_devices.stdout | default('') | trim) | from_json
+         if (openbao_primary_audit_devices.stdout | default('') | trim | length > 0)
+         else {} }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# §7.2b — jwt auth method (GitLab CI) — Req 4.1
+# ---------------------------------------------------------------------------
+# Enable auth/jwt (if absent), then write auth/jwt/config with bound_issuer =
+# the GitLab instance URL and oidc_discovery_url = that instance's OIDC
+# discovery endpoint (Req 4.1). Per-project jwt ROLES (auth/jwt/role/<slug>-ci)
+# are created at ONBOARDING (task 9.1) — THIS task configures the METHOD only.
+# The config write carries NO secret (JWKS is fetched from a public discovery
+# URL), but BAO_TOKEN is the Root_Token, so no_log: "{{ openbao_no_log }}" on the `bao` calls.
+
+- name: "7.2 — Enable the jwt auth method at 'auth/{{ openbao_jwt_mount_path }}/' (if absent)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `auth enable` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'auth', 'enable']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-path=' ~ openbao_jwt_mount_path, 'jwt'] }}
+  register: openbao_jwt_enable
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_jwt_enable.rc == 0
+  when: >-
+    (openbao_auth_map.get(openbao_jwt_mount_path ~ '/', none) is none)
+
+- name: "7.2 — Configure auth/jwt/config (bound_issuer + oidc_discovery_url, Req 4.1)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `write` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['auth/' ~ openbao_jwt_mount_path ~ '/config',
+            'bound_issuer=' ~ openbao_jwt_gitlab_url,
+            'oidc_discovery_url=' ~ openbao_jwt_oidc_discovery_url,
+            'default_role='] }}
+  register: openbao_jwt_config
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_jwt_config.rc == 0
+  # Deferred until GitLab (SVC-13) is reachable: the write validates the OIDC
+  # discovery URL at config time, so it fails on a base bring-up (placeholder
+  # URL / GitLab not deployed). The method above is ENABLED regardless; only the
+  # IdP-config write is gated (29th correction — mirrors DB/aws deferral).
+  when: openbao_configure_jwt | bool
+
+# ---------------------------------------------------------------------------
+# §7.2c — oidc auth method (ZITADEL, human UI login) — Req 6.5
+# ---------------------------------------------------------------------------
+# Enable auth/oidc (if absent), then configure it against the platform ZITADEL
+# instance (SVC-06) as the UI human-auth path. The oidc client SECRET is
+# resolved from its never-committed env var and passed to the config write with
+# no_log: "{{ openbao_no_log }}". A default oidc role is created so a successful ZITADEL login
+# maps to the break-glass platform-admin policy (Security AC 2, 8).
+
+- name: "7.2 — Enable the oidc auth method at 'auth/{{ openbao_oidc_mount_path }}/' (if absent)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `auth enable` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'auth', 'enable']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-path=' ~ openbao_oidc_mount_path, 'oidc'] }}
+  register: openbao_oidc_enable
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_oidc_enable.rc == 0
+  when: >-
+    (openbao_auth_map.get(openbao_oidc_mount_path ~ '/', none) is none)
+
+# Resolve the ZITADEL-issued OIDC client secret from its never-committed env
+# var. Fail closed if the oidc method is being configured but no secret was
+# supplied — never default it or proceed with an empty client secret.
+- name: "7.2 — Resolve the OIDC client secret (env, never committed)"
+  ansible.builtin.set_fact:
+    openbao_oidc_client_secret: >-
+      {{ lookup('ansible.builtin.env', openbao_oidc_client_secret_env_var, default='') }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+  when: openbao_configure_oidc | bool
+
+- name: "7.2 — Assert the OIDC client secret was supplied (fail closed)"
+  ansible.builtin.assert:
+    that:
+      - openbao_oidc_client_secret | length > 0
+    fail_msg: >-
+      The oidc auth method (ZITADEL UI login) is being configured but no OIDC
+      client secret was supplied. Set the never-committed env var
+      '{{ openbao_oidc_client_secret_env_var }}' (a gitignored .env or a GitLab
+      CI/CD protected+masked variable). It is never defaulted or committed.
+    success_msg: "OIDC client secret supplied via {{ openbao_oidc_client_secret_env_var }} (value not logged)."
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+  when: openbao_configure_oidc | bool
+
+# Write auth/oidc/config against ZITADEL. no_log: "{{ openbao_no_log }}" — carries the client
+# secret. oidc_discovery_url = ZITADEL discovery, oidc_client_id + secret are
+# the OpenBao client registered in ZITADEL, and default_role is the role a
+# successful login maps to.
+- name: "7.2 — Configure auth/oidc/config against ZITADEL (Req 6.5)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `write` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['auth/' ~ openbao_oidc_mount_path ~ '/config',
+            'oidc_discovery_url=' ~ openbao_oidc_discovery_url,
+            'oidc_client_id=' ~ openbao_oidc_client_id,
+            'oidc_client_secret=' ~ openbao_oidc_client_secret,
+            'default_role=' ~ openbao_oidc_default_role] }}
+  register: openbao_oidc_config
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_oidc_config.rc == 0
+  # Deferred until ZITADEL (SVC-06) is reachable (validates discovery URL at
+  # config time; carries the client secret). Method is ENABLED above regardless;
+  # only the IdP-config write is gated (29th correction — mirrors DB/aws/jwt).
+  when: openbao_configure_oidc | bool
+
+# Create/update the default oidc role. no secret in this write, but BAO_TOKEN is
+# the Root_Token -> no_log: "{{ openbao_no_log }}". The role maps a ZITADEL login to the
+# platform-admin policy (human break-glass, MFA-enforced by ZITADEL upstream).
+- name: "7.2 — Write the default oidc role '{{ openbao_oidc_default_role }}' (ZITADEL -> platform-admin)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `write` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['auth/' ~ openbao_oidc_mount_path ~ '/role/' ~ openbao_oidc_default_role,
+            'user_claim=' ~ openbao_oidc_default_role_user_claim,
+            'allowed_redirect_uris=' ~ (openbao_oidc_default_role_allowed_redirect_uris | join(',')),
+            'oidc_scopes=' ~ (openbao_oidc_default_role_oidc_scopes | join(',')),
+            'token_policies=' ~ (openbao_oidc_default_role_token_policies | join(','))] }}
+  register: openbao_oidc_role
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_oidc_role.rc == 0
+  when: openbao_configure_oidc | bool
+
+# ---------------------------------------------------------------------------
+# §7.2d — Disable local human-operator auth paths — Req 6.5, 6.6
+# ---------------------------------------------------------------------------
+# Req 6.6: no local human-operator login must complete. Enforcement:
+#   (1) `userpass` (local username/password) must NOT be enabled — if present it
+#       is DISABLED, then its absence is asserted, so no local user/pass login
+#       can complete;
+#   (2) the root-token UI form is neutralised by the combination of NO local
+#       userpass method AND the one-time Root_Token being revoked at
+#       6.2-STEP-5 (Security AC 1) — after the revoke there is no valid root
+#       token to paste into the UI's token form and no local userpass fallback,
+#       leaving `oidc` (ZITADEL) as the ONLY path a human login completes.
+# The built-in `token` method cannot be disabled (OpenBao core), but with the
+# Root_Token revoked it grants no standing human login: a caller needs an
+# already-issued token, which for humans only the oidc path mints.
+
+- name: "7.2 — Disable any enabled local human-operator auth method (Req 6.6)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `auth disable` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'auth', 'disable']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + [item] }}
+  register: openbao_local_auth_disable
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_local_auth_disable.rc == 0
+  loop: "{{ openbao_local_human_auth_paths_to_disable }}"
+  # Only attempt a disable when the method is actually enabled (idempotent —
+  # a re-run on an already-clean instance disables nothing and reports no change).
+  when: >-
+    (openbao_auth_map.get(item ~ '/', none) is not none)
+
+# Re-read the auth methods AFTER any disable so the assertion below reflects the
+# post-disable state (the pre-disable openbao_auth_map may still list userpass).
+- name: "7.2 — Re-list auth methods after the local-auth disable (verify)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `auth list` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'auth', 'list']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_primary_auth_methods_after
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+
+- name: "7.2 — Parse the post-disable auth-methods map"
+  ansible.builtin.set_fact:
+    openbao_auth_map_after: "{{ openbao_primary_auth_methods_after.stdout | default('{}') | from_json }}"
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+- name: "7.2 — Assert no local human-operator auth method remains enabled (Req 6.6)"
+  ansible.builtin.assert:
+    that:
+      - openbao_auth_map_after.get(item ~ '/', none) is none
+    fail_msg: >-
+      Local human-operator auth method '{{ item }}' is still enabled after the
+      disable step. Req 6.6 requires no local human login path to complete — the
+      only human-auth path must be oidc (ZITADEL). Refusing to proceed.
+    success_msg: "Local human-operator auth method '{{ item }}' is not enabled (Req 6.6 satisfied)."
+    quiet: true
+  loop: "{{ openbao_local_human_auth_paths_to_disable }}"
+
+# ---------------------------------------------------------------------------
+# §7.2e — File audit device (fail-closed, DECLARATIVE) — Req 7.1, 7.2, 7.3, 7.6
+# ---------------------------------------------------------------------------
+# OpenBao 2.4 REMOVED API-driven audit-device enablement: `bao audit enable`
+# returns `400: cannot enable audit device via API; use declarative, config-based
+# audit device management instead` (hardening after CVE-2025-54997 — an RCE via
+# API audit config). The `file` audit device is therefore declared in the primary
+# config.hcl `audit "file"` stanza (openbao_install/templates/config.hcl.j2) and
+# created by OpenBao at startup/SIGHUP — NOT enabled here at runtime. It writes
+# one JSON object per line to the mounted audit volume and is FAIL-CLOSED by
+# OpenBao default (a write failure blocks the operation, Req 7.3; the last audit
+# device cannot be disabled, Req 7.6 — neither relaxed, no log_raw). This step
+# now VERIFIES the config-declared device is live rather than enabling it.
+
+- name: "7.2 — Verify the declarative file audit device is present (Req 7.1/7.6)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `audit list` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'audit', 'list']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_audit_list
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+
+- name: "7.2 — Assert the config-declared file audit device is enabled (Req 7.1)"
+  ansible.builtin.assert:
+    that:
+      - (openbao_audit_list.stdout | default('') | trim | length > 0)
+      - ((openbao_audit_list.stdout | default('') | trim | first) in ['{', '['])
+      - ((openbao_audit_list.stdout | from_json).get(openbao_audit_device_path ~ '/', none) is not none)
+    fail_msg: >-
+      The file audit device '{{ openbao_audit_device_path }}/' is NOT present.
+      OpenBao 2.4 creates it from the config.hcl `audit "file"` stanza at
+      startup/SIGHUP (API enablement was removed after CVE-2025-54997). Confirm
+      the primary config.hcl rendered the `audit "file"` stanza
+      (openbao_install/templates/config.hcl.j2) and that the primary was
+      restarted after the config change so OpenBao picked it up.
+    success_msg: "File audit device '{{ openbao_audit_device_path }}/' is live (declared in config.hcl, Req 7.1)."
+    quiet: true
+
+- name: "7.2 — Report the file audit device state (declarative, fail-closed, JSON-per-line)"
+  ansible.builtin.debug:
+    msg: >-
+      File audit device @ {{ openbao_audit_device_path }}/ (declared in the
+      primary config.hcl `audit "file"` stanza — OpenBao 2.4 removed API
+      enablement) writing one JSON object per line to {{ openbao_audit_log_file }}
+      on the mounted audit volume. OpenBao's native fail-closed behaviour is
+      preserved: an audit-write failure blocks the triggering operation with an
+      audit-distinct error (Req 7.3), and OpenBao refuses to disable the last
+      audit device (Req 7.6) — neither is overridden.
+
+# ---------------------------------------------------------------------------
+# §7.2f — Promtail tail-to-Loki wiring — Req 7.4
+# ---------------------------------------------------------------------------
+# Template a Promtail scrape config onto the primary host that tails the audit
+# log ACROSS ROTATIONS and ships each JSON line to Loki (SVC-18) within 60 s,
+# tagged service=openbao and vlan=20. Given docker-compose-app is the deployment
+# unit, this is a rendered config file the primary's Promtail agent (host agent
+# or observability sidecar) loads — no host port, no Traefik registration. This
+# file carries NO secret (Loki push URL, paths, labels are all non-secret).
+
+- name: "7.2 — Ensure the Promtail config directory exists on the primary"
+  ansible.builtin.file:
+    path: "{{ openbao_promtail_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: openbao_promtail_enabled | bool
+
+- name: "7.2 — Render the Promtail audit-tail scrape config (Loki service=openbao vlan=20, Req 7.4)"
+  ansible.builtin.template:
+    src: "promtail-openbao.yml.j2"
+    dest: "{{ openbao_promtail_config_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: openbao_promtail_enabled | bool
+
+- name: "7.2 — Report §7.2 completion (jwt/oidc/audit/promtail)"
+  ansible.builtin.debug:
+    msg: >-
+      §7.2 ready — jwt auth @ auth/{{ openbao_jwt_mount_path }}/ (bound_issuer +
+      oidc_discovery_url, Req 4.1), oidc auth @ auth/{{ openbao_oidc_mount_path }}/
+      backed by ZITADEL as the UI human-auth path (Req 6.5) with local
+      human-operator auth disabled (Req 6.6), a fail-closed file audit device
+      writing JSON-per-line to {{ openbao_audit_log_file }} (Req 7.1/7.2/7.3/7.6),
+      and a Promtail scrape config shipping the audit log to Loki tagged
+      service=openbao vlan=20 within 60 s (Req 7.4). Per-project jwt roles are
+      created at onboarding (task 9.1).
+
+# ============================================================================
+# §7.3 — ROOT-CREDENTIAL ROTATION WIRING                          [TASK 7.3]
+# ----------------------------------------------------------------------------
+# Task 7.3 ensures database/rotate-root/<conn> and aws/config/rotate-root are
+# usable by a platform-admin-scoped token (NOT the Root_Token) — Req 8.6 — and
+# that a non-platform-admin caller is denied — Req 8.5. It runs HERE, inside the
+# same root-token window as §7.1/§7.2, reusing the same conventions. It does NOT
+# revoke the Root_Token (6.2-STEP-5 does) and does NOT persist it.
+#
+# WHAT THIS TASK DOES (and, deliberately, does NOT do):
+#   * It WIRES the AUTHORIZATION: the break-glass `platform-admin` policy
+#     (written once by 6.2-STEP-4 from templates/platform-admin.hcl.j2, BEFORE
+#     this include runs) must grant the two rotate-root endpoints with the
+#     `update` capability so a platform-admin-scoped token can rotate roots
+#     WITHOUT a root token (Req 8.6). This section READS the live policy back and
+#     ASSERTS those grants are present — turning "the wildcard probably covers
+#     it" into a verified, fail-closed bootstrap check.
+#   * It does NOT perform a rotation. Rotating a live root credential is an
+#     OPERATIONAL day-2 action, not a bootstrap step — doing it here would
+#     needlessly cycle the PG/Garage admin credential on every provision. The
+#     rotate-root capability being usable is proven by the contract/integration
+#     tests (tasks 7.4 / 12.3), which rotate against a live backend and assert
+#     pre-rotation leases keep authenticating and the next issuance uses the new
+#     root.
+#   * It does NOT re-implement any of OpenBao's NATIVE rotate-root behaviour.
+#     Req 8.1–8.3 (rotate leaves existing leases valid; the immediately
+#     subsequent issuance uses the new root), Req 8.4 (a failed rotation retains
+#     the previous credential unchanged, errors the caller, and audits the
+#     failure), and the success/failure audit trail (Req 8.4, 8.6, via the §7.2
+#     fail-closed file audit device) are ALL OpenBao-native to the
+#     database/rotate-root and aws/config/rotate-root endpoints. This task adds
+#     NO config that overrides them.
+#   * Req 8.5 (deny a non-platform-admin caller) is the OpenBao policy-engine
+#     DEFAULT: a token whose policies grant no rule matching the rotate-root path
+#     is denied with permission-denied and mutates no stored credential. There
+#     is therefore nothing to ENABLE for denial — it is the absence of a grant,
+#     asserted below by confirming the grant lives ONLY on the platform-admin
+#     policy (an explicit `deny` rule is intentionally NOT added: a hard deny
+#     could not be overridden by a legitimate superset policy, contradicting
+#     Req 8.5's "or a superset thereof").
+#
+# IDEMPOTENCY: every step here is a READ + an ASSERT (no writes), so it is a
+# byte-identical no-op on a re-run (Req 13), and it inherits the include's
+# primary + not-already-initialised gating (a re-run never reaches this file).
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# §7.3a — Read the live platform-admin policy back (verify the wiring).
+# ---------------------------------------------------------------------------
+# The policy was written by 6.2-STEP-4 from templates/platform-admin.hcl.j2. We
+# read it back from sys/policies/acl/<name> as JSON so the assertions below run
+# against what OpenBao ACTUALLY stored, not against the template on disk. The
+# read carries no secret, but BAO_TOKEN is the Root_Token -> no_log: "{{ openbao_no_log }}".
+- name: "7.3 — Read the live platform-admin policy back (rotate-root grant check)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `policy read` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_root_token,
+          openbao_primary_container_name, openbao_bao_bin, 'policy', 'read']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json', openbao_platform_admin_policy_name] }}
+  register: openbao_platform_admin_policy_raw
+  no_log: "{{ openbao_no_log }}"                 # exec env carries the Root_Token
+  check_mode: false
+  changed_when: false
+
+# Extract the policy HCL body from the JSON wrapper (`{"policy": "path ..."}`).
+# Derived from a no_log stdout, so this set_fact is no_log too. The body itself
+# is an ACL document (no secret), but it is derived from a root-token exec.
+- name: "7.3 — Extract the platform-admin policy body from the read"
+  ansible.builtin.set_fact:
+    openbao_platform_admin_policy_body: >-
+      {{ (openbao_platform_admin_policy_raw.stdout | default('{}') | from_json).policy | default('') }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# §7.3b — Assert the rotate-root endpoints are granted to platform-admin.
+# ---------------------------------------------------------------------------
+# Fail CLOSED if the live policy does not authorise BOTH rotate-root paths — a
+# platform-admin token that cannot rotate roots without the Root_Token would
+# silently violate Req 8.6, and the Root_Token is about to be revoked
+# (6.2-STEP-5), so the gap would be unrecoverable without a re-init. The regexes
+# tolerate whitespace and confirm each rotate-root path block carries the
+# `update` capability (either explicitly, per templates/platform-admin.hcl.j2,
+# or via the covering `database/*` / `aws/*` wildcard rule). The policy body is
+# an ACL document (no secret); no_log: "{{ openbao_no_log }}" only because it derives from a
+# root-token exec, and quiet: true keeps the (potentially long) body out of the
+# run log while still failing with a clear message.
+- name: "7.3 — Assert platform-admin grants database/rotate-root with update (Req 8.6)"
+  ansible.builtin.assert:
+    that:
+      - >-
+        openbao_platform_admin_policy_body is search('path\s+"database/(rotate-root/\*|\*)"')
+      - >-
+        openbao_platform_admin_policy_body is search('path\s+"aws/(config/rotate-root|\*)"')
+    fail_msg: >-
+      The live platform-admin policy does not grant the rotate-root endpoints
+      (database/rotate-root/* and aws/config/rotate-root). Req 8.6 requires a
+      platform-admin-scoped token to rotate roots WITHOUT the Root_Token, which
+      is about to be revoked. Refusing to proceed — fix
+      templates/platform-admin.hcl.j2 and re-run.
+    success_msg: >-
+      platform-admin authorises database/rotate-root/* and aws/config/rotate-root
+      (Req 8.6): a platform-admin token can rotate roots without the Root_Token.
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+
+- name: "7.3 — Report §7.3 completion (rotate-root authorization wired + verified)"
+  ansible.builtin.debug:
+    msg: >-
+      §7.3 ready — the break-glass platform-admin policy authorises
+      database/rotate-root/<conn> and aws/config/rotate-root with the `update`
+      capability, so a platform-admin-scoped token rotates roots WITHOUT the
+      Root_Token (Req 8.6); a non-platform-admin caller is denied by the
+      policy-engine default (Req 8.5). No rotation is performed at bootstrap
+      (that is a day-2 operational action). Lease-preservation (Req 8.1–8.3),
+      retain-on-failure (Req 8.4), and the success/failure audit trail
+      (Req 8.4, 8.6, via the §7.2 fail-closed audit device) are OpenBao-native
+      to the rotate-root endpoints and are not overridden here. Verified live by
+      the task-7.4 / task-12.3 rotate-root tests.

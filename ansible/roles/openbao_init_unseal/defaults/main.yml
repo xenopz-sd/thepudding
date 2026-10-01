@@ -1,0 +1,779 @@
+---
+# defaults/main.yml — openbao_init_unseal
+#
+# Variable set for the openbao_init_unseal role (SVC-07 Secrets Manager).
+# Mirrors the addressing/naming vars of the sibling openbao_install role
+# (design.md: "Ansible variable sets") so the two roles agree on where the
+# primary and the Transit unsealer live without a shared group_vars file.
+#
+# NOTE: NO secret value ever lives here. In particular:
+#   - the Bootstrap_Transit_Token is NOT a variable defaulted to a value; it
+#     arrives at bootstrap from an operator-supplied external source (a local
+#     gitignored .env or a GitLab CI/CD protected+masked variable), is used by
+#     task 6.2's `bao operator init` flow, then rotated into KV with the
+#     external copy removed (design.md: Init/unseal/bootstrap sequence).
+#   - no Root_Token, recovery key, or unseal key is ever written here.
+# This role's task 6.1 scope is purely: status guard + unsealer Transit-engine
+# init. (Swap hardening is NOT here — per ADR-0006 it is encrypted host swap +
+# the per-container swap cap in openbao_install/Terraform, not a host-global
+# vm.swappiness write from inside the LXC.) Tasks 6.2 (primary init/bootstrap/
+# revoke) and 7.x (engines/auth/audit) extend tasks/main.yml at the marked
+# extension points.
+
+# =============================================================================
+# Instance addressing (kept in sync with openbao_install defaults)
+# =============================================================================
+
+# --- Primary OpenBao instance (svc07-20-01) ---
+openbao_primary_ip: "10.0.20.10"
+openbao_api_port: 8200
+openbao_primary_addr: "https://{{ openbao_primary_ip }}:{{ openbao_api_port }}"
+openbao_primary_node_id: "svc07-20-01"
+
+# --- Transit unsealer instance (svc07-unsealer-20-01) ---
+openbao_unsealer_ip: "10.0.20.11"
+openbao_unsealer_addr: "https://{{ openbao_unsealer_ip }}:{{ openbao_api_port }}"
+openbao_unsealer_node_id: "svc07-unsealer-20-01"
+
+# --- Role behaviour switch (which instance this run targets) ---
+# One of: "primary" | "unsealer". Selects which health endpoint the status
+# guard reads and which init path runs. The unsealer's Transit engine is
+# initialised FIRST (design's sequence), then the primary's Raft store (the
+# primary Raft `bao operator init` is task 6.2, gated at the extension point).
+openbao_role: "primary"
+
+# =============================================================================
+# `bao status` / health guard (Req 13.3)
+# =============================================================================
+# The guard reads GET /v1/sys/health and gates every init task on the reported
+# `initialized` flag, so a re-run against an already-initialised instance is a
+# no-op reporting changed=0. The read itself is check_mode-safe and never
+# reports a change (see tasks/main.yml).
+
+# NOTE: the former openbao_health_addr / _path / _validate_certs / _timeout vars
+# were REMOVED. They backed an `ansible.builtin.uri` GET to /v1/sys/health that
+# the init guard no longer performs: the guard reads `bao status` via `docker exec`
+# INSIDE the target container (tasks/main.yml), because the primary publishes no
+# host port (Traefik-labels-only, PF FR-7) so a host-side `uri` GET returned no
+# body and mis-derived `openbao_already_initialized`. The `docker exec` path works
+# for both roles and consumes none of those health vars, so they were dead config.
+
+# =============================================================================
+# Transit unsealer engine (task 6.1 — unsealer init path)
+# =============================================================================
+# Enabling the Transit secrets engine and creating the unseal key on the
+# unsealer is what makes auto-unseal possible. These MUST match the primary's
+# seal "transit" stanza in openbao_install (key_name openbao-unseal, mount
+# transit/), otherwise the primary cannot unseal.
+openbao_transit_mount_path: "transit"
+openbao_transit_key_name: "openbao-unseal"
+
+# Transit key type. aes256-gcm96 is OpenBao's default symmetric key type and is
+# the appropriate choice for a seal-wrapping (encrypt/decrypt) key.
+openbao_transit_key_type: "aes256-gcm96"
+
+# Path to the `bao` CLI inside the running container. The engine-enable and
+# key-create steps run via `docker exec` against the unsealer container so they
+# use the same binary/version as the server (no host bao install needed).
+openbao_bao_bin: "bao"
+
+# The unsealer Compose container name (matches openbao_install's default).
+openbao_unsealer_container_name: "openbao-unsealer-openbao-unsealer-1"
+
+# --- Unsealer authentication for the Transit-init docker-exec bao calls -------
+# The `bao secrets list/enable` + `write transit/keys/...` calls below are
+# AUTHENTICATED operations against the unsealer's own API. They need the
+# unsealer ROOT token (captured by the operator at `bao operator init`, per the
+# INSTALL-RUNBOOK §2 offline window). SECRETS DISCIPLINE (this IS the secrets
+# manager): the token is NEVER defaulted to a value and NEVER committed — it is
+# resolved at runtime from an operator-supplied environment variable (a
+# gitignored .env for a homelab bootstrap, or a GitLab CI/CD protected+masked
+# variable for a pipeline bootstrap) via an `env` lookup, the SAME never-committed
+# discipline as the Bootstrap_Transit_Token. The var below carries only the ENV
+# VAR NAME; the tasks that use the resolved value set `no_log: true`. If it is
+# unset the token resolves to an empty string and `bao` runs unauthenticated —
+# which is correct for a brand-new unsealer whose `operator init` has not yet run
+# (the guarded/idempotent tasks below tolerate that and are re-run once the token
+# is available).
+openbao_unsealer_root_token_env_var: "OPENBAO_UNSEALER_ROOT_TOKEN"
+openbao_unsealer_root_token: "{{ lookup('ansible.builtin.env', openbao_unsealer_root_token_env_var, default='') }}"
+
+# Pass `-tls-skip-verify` to the unsealer `bao` docker-exec calls when the
+# listener uses the self-signed MOCK cert (openbao_install's
+# openbao_tls_self_signed). With a real SVC-08/EJBCA cert chaining to a trusted
+# CA this is false and bao verifies normally. Kept as its own var (defaulting to
+# the install role's flag) so the two agree without a group_vars file.
+openbao_unsealer_tls_skip_verify: "{{ openbao_tls_self_signed | default(false) | bool }}"
+
+# =============================================================================
+# Unsealer Raft bootstrap (tasks/unsealer_bootstrap.yml) — the guarded,
+# idempotent, readiness-aware `operator init` + unseal + seal-policy + mint +
+# revoke the role now OWNS for the unsealer (mirrors primary_bootstrap.yml).
+# NO secret value lives here — only shares/threshold counts, names, and toggles.
+# =============================================================================
+
+# --- Shamir key parameters for the unsealer's own `operator init` -------------
+# The unsealer's config has NO seal stanza (it IS the seal provider), so its
+# `bao operator init` yields SHAMIR unseal keys (unseal_keys_b64), NOT recovery
+# keys. These counts were previously orchestrator facts (svc07_unsealer_key_*);
+# they move here so the role that now runs the init owns them. 5/3 matches the
+# INSTALL-RUNBOOK §2 offline-key-custody guidance.
+openbao_unsealer_key_shares: 5
+openbao_unsealer_key_threshold: 3
+
+# --- The `openbao-seal` scoped policy the unsealer mints the seal token against.
+# It grants `update` on transit/encrypt/<key> and transit/decrypt/<key> ONLY
+# (derived from openbao_transit_key_name) — never a root token as the seal
+# token. Name kept a var so it agrees with the primary's seal expectations.
+openbao_seal_policy_name: "openbao-seal"
+
+# TTL/period of the periodic Bootstrap_Transit_Token minted against the
+# openbao-seal policy. 768h = 32 days; `-period` makes it a periodic token that
+# renews indefinitely so the primary's auto-unseal keeps working. Overridable.
+openbao_seal_token_period: "768h"
+
+# --- OPT-IN: mint the Bootstrap_Transit_Token during the unsealer bootstrap ---
+# OFF by default, PARALLELING openbao_mint_admin_token. When the orchestrator
+# delegates the unsealer bootstrap it passes `-e openbao_mint_seal_token=true`
+# so the role mints the periodic seal token and (under the dev-expose opt-in)
+# hands it off to the orchestrator via the 0600 Handoff_File below. Left off,
+# the role still does init/unseal/Transit/policy but does not mint/hand off a
+# seal token — the operator supplies OPENBAO_BOOTSTRAP_TRANSIT_TOKEN instead.
+openbao_mint_seal_token: false
+
+# --- Bootstrap_Transit_Token handoff (producer side, Component 4) -------------
+# A 0600 control-node file path the ORCHESTRATOR chooses and passes in; the role
+# writes the minted seal token there (delegate_to: localhost, no_log) so the
+# orchestrator can read it back across the child-process boundary, then deletes
+# it. EMPTY by default -> no handoff file is written (the role default is safe:
+# a bare `ansible-playbook openbao.yml` run never persists a seal token). The
+# handoff is additionally gated on openbao_mint_seal_token AND the dev-expose
+# opt-in, so acceptance/production posture (no secret to disk) is unchanged.
+openbao_seal_token_handoff_path: ""
+
+# --- Readiness_Guard bounded-poll budget (Req 1.2) ----------------------------
+# The `bao status` readiness poll before `operator init` and after the threshold
+# unseal (fixes bug #7 and the sibling post-unseal races) retries this many
+# times with this delay (seconds) between attempts before failing with a named
+# readiness-timeout. 12 x 5s = 60s, matching the primary's auto-unseal wait
+# budget in primary_bootstrap.yml (6.2-STEP-3).
+openbao_readiness_retries: 12
+openbao_readiness_delay: 5
+
+# =============================================================================
+# Task 6.2 — primary Raft init + Root_Token bootstrap + revoke + token rotation
+# =============================================================================
+# This block configures the CI-OPTIONAL Bootstrap_Transit_Token flow and the
+# primary's one-time `bao operator init`. NO secret value is defaulted here.
+#
+# --- The primary Compose container the `bao` CLI runs against (docker exec) ---
+# Matches openbao_install's default (`<stack>-<service>-1`).
+openbao_primary_container_name: "openbao-openbao-1"
+
+# Pass `-tls-skip-verify` to the PRIMARY `bao` docker-exec calls (in
+# primary_bootstrap.yml and engines_auth_audit.yml) when the primary's TLS
+# listener uses the self-signed MOCK cert (openbao_install's
+# openbao_tls_self_signed). Without it, every primary-side `bao` call that hits
+# the primary API over TLS fails cert verification (the root cause of the
+# 6.2 `bao operator init` failure). Parallels openbao_unsealer_tls_skip_verify.
+# With a real SVC-08/EJBCA cert chaining to a trusted CA this is false and bao
+# verifies normally. The flag is spliced AFTER the bao subcommand keyword and
+# BEFORE positional args (bao rejects flags after positionals).
+openbao_primary_tls_skip_verify: "{{ openbao_tls_self_signed | default(false) | bool }}"
+
+# --- Where the primary reads its rendered config (config.hcl with the seal
+#     "transit" stanza). Kept in sync with openbao_install. ---
+# DEV-ONLY secret exposure opt-in (security-standards.md "Secrets handling").
+# Default FALSE -> openbao_no_log is TRUE -> every token/secret-bearing task keeps
+# `no_log`, so secrets never leak to output. This is the NON-NEGOTIABLE default for
+# acceptance/production. A developer debugging a throwaway cluster MAY expose the
+# censored output for a SINGLE run with `-e openbao_dev_expose_secrets=true`
+# (ephemeral tokens only) — never committed, never in CI/acceptance/production.
+openbao_dev_expose_secrets: false
+# Resolved no_log value applied to every secret-bearing task via
+# `no_log: "{{ openbao_no_log }}"`. Hidden by default; exposed only on the
+# explicit dev opt-in above.
+openbao_no_log: "{{ not (openbao_dev_expose_secrets | bool) }}"
+openbao_config_dir: "/openbao/config"
+# Host-side staging dir for policy HCL that is `docker cp`-ed into the container
+# then written via `bao policy write`. It MUST NOT be openbao_config_dir: that
+# dir is bind-mounted into the container and OpenBao loads EVERY file in it as
+# server config (`server -config=/openbao/config`), so a policy .hcl staged there
+# crash-loops the server with `error loading configuration ... permission denied`
+# (27th correction). /etc/openbao is the established host staging root (TLS,
+# prometheus, promtail all live there) and is NOT the config bind-mount.
+openbao_policy_staging_dir: "/etc/openbao"
+
+# --- Bootstrap_Transit_Token SOURCE (operator-supplied, NEVER committed) ------
+# The token is NOT stored in this file. It is supplied at bootstrap time from an
+# operator-controlled, never-committed location, and this role supports BOTH
+# paths without hardcoding either as the only source (Req 5.4; Security AC 1, 7):
+#
+#   * homelab / hands-on : a local, gitignored `.env` exports the env var below,
+#     which the operator sources before running the play (or Ansible inherits it
+#     from the environment). `.env` is gitignored (see repo .gitignore).
+#   * pipeline           : a GitLab CI/CD protected+masked variable of the SAME
+#     name is present in the job environment.
+#
+# In BOTH cases the token reaches this role as the environment variable named
+# below — resolved at runtime via a `env` lookup, never a committed literal and
+# never written to a vars file. If neither source set it, the lookup yields an
+# empty string and the primary-bootstrap flow fails closed with a clear message.
+openbao_bootstrap_token_env_var: "OPENBAO_BOOTSTRAP_TRANSIT_TOKEN"
+
+# --- KV destination the token is rotated INTO once the primary is live --------
+# After the primary reports initialized:true + sealed:false, the token is
+# written here and the external copy (the .env entry or the CI variable) is
+# removed (Req 5.5; Security AC 7).
+openbao_kv_mount: "secret"
+openbao_transit_token_kv_path: "platform/svc07/transit-token"
+
+# --- platform-admin policy bootstrapped by the Root_Token (Security AC 2) -----
+# The break-glass policy created ONCE with the Root_Token before it is revoked;
+# task 7.x's engine/auth/audit steps run under the Root_Token in the same
+# bootstrap window (see the ordering contract in tasks/primary_bootstrap.yml).
+openbao_platform_admin_policy_name: "platform-admin"
+
+# --- OPT-IN: mint a platform-admin token during bootstrap (spec openbao-admin-token-bootstrap) ---
+# OFF by default. In PRODUCTION a human obtains a platform-admin token by logging in
+# via OIDC -> ZITADEL (SVC-06), mapped to the platform-admin policy — the bootstrap
+# NEVER mints a static admin token. But in a homelab / bring-up WITHOUT ZITADEL there
+# is no way to get one, which strands the day-2 `openbao_project_onboard` role (it
+# reads OPENBAO_ADMIN_TOKEN). When this flag is set true (a deliberate homelab choice,
+# like the mock TLS / mock edge-network stand-ins), the primary bootstrap mints a
+# real, renewable token bound to the EXISTING platform-admin policy — inside the
+# root-token window, before the Root_Token is revoked — and surfaces it (no_log by
+# default; visible for one run via `-e openbao_dev_expose_secrets=true`) so the
+# operator stores it as OPENBAO_ADMIN_TOKEN in the gitignored .env. Never on in
+# CI/acceptance/production.
+openbao_mint_admin_token: false
+
+# TTL of the opt-in platform-admin token (renewable — it is a day-2 credential, not a
+# transient like the KV-writer). 768h = 32 days; operator-overridable. Only used when
+# openbao_mint_admin_token is true.
+openbao_admin_token_ttl: "768h"
+
+# --- External-copy removal knobs (Req 5.5; Security AC 7) ---------------------
+# Once the token is safely in KV, its external copy MUST be removed. Which copy
+# exists depends on the bootstrap path:
+#   * "dotenv"  -> remove the token line from a local gitignored .env file at
+#                  `openbao_bootstrap_dotenv_path` (homelab path).
+#   * "gitlab"  -> delete the GitLab CI/CD variable named by
+#                  `openbao_bootstrap_token_env_var` in project
+#                  `openbao_gitlab_project_id` via the API (pipeline path).
+#   * "manual"  -> this role cannot reach the source; it FAILS LOUDLY with an
+#                  instruction to remove it, so removal is never silently skipped.
+# Auto-detected at runtime when left as "auto": dotenv if the .env file exists,
+# else gitlab if a CI token+project are present, else manual.
+openbao_bootstrap_external_source: "auto"
+# The homelab .env lives at the REPO ROOT (INSTALL-RUNBOOK §2 Step 4:
+# `echo "...=..." >> .env` from repo root), and the playbook is at
+# ansible/playbooks/openbao.yml, so the repo root is two levels up from
+# playbook_dir. The external-copy detect/removal below run with
+# `delegate_to: localhost` so this path is resolved on the CONTROL NODE (where
+# the operator's .env is), NOT on the primary LXC (33rd correction).
+openbao_bootstrap_dotenv_path: "{{ playbook_dir }}/../../.env"
+
+# GitLab API removal inputs (pipeline path). These are NON-secret identifiers;
+# the CI job token used for the API call is read from the environment at runtime
+# (never committed), same discipline as the bootstrap token itself.
+openbao_gitlab_api_url: "{{ lookup('ansible.builtin.env', 'CI_API_V4_URL', default='') }}"
+openbao_gitlab_project_id: "{{ lookup('ansible.builtin.env', 'CI_PROJECT_ID', default='') }}"
+openbao_gitlab_token_env_var: "GITLAB_API_TOKEN"
+
+# =============================================================================
+# Task 7.1 — Secrets-engine enablement (KV v2 + database + aws)
+# =============================================================================
+# These vars drive tasks/engines_auth_audit.yml, which is included INSIDE the
+# task-6.2 root-token bootstrap window (before the Root_Token revoke). Every
+# engine-enable is check-then-enable against `bao secrets list -format=json`, so
+# a re-run is a byte-identical no-op (Req 13 idempotency, inherited from the
+# include's primary + not-already-initialised gating).
+#
+# CRITICAL SECRETS DISCIPLINE (security-standards.md — this IS the secrets
+# manager): the PostgreSQL `openbao` superuser password and the Garage admin
+# access/secret keys are SECRETS. They are NEVER defaulted to a value and NEVER
+# committed. They are resolved at runtime from an operator-supplied environment
+# variable (a gitignored .env for a homelab bootstrap, or a GitLab CI/CD
+# protected+masked variable for a pipeline bootstrap) via an `env` lookup — the
+# SAME never-committed discipline as the Bootstrap_Transit_Token (task 6.2). The
+# vars below carry only the ENV VAR NAMES, never the values, and every task that
+# renders a credential into a connection/config write sets `no_log: true`.
+#
+# Non-secret CONNECTION/ENDPOINT config (PostgreSQL host, Garage S3 endpoint)
+# are ordinary variables with placeholder defaults — a real deployment overrides
+# them per-environment. They are not secrets and carry no `no_log`.
+
+# --- KV v2 secrets engine (Req 1.1, 1.4) -------------------------------------
+# Exactly ONE KV v2 engine mounted at `secret/` (openbao_kv_mount, already
+# defined for task 6.2) with max_versions = 10. Enable-if-absent + a `kv-v2`
+# metadata tune to pin max_versions so the value is idempotently enforced.
+openbao_kv_max_versions: 10
+
+# --- database secrets engine (PostgreSQL) — Req 2.1, 2.2, 2.3 ----------------
+# Engine mount + connection template. Per-project dynamic ROLES
+# (database/roles/<slug>-<db>-rw) are created at onboarding (task 9.1); THIS
+# task enables the engine and configures the connection to the shared SVC-01
+# instance, connecting as the dedicated `openbao` PostgreSQL SUPERUSER.
+openbao_database_mount_path: "database"
+openbao_database_plugin_name: "postgresql-database-plugin"
+
+# TTL defaults applied to EVERY dynamic database role (Req 2.3). Carried here so
+# task 9.1's role creation and task 7.4's contract test read one source.
+openbao_database_default_ttl: "1h"
+openbao_database_max_ttl: "24h"
+
+# Whether to configure a database CONNECTION at engine-enable time. Left false
+# by default: in a fresh homelab bootstrap SVC-01 may not exist yet, so the
+# engine is enabled but no connection is written until the PG host + `openbao`
+# superuser credential are available. Set true (and supply the vars below) to
+# configure the connection in the same run.
+openbao_database_configure_connection: false
+
+# The connection name and target. `openbao_database_connection_name` is the
+# `database/config/<conn>` key. The host/port/db-name/SSL mode are NON-secret
+# placeholders; override per-environment. The `openbao` superuser USERNAME is
+# non-secret; the PASSWORD is a secret resolved from the env var named below.
+openbao_database_connection_name: "svc01-postgres"
+openbao_database_host: "svc01-20-01.platform.internal"
+openbao_database_port: 5432
+openbao_database_name: "postgres"
+openbao_database_sslmode: "require"
+openbao_database_superuser_name: "openbao"
+# ENV VAR NAME (not value) the `openbao` superuser password is read from at
+# runtime. Never defaulted to a value, never committed.
+openbao_database_superuser_password_env_var: "OPENBAO_DB_SUPERUSER_PASSWORD"
+
+# The connection_url template OpenBao uses to reach PostgreSQL as the `openbao`
+# superuser. `{{username}}`/`{{password}}` are OpenBao's own runtime
+# substitution tokens (NOT Jinja) — the actual password is passed separately via
+# the `password=` field so it never appears in the URL or the audit log.
+openbao_database_connection_url: >-
+  postgresql://{{ '{{username}}' }}:{{ '{{password}}' }}@{{ openbao_database_host }}:{{ openbao_database_port }}/{{ openbao_database_name }}?sslmode={{ openbao_database_sslmode }}
+
+# The list of dynamic-role NAMES the connection is allowed to serve. Empty by
+# default (roles are created per-project at onboarding, task 9.1); a wildcard or
+# explicit list can be set to pre-authorise role names on the connection.
+openbao_database_allowed_roles: ["*"]
+
+# Least-privilege creation_statements TEMPLATE for a read/write dynamic role
+# (Req 2.2, 2.3). Grants ONLY connect + schema usage + table DML for the role's
+# TTL window — NO superuser, NO CREATEROLE, NO cross-database access. This is the
+# TEMPLATE task 9.1 instantiates per <slug>-<db>-rw role; it is defined here so
+# the engine-level least-privilege contract lives with the engine config. The
+# `{{name}}`/`{{password}}`/`{{expiration}}` tokens are OpenBao runtime
+# substitutions, not Jinja.
+openbao_database_creation_statements_rw:
+  - >-
+    CREATE ROLE "{{ '{{name}}' }}" WITH LOGIN PASSWORD '{{ '{{password}}' }}' VALID UNTIL '{{ '{{expiration}}' }}' NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION;
+  - >-
+    GRANT CONNECT ON DATABASE "{{ openbao_database_name }}" TO "{{ '{{name}}' }}";
+  - >-
+    GRANT USAGE ON SCHEMA public TO "{{ '{{name}}' }}";
+  - >-
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "{{ '{{name}}' }}";
+
+# --- aws secrets engine (Garage S3-compatible) — Req 3.1, 3.2, 3.3 -----------
+# Engine mount + root-config against Garage's S3-compatible endpoint. Per-project
+# ROLES (aws/roles/<slug>-<bucket>-rw) are created at onboarding (task 9.1); THIS
+# task enables the engine and configures the root credential + endpoint.
+# Whether to ENABLE the aws secrets engine at all. Default FALSE: OpenBao 2.4
+# does NOT bundle the `aws` secrets-engine plugin in its built-in catalog (unlike
+# HashiCorp Vault), so `bao secrets enable aws` fails with `plugin not found in
+# the catalog: aws` on a stock build (28th correction). The aws engine is the
+# generic S3-compatible dynamic-credential broker for Garage/SVC-03 (Req 3.1-3.3);
+# a project that needs it must first register the external `aws` plugin in the
+# OpenBao catalog, THEN set openbao_enable_aws=true (and openbao_aws_configure_root
+# to write the Garage root config). Left off, the base bring-up never touches aws.
+openbao_enable_aws: false
+openbao_aws_mount_path: "aws"
+
+# TTL defaults applied to EVERY dynamic aws role (Req 3.3).
+openbao_aws_default_ttl: "1h"
+openbao_aws_max_ttl: "24h"
+
+# Whether to configure the aws root credential at engine-enable time. Left false
+# by default: in a fresh homelab bootstrap Garage (SVC-03) may not exist yet, so
+# the engine is enabled but no root config is written until the Garage endpoint +
+# admin key are available. Set true (and supply the vars below) to configure it
+# in the same run.
+openbao_aws_configure_root: false
+
+# Garage S3-compatible endpoint + region — NON-secret placeholders; override
+# per-environment. Garage exposes an S3-compatible API, so the generic `aws`
+# engine is pointed at it (design.md: aws engine rationale).
+openbao_aws_endpoint: "https://svc03-20-01.platform.internal:3900"
+openbao_aws_region: "garage"
+
+# The Garage admin ACCESS KEY id is treated as non-secret-ish config here (an
+# identifier), but the SECRET KEY is a secret. Both are resolved from env var
+# NAMES at runtime — never defaulted to a value, never committed. The access-key
+# id env var is included in the same never-committed discipline for consistency.
+openbao_aws_access_key_env_var: "OPENBAO_AWS_ROOT_ACCESS_KEY"
+openbao_aws_secret_key_env_var: "OPENBAO_AWS_ROOT_SECRET_KEY"
+
+# The IAM-style policy TEMPLATE for a per-bucket read/write aws role (Req 3.2).
+# Scoped to the `<slug>-<bucket>` resource ONLY — s3:GetObject/PutObject/
+# DeleteObject/ListBucket, no access to any other project's bucket. This is the
+# TEMPLATE task 9.1 instantiates per role (substituting the real <slug>-<bucket>
+# for the placeholder); defined here so the per-bucket-scoping contract lives
+# with the engine config.
+openbao_aws_policy_document_rw_template:
+  Version: "2012-10-17"
+  Statement:
+    - Effect: "Allow"
+      Action:
+        - "s3:GetObject"
+        - "s3:PutObject"
+        - "s3:DeleteObject"
+        - "s3:ListBucket"
+      Resource:
+        - "arn:aws:s3:::<slug>-<bucket>"
+        - "arn:aws:s3:::<slug>-<bucket>/*"
+
+# =============================================================================
+# Task 7.2 — jwt/oidc auth methods + file audit device + Promtail
+# =============================================================================
+# These vars drive the §7.2 section of tasks/engines_auth_audit.yml, which runs
+# INSIDE the same task-6.2 root-token window as §7.1 (before the Root_Token
+# revoke). Every enable is check-then-enable against `bao auth list -format=json`
+# / `bao audit list -format=json`, so a re-run is a byte-identical no-op
+# (Req 13 idempotency, inherited from the include's primary +
+# not-already-initialised gating).
+#
+# CRITICAL SECRETS DISCIPLINE (security-standards.md — this IS the secrets
+# manager): the OIDC client SECRET (the credential ZITADEL issues for OpenBao's
+# UI OIDC client) is a SECRET. It is NEVER defaulted to a value and NEVER
+# committed. It is resolved at runtime from an operator-supplied environment
+# variable (a gitignored .env for a homelab bootstrap, or a GitLab CI/CD
+# protected+masked variable for a pipeline bootstrap) via an `env` lookup — the
+# SAME never-committed discipline as the Bootstrap_Transit_Token and the §7.1
+# backend credentials. The var below carries only the ENV VAR NAME, never the
+# value, and the oidc-config write task sets `no_log: true`.
+#
+# All other jwt/oidc config (GitLab URL, discovery URLs, audience, client id) is
+# NON-secret placeholder config — override per-environment. No `no_log`.
+
+# --- jwt auth method (GitLab CI) — Req 4.1 -----------------------------------
+# THIS task configures the METHOD only: enable auth/jwt (if absent) and write
+# auth/jwt/config with bound_issuer = the GitLab instance URL and
+# oidc_discovery_url = that instance's OIDC discovery endpoint, so token
+# signatures verify against GitLab's published JWKS without a hand-managed key.
+# Per-project jwt ROLES (auth/jwt/role/<slug>-ci) are created at ONBOARDING
+# (task 9.1); the audience placeholder below is carried here so onboarding and
+# the task-7.4 contract test read one source.
+openbao_jwt_mount_path: "jwt"
+# Non-secret placeholders — a real deployment overrides these with the platform
+# GitLab instance URL, its OIDC discovery endpoint, and the configured OpenBao
+# audience value. No secret is present in any of them.
+# Whether to CONFIGURE the jwt/oidc auth methods against a live IdP. Both default
+# FALSE and OFF-by-default for the SAME reason the DB connection + aws root config
+# are (openbao_database_configure_connection / openbao_aws_configure_root): the
+# auth METHOD enable has no external dependency (always done), but the CONFIG
+# write validates the OIDC discovery URL by fetching .well-known/openid-config
+# from the IdP AT CONFIG TIME. On a base bring-up GitLab (SVC-13, jwt) and ZITADEL
+# (SVC-06, oidc) are not deployed, so configuring against the placeholder
+# *.platform.example.test URLs fails `connection refused`/discovery error (29th
+# correction). A project wires the real IdP, sets the discovery URL/client vars,
+# then flips these to true. Until then jwt/oidc are ENABLED but UNCONFIGURED.
+openbao_configure_jwt: false
+openbao_configure_oidc: false
+openbao_jwt_gitlab_url: "https://gitlab.platform.example.test"
+openbao_jwt_oidc_discovery_url: "https://gitlab.platform.example.test"
+openbao_jwt_bound_audience: "https://openbao.platform.example.test"
+
+# --- oidc auth method (ZITADEL, human UI login) — Req 6.5 --------------------
+# Enable auth/oidc (if absent) and configure it against the platform ZITADEL
+# instance (SVC-06) as the UI human-auth path. The oidc_discovery_url points at
+# ZITADEL's discovery endpoint; oidc_client_id is a non-secret identifier; the
+# oidc client SECRET is resolved from the env var NAME below (never committed).
+# default_role is the OpenBao role a successful ZITADEL login maps to.
+openbao_oidc_mount_path: "oidc"
+# Non-secret placeholders — override per-environment with the ZITADEL discovery
+# endpoint, the OpenBao OIDC client id registered in ZITADEL, and the OpenBao
+# external UI URL used to build the OIDC redirect/allowed URIs.
+openbao_oidc_discovery_url: "https://zitadel.platform.example.test"
+openbao_oidc_client_id: "openbao-ui"
+openbao_oidc_default_role: "operator"
+openbao_oidc_ui_base_url: "https://openbao.platform.example.test"
+# ENV VAR NAME (not value) the ZITADEL-issued OIDC client secret is read from at
+# runtime. Never defaulted to a value, never committed.
+openbao_oidc_client_secret_env_var: "OPENBAO_OIDC_CLIENT_SECRET"
+# The default oidc role's allowed_redirect_uris + scopes/claim mappings. These
+# are non-secret config; the redirect URIs are derived from the UI base URL.
+openbao_oidc_default_role_allowed_redirect_uris:
+  - "{{ openbao_oidc_ui_base_url }}/ui/vault/auth/oidc/oidc/callback"
+  - "{{ openbao_oidc_ui_base_url }}/oidc/callback"
+openbao_oidc_default_role_user_claim: "sub"
+openbao_oidc_default_role_oidc_scopes:
+  - "openid"
+  - "profile"
+  - "email"
+# The OpenBao policy a successful human ZITADEL login is granted. Human
+# operators use the break-glass platform-admin policy (Security AC 2); ZITADEL
+# enforces the SSO+MFA in front of it (Security AC 8).
+openbao_oidc_default_role_token_policies:
+  - "{{ openbao_platform_admin_policy_name }}"
+
+# --- Local human-operator auth disablement — Req 6.5, 6.6 --------------------
+# Req 6.6: no local human-operator login must complete. Enforcement is twofold
+# and BOTH are asserted/performed here:
+#   (1) `userpass` (the local username/password method) must NOT be enabled — if
+#       present it is DISABLED (`bao auth disable userpass`), and its absence is
+#       then asserted, so no local username/password login can complete.
+#   (2) the root-token UI form is neutralised by the combination of (a) NO local
+#       userpass method existing and (b) the one-time Root_Token being revoked at
+#       6.2-STEP-5 (Security AC 1) — after the revoke there is no valid root
+#       token to paste into the UI's token form, and no local userpass to fall
+#       back to, so `oidc` (ZITADEL) is the ONLY path by which a human login
+#       completes. This var lists the local human-auth mount paths this task
+#       asserts-absent / disables. The built-in `token` method cannot be
+#       disabled (OpenBao core), but with the Root_Token revoked it grants no
+#       standing human login — a caller needs an already-issued token, which for
+#       humans only the oidc path mints.
+openbao_local_human_auth_paths_to_disable:
+  - "userpass"
+
+# --- File audit device (fail-closed) — Req 7.1, 7.2, 7.3, 7.6 ----------------
+# Enable a `file` audit device (if absent) writing one JSON object per line to a
+# file on the mounted audit volume (openbao_audit_dir from openbao_install,
+# /openbao/audit). OpenBao's file audit device is JSON-per-line by default and
+# is FAIL-CLOSED by default: a write failure BLOCKS the triggering operation and
+# returns an audit-distinct error, and OpenBao natively REFUSES to disable the
+# only/last audit device. This task therefore does NOT set any option that would
+# relax that native behaviour (it does not set `log_raw`, and it leaves the
+# default `hmac_accessor`/`format=json` in place). Req 7.3/7.6 are largely
+# OpenBao-native; this config preserves — never overrides — that fail-closed
+# posture. The audit FILE lives on the mounted audit VOLUME so Promtail can tail
+# it and it survives container restarts.
+openbao_audit_device_path: "file"
+openbao_audit_dir: "/openbao/audit"
+openbao_audit_log_file: "{{ openbao_audit_dir }}/openbao_audit.log"
+# `format=json` is OpenBao's default for the file device; set explicitly so the
+# one-JSON-object-per-line contract (Req 7.1) is pinned and never relaxed.
+openbao_audit_log_format: "json"
+
+# --- Promtail tail-to-Loki wiring — Req 7.4 ----------------------------------
+# The primary's Promtail tails the OpenBao audit log ACROSS ROTATIONS and ships
+# each line to Loki (SVC-18) within 60 s, tagged service=openbao and vlan=20.
+# Given docker-compose-app is the deployment unit, this task templates a Promtail
+# scrape-config file onto the primary host (into the audit/observability config
+# dir) that the primary's Promtail agent (host or sidecar) loads. The Loki push
+# endpoint is a NON-secret placeholder var — override per-environment.
+openbao_promtail_enabled: true
+# Where the rendered Promtail scrape config is written on the primary host. This
+# is a config file the primary's Promtail agent reads; it is NOT a secret.
+openbao_promtail_config_dir: "/etc/openbao/promtail"
+openbao_promtail_config_file: "{{ openbao_promtail_config_dir }}/promtail-openbao.yml"
+# The audit-log path as seen by Promtail. The audit volume is mounted at
+# openbao_audit_dir on the host/agent, so Promtail tails the same file the audit
+# device writes. `*` glob + Promtail's native file-watching handles rotation.
+openbao_promtail_audit_log_glob: "{{ openbao_audit_dir }}/openbao_audit*.log"
+# Loki push API endpoint (SVC-18) — NON-secret placeholder, override per-env.
+openbao_loki_push_url: "http://svc17-20-01.platform.internal:3100/loki/api/v1/push"
+# Labels every shipped line carries (Req 7.4).
+openbao_promtail_labels:
+  service: "openbao"
+  vlan: "20"
+# Promtail positions file (tracks tail offset across restarts/rotations so no
+# line is lost or duplicated — Req 7.4). Non-secret.
+openbao_promtail_positions_file: "{{ openbao_promtail_config_dir }}/positions.yaml"
+# Promtail job name for the audit scrape.
+openbao_promtail_job_name: "openbao_audit"
+
+# =============================================================================
+# Task 10.1 — Prometheus (SVC-17) scrape config contributed by SVC-07
+# =============================================================================
+# SVC-07 contributes a Prometheus scrape-config FRAGMENT to the shared SVC-17
+# observability stack, mirroring how task 7.2 contributes the Promtail fragment
+# to Loki (SVC-18) rather than owning the collector itself. SVC-17 is a separate
+# catalog service; a full Prometheus role may not exist yet, so this task
+# renders the scrape-config drop-in SVC-07 owns onto a Prometheus scrape-config
+# directory the SVC-17 Prometheus loads.
+#
+# The fragment declares TWO scrape jobs (design.md "Component topology"):
+#   * job `openbao`          -> the PRIMARY's /v1/sys/metrics at <= 30 s (Req 10.2, 10.3)
+#   * job `openbao_unsealer`  -> the UNSEALER's up{} target (Req 10.2)
+#
+# METRICS AUTH: OpenBao's /v1/sys/metrics requires a token by default. The
+# primary sets `unauthenticated_metrics_access = true` in its telemetry stanza
+# (openbao_install: openbao_telemetry_unauthenticated_metrics), so this scrape
+# needs NO bearer token — the endpoint carries only operational counters (no
+# secrets) and :8200 is reachable only over the internal VLAN-20 path (Req 6.4).
+# The authenticated-scrape alternative (a scoped metrics-read token in a scrape
+# `authorization.credentials_file`) is referenced BY FILE PATH only, never a
+# committed literal — see openbao_prometheus_scrape_bearer_token_file below.
+#
+# NO secret value lives here. Endpoints, labels, CA path, job names are all
+# non-secret config; override per-environment.
+
+# Whether to render the Prometheus scrape fragment (parallels
+# openbao_promtail_enabled). Set false only if a deployment wires OpenBao into
+# Prometheus by another mechanism (e.g. Prometheus-native file_sd elsewhere).
+openbao_prometheus_enabled: true
+
+# Where the rendered scrape-config drop-in is written on the primary host — a
+# directory the SVC-17 Prometheus loads via `scrape_config_files:` / file drop-in.
+# NON-secret config file, not a secret.
+openbao_prometheus_scrape_config_dir: "/etc/openbao/prometheus"
+openbao_prometheus_scrape_config_file: "{{ openbao_prometheus_scrape_config_dir }}/prometheus-openbao.yml"
+
+# --- job `openbao` (primary /v1/sys/metrics) — Req 10.2, 10.3 ----------------
+openbao_prometheus_job_name: "openbao"
+# Req 10.3 — <= 30 s. The offline test parses this back to seconds and asserts
+# it is <= 30 s, so keep it in a Prometheus duration form (e.g. "30s", "15s").
+openbao_prometheus_scrape_interval: "30s"
+openbao_prometheus_scrape_timeout: "10s"
+# OpenBao's Prometheus exposition path; the `?format=prometheus` query arg is
+# carried as a scrape `params` entry in the template.
+openbao_prometheus_metrics_path: "/v1/sys/metrics"
+# The primary scrape target (host:port on the internal VLAN-20 path).
+openbao_prometheus_primary_target: "{{ openbao_primary_ip }}:{{ openbao_api_port }}"
+# TLS: verify the primary's listener cert against the platform CA bundle
+# (SVC-08 EJBCA / Let's Encrypt fallback). NON-secret path (a CA cert, not a key).
+openbao_prometheus_tls_ca_file: "/etc/openbao/tls/ca.pem"
+openbao_prometheus_primary_server_name: "{{ openbao_primary_node_id }}"
+
+# --- job `openbao_unsealer` (unsealer up{} target) — Req 10.2 ----------------
+openbao_prometheus_unsealer_job_name: "openbao_unsealer"
+openbao_prometheus_unsealer_target: "{{ openbao_unsealer_ip }}:{{ openbao_api_port }}"
+openbao_prometheus_unsealer_server_name: "{{ openbao_unsealer_node_id }}"
+
+# --- authenticated-scrape alternative (only if unauthenticated access is off) -
+# File PATH (never a literal token) a scoped metrics-read bearer token would live
+# at IF openbao_telemetry_unauthenticated_metrics is set false. Referenced by the
+# commented `authorization.credentials_file` line in the template. Never
+# committed; supplied out-of-band to Prometheus (same discipline as any secret).
+openbao_prometheus_scrape_bearer_token_file: "/etc/openbao/prometheus/metrics-token"
+
+# =============================================================================
+# Task 10.2 — Alertmanager alerts (Prometheus + Loki) + escalation route
+# =============================================================================
+# SVC-07 contributes THREE fragments to the shared SVC-17/18 observability stack
+# (mirroring task 10.1's scrape fragment and task 7.2's Promtail fragment — SVC-07
+# CONTRIBUTES the rule/route files, it does NOT own Prometheus/Alertmanager/Loki):
+#
+#   * prometheus-openbao-alerts.yml.j2  -> a Prometheus rule_files drop-in with
+#     the THREE metric-based alerts (Req 10.4, 10.5, 10.6). Auto-resolve is
+#     inherent to Prometheus alerting (the alert clears when its expr stops
+#     matching), so no explicit resolve config is needed.
+#   * loki-openbao-audit-rule.yml.j2    -> a Loki ruler rule for the FOURTH alert
+#     OpenBaoAuditFailure (Req 10.7) — an audit-write failure is a LOG signal,
+#     not a metric, so it is a LogQL-derived rule firing within 1 min of the
+#     audit-write-failure log line. DISTINCT from the snapshot-failure marker
+#     (OPENBAO_SNAPSHOT_FAILURE, task 11.1) which is its own separate alert.
+#   * alertmanager-openbao-route.yml.j2 -> an Alertmanager route + receivers
+#     fragment: primary routing to the platform-ops receiver (Req 10.4) and the
+#     30-MIN UNACKNOWLEDGED ESCALATION to the SECONDARY on-call receiver (Req 10.9).
+#
+# NO secret value lives here. Metric/log expressions, thresholds, durations,
+# severities, receiver NAMES, and routing labels are all non-secret config;
+# override per-environment. Any receiver credential (pager key, SMTP password)
+# is supplied to Alertmanager out-of-band, never committed.
+
+# Whether to render the task-10.2 alerting fragments (parallels
+# openbao_prometheus_enabled / openbao_promtail_enabled). Set false only if a
+# deployment wires OpenBao alerting by another mechanism.
+openbao_alerts_enabled: true
+
+# --- Where the rendered fragments land on the primary host -------------------
+# Directories the SVC-17 Prometheus (rule_files), the SVC-18 Loki ruler, and the
+# SVC-17 Alertmanager (config include/merge) load. NON-secret config files.
+openbao_prometheus_alerts_rule_dir: "/etc/openbao/prometheus/rules"
+openbao_prometheus_alerts_rule_file: "{{ openbao_prometheus_alerts_rule_dir }}/openbao-alerts.yml"
+openbao_loki_audit_rule_dir: "/etc/openbao/loki/rules"
+openbao_loki_audit_rule_file: "{{ openbao_loki_audit_rule_dir }}/openbao-audit-alert.yml"
+openbao_alertmanager_route_dir: "/etc/openbao/alertmanager"
+openbao_alertmanager_route_file: "{{ openbao_alertmanager_route_dir }}/openbao-route.yml"
+
+# --- Shared routing label + runbook base -------------------------------------
+# Every OpenBao alert carries receiver_team=<this> so the Alertmanager route
+# fragment can match/escalate them uniformly. Non-secret.
+openbao_alert_primary_team_label: "platform-ops"
+# Base URL for alert runbook links (annotation). Non-secret placeholder.
+openbao_alert_runbook_base: "https://runbooks.platform.example.test/openbao"
+
+# =============================================================================
+# Prometheus metric-based alert rules (Req 10.4, 10.5, 10.6)
+# =============================================================================
+# The rule group name + evaluation cadence. interval kept <= the scrape interval
+# so the `for:` windows are honoured promptly.
+openbao_prometheus_alert_group_name: "openbao.rules"
+openbao_prometheus_alert_group_interval: "30s"
+
+# --- OpenBaoSealed (critical) — Req 10.4 -------------------------------------
+# openbao_core_unsealed == 0 for > 2 min. Auto-resolves when it returns to 1
+# (expr stops matching). `== bool 0` yields a clean 1/0 series for the alert.
+openbao_alert_sealed_expr: "openbao_core_unsealed == 0"
+openbao_alert_sealed_for: "2m"
+
+# --- OpenBaoUnsealerUnreachable (critical) — Req 10.5 ------------------------
+# up{job="openbao_unsealer"} == 0 for > 2 min. Keys off the scrape job task 10.1
+# created (openbao_prometheus_unsealer_job_name). Auto-resolves on up==1.
+openbao_alert_unsealer_unreachable_expr: 'up{job="openbao_unsealer"} == 0'
+openbao_alert_unsealer_unreachable_for: "2m"
+
+# --- OpenBaoLeaseCountHigh (warning) — Req 10.6 ------------------------------
+# openbao_expire_num_leases > threshold for > 5 min. Auto-resolves at/below
+# threshold. THRESHOLD DEFAULT 1000, OVERRIDABLE via this var (a rule-config
+# change, no code change — Req 10.6). The expr interpolates the threshold var.
+openbao_alert_lease_count_threshold: 1000
+openbao_alert_lease_count_expr: "openbao_expire_num_leases > {{ openbao_alert_lease_count_threshold }}"
+openbao_alert_lease_count_for: "5m"
+
+# =============================================================================
+# Loki ruler audit-failure alert (Req 10.7)
+# =============================================================================
+# OpenBaoAuditFailure: a Loki-derived rule that fires within 1 min of an
+# audit-write-failure log line. The rule evaluates a LogQL count over a short
+# window and fires on the FIRST matching line (for: 0s), so the end-to-end fire
+# is well inside the 1-min SLA.
+openbao_loki_audit_rule_group_name: "openbao.audit.rules"
+# Evaluate every 30s so a matching line alerts inside the 1-min budget.
+openbao_loki_audit_rule_interval: "30s"
+# 0s so the first ingested matching line fires immediately at the next eval.
+openbao_loki_audit_failure_for: "0s"
+
+# The literal substring OpenBao emits to its OPERATIONAL log stream when the
+# file audit device write fails (fail-closed). OpenBao logs an audit-backend
+# error on write failure; this matcher is the audit-write-failure SIGNAL — it is
+# DISTINCT from the snapshot-failure marker (OPENBAO_SNAPSHOT_FAILURE, task 11.1)
+# so the two alerts never conflate. A deployment can widen/narrow this to match
+# its OpenBao version's exact wording without a code change.
+openbao_audit_failure_log_matcher: "audit"
+openbao_audit_failure_log_error_matcher: "error"
+# LogQL: over the OpenBao operational stream (service=openbao), count lines that
+# mention an audit backend error over a 1-min window; fire when >= 1 is seen.
+# Scoped to service=openbao and the audit+error signal — NOT the snapshot marker.
+openbao_loki_audit_failure_expr: >-
+  sum(count_over_time({service="openbao"} |~ `(?i){{ openbao_audit_failure_log_matcher }}`
+  |~ `(?i){{ openbao_audit_failure_log_error_matcher }}`
+  != `{{ openbao_backup_failure_marker | default('OPENBAO_SNAPSHOT_FAILURE') }}` [1m])) > 0
+
+# =============================================================================
+# Alertmanager route + receivers (Req 10.4 routing, Req 10.9 escalation)
+# =============================================================================
+# Placeholder receiver NAMES + endpoints — a real deployment overrides the URLs.
+# The primary receiver is the platform operations receiver (Req 10.4); the
+# secondary is the on-call escalation target (Req 10.9).
+openbao_alertmanager_primary_receiver: "platform-ops"
+openbao_alertmanager_secondary_receiver: "platform-oncall-secondary"
+# Placeholder webhook endpoints. Non-secret; override per-environment. Any
+# receiver credential is supplied to Alertmanager out-of-band, never committed.
+openbao_alertmanager_primary_receiver_url: "http://svc17-20-01.platform.internal:9093/hook/platform-ops"
+openbao_alertmanager_secondary_receiver_url: "http://svc17-20-01.platform.internal:9093/hook/oncall-secondary"
+
+# Primary-route timings. group_wait/interval keep a seal+unsealer storm as one
+# notification; repeat_interval re-notifies the primary until the alert clears.
+openbao_alertmanager_group_wait: "30s"
+openbao_alertmanager_group_interval: "5m"
+openbao_alertmanager_repeat_interval: "4h"
+
+# --- 30-min unacknowledged escalation (Req 10.9) -----------------------------
+# The escalation child-route holds for 30 min before first notifying the
+# SECONDARY on-call receiver: an alert resolved/silenced (== acknowledged)
+# before this elapses is never escalated; one still firing after 30 min is.
+# Alertmanager has no native ack state, so "unacknowledged" == "still firing".
+openbao_alertmanager_escalation_after: "30m"
+# After escalating, re-notify the secondary at this cadence until resolved.
+openbao_alertmanager_escalation_repeat_interval: "30m"

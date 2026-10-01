@@ -1,0 +1,50 @@
+---
+# tasks/main.yml — docker-compose-app (generic)
+#
+# Templates a compose.yaml + .env from the service-supplied variable set and
+# reconciles the stack declaratively via community.docker.docker_compose_v2
+# (PF §9: NOT a shell `docker compose up`). Owns no service-specific knowledge.
+
+- name: Validate the caller supplied a stack name
+  ansible.builtin.assert:
+    that:
+      - dca_app_name | length > 0
+    fail_msg: "docker-compose-app requires dca_app_name to be set by the calling role."
+    quiet: true
+
+- name: Ensure the stack directory exists
+  ansible.builtin.file:
+    path: "{{ dca_stack_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Template the .env (non-secret config only)
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ dca_stack_dir }}/.env"
+    owner: root
+    group: root
+    mode: "0640"
+  register: dca_env_render
+
+- name: Template the compose.yaml
+  ansible.builtin.template:
+    src: compose.yaml.j2
+    dest: "{{ dca_stack_dir }}/compose.yaml"
+    owner: root
+    group: root
+    mode: "0640"
+  register: dca_compose_render
+
+- name: Reconcile the Compose stack (declarative)
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_stack_dir }}"
+    project_name: "{{ dca_app_name }}"
+    state: "{{ dca_state }}"
+    recreate: "{{ dca_recreate }}"
+    pull: "missing"
+  # A config change (compose.yaml or .env) forces a recreate so the stack
+  # picks up the new configuration; otherwise this is a no-op (idempotent).
+  when: dca_state == "present"

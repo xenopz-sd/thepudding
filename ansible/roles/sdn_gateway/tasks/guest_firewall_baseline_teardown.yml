@@ -1,0 +1,63 @@
+---
+# tasks/guest_firewall_baseline_teardown.yml — sdn_gateway
+# (spec openbao-unsealer-firewall-scoping; ADR-0008)
+#
+# Runs ONCE PER GUEST listed in `sdn_gateway_firewalled_guests_teardown` (loop_var
+# `sdn_gateway_fw_guest_td`). Removes EXACTLY the managed egress-baseline ALLOW
+# rules that `guest_firewall_baseline.yml` created on that guest — and no others —
+# so a guest whose NIC firewall was reverted (ADR-0008) is not left with orphaned
+# `out` ACCEPT rules on its guest firewall.
+#
+# Idempotent: a guest with no such rules reports changed=0. A failed delete is a
+# HARD failure (no `failed_when: false`) so a stale rule is never silently left.
+# NO secret material is read or echoed here.
+
+- name: "Guest firewall baseline teardown | Assert guest node + vmid are set (fail closed)"
+  ansible.builtin.assert:
+    that:
+      - sdn_gateway_fw_guest_td.node is defined
+      - (sdn_gateway_fw_guest_td.node | string | trim) | length > 0
+      - sdn_gateway_fw_guest_td.vmid is defined
+      - (sdn_gateway_fw_guest_td.vmid | string | trim) | length > 0
+    fail_msg: >-
+      Every entry in sdn_gateway_firewalled_guests_teardown must carry a non-empty
+      `node` and `vmid`. Got:
+      {{ sdn_gateway_fw_guest_td | default('<undefined>') }}.
+    success_msg: "Teardown target guest {{ sdn_gateway_fw_guest_td.vmid }} identified."
+    quiet: true
+
+- name: "Guest firewall baseline teardown | Compute the guest rules path for vmid {{ sdn_gateway_fw_guest_td.vmid }}"
+  ansible.builtin.set_fact:
+    sdn_gateway_gfbtd_rules_path: >-
+      /nodes/{{ sdn_gateway_fw_guest_td.node }}/lxc/{{ sdn_gateway_fw_guest_td.vmid }}/firewall/rules
+
+- name: "Guest firewall baseline teardown | Read current firewall rules for vmid {{ sdn_gateway_fw_guest_td.vmid }}"
+  ansible.builtin.command:
+    cmd: "sudo pvesh get {{ sdn_gateway_gfbtd_rules_path }} --output-format json"
+  register: sdn_gateway_gfbtd_rules_raw
+  changed_when: false
+  check_mode: false
+
+# Positions of every managed egress-baseline rule (comment starts with the stable
+# prefix), sorted descending so index-based deletes do not shift remaining ones.
+- name: "Guest firewall baseline teardown | Compute managed egress-rule positions"
+  ansible.builtin.set_fact:
+    sdn_gateway_gfbtd_positions: >-
+      {{
+        (sdn_gateway_gfbtd_rules_raw.stdout | from_json)
+        | selectattr('comment', 'defined')
+        | selectattr('comment', 'match', '^sdn_gateway: ALLOW egress ')
+        | map(attribute='pos') | map('int') | list | sort(reverse=true)
+      }}
+
+- name: "Guest firewall baseline teardown | Remove the managed egress rules (state absent)"
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - pvesh
+      - delete
+      - "{{ sdn_gateway_gfbtd_rules_path }}/{{ item }}"
+  loop: "{{ sdn_gateway_gfbtd_positions }}"
+  register: sdn_gateway_gfbtd_delete
+  changed_when: sdn_gateway_gfbtd_delete.rc == 0
+  notify: Reload pve-firewall

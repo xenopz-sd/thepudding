@@ -1,0 +1,55 @@
+---
+# defaults/main.yml — platform_host_prep (Platform Prerequisites Bootstrap —
+# host bucket, ensure the base template).
+#
+# Spec: .kiro/specs/platform-prerequisites-bootstrap/. Design ref:
+# "Component 4: platform_host_prep".
+#
+# Implemented in SPEC TASK 6.1 (Ensure_Template). Cross-bucket constants
+# (platform_repo_root, platform_venv_python, cluster_env_file, ...) stay as
+# play-level vars on platform-bootstrap.yml (see design.md "Data Models"); only
+# this role's phase-specific knobs live here. NO secret value ever lives here.
+#
+# NOTE (Fix A — phase reorder, ADR-0010): the gateway child-run knobs (admin
+# source CIDR, gateway playbook/inventory, registry-status emitter) MOVED to the
+# split-out `platform_gateway` role's defaults, because the gateway now runs as
+# its own phase AFTER the api bucket creates the SDN VNet bridge `p<vlan>`.
+
+# --- Host target (Req 3.5) ---------------------------------------------------
+# The Proxmox host address the pveam query/download is delegated to. Sourced
+# from cluster.env PROXMOX_HOST_LAN_IP — supplied at run time via --extra-vars
+# (the real IP is never committed), mirroring how the sdn_gateway invocation
+# overrides `ansible_host` for the static proxmox-hosts.yml inventory. There is
+# deliberately NO bogus default: prefer the host address the shared
+# platform_preflight role resolved from cluster.env (the play fact
+# `platform_host_lan_ip`), fall back to a PROXMOX_HOST_LAN_IP env lookup, else
+# empty — an empty value fails closed in Task 6.1 rather than delegating to a
+# bogus host. (The env lookup alone was unreliable here: the orchestrator does
+# not export cluster.env into the process environment, so the resolved-fact path
+# is the primary source.)
+platform_host_prep_host: >-
+  {{ platform_host_lan_ip
+     | default(lookup('ansible.builtin.env', 'PROXMOX_HOST_LAN_IP', default='')) }}
+
+# The admin SSH user the delegated pveam commands run as on the Proxmox host
+# (key-based auth, no password — same connection profile as proxmox-hosts.yml).
+platform_host_prep_ssh_user: root
+
+# Absolute path to the `pveam` CLI on the Proxmox host. The command module
+# resolves argv[0] against the module's own PATH (not a login shell's), and on a
+# delegated remote host that PATH lacks /usr/bin, so a bare `pveam` raises ENOENT.
+# Proxmox VE installs pveam at /usr/bin/pveam on every node. Non-secret.
+platform_host_prep_pveam_bin: /usr/bin/pveam
+
+# --- Ensure_Template (Task 6.1, Req 3.1/3.2/3.4) -----------------------------
+# The storage the base template is ensured on. Default `local` (the standard
+# pveam template store); overridable from cluster.env PROXMOX_TEMPLATE_STORAGE.
+platform_host_prep_template_storage: "local"
+
+# The configured base template in `<storage>:vztmpl/<file>` form, sourced from
+# cluster.env PROXMOX_LXC_TEMPLATE (the same value the guests provision from).
+# The shared platform_preflight role resolves it into the play fact
+# `platform_lxc_template` (from TF_VAR_openbao_template_file_id); consume that,
+# still overridable via --extra-vars. An unresolved value (empty) fails closed
+# in Task 6.1 rather than guessing a template name.
+platform_host_prep_template_volid: "{{ platform_lxc_template | default('') }}"

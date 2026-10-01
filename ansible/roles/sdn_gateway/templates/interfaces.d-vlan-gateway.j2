@@ -1,0 +1,59 @@
+{#
+  templates/interfaces.d-vlan-gateway.j2 — sdn_gateway (spec sdn-vlan-gateway-reachability, C5)
+
+  Rendered ONCE PER SERVED VLAN into
+    /etc/network/interfaces.d/sdn-gw-{{ sdn_gateway_vlan_id }}.cfg
+  by tasks/configure.yml. This is the PERSISTENT mechanism that gives the
+  Proxmox host its Layer-3 gateway address on the served VLAN — it survives a
+  host reboot (a bare `ip addr add` would not), satisfying spec Req 1.1 and the
+  design's "sub-interface persistence" Open Risk.
+
+  IMPORTANT — the gateway address lives on the SDN VNet BRIDGE `p{{ sdn_gateway_vlan_id }}`,
+  NOT on a `vmbr0.{{ sdn_gateway_vlan_id }}` sub-interface. A Proxmox SDN VLAN
+  zone builds its own L2 chain (nic0.<vlan> -> vmbrNvN -> the `p<vlan>` VNet
+  bridge that guests attach to); `p<vlan>` is the interface that is L2-adjacent
+  to the guests, so the host only answers the guests at `10.0.<vlan>.1` when the
+  address sits on `p<vlan>`. A `vmbr0.<vlan>` sub-interface would tag the VLAN
+  off the LAN uplink — a DIFFERENT L2 segment than the guests — and never reach
+  them. (Verified live against a real cluster; corrects the original vmbr0.<vlan>
+  design and ADR-0004's Decision wording — see ADR-0004 addendum.)
+
+  The SDN applier (Terraform) owns the `iface p{{ sdn_gateway_vlan_id }}` bridge
+  stanza in /etc/network/interfaces.d/sdn. We must NOT redeclare that interface
+  (two `iface` stanzas for one device is fragile under ifupdown2). Instead we
+  attach the gateway address as a `post-up` hook on a separate `inet manual`
+  stanza, which ifupdown2 layers on top of the SDN-owned stanza without
+  redefining the bridge. `post-up ... || true` keeps a re-apply idempotent (the
+  address already being present is not an error).
+
+  Egress NAT (guest -> internet) is added here as a scoped iptables MASQUERADE in
+  the same post-up hook, ONLY when sdn_gateway_enable_egress_nat is true. It SNATs
+  this VLAN's guests behind the host LAN IP for internet-bound traffic (needed for
+  apt / Docker pulls), but EXCLUDES destinations in the platform supernet
+  ({{ sdn_gateway_no_nat_dest_supernet }}) so inter-VLAN and guest->LAN-internal
+  traffic stay un-NAT'd — true routing with source IP preserved for those, and
+  still governed by the standing isolation DENY rules (Req 1.4 refined; see the
+  ADR-0004 egress addendum). Global forwarding is enabled via net.ipv4.ip_forward
+  in tasks/main.yml, not here.
+
+  The MASQUERADE rule is guarded with `iptables -C ... || iptables -A ...` so a
+  re-apply never duplicates it (idempotent), and removed on pre-down with
+  `-D ... || true`.
+
+  NO secret material is templated. Bridge/VLAN/CIDR are generic topology values.
+#}
+# MANAGED BY ANSIBLE (sdn_gateway role) — DO NOT EDIT BY HAND.
+# L3 gateway address for served SDN VLAN {{ sdn_gateway_vlan_id }}.
+# The SDN VLAN zone is Layer-2 only; this host owns the advertised gateway
+# 10.0.{{ sdn_gateway_vlan_id }}.1/24 on the SDN VNet bridge p{{ sdn_gateway_vlan_id }}
+# so the host answers the guests at .1 (ADR-0004 + addendum).
+auto p{{ sdn_gateway_vlan_id }}
+iface p{{ sdn_gateway_vlan_id }} inet manual
+    post-up ip addr add 10.0.{{ sdn_gateway_vlan_id }}.1/24 dev p{{ sdn_gateway_vlan_id }} || true
+{% if sdn_gateway_enable_egress_nat %}
+    post-up iptables -t nat -C POSTROUTING -s 10.0.{{ sdn_gateway_vlan_id }}.0/24 ! -d {{ sdn_gateway_no_nat_dest_supernet }} -o {{ sdn_gateway_egress_interface }} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.0.{{ sdn_gateway_vlan_id }}.0/24 ! -d {{ sdn_gateway_no_nat_dest_supernet }} -o {{ sdn_gateway_egress_interface }} -j MASQUERADE
+{% endif %}
+    pre-down ip addr del 10.0.{{ sdn_gateway_vlan_id }}.1/24 dev p{{ sdn_gateway_vlan_id }} || true
+{% if sdn_gateway_enable_egress_nat %}
+    pre-down iptables -t nat -D POSTROUTING -s 10.0.{{ sdn_gateway_vlan_id }}.0/24 ! -d {{ sdn_gateway_no_nat_dest_supernet }} -o {{ sdn_gateway_egress_interface }} -j MASQUERADE || true
+{% endif %}

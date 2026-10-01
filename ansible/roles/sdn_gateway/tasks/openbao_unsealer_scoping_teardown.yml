@@ -1,0 +1,70 @@
+---
+# tasks/openbao_unsealer_scoping_teardown.yml — sdn_gateway
+# (spec openbao-unsealer-firewall-scoping; ADR-0007 rev 2; Req 4)
+#
+# Runs ONCE (included from tasks/main.yml, gated on
+# `sdn_gateway_openbao_unsealer_scoping_teardown`, default FALSE). Removes EXACTLY
+# the two managed-comment-tagged unsealer scoping rules — at the UNSEALER GUEST
+# firewall scope (`/nodes/<node>/lxc/<vmid>/firewall/rules`, the same scope the
+# scoping task writes to, ADR-0007 rev 2) — and no others, making the scoping
+# fully reversible (Req 4.1). Idempotent: if the rules are already gone this
+# reports changed=0. A failed delete is a hard failure (no `failed_when: false`)
+# so a stale opening/deny is never silently left behind.
+#
+# NO secret material is read, templated, or echoed here.
+
+# Fail CLOSED if the target guest is not identified — never delete against the
+# wrong guest's firewall path.
+- name: "OpenBao unsealer scoping teardown | Assert the unsealer node + vmid are set (fail closed)"
+  ansible.builtin.assert:
+    that:
+      - sdn_gateway_openbao_unsealer_node is string
+      - (sdn_gateway_openbao_unsealer_node | trim) | length > 0
+      - sdn_gateway_openbao_unsealer_vmid is not none
+      - (sdn_gateway_openbao_unsealer_vmid | string | trim) | length > 0
+    fail_msg: >-
+      sdn_gateway_openbao_unsealer_node / sdn_gateway_openbao_unsealer_vmid is
+      unset. Refusing to delete unsealer firewall rules without knowing which
+      guest to target. These come from the Terraform-generated inventory.
+    success_msg: "Unsealer guest identified; teardown will target its guest firewall."
+    quiet: true
+
+- name: "OpenBao unsealer scoping teardown | Compute the unsealer guest firewall rules path"
+  ansible.builtin.set_fact:
+    sdn_gateway_ob_td_rules_path: >-
+      /nodes/{{ sdn_gateway_openbao_unsealer_node }}/lxc/{{ sdn_gateway_openbao_unsealer_vmid }}/firewall/rules
+
+- name: "OpenBao unsealer scoping teardown | Read the unsealer guest's current firewall rules"
+  ansible.builtin.command:
+    cmd: "sudo pvesh get {{ sdn_gateway_ob_td_rules_path }} --output-format json"
+  register: sdn_gateway_ob_td_rules_raw
+  changed_when: false
+  check_mode: false
+
+# Compute the positions of BOTH managed rules, sorted descending so deleting by
+# index does not shift the positions of rules not yet deleted (pvesh deletes a
+# firewall rule by its integer position).
+- name: "OpenBao unsealer scoping teardown | Compute managed-rule positions"
+  ansible.builtin.set_fact:
+    sdn_gateway_ob_td_positions: >-
+      {{
+        (sdn_gateway_ob_td_rules_raw.stdout | from_json)
+        | selectattr('comment', 'defined')
+        | selectattr('comment', 'in', [
+            'sdn_gateway: ALLOW openbao primary -> unsealer 8200 (managed)',
+            'sdn_gateway: DENY non-primary -> unsealer 8200 (managed)'
+          ])
+        | map(attribute='pos') | map('int') | list | sort(reverse=true)
+      }}
+
+- name: "OpenBao unsealer scoping teardown | Remove the managed unsealer rules (guest scope, state absent)"
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - pvesh
+      - delete
+      - "{{ sdn_gateway_ob_td_rules_path }}/{{ item }}"
+  loop: "{{ sdn_gateway_ob_td_positions }}"
+  register: sdn_gateway_ob_td_delete
+  changed_when: sdn_gateway_ob_td_delete.rc == 0
+  notify: Reload pve-firewall

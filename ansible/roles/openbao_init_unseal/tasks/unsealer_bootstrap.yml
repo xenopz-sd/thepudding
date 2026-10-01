@@ -1,0 +1,490 @@
+---
+# tasks/unsealer_bootstrap.yml — openbao_init_unseal / UNSEALER Raft bootstrap
+#
+# The guarded, idempotent, readiness-aware `operator init` + threshold
+# `operator unseal` + Transit-engine setup + `openbao-seal` scoped-policy write
+# + periodic Bootstrap_Transit_Token mint + unsealer root-token revoke that the
+# role now OWNS for the unsealer — mirroring tasks/primary_bootstrap.yml so the
+# unsealer path gains the SAME readiness guard and idempotency the primary has.
+#
+# WHY THIS EXISTS (spec svc07-unsealer-bootstrap-delegation): the orchestrator
+# (svc-07-bootstrap.yml) previously hand-rolled the unsealer's init/unseal/
+# policy/mint/revoke as raw `docker exec` steps WITHOUT the role's readiness
+# guard — the root cause of bug #7 (`operator init` fired before the fresh
+# unsealer's Raft backend was ready) and the sibling post-unseal races. Moving
+# it here lets the orchestrator DELEGATE the unsealer bootstrap exactly as it
+# already delegates the primary, eliminating the "orchestrator missing a guard
+# the role has" bug class by construction.
+#
+# INCLUDED FROM tasks/main.yml, GATED (by the include's `when:`) on:
+#   - openbao_role == "unsealer"
+#   - not openbao_already_initialized      (Req 3.1/3.2 — a re-run is a no-op)
+# so a re-run against an already-initialised unsealer skips this file entirely
+# (the operator holds the Shamir keys offline). Each secret-bearing step below
+# ALSO re-asserts no_log: "{{ openbao_no_log }}" as defence-in-depth.
+#
+# SECRETS DISCIPLINE (security-standards.md — this IS the secrets manager):
+#   - The Shamir unseal keys and the unsealer Root_Token are captured IN MEMORY
+#     ONLY (no_log facts), NEVER persisted, and scrubbed after the seal-token
+#     mint + root revoke.
+#   - The Bootstrap_Transit_Token is held in memory (no_log) and written to disk
+#     ONLY under the explicit per-run dev-expose opt-in, to a 0600 Handoff_File
+#     the orchestrator deletes immediately after reading it.
+#   - NOTE the unsealer's `operator init` yields SHAMIR keys (unseal_keys_b64),
+#     NOT recovery keys — its config has no seal stanza (it IS the seal
+#     provider). This is the key difference from primary_bootstrap.yml's init.
+#
+# ORDERED SEQUENCE (design's sequence diagram):
+#   1. readiness wait (bao status until API answers) BEFORE init  — fixes #7
+#   2. operator init (Raft, Shamir), capture keys + root token in-memory no_log
+#   3. threshold operator unseal; post-unseal readiness wait until sealed:false
+#   4. Transit engine enable + unseal-key create (relocated from main.yml (c))
+#   5. write the openbao-seal scoped policy (encrypt/decrypt on the key only)
+#   6. mint the periodic Bootstrap_Transit_Token; capture in-memory no_log
+#   7. HANDOFF: write the token to the 0600 Handoff_File (dev-expose opt-in)
+#   8. revoke the unsealer root token; scrub root + Shamir keys from memory
+
+# ----------------------------------------------------------------------------
+# STEP-1 — Readiness_Guard BEFORE `operator init` (fixes bug #7).
+# ----------------------------------------------------------------------------
+# Never fire `operator init` against a Raft backend that has not settled after
+# the unsealer Compose stack just started. `bao status` answers (lightweight)
+# BEFORE `operator init` is safe on a fresh backend, so we poll `bao status`
+# INSIDE the container via `docker exec` (consistent with the role's existing
+# guard — the container's own network namespace is where :8200 is bound) until
+# its stdout's first non-space char is a JSON opener ({ or [), meaning the API
+# answered with a parseable body. Any rc is tolerated (a sealed/uninitialised/
+# just-starting backend is a RETRY, not a failure). `-tls-skip-verify` is
+# spliced for the mock cert, matching every other unsealer `bao` call.
+- name: "Unsealer bootstrap — readiness wait: bao status answers before init (Req 1.1)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec',
+          openbao_unsealer_container_name, openbao_bao_bin, 'status']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_unsealer_readiness
+  until: "((openbao_unsealer_readiness.stdout | default('') | trim)[:1]) in ['{', '[']"
+  retries: "{{ openbao_readiness_retries | int }}"
+  delay: "{{ openbao_readiness_delay | int }}"
+  changed_when: false
+  failed_when: false   # a not-yet-up backend is 'retry', not 'fail'
+
+# If the readiness poll NEVER returned a JSON body, `until` exhausts the retry
+# budget and this assert fails with a READINESS-TIMEOUT message naming the
+# container + the retries×delay budget (Req 1.2) — distinct from the raw
+# `operator init` non-zero exit that WAS the bug #7 symptom. We do NOT rely on
+# the readiness task's rc (it is failed_when:false); we re-test its last stdout.
+- name: "Unsealer bootstrap — fail with a readiness-timeout if the API never answered (Req 1.2)"
+  ansible.builtin.assert:
+    that:
+      - "((openbao_unsealer_readiness.stdout | default('') | trim)[:1]) in ['{', '[']"
+    fail_msg: >-
+      The unsealer container '{{ openbao_unsealer_container_name }}' did not
+      answer `bao status` with a parseable body within the readiness budget
+      ({{ openbao_readiness_retries }} retries × {{ openbao_readiness_delay }}s
+      = {{ (openbao_readiness_retries | int) * (openbao_readiness_delay | int) }}s).
+      The Raft backend is not ready to accept `operator init` (this is bug #7's
+      readiness race, now surfaced as a named timeout rather than a raw
+      operator-init non-zero exit). Inspect the unsealer container and re-run —
+      the bootstrap is idempotent.
+    success_msg: "Unsealer API answered bao status; proceeding with operator init."
+    quiet: true
+
+# ----------------------------------------------------------------------------
+# STEP-2 — `bao operator init` on the unsealer (Raft, SHAMIR), ONCE.
+# ----------------------------------------------------------------------------
+# Run via `docker exec` against the unsealer container. The unsealer config has
+# NO seal stanza, so `operator init` returns SHAMIR unseal keys
+# (unseal_keys_b64) — NOT recovery keys — plus the initial Root_Token, as JSON.
+# The whole stdout carries secret material -> no_log. Gated (by the include) so
+# it runs exactly once; skipped entirely on an already-initialised re-run.
+- name: "Unsealer bootstrap — bao operator init (Raft, Shamir keys), once (no_log)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` spliced AFTER `operator init` and BEFORE the positional
+    # flags (bao rejects flags after positionals), matching the unsealer idiom.
+    argv: >-
+      {{ ['docker', 'exec',
+          openbao_unsealer_container_name, openbao_bao_bin, 'operator', 'init']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + ['-key-shares=' ~ openbao_unsealer_key_shares,
+            '-key-threshold=' ~ openbao_unsealer_key_threshold, '-format=json'] }}
+  register: openbao_unsealer_init_raw
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_unsealer_init_raw.rc == 0
+
+# Capture the SHAMIR keys + Root_Token from the init JSON into in-memory no_log
+# facts. The keys unseal the instance at STEP-3; the Root_Token authenticates
+# the Transit/policy/mint writes (STEP-4..6) — on a FRESH init we use THIS
+# in-memory root token, not the env-var one (which is unset on a fresh unsealer
+# whose `operator init` just ran here). Never persisted; scrubbed at STEP-8.
+- name: "Unsealer bootstrap — capture Shamir keys + root token in memory (no_log)"
+  ansible.builtin.set_fact:
+    openbao_unsealer_unseal_keys: "{{ (openbao_unsealer_init_raw.stdout | from_json).unseal_keys_b64 }}"
+    openbao_unsealer_init_root_token: "{{ (openbao_unsealer_init_raw.stdout | from_json).root_token }}"
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+# Resolve the token the STEP-4..6 authenticated writes use. On a fresh init the
+# in-memory Root_Token (captured just above) is the source of truth; the env-var
+# openbao_unsealer_root_token is empty on a fresh unsealer. We prefer the
+# in-memory token when present and fall back to the env-var token otherwise, so
+# the SAME tasks work on both the fresh path (in-memory root) and any
+# already-configured path (env-var root). no_log — it holds a root token.
+- name: "Unsealer bootstrap — resolve the effective root token for the writes (no_log)"
+  ansible.builtin.set_fact:
+    openbao_unsealer_effective_token: >-
+      {{ openbao_unsealer_init_root_token
+         if (openbao_unsealer_init_root_token | default('') | length > 0)
+         else openbao_unsealer_root_token }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+# ----------------------------------------------------------------------------
+# STEP-3 — threshold `operator unseal`, then a post-unseal readiness wait.
+# ----------------------------------------------------------------------------
+# Feed the first `threshold` Shamir keys to separate `operator unseal` execs.
+# Each argv carries a Shamir key -> no_log. `-tls-skip-verify` spliced for the
+# mock cert.
+- name: "Unsealer bootstrap — bao operator unseal (threshold Shamir keys, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec',
+          openbao_unsealer_container_name, openbao_bao_bin, 'operator', 'unseal']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + [item] }}
+  loop: "{{ openbao_unsealer_unseal_keys[0:(openbao_unsealer_key_threshold | int)] }}"
+  register: openbao_unsealer_unseal
+  changed_when: openbao_unsealer_unseal.rc == 0
+  no_log: "{{ openbao_no_log }}"
+
+# POST-UNSEAL readiness wait (Req 1.3, Property 2): before ANY write (Transit
+# enable, seal-policy, mint) poll `bao status` until it reports initialized:true
+# AND sealed:false. This closes the sibling post-unseal race — the beat between
+# the last `operator unseal` returning and the backend being ready to accept the
+# Transit/policy/mint writes. Same docker-exec / any-rc idiom; readiness is
+# decided purely from the parsed JSON, never the rc.
+- name: "Unsealer bootstrap — post-unseal wait: initialized:true AND sealed:false (Req 1.3)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec',
+          openbao_unsealer_container_name, openbao_bao_bin, 'status']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_unsealer_status_post
+  until:
+    - ((openbao_unsealer_status_post.stdout | default('') | trim)[:1]) in ['{', '[']
+    - ((openbao_unsealer_status_post.stdout | from_json).initialized | default(false)) | bool
+    - not (((openbao_unsealer_status_post.stdout | from_json).sealed | default(true)) | bool)
+  retries: "{{ openbao_readiness_retries | int }}"
+  delay: "{{ openbao_readiness_delay | int }}"
+  changed_when: false
+  failed_when: false
+
+- name: "Unsealer bootstrap — assert the unsealer reached initialized:true + sealed:false"
+  ansible.builtin.assert:
+    that:
+      - ((openbao_unsealer_status_post.stdout | default('') | trim)[:1]) in ['{', '[']
+      - ((openbao_unsealer_status_post.stdout | from_json).initialized | default(false)) | bool
+      - not (((openbao_unsealer_status_post.stdout | from_json).sealed | default(true)) | bool)
+    fail_msg: >-
+      The unsealer did not reach initialized:true + sealed:false within the
+      post-unseal readiness budget
+      ({{ openbao_readiness_retries }} × {{ openbao_readiness_delay }}s). The
+      Transit engine / seal-policy / mint writes below need an unsealed backend;
+      halting rather than writing against a sealed instance. Re-unseal with the
+      offline-held threshold Shamir keys and re-run (idempotent).
+    success_msg: "Unsealer is initialized and unsealed; proceeding with Transit-engine setup."
+    quiet: true
+
+# ----------------------------------------------------------------------------
+# STEP-3b — POST-FLUSH RE-UNSEAL GUARD (defence-in-depth; spec
+# fix-svc07-unsealer-reseal-on-handler-restart, Change 2 / Property 1).
+# ----------------------------------------------------------------------------
+# EVEN with the flush-before-unseal seam in Play 1 (Change 1), any restart that
+# fires WITHIN this run after STEP-3's unseal would recreate the Shamir-sealed
+# unsealer (its config.hcl has NO seal stanza -> it comes back Sealed:true with
+# nothing to auto-unseal it). Because we are on the FRESH-init path, the Shamir
+# threshold keys are still held IN MEMORY (openbao_unsealer_unseal_keys, captured
+# at STEP-2, only scrubbed at STEP-8), so we can re-unseal idempotently HERE —
+# BEFORE STEP-4's Transit/policy/mint writes ever touch the backend — guaranteeing
+# those writes never fire against a re-sealed instance.
+#
+# 1. Re-read `bao status` (the re-check), same docker-exec idiom as STEP-1/STEP-3,
+#    any rc tolerated (a sealed backend is the exact case we handle, not a fail).
+- name: "Unsealer bootstrap — re-unseal guard: re-check bao status before Transit writes"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec',
+          openbao_unsealer_container_name, openbao_bao_bin, 'status']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_unsealer_status_reguard
+  changed_when: false
+  failed_when: false
+
+# 2. CONDITIONAL re-unseal: run ONLY IF the re-check reports sealed:true, feeding
+#    the in-memory threshold Shamir keys back through `operator unseal`. The
+#    `when:` keyed on `sealed` is what distinguishes this guard's re-unseal from
+#    STEP-3's UNCONDITIONAL initial unseal. Each argv carries a Shamir key -> no_log.
+- name: "Unsealer bootstrap — re-unseal guard: re-unseal if a restart re-sealed it (threshold keys, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec',
+          openbao_unsealer_container_name, openbao_bao_bin, 'operator', 'unseal']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + [item] }}
+  loop: "{{ openbao_unsealer_unseal_keys[0:(openbao_unsealer_key_threshold | int)] }}"
+  register: openbao_unsealer_reunseal
+  when: (openbao_unsealer_status_reguard.stdout | default('{}') | from_json).sealed | default(false) | bool
+  changed_when: openbao_unsealer_reunseal.rc == 0
+  no_log: "{{ openbao_no_log }}"
+
+# 3. Final post-guard readiness wait/assert: confirm sealed:false before STEP-4.
+#    On the common case (the guard found sealed:false and skipped the re-unseal)
+#    this simply re-confirms the STEP-3 state; if the guard DID re-unseal, this
+#    proves it succeeded before any Transit/policy/mint write proceeds.
+- name: "Unsealer bootstrap — re-unseal guard: confirm sealed:false before Transit writes"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec',
+          openbao_unsealer_container_name, openbao_bao_bin, 'status']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_unsealer_status_postguard
+  until:
+    - ((openbao_unsealer_status_postguard.stdout | default('') | trim)[:1]) in ['{', '[']
+    - not (((openbao_unsealer_status_postguard.stdout | from_json).sealed | default(true)) | bool)
+  retries: "{{ openbao_readiness_retries | int }}"
+  delay: "{{ openbao_readiness_delay | int }}"
+  changed_when: false
+  failed_when: false
+
+- name: "Unsealer bootstrap — re-unseal guard: assert the unsealer is sealed:false"
+  ansible.builtin.assert:
+    that:
+      - ((openbao_unsealer_status_postguard.stdout | default('') | trim)[:1]) in ['{', '[']
+      - not (((openbao_unsealer_status_postguard.stdout | from_json).sealed | default(true)) | bool)
+    fail_msg: >-
+      The post-flush re-unseal guard could not confirm the unsealer is
+      sealed:false within the readiness budget
+      ({{ openbao_readiness_retries }} × {{ openbao_readiness_delay }}s). A
+      restart within the run re-sealed the Shamir-sealed unsealer and the
+      in-memory threshold keys did not re-unseal it. Halting rather than writing
+      the Transit engine / seal-policy / mint against a sealed backend; inspect
+      the unsealer container and re-run (the bootstrap is idempotent).
+    success_msg: "Re-unseal guard confirms sealed:false; proceeding with Transit-engine setup."
+    quiet: true
+
+# ============================================================================
+# STEP-4 — Transit-engine setup (RELOCATED here from tasks/main.yml (c) block).
+# ----------------------------------------------------------------------------
+# Enabling the Transit secrets engine and creating the unseal key is what lets
+# the primary auto-unseal against this unsealer. These steps moved OUT of
+# main.yml's (c) block and INTO this guarded include so the WHOLE unsealer
+# bootstrap is one ordered, guarded sequence: they now run AFTER the post-unseal
+# readiness wait (STEP-3), so they never fire against a not-yet-ready backend.
+#
+# AUTH CHANGE vs the old (c) block: those tasks authenticated with
+# openbao_unsealer_root_token (env-var only). On a FRESH init the env-var is
+# unset and we hold the Root_Token in memory (STEP-2). We therefore authenticate
+# with openbao_unsealer_effective_token (in-memory fresh root, or env-var root
+# on an already-configured path) — resolved at STEP-2. Idempotency is preserved
+# exactly as before: the `secrets list` probe is tolerated, enable tolerates
+# already-in-use, key-create is create-if-absent. no_log is CONDITIONAL on the
+# argv actually carrying a token (an unauthenticated run shows its real error).
+# ============================================================================
+
+- name: "Unsealer bootstrap — list enabled secrets engines (probe; tolerated, no change)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec']
+         + (['-e', 'BAO_TOKEN=' ~ openbao_unsealer_effective_token]
+            if (openbao_unsealer_effective_token | length > 0) else [])
+         + [openbao_unsealer_container_name, openbao_bao_bin, 'secrets', 'list']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_unsealer_mounts
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  no_log: "{{ openbao_unsealer_effective_token | length > 0 }}"   # censor only when argv carries a token
+
+# Fail CLOSED with an actionable message when the unsealer is reachable but the
+# `secrets list` probe did not return a JSON engines map — the overwhelmingly
+# common cause on an already-configured re-run path is a missing/empty effective
+# token (401/403) or a TLS verify failure against the mock cert. On the FRESH
+# path the in-memory Root_Token is always present, so this passes trivially.
+- name: "Unsealer bootstrap — require auth before Transit-engine writes (clear failure, not a censored 403)"
+  ansible.builtin.assert:
+    that:
+      - openbao_unsealer_effective_token | length > 0
+      - (openbao_unsealer_mounts.rc | default(1)) == 0
+      - ((openbao_unsealer_mounts.stdout | default('') | trim)[:1]) in ['{', '[']
+    fail_msg: >-
+      The unsealer Transit-engine writes need an authenticated `bao`, but the
+      `secrets list` probe did not return a JSON engines map. On a FRESH init
+      the in-memory Root_Token from `operator init` (STEP-2) authenticates these
+      writes automatically — if you see this on a fresh run the init/unseal
+      above did not complete. On an ALREADY-CONFIGURED path the writes fall back
+      to the env var {{ openbao_unsealer_root_token_env_var }}; if that is unset,
+      empty, revoked, or the instance is SEALED, set/refresh it (or re-unseal)
+      and re-run. For the mock cert pass `-e openbao_tls_self_signed=true`.
+    success_msg: "Unsealer `bao` is authenticated and reachable; proceeding with Transit-engine setup."
+    quiet: true
+
+- name: "Unsealer bootstrap — enable the Transit secrets engine (idempotent: tolerate already-enabled)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec']
+         + (['-e', 'BAO_TOKEN=' ~ openbao_unsealer_effective_token]
+            if (openbao_unsealer_effective_token | length > 0) else [])
+         + [openbao_unsealer_container_name, openbao_bao_bin, 'secrets', 'enable']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + ['-path=' ~ openbao_transit_mount_path, 'transit'] }}
+  register: openbao_transit_enable
+  # `bao secrets enable` errors if the path is ALREADY in use — that is the
+  # idempotent no-op case, not a failure. Tolerate it; any OTHER non-zero rc is
+  # a real failure.
+  changed_when: openbao_transit_enable.rc == 0
+  failed_when: >-
+    openbao_transit_enable.rc != 0
+    and (openbao_transit_enable.stderr | default('') | regex_search('(?i)already in use|path is already')) is none
+  no_log: "{{ openbao_unsealer_effective_token | length > 0 }}"   # censor only when argv carries a token
+  when:
+    # Only enable when the mount is not already present in the engines list.
+    # Parse the probe's JSON only when it returned a good listing; otherwise fall
+    # through to enable (which is itself idempotent via failed_when above).
+    - >-
+      (openbao_unsealer_mounts.rc | default(1)) != 0
+      or ((openbao_unsealer_mounts.stdout | default('') | trim)[:1]) not in ['{', '[']
+      or ((openbao_unsealer_mounts.stdout | from_json).get(
+            openbao_transit_mount_path ~ '/', none) is none)
+
+- name: "Unsealer bootstrap — create the Transit unseal key '{{ openbao_transit_key_name }}' (create-if-absent)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec']
+         + (['-e', 'BAO_TOKEN=' ~ openbao_unsealer_effective_token]
+            if (openbao_unsealer_effective_token | length > 0) else [])
+         + [openbao_unsealer_container_name, openbao_bao_bin, 'write']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + ['-f', openbao_transit_mount_path ~ '/keys/' ~ openbao_transit_key_name,
+            'type=' ~ openbao_transit_key_type] }}
+  register: openbao_transit_key
+  # `bao write -f transit/keys/<name>` is create-if-absent and does not rotate an
+  # existing key, so rc==0 on both create and re-run; tolerate a benign
+  # already-exists just in case a future bao version returns non-zero for it.
+  changed_when: openbao_transit_key.rc == 0
+  failed_when: >-
+    openbao_transit_key.rc != 0
+    and (openbao_transit_key.stderr | default('') | regex_search('(?i)already exists')) is none
+  no_log: "{{ openbao_unsealer_effective_token | length > 0 }}"   # censor only when argv carries a token
+
+# ----------------------------------------------------------------------------
+# STEP-5 — Write the `openbao-seal` scoped policy (encrypt/decrypt on the key
+# only). Authenticated with the effective (in-memory fresh) Root_Token.
+# ----------------------------------------------------------------------------
+# `docker exec -i` is REQUIRED: `bao policy write <name> -` reads the HCL from
+# stdin, and `docker exec` forwards the parent stdin to the container ONLY with
+# `-i` (without it the container sees empty stdin and OpenBao rejects the policy
+# with `400: 'policy' parameter not supplied or empty`). The policy grants
+# `update` on transit/encrypt/<key> and transit/decrypt/<key> ONLY — the exact
+# two paths the primary's seal token needs — never a root token as the seal
+# token. `-tls-skip-verify` after `policy write`, before positionals. no_log
+# (the exec env carries the Root_Token).
+- name: "Unsealer bootstrap — write the openbao-seal scoped policy (encrypt/decrypt only, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-i', '-e', 'BAO_TOKEN=' ~ openbao_unsealer_effective_token,
+          openbao_unsealer_container_name, openbao_bao_bin, 'policy', 'write']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + [openbao_seal_policy_name, '-'] }}
+    stdin: >-
+      path "{{ openbao_transit_mount_path }}/encrypt/{{ openbao_transit_key_name }}" { capabilities = ["update"] }
+      path "{{ openbao_transit_mount_path }}/decrypt/{{ openbao_transit_key_name }}" { capabilities = ["update"] }
+  register: openbao_seal_policy_write
+  changed_when: openbao_seal_policy_write.rc == 0
+  no_log: "{{ openbao_no_log }}"
+
+# ----------------------------------------------------------------------------
+# STEP-6 — Mint the periodic Bootstrap_Transit_Token against openbao-seal.
+# ----------------------------------------------------------------------------
+# `-field=token` prints ONLY the token value on stdout; `-period` makes it a
+# periodic token so the primary's auto-unseal keeps renewing indefinitely.
+# Authenticated with the effective (in-memory fresh) Root_Token. Captured into
+# an in-memory no_log fact bridged to the orchestrator via the Handoff_File
+# (STEP-7). `-tls-skip-verify` after `token create`, before positionals.
+- name: "Unsealer bootstrap — mint the periodic Bootstrap_Transit_Token (openbao-seal policy, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_unsealer_effective_token,
+          openbao_unsealer_container_name, openbao_bao_bin, 'token', 'create']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + ['-orphan', '-policy=' ~ openbao_seal_policy_name,
+            '-period=' ~ openbao_seal_token_period, '-field=token'] }}
+  register: openbao_seal_token_raw
+  changed_when: openbao_seal_token_raw.rc == 0
+  no_log: "{{ openbao_no_log }}"
+
+- name: "Unsealer bootstrap — capture the Bootstrap_Transit_Token in memory (no_log)"
+  ansible.builtin.set_fact:
+    openbao_seal_token: "{{ openbao_seal_token_raw.stdout | trim }}"
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+# ----------------------------------------------------------------------------
+# STEP-7 — HANDOFF: write the minted token to the 0600 Handoff_File.
+# ----------------------------------------------------------------------------
+# A fact set inside a child `ansible-playbook` process does NOT propagate back
+# to the parent orchestrator, so the minted token is handed off via a 0600
+# control-node file the orchestrator reads (then deletes immediately). Written
+# on the CONTROL NODE (delegate_to: localhost, become: false — the file is owned
+# by the invoking user), ONLY under the mint + dev-expose opt-in and only when
+# the orchestrator supplied a non-empty path. no_log — content is the token.
+# Acceptance/production posture (no secret to disk) is unchanged by default:
+# openbao_mint_seal_token defaults false and the handoff path defaults empty.
+- name: "Unsealer bootstrap — write the Bootstrap_Transit_Token to the 0600 handoff file (dev-expose opt-in)"
+  ansible.builtin.copy:
+    dest: "{{ openbao_seal_token_handoff_path }}"
+    content: "{{ openbao_seal_token }}"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  no_log: "{{ openbao_no_log }}"
+  when:
+    - openbao_mint_seal_token | bool
+    - openbao_dev_expose_secrets | bool
+    - openbao_seal_token_handoff_path | length > 0
+
+# ----------------------------------------------------------------------------
+# STEP-8 — Revoke the unsealer Root_Token, then scrub secret facts.
+# ----------------------------------------------------------------------------
+# Revoke with the ROOT token (openbao_unsealer_effective_token — the in-memory
+# fresh root on the fresh path), NOT the scoped seal token, so a leaked seal
+# token cannot administer the unsealer (the scoped seal token can only
+# encrypt/decrypt the unseal key). `-self` on the root token. no_log.
+- name: "Unsealer bootstrap — revoke the unsealer root token (bao token revoke -self, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_unsealer_effective_token,
+          openbao_unsealer_container_name, openbao_bao_bin, 'token', 'revoke']
+         + (['-tls-skip-verify'] if (openbao_unsealer_tls_skip_verify | bool) else [])
+         + ['-self'] }}
+  register: openbao_unsealer_root_revoke
+  changed_when: openbao_unsealer_root_revoke.rc == 0
+  no_log: "{{ openbao_no_log }}"
+
+# Scrub the root token + Shamir keys from memory now they are no longer needed
+# (the seal token is minted, handed off, and root is revoked). The seal token
+# fact was already written to the Handoff_File at STEP-7 (which precedes this
+# revoke), so scrubbing it here too keeps nothing secret lingering as a fact for
+# the rest of the play. Ordered AFTER both the handoff (STEP-7) and the revoke.
+- name: "Unsealer bootstrap — scrub root token, Shamir keys, and seal token from memory (no_log)"
+  ansible.builtin.set_fact:
+    openbao_unsealer_init_root_token: ""
+    openbao_unsealer_effective_token: ""
+    openbao_unsealer_unseal_keys: []
+    openbao_seal_token: ""
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false

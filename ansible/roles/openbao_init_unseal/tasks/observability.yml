@@ -1,0 +1,73 @@
+---
+# tasks/observability.yml — openbao_init_unseal / TASK 10.1
+#
+# Prometheus (SVC-17) scrape-config FRAGMENT contributed by SVC-07. INCLUDED
+# FROM tasks/main.yml at the "EXTENSION POINT — Task 10.1 (observability)"
+# marker, gated on `openbao_role == "primary"` (the scrape fragment is rendered
+# once, from the primary host) and `openbao_prometheus_enabled`.
+#
+# WHY HERE (not in the root-token window): unlike the §7.x engine/auth/audit
+# steps, rendering a Prometheus scrape-config file needs NO Root_Token and no
+# live OpenBao API call — it is a pure host-file template render (exactly like
+# the Promtail scrape fragment in §7.2). It therefore runs OUTSIDE the bootstrap
+# window and is NOT gated on `openbao_already_initialized`: the scrape config
+# should be reconciled on every run so it stays present/correct even on an
+# already-initialised primary (Req 13 — the template module is idempotent).
+#
+# WHAT THIS TASK DOES (and, deliberately, does NOT do):
+#   * It RENDERS the scrape-config drop-in SVC-07 owns onto a Prometheus
+#     scrape-config directory the SVC-17 Prometheus loads — the SVC-07
+#     CONTRIBUTION to the shared observability stack, mirroring how §7.2
+#     contributes the Promtail fragment to Loki. It declares:
+#       - job `openbao`          -> primary /v1/sys/metrics at <= 30 s (Req 10.2, 10.3);
+#       - job `openbao_unsealer`  -> unsealer up{} target (Req 10.2).
+#   * It does NOT stand up Prometheus (SVC-17 is a separate catalog service) and
+#     does NOT own the Alertmanager alert rules (those are task 10.2).
+#   * It does NOT implement the sealed-metric guarantee (`openbao_core_unsealed
+#     = 0` while sealed, Req 10.8 / FD.7) — that is OpenBao-NATIVE: the metric is
+#     exposed on /v1/sys/metrics even while the instance is sealed, so Prometheus
+#     can scrape it without the server being unsealed first. The primary's
+#     telemetry stanza (openbao_install config.hcl.j2) exposes the endpoint; this
+#     fragment merely points a scrape at it. The guarantee is VERIFIED by the
+#     degraded-mode tests (tasks 12.4 / 12.5), not asserted here.
+#   * METRICS AUTH: the primary sets `unauthenticated_metrics_access = true`
+#     (openbao_telemetry_unauthenticated_metrics), so this scrape carries NO
+#     bearer token. The authenticated-scrape alternative (a scoped metrics-read
+#     token in a `credentials_file`) is referenced BY PATH only in the template,
+#     never a committed literal.
+#
+# NO secret value is templated: endpoints, labels, CA path, and job names are
+# all non-secret config.
+
+- name: "10.1 — Ensure the Prometheus scrape-config directory exists on the primary"
+  ansible.builtin.file:
+    path: "{{ openbao_prometheus_scrape_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: openbao_prometheus_enabled | bool
+
+- name: "10.1 — Render the OpenBao Prometheus scrape config (job openbao <= 30 s + openbao_unsealer target, Req 10.2/10.3)"
+  ansible.builtin.template:
+    src: "prometheus-openbao.yml.j2"
+    dest: "{{ openbao_prometheus_scrape_config_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: openbao_prometheus_enabled | bool
+
+- name: "10.1 — Report §10.1 completion (Prometheus scrape jobs wired)"
+  ansible.builtin.debug:
+    msg: >-
+      §10.1 ready — SVC-07 Prometheus scrape config rendered to
+      {{ openbao_prometheus_scrape_config_file }}: job
+      '{{ openbao_prometheus_job_name }}' scrapes the primary's
+      {{ openbao_prometheus_metrics_path }}?format=prometheus at
+      {{ openbao_prometheus_scrape_interval }} (<= 30 s, Req 10.3), and job
+      '{{ openbao_prometheus_unsealer_job_name }}' scrapes the unsealer so
+      up{job="{{ openbao_prometheus_unsealer_job_name }}"} is queryable for the
+      OpenBaoUnsealerUnreachable alert (task 10.2, Req 10.2). The primary
+      exposes openbao_core_unsealed even while sealed (= 0, Req 10.8 / FD.7) —
+      OpenBao-native, verified by the degraded-mode tests (12.4 / 12.5).
+  when: openbao_prometheus_enabled | bool

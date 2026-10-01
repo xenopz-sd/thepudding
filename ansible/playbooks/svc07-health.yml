@@ -1,0 +1,154 @@
+---
+# svc07-health.yml — SVC-07 installer Phase-4 health gate (CHILD configurator play)
+#
+# This is the child play the svc07_handoff role invokes via
+# `ansible-playbook -i {{ svc07_generated_inventory }} svc07-health.yml`
+# (integration-boundaries.md §4). It runs `hosts: openbao` NATIVELY on the guest
+# — there is NO delegate_to health task anywhere (the HARD CONSTRAINT). The
+# generated inventory's `openbao` group primary entry carries
+# `ansible_host: 10.0.20.10` / `ansible_user: root` over SSH, so the two-stage
+# recreate-robust gate below runs as ordinary guest tasks (the guest's own Docker
+# daemon), not against the control node.
+#
+# Two-stage recreate-robust gate (mirrors the baseline svc-07-bootstrap.yml
+# Phase-4 delegate_to health block, now expressed as native guest tasks):
+#   Stage 1 — `docker inspect <primary>`: wait for the primary container to EXIST
+#             and be RUNNING (State.Running true). This absorbs the end-of-play
+#             recreate window (Task 8.4's openbao.yml child run destroys +
+#             recreates the primary) where `docker inspect` transiently returns
+#             rc!=0 / "No such container" — that is a RETRY, not a failure.
+#   Stage 2 — `docker exec <primary> bao status [-tls-skip-verify] -format=json`:
+#             poll until initialized:true AND sealed:false. Runs only after
+#             Stage 1 has confirmed the container is running, so it never polls a
+#             non-existent container.
+#
+# Each `until` gate is EMPTY-SAFE: a length>0 + first-character guard is
+# evaluated BEFORE any `from_json`, short-circuited left-to-right, so a transient
+# absent-container / empty-output is a falsy RETRY, never a parse throw and never
+# a false-healthy. Both stages tolerate any rc (`failed_when: false`); the
+# `until` gate is the real gate. On timeout each loop exhausts its retries
+# WITHOUT failing, so the state is asserted by the explicit assert tasks that
+# follow — Stage 1 asserted FIRST so a stuck-mid-recreate container yields an
+# accurate "never became running" diagnostic distinct from a
+# running-but-never-healthy primary.
+#
+# The health-gate knob variables (svc07_openbao_primary_container_name,
+# svc07_openbao_bao_bin, svc07_openbao_primary_tls_skip_verify,
+# svc07_health_retries, svc07_health_delay) are supplied by
+# svc07_handoff/defaults/main.yml and/or passed via -e; they are referenced by
+# name here, never redefined in this play.
+#
+# The consolidated, guarded Phase-4 debug include lives in
+# tasks/svc07-health-debug-probes.yml and is imported as the FIRST task below,
+# guarded by `when: svc07_debug_instrumentation | default(false) | bool` (so the
+# per-invocation probes are available at play start). This play intentionally
+# carries NO inline debug probes in the functional Stage-1/Stage-2 loops — all
+# Phase-4 instrumentation is consolidated in that one guarded include (Task 7.2,
+# design plan item 4).
+- name: SVC-07 primary health gate
+  hosts: openbao
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    # Consolidated Phase-4 DEV-ONLY debug probes — imported ONCE as the FIRST
+    # task so per-invocation probes are available before the functional loops.
+    # Guarded so it runs ONLY when svc07_debug_instrumentation resolves true; a
+    # normal run is byte-for-byte unaffected. Path resolves relative to this
+    # playbook's directory (ansible/playbooks/tasks/...).
+    - name: "Health | Import consolidated Phase-4 debug probes (guarded, dev-only)"
+      ansible.builtin.import_tasks: tasks/svc07-health-debug-probes.yml
+      when: svc07_debug_instrumentation | default(false) | bool
+
+    # Stage 1 — wait for the primary container to EXIST and be RUNNING
+    # (recreate-robust). `docker inspect <container>` returns rc!=0 ("No such
+    # container") mid-recreate — that is a RETRY, not a failure. On rc==0 it
+    # prints a JSON ARRAY [ { ... "State": { "Running": true|false ... } } ] and
+    # the gate reads (stdout|from_json)[0].State.Running. We deliberately parse
+    # the plain-`docker inspect` JSON rather than a Go-template `-f
+    # {{.State.Running}}` format: the latter is re-evaluated as (invalid) Jinja
+    # when the command module resolves the argv and renders EMPTY. The gate is
+    # empty-safe — length>0 + first-char '[' guard BEFORE from_json,
+    # short-circuited left-to-right, so an empty / No-such-container stdout is a
+    # falsy RETRY, never a throw.
+    - name: "Health | Stage 1 — wait for the primary container to exist and be running (recreate-robust)"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ svc07_openbao_primary_container_name }}"
+      register: svc07_primary_container_running
+      failed_when: false
+      changed_when: false
+      until: >-
+        (svc07_primary_container_running.rc | default(1)) == 0
+        and (svc07_primary_container_running.stdout | default('') | trim | length > 0)
+        and ((svc07_primary_container_running.stdout | trim)[0] == '[')
+        and ((svc07_primary_container_running.stdout | from_json)[0].State.Running | default(false) | bool)
+      retries: "{{ svc07_health_retries | default(30) | int }}"
+      delay: "{{ svc07_health_delay | default(5) | int }}"
+
+    # Stage 2 — the `bao status` health poll. Runs ONLY after Stage 1 confirmed
+    # the primary container exists and is running, so it no longer polls a
+    # non-existent container mid-recreate. Should a "No such container" (rc=1,
+    # empty stdout) still slip through between Stage 1 and Stage 2, the empty-safe
+    # gate below handles it: empty stdout => length>0 false => gate false =>
+    # RETRY (never a false-healthy). Any rc tolerated; the `until` JSON-parse gate
+    # is the real health gate: stdout is a JSON body AND initialized:true AND
+    # sealed:false. The `-tls-skip-verify` flag is conditional on
+    # svc07_openbao_primary_tls_skip_verify (self-signed cert during Day-0 dev).
+    - name: "Health | Stage 2 — poll the primary via `bao status` until healthy (after Stage 1 container-running gate)"
+      ansible.builtin.command:
+        argv: >-
+          {{ ['docker', 'exec', svc07_openbao_primary_container_name, svc07_openbao_bao_bin, 'status']
+             + (['-tls-skip-verify'] if (svc07_openbao_primary_tls_skip_verify | default(true) | bool) else [])
+             + ['-format=json'] }}
+      register: svc07_primary_status
+      failed_when: false
+      changed_when: false
+      until: >-
+        (svc07_primary_status.stdout | default('') | trim | length > 0)
+        and ((svc07_primary_status.stdout | trim)[0] in ['{', '['])
+        and ((svc07_primary_status.stdout | from_json).initialized | default(false) | bool)
+        and (not ((svc07_primary_status.stdout | from_json).sealed | default(true) | bool))
+      retries: "{{ svc07_health_retries | default(30) | int }}"
+      delay: "{{ svc07_health_delay | default(5) | int }}"
+
+    # On timeout each loop above exhausts its retries WITHOUT the task failing
+    # (failed_when:false), so the state is asserted here. Assert Stage 1 FIRST so
+    # a stuck-mid-recreate container produces an accurate diagnostic ("never
+    # became running") distinct from a running-but-never-healthy primary.
+    - name: "Health | Assert Stage 1 — the primary container became running within the deadline"
+      ansible.builtin.assert:
+        that: >-
+          (svc07_primary_container_running.rc | default(1)) == 0
+          and (svc07_primary_container_running.stdout | default('') | trim | length > 0)
+          and ((svc07_primary_container_running.stdout | trim)[0] == '[')
+          and ((svc07_primary_container_running.stdout | from_json)[0].State.Running | default(false) | bool)
+        fail_msg: >-
+          The OpenBao primary container ({{ svc07_openbao_primary_container_name }})
+          never became running within
+          {{ (svc07_health_retries | default(30) | int) * (svc07_health_delay | default(5) | int) }} seconds
+          on the primary guest — it may be stuck mid-recreate. This health gate
+          waits for the container to exist and run before polling `bao status`
+          (recreate-robust); a persistent not-running state means the container
+          itself did not settle. Inspect `docker ps -a` / `docker inspect` on the
+          guest and re-run.
+        success_msg: "OpenBao primary container is running (Stage 1 gate passed)."
+
+    - name: "Health | Assert Stage 2 — the primary became healthy within the deadline"
+      ansible.builtin.assert:
+        that: >-
+          (svc07_primary_status.stdout | default('') | trim | length > 0)
+          and ((svc07_primary_status.stdout | trim)[0] in ['{', '['])
+          and ((svc07_primary_status.stdout | from_json).initialized | default(false) | bool)
+          and (not ((svc07_primary_status.stdout | from_json).sealed | default(true) | bool))
+        fail_msg: >-
+          The OpenBao primary health check timed out: `bao status` in the primary
+          container ({{ svc07_openbao_primary_container_name }}) did not report
+          initialized:true and sealed:false within
+          {{ (svc07_health_retries | default(30) | int) * (svc07_health_delay | default(5) | int) }} seconds
+          on the primary guest. The primary publishes no host port by design;
+          this check reaches it via `docker exec` on the guest. Inspect the
+          primary container and re-run once it is unsealed and active.
+        success_msg: "OpenBao primary is healthy (initialized, unsealed, active)."
