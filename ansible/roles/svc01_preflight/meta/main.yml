@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: svc01_preflight
+  namespace: devinfra
+  author: Developer Services Platform
+  description: SVC-01 installer Phase 1 — preflight & environment validation for a per-project database.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

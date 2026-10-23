@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+{#
+  templates/pg_dump_backup.sh.j2 — postgres-server (SVC-01)
+  Nightly logical backup (pg_dump custom format -Fc). Runs on the guest via a
+  systemd timer. Writes to {{ postgres_backup_dir }} (included in the PBS LXC
+  backup), prunes dumps older than {{ postgres_backup_retention_days }} days. The
+  superuser password is read from the container's own env at runtime via
+  `docker exec`, never embedded here (no secret in this file).
+#}
+# MANAGED BY ANSIBLE (postgres-server) — DO NOT EDIT BY HAND.
+set -euo pipefail
+BACKUP_DIR="{{ postgres_backup_dir }}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+OUT="${BACKUP_DIR}/{{ postgres_db_name }}-${STAMP}.dump"
+mkdir -p "${BACKUP_DIR}"
+# pg_dump runs INSIDE the container (it owns the credentials via its env); -Fc is
+# the custom, consistent, non-blocking snapshot format (SVC-01 §6).
+docker exec {{ postgres_container_name }} \
+  pg_dump -U postgres -d {{ postgres_db_name }} -Fc > "${OUT}"
+# Prune dumps older than the retention window.
+find "${BACKUP_DIR}" -name '{{ postgres_db_name }}-*.dump' -type f \
+  -mtime +{{ postgres_backup_retention_days }} -delete
+echo "pg_dump backup written: ${OUT}"

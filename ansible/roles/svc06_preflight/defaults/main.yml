@@ -1,0 +1,25 @@
+---
+# defaults/main.yml — svc06_preflight (SVC-06 installer — Phase 1)
+#
+# Phase-1 phase-specific defaults. Cross-phase constants (cluster_env_file,
+# svc06_repo_root, svc06_venv_python, project_slug placeholders, etc.) are
+# play-level vars on svc-06-bootstrap.yml. NO secret here. Clone of
+# svc01_preflight/defaults.
+
+svc06_cluster_env_helper: scripts/installer/cluster_env.py
+svc06_autodetect_sentinel: "__AUTODETECT__"
+
+# Homelab Proxmox self-signed cert tolerance (governs both preflight uri + the
+# bpg/proxmox provider insecure setting via svc06_tf_env).
+svc06_proxmox_validate_certs: false
+
+svc06_required_collections:
+  - community.docker
+  - community.general
+  - ansible.posix
+  - community.crypto
+
+svc06_required_venv_binaries:
+  - "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+  - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+  - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-galaxy"

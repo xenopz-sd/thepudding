@@ -1,0 +1,10 @@
+---
+# defaults/main.yml — svc01_handoff (SVC-01 installer — Phase 4)
+#
+# Phase-4 health-gate knobs, consumed by svc01-health.yml (bridged via -e) and
+# the completion banner. NO secret here.
+
+svc01_postgres_container_name: "postgres-postgres-1"
+svc01_mariadb_container_name: "mariadb-mariadb-1"
+svc01_health_retries: 24
+svc01_health_delay: 5

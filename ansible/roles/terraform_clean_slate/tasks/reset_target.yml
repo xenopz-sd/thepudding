@@ -11,10 +11,14 @@
 - name: "Clean-slate | Assert target fields are all present (fail closed)"
   ansible.builtin.assert:
     that:
-      - clean_slate_target.terraform_root is defined and (clean_slate_target.terraform_root | string | trim) | length > 0
-      - clean_slate_target.resource_address is defined and (clean_slate_target.resource_address | string | trim) | length > 0
-      - clean_slate_target.node is defined and (clean_slate_target.node | string | trim) | length > 0
-      - clean_slate_target.vmid is defined and (clean_slate_target.vmid | string | trim) | length > 0
+      - clean_slate_target.terraform_root is defined
+        and (clean_slate_target.terraform_root | string | trim) | length > 0
+      - clean_slate_target.resource_address is defined
+        and (clean_slate_target.resource_address | string | trim) | length > 0
+      - clean_slate_target.node is defined
+        and (clean_slate_target.node | string | trim) | length > 0
+      - clean_slate_target.vmid is defined
+        and (clean_slate_target.vmid | string | trim) | length > 0
     fail_msg: >-
       Clean-slate target is incompletely specified — every entry needs
       terraform_root, resource_address, node, and vmid. Got:

@@ -144,7 +144,9 @@
 # ============================================================================
 # token_ttl and token_max_ttl must BOTH be <= 3600. Assert up front so a
 # misconfiguration fails before touching OpenBao.
-- name: "9.1 — Assert jwt token_ttl and token_max_ttl are both <= {{ openbao_project_jwt_token_ttl_ceiling }}s (Req 4.2)"
+- name: >-
+    9.1 — Assert jwt token_ttl and token_max_ttl are both
+    <= {{ openbao_project_jwt_token_ttl_ceiling }}s (Req 4.2)
   ansible.builtin.assert:
     that:
       - (openbao_project_jwt_token_ttl | int) > 0
@@ -381,8 +383,10 @@
 - name: "9.1 — Assert the stored jwt role honours the bound_claims + TTL contract (Req 4.2, 4.7)"
   ansible.builtin.assert:
     that:
-      - (openbao_jwt_role_verify.stdout | from_json).data.token_ttl | int <= (openbao_project_jwt_token_ttl_ceiling | int)
-      - (openbao_jwt_role_verify.stdout | from_json).data.token_max_ttl | int <= (openbao_project_jwt_token_ttl_ceiling | int)
+      - (openbao_jwt_role_verify.stdout | from_json).data.token_ttl | int
+        <= (openbao_project_jwt_token_ttl_ceiling | int)
+      - (openbao_jwt_role_verify.stdout | from_json).data.token_max_ttl | int
+        <= (openbao_project_jwt_token_ttl_ceiling | int)
       - (openbao_jwt_role_verify.stdout | from_json).data.bound_claims == openbao_jwt_bound_claims
       - openbao_project_policy_name in ((openbao_jwt_role_verify.stdout | from_json).data.token_policies | default([]))
       # ref_type / ref, when supplied, must be present in the stored bound_claims (Req 4.7)

@@ -1,0 +1,174 @@
+---
+# defaults/main.yml — zitadel-server (SVC-06)
+#
+# Deploys the shared ZITADEL identity provider as a Docker Compose stack via the
+# generic docker-compose-app role. ZITADEL is HTTP-exposed ONLY via Traefik
+# (SVC-09) — registered with Docker labels, never a published host port
+# (integration-boundaries §1). Its masterkey + backing-DB connection come from
+# OpenBao (SVC-07) at provision time via the `bao` CLI docker-exec pattern,
+# written to a 0600 secret env on the guest and layered onto the Compose stack
+# via docker-compose-app's `extra_env_files` — never the committed .env.
+# Spec: .kiro/specs/svc-06-identity-provider/.
+
+# --- Image pin (tech.md: never track `latest`) ---
+# ZITADEL requires PostgreSQL 14-18; the SVC-01 backing DB (postgres:17)
+# satisfies this. Pin a specific published v4 release tag — verified to exist on
+# ghcr (`docker manifest inspect`). v4.18.0 is the current stable v4 line; the
+# earlier v4.5.6 pin was never a published tag (live pull → "manifest unknown").
+zitadel_image: "ghcr.io/zitadel/zitadel:v4.18.0"
+
+# --- Compose stack identity (consumed by docker-compose-app) ---
+zitadel_stack_name: "zitadel"
+zitadel_container_name: "{{ zitadel_stack_name }}-zitadel-1"
+
+# --- Addressing (host IP computed by NET-00; set by the installer) ---
+# The ZITADEL guest's own VLAN-20 IP (host_index 5 -> 10.0.20.15). The role does
+# not bind a host port for HTTP (Traefik-only ingress), so this is used only for
+# the local health check and the metrics scrape target.
+zitadel_vlan_id: 20
+zitadel_host_index: 5
+zitadel_bind_ip: "10.0.{{ zitadel_vlan_id }}.{{ 10 + (zitadel_host_index | int) }}"
+
+# --- External endpoint (MUST match the Traefik-fronted public endpoint) ---
+# ZITADEL requires its configured external domain/port/TLS to match the actual
+# public endpoint EXACTLY, or redirect URIs + token issuance break (requirements
+# §6/§12). The platform domain is supplied per env; the issuer is
+# https://auth.<platform_domain>.
+zitadel_platform_domain: "platform.example.test"
+zitadel_external_domain: "auth.{{ zitadel_platform_domain }}"
+zitadel_external_port: 443
+# EXTERNALSECURE=true -> ZITADEL serves/links https. In dev with the self-signed
+# mock this is still true (the mock serves HTTPS); in prod Traefik terminates TLS.
+zitadel_external_secure: true
+
+# --- HTTP / gRPC ports (ZITADEL container-internal) ---
+zitadel_http_port: 8080
+zitadel_grpc_port: 8081
+
+# --- Backing database (an SVC-01 instance: project_slug=shared-zitadel) ---
+# These point ZITADEL's ZITADEL_DATABASE_POSTGRES_* env at the SVC-01 backing DB.
+# The host is the backing DB's computed VLAN-20 IP (host_index 4 -> 10.0.20.14).
+# The DB name + app role follow SVC-01's derivation (slug with hyphens -> under-
+# scores): shared-zitadel -> db `shared_zitadel`, role `shared_zitadel_app`.
+zitadel_db_slug: "shared-zitadel"
+zitadel_db_host_index: 4
+zitadel_db_host: "10.0.{{ zitadel_vlan_id }}.{{ 10 + (zitadel_db_host_index | int) }}"
+zitadel_db_port: 5432
+zitadel_db_name: "{{ zitadel_db_slug | regex_replace('-', '_') }}"
+zitadel_db_user: "{{ zitadel_db_slug | regex_replace('-', '_') }}_app"
+# ZITADEL also needs an admin/owner DB user for migrations; it reuses the SVC-01
+# superuser for first-init migrations only (ZITADEL splits "admin" vs "user" DB
+# roles). On this platform the SVC-01 app role owns its database, so ZITADEL's
+# admin + user DB identity are the same least-privilege app role.
+zitadel_db_admin_user: "{{ zitadel_db_user }}"
+
+# --- Traefik ingress labels (SVC-09; the only HTTP ingress path) ---
+# Registered via Docker labels, discovered by Traefik's docker provider. NO host
+# port is published for HTTP (integration-boundaries §1). ZITADEL speaks h2c
+# (HTTP/2 cleartext) internally; the loadbalancer scheme is h2c on 8080.
+zitadel_traefik_router: "zitadel"
+zitadel_traefik_network: "edge"
+
+# --- OpenBao (SVC-07) secret storage ---
+# The masterkey + DB password are read from / written to OpenBao under this path
+# via the `bao` CLI docker-exec pattern. The admin token is supplied in the role
+# ENVIRONMENT (OPENBAO_ADMIN_TOKEN), never on the argv.
+zitadel_openbao_addr: ""   # when empty, the OpenBao read/write is skipped (dev offline)
+zitadel_openbao_primary_container_name: "openbao-openbao-1"
+zitadel_openbao_bao_bin: "bao"
+zitadel_openbao_tls_skip_verify: true
+zitadel_openbao_kv_mount: "secret"
+zitadel_openbao_secret_path: "{{ zitadel_openbao_kv_mount }}/proj-{{ zitadel_db_slug }}/zitadel"
+
+# --- Provisioning service account + PAT (first-init mint; ADR-0016) ----------
+# A from-scratch bring-up obtains the ZITADEL management-API provisioning
+# credential automatically at first-init and stores it in OpenBao, so the
+# zitadel-org-provision role onboards the first org + OIDC app with NO
+# human-minted token (spec: svc06-org-provision-token-wiring). ZITADEL's
+# `FirstInstance.Org.Machine` block seeds a dedicated MACHINE (service) user and
+# writes its PAT to a mounted path during the setup phase of `start-from-init`
+# — ONCE, on the first init against an empty DB. These vars map onto the
+# ZITADEL_FIRSTINSTANCE_* env (non-secret config) in dca_env.
+#
+# Scope (ADR-0016): ZITADEL creates the FirstInstance machine user with the
+# instance-level IAM_OWNER role, and offers no narrower first-init grant;
+# org-CREATION itself requires an instance-level grant no narrower than
+# IAM_OWNER. The provisioning PAT is therefore IAM_OWNER-scoped by necessity
+# (Option A). Blast radius is bounded NOT by a narrower grant (none exists) but
+# by: a dedicated non-human machine user, a bounded PAT expiry, OpenBao-only
+# durable storage, no_log throughout, and the emit file scrubbed after capture.
+zitadel_provision_sa_username: "provision-sa"
+zitadel_provision_sa_name: "Provisioning Service Account"
+# Bounded Pat.ExpirationDate (ISO-8601, `2023-01-01T00:00:00Z` form). ~1y out by
+# default; shorten to narrow the blast-radius window of the IAM_OWNER PAT.
+zitadel_provision_pat_expiration: "2027-01-01T00:00:00Z"
+# The IN-CONTAINER path ZITADEL writes the PAT to (ZITADEL_FIRSTINSTANCE_PATPATH).
+zitadel_provision_pat_emit_path: "/machinekey/provision-sa.pat"
+# The GUEST directory mounted at the container's /machinekey dir so the role can
+# read the emitted PAT from the guest. Owned by the zitadel container uid.
+zitadel_provision_pat_host_dir: "/etc/zitadel/machinekey"
+# The OpenBao field at zitadel_openbao_secret_path that holds the provision token.
+zitadel_provision_token_field: "provision_token"
+# The `bao` CLI runs via `docker exec` against the SVC-07 PRIMARY's container,
+# which lives on the OpenBao guest (svc07-20-01) — NOT on the ZITADEL guest. The
+# bao tasks therefore delegate_to this host (same pattern as postgres-server's
+# OpenBao write). In the zitadel.yml child play the inventory holds only the
+# zitadel group, so this defaults to the known OpenBao guest hostname; the
+# installer can override it. BAO_ADDR is the primary's internal API endpoint.
+# Defaulted to the OpenBao primary's VLAN-20 IP (10.0.20.10) so `delegate_to`
+# resolves to a connectable address even when the child play's inventory holds
+# only the ZITADEL guest (ansible connects to the delegate by this name/address).
+zitadel_openbao_cli_host: "10.0.20.10"
+# BAO_ADDR as seen FROM INSIDE the OpenBao container's network namespace — the
+# container-local loopback, NOT the external VLAN address in zitadel_openbao_addr
+# (that is used only to gate the bao tasks and to select the delegate guest).
+# Inside the container the external 10.0.20.x:8200 refuses; the listener answers
+# on 127.0.0.1.
+zitadel_openbao_cli_bao_addr: "https://127.0.0.1:8200"
+
+# --- Runtime secret env on the guest (0600; layered via extra_env_files) ---
+# Carries ZITADEL_MASTERKEY + ZITADEL_DATABASE_POSTGRES_*_PASSWORD. NEVER the
+# committed docker-compose-app .env (that is non-secret config only).
+zitadel_secret_env_path: "/etc/zitadel/zitadel.secret.env"
+
+# --- Observability (requirements §13) ---
+zitadel_metrics_enabled: true
+
+# --- docker-compose-app reconciliation ---
+zitadel_state: "present"
+
+# ======================================================================
+# PERMANENT, DEFAULT-OFF MOCK STAND-INS (mock-stand-ins.md; the platform's
+# "proxies must stay" mandate). Both OFF by default; a conscious per-run
+# -e ...=true turns one on for dev/offline testing. Never on in prod.
+# ======================================================================
+
+# --- Mock 5: zitadel_tls_self_signed ---
+# When no real CA/Traefik cert is available (dev/offline, SVC-09 not deployed),
+# generate a self-signed cert on the CONTROL NODE and have ZITADEL serve HTTPS
+# directly so the OIDC endpoint is testable. OFF in acceptance/production, where
+# Traefik terminates TLS with a real (Let's Encrypt / EJBCA) cert. Clone of the
+# SVC-07 / SVC-09 self-signed-cert mock.
+zitadel_tls_self_signed: false
+zitadel_tls_dir: "/etc/zitadel/tls"
+zitadel_tls_host_dir: "/etc/zitadel/tls"
+zitadel_tls_cert_file: "{{ zitadel_tls_dir }}/zitadel.crt"
+zitadel_tls_key_file: "{{ zitadel_tls_dir }}/zitadel.key"
+zitadel_tls_self_signed_cn: "{{ zitadel_external_domain }}"
+zitadel_tls_self_signed_sans:
+  - "DNS:{{ zitadel_external_domain }}"
+  - "DNS:localhost"
+  - "IP:127.0.0.1"
+  - "IP:{{ zitadel_bind_ip }}"
+zitadel_tls_self_signed_valid_days: 825
+# container uid/gid ZITADEL runs as (the official image runs as uid 1000).
+zitadel_container_uid: "1000"
+zitadel_container_gid: "1000"
+
+# --- Mock 6: zitadel_mock_edge_network ---
+# When SVC-09/Traefik is NOT deployed on the target, create a LOCAL placeholder
+# `edge` Docker network so the Compose stack's `networks: ["edge"]` resolves and
+# the stack starts. OFF when the real Traefik owns `edge`. Clone of SVC-07's
+# openbao_mock_edge_network. NEVER enable alongside a real Traefik on the same
+# host.
+zitadel_mock_edge_network: false

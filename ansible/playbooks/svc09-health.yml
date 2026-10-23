@@ -1,0 +1,106 @@
+---
+# svc09-health.yml — SVC-09 installer Phase-4 health gate (CHILD configurator play)
+#
+# The child play the svc09_handoff role invokes via
+# `ansible-playbook -i {{ svc09_generated_inventory }} svc09-health.yml`
+# (integration-boundaries.md §4). Runs `hosts: traefik` NATIVELY on the Traefik
+# LXC — no delegate_to. The generated inventory's `traefik` group entry carries
+# `ansible_host: 10.0.20.10` / `ansible_user: root` over SSH.
+#
+# Two-stage recreate-robust gate (mirrors svc07-health.yml):
+#   Stage 1 — `docker inspect <container>`: wait for the Traefik container to
+#             EXIST and be RUNNING (State.Running true). A crash-loop on a bad
+#             static config shows up here as never-running. Mid-recreate rc!=0 /
+#             "No such container" is a RETRY, not a failure.
+#   Stage 2 — probe the `web` entrypoint on the guest localhost and assert
+#             Traefik answers with the HTTP->HTTPS redirect (301/308). This runs
+#             on the GUEST (not inside the container — the official Traefik image
+#             is scratch-based with no shell), using the guest's own Python via
+#             ansible.builtin.uri. It does NOT follow the redirect and does NOT
+#             hit HTTPS, so it needs NO CA trust — the health gate must not assume
+#             a real CA exists (self-signed TLS mock may be in use). The HTTPS
+#             side is validated end-to-end by the live acceptance, not here.
+#
+# Each `until` gate is EMPTY-SAFE (length>0 + first-char guard before from_json,
+# short-circuited). Both stages tolerate any rc / status; the explicit asserts
+# after the loops produce accurate diagnostics on timeout (Stage 1 asserted
+# first so a stuck-mid-recreate container is distinct from a running-but-not-
+# answering Traefik).
+#
+# Knob vars (svc09_traefik_container_name, svc09_traefik_tls_skip_verify,
+# svc09_health_retries, svc09_health_delay) come from svc09_handoff/defaults and
+# are passed via -e; referenced by name here, never redefined.
+- name: SVC-09 Traefik health gate
+  hosts: traefik
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    # Stage 1 — wait for the Traefik container to exist and be running
+    # (recreate-robust). Parse plain `docker inspect` JSON (array) rather than a
+    # Go-template format (which the command module would re-evaluate as Jinja).
+    # Empty-safe: length>0 + first-char '[' guard BEFORE from_json.
+    - name: "Health | Stage 1 — wait for the Traefik container to exist and be running"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ svc09_traefik_container_name }}"
+      register: svc09_traefik_container_running
+      failed_when: false
+      changed_when: false
+      until: >-
+        (svc09_traefik_container_running.rc | default(1)) == 0
+        and (svc09_traefik_container_running.stdout | default('') | trim | length > 0)
+        and ((svc09_traefik_container_running.stdout | trim)[0] == '[')
+        and ((svc09_traefik_container_running.stdout | from_json)[0].State.Running | default(false) | bool)
+      retries: "{{ svc09_health_retries | default(24) | int }}"
+      delay: "{{ svc09_health_delay | default(5) | int }}"
+
+    - name: "Health | Assert Stage 1 — the Traefik container became running within the deadline"
+      ansible.builtin.assert:
+        that: >-
+          (svc09_traefik_container_running.rc | default(1)) == 0
+          and (svc09_traefik_container_running.stdout | default('') | trim | length > 0)
+          and ((svc09_traefik_container_running.stdout | trim)[0] == '[')
+          and ((svc09_traefik_container_running.stdout | from_json)[0].State.Running | default(false) | bool)
+        fail_msg: >-
+          The Traefik container ({{ svc09_traefik_container_name }}) never became
+          running within
+          {{ (svc09_health_retries | default(24) | int) * (svc09_health_delay | default(5) | int) }} seconds
+          on the guest. A crash-loop here usually means a bad static traefik.yml
+          (or, with the TLS mock off and no CA, a fail-closed cert error).
+          Inspect `docker logs {{ svc09_traefik_container_name }}` on the guest.
+        success_msg: "Traefik container is running (Stage 1 gate passed)."
+
+    # Stage 2 — probe the web entrypoint on the guest localhost. Expect the
+    # HTTP->HTTPS redirect (FR-4). NO redirect follow, NO HTTPS -> NO CA trust
+    # needed (works under the self-signed TLS mock). status_code accepts the
+    # redirect codes; a connection failure (Traefik not listening) is a RETRY.
+    - name: "Health | Stage 2 — poll the web entrypoint for the HTTP->HTTPS redirect"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:80/"
+        method: GET
+        follow_redirects: none
+        validate_certs: false
+        status_code: [301, 302, 308]
+      register: svc09_web_redirect
+      failed_when: false
+      changed_when: false
+      until: >-
+        (svc09_web_redirect.status | default(0)) in [301, 302, 308]
+      retries: "{{ svc09_health_retries | default(24) | int }}"
+      delay: "{{ svc09_health_delay | default(5) | int }}"
+
+    - name: "Health | Assert Stage 2 — Traefik answers the web entrypoint with the HTTPS redirect"
+      ansible.builtin.assert:
+        that:
+          - "(svc09_web_redirect.status | default(0)) in [301, 302, 308]"
+        fail_msg: >-
+          Traefik did not answer the web entrypoint (http://127.0.0.1:80/) with an
+          HTTP->HTTPS redirect within
+          {{ (svc09_health_retries | default(24) | int) * (svc09_health_delay | default(5) | int) }} seconds.
+          The container is running (Stage 1 passed) but the `web` entrypoint is not
+          serving the redirect — check the entryPoints/redirect block in the
+          rendered traefik.yml and `docker logs {{ svc09_traefik_container_name }}`.
+        success_msg: "Traefik `web` entrypoint serves the HTTP->HTTPS redirect (Stage 2 gate passed)."

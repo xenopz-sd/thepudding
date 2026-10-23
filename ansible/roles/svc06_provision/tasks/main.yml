@@ -1,0 +1,302 @@
+---
+# tasks/main.yml — svc06_provision (SVC-06 installer — Phase 2: Provision)
+#
+# Phase-2 "Infrastructure provisioning" for ZITADEL. TWO applies, in order:
+#   A. The BACKING DB — a child svc-01-bootstrap run (project_slug=shared-zitadel)
+#      that provisions ZITADEL's dedicated PostgreSQL as an SVC-01 instance with
+#      its OWN isolated state (shared-zitadel-svc01-postgres). This preserves
+#      SVC-01's per-instance state isolation (design.md §3.3) — the DB is NOT a
+#      module block in the SVC-06 root.
+#   B. The ZITADEL LXC — a terraform apply of the svc-06-identity-provider root,
+#      with the backend swap-gate (GitLab vs local override) + per-service state
+#      name svc-06-identity-provider.
+# Then generate_inventory + add_host + known_hosts for the ZITADEL guest.
+#
+# NOTE (agent-live meta-guard): this role runs `terraform apply` + a child
+# destructive bootstrap but is LEAF-EXEMPT — the throwaway-guard consult is
+# carried UPSTREAM by svc06_preflight (and the child svc-01-bootstrap carries its
+# own guard in svc01_preflight).
+
+# ============================================================ #
+# A. BACKING DB — child svc-01-bootstrap (project_slug=shared-zitadel)          #
+# ============================================================ #
+# Runs the WHOLE SVC-01 installer as a child orchestration for the ZITADEL
+# backing DB, FIRST, so the DB exists + its app-role credential is in OpenBao
+# before ZITADEL starts. The agent-live interlock (AGENT_LIVE_AUTHORIZED) and the
+# OpenBao admin token are inherited via the child process ENV. no_log — the child
+# run output may carry secrets.
+- name: "Provisioning | Stand up the ZITADEL backing DB via a child svc-01-bootstrap (no_log)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - ansible/inventory/localhost.yml
+      - ansible/playbooks/svc-01-bootstrap.yml
+      - -e
+      - "cluster_env_file={{ cluster_env_file }}"
+      - -e
+      - "project_slug={{ svc06_db_project_slug }}"
+      - -e
+      - "vlan_id={{ svc06_db_vlan_id }}"
+      - -e
+      - "svc01_vmid={{ svc06_db_vmid }}"
+      - -e
+      - "host_index={{ svc06_db_host_index }}"
+      # Host_Index_Authority self-key (fix-vlan-host-index-collision, C9): the
+      # backing DB's own ledger row on VLAN 20 is (svc_code=svc01,
+      # component=shared-zitadel, host_index=4). Pass ledger_component so the
+      # SVC-01 root excludes exactly THIS guest's index 4 when deriving the VLAN-20
+      # peer set (and keeps svc07 .10/.11, svc09 .12, svc06 .15 as peers) — so the
+      # Guard-4 precondition can only fire on a genuine cross-guest collision.
+      - -e
+      - "ledger_component={{ svc06_db_ledger_component | default('shared-zitadel') }}"
+      - -e
+      - "tier={{ svc06_db_tier }}"
+      - -e
+      - "db_engine={{ svc06_db_engine }}"
+      - -e
+      - "app_subnet_cidr={{ svc06_db_app_subnet_cidr }}"
+      # ZITADEL is a CROSS-GUEST client of this backing DB: its start-from-init
+      # opens an admin connection to the `postgres` maintenance DB (needs CREATEDB
+      # + a non-TLS subnet pg_hba line while no SVC-08 cert exists). Enable the two
+      # default-OFF postgres-server opt-ins for THIS backing instance only
+      # (SVC-06 design §3.3). Generic SVC-01 projects leave both off.
+      - -e
+      - "postgres_app_role_createdb={{ svc06_db_app_role_createdb | default(true) }}"
+      - -e
+      - "postgres_client_nontls_subnet={{ svc06_db_client_nontls_subnet | default(true) }}"
+      - -e
+      - "openbao_addr={{ svc06_openbao_addr | default('') }}"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  environment:
+    # The agent-live interlock must propagate so the child's svc01_preflight
+    # throwaway-guard consult runs under the same authorization.
+    AGENT_LIVE_AUTHORIZED: "{{ lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED') | default('', true) }}"
+    OPENBAO_ADMIN_TOKEN: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+  register: svc06_db_bootstrap
+  changed_when: "'changed=0' not in (svc06_db_bootstrap.stdout | default(''))"
+  no_log: true
+
+# ============================================================ #
+# B. ZITADEL LXC — backend swap-gate + terraform apply                          #
+# ============================================================ #
+# --- Backend swap-gate selection (clone of svc01/svc07) ---------------------
+- name: "Provisioning | Read the cluster env file to detect the state-backend signal"
+  ansible.builtin.slurp:
+    src: "{{ svc06_repo_root }}/{{ cluster_env_file }}"
+  register: svc06_env_slurp
+  no_log: true
+
+- name: "Provisioning | Reduce the env file to KEY=VALUE lines"
+  ansible.builtin.set_fact:
+    svc06_env_pairs: >-
+      {{ (svc06_env_slurp.content | b64decode).splitlines()
+         | map('trim')
+         | reject('match', '^\s*#')
+         | select('search', '=')
+         | list }}
+  no_log: true
+
+- name: "Provisioning | Extract the set of env keys (names only, no values)"
+  ansible.builtin.set_fact:
+    svc06_env_keys: >-
+      {{ svc06_env_pairs | map('regex_replace', '^\s*([^=]+?)\s*=.*$', '\1') | list }}
+
+- name: "Provisioning | Decide the Terraform backend (swap gate)"
+  ansible.builtin.set_fact:
+    svc06_use_gitlab_backend: >-
+      {{ ('CI_API_V4_URL' in svc06_env_keys)
+         and ('CI_PROJECT_ID' in svc06_env_keys)
+         and ('CI_JOB_TOKEN' in svc06_env_keys) }}
+
+- name: "Provisioning | Extract GitLab CI state-backend values (GitLab backend only)"
+  ansible.builtin.set_fact:
+    svc06_env_ci_values: >-
+      {{ dict(svc06_env_keys | zip(
+           svc06_env_pairs
+           | map('regex_replace', '^[^=]+=\s*(.*?)\s*$', '\1')
+           | map('regex_replace', '^"(.*)"$', '\1')
+           | list)) }}
+  when: svc06_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Derive the GitLab state address + job token (GitLab backend only)"
+  ansible.builtin.set_fact:
+    svc06_env_gitlab_state_address: >-
+      {{ svc06_env_ci_values['CI_API_V4_URL'] }}/projects/{{
+         svc06_env_ci_values['CI_PROJECT_ID'] }}/terraform/state/svc-06-identity-provider
+    svc06_env_ci_job_token: "{{ svc06_env_ci_values['CI_JOB_TOKEN'] }}"
+  when: svc06_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Log the Terraform backend selection (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Terraform backend:
+      {{ 'GitLab HTTP state (svc-06-identity-provider) — the Cluster_Env_File '
+         ~ 'configures the GitLab CI state-backend variables'
+         if (svc06_use_gitlab_backend | bool)
+         else 'LOCAL (local_backend_override.tf) — solo/offline Developer-B default; '
+              ~ 'state svc-06-identity-provider' }}
+
+- name: "Provisioning | Ensure local_backend_override.tf is present (local backend)"
+  ansible.builtin.copy:
+    dest: "{{ svc06_tf_root }}/local_backend_override.tf"
+    mode: "0644"
+    content: |
+      # Local, gitignored state backend for a solo/offline apply — overrides the
+      # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+      terraform {
+        backend "local" {}
+      }
+  when: not (svc06_use_gitlab_backend | bool)
+
+- name: "Provisioning | Remove any local_backend_override.tf (GitLab HTTP backend)"
+  ansible.builtin.file:
+    path: "{{ svc06_tf_root }}/local_backend_override.tf"
+    state: absent
+  when: svc06_use_gitlab_backend | bool
+
+- name: "Provisioning | terraform init (local backend)"
+  ansible.builtin.command:
+    argv: [terraform, init, -input=false, -reconfigure]
+  args:
+    chdir: "{{ svc06_tf_root }}"
+  environment: "{{ svc06_tf_env }}"
+  register: svc06_tf_init_local
+  changed_when: true
+  when: not (svc06_use_gitlab_backend | bool)
+  no_log: true
+
+- name: "Provisioning | terraform init (GitLab HTTP backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+      - "-backend-config=address={{ svc06_env_gitlab_state_address }}"
+      - "-backend-config=lock_address={{ svc06_env_gitlab_state_address }}/lock"
+      - "-backend-config=unlock_address={{ svc06_env_gitlab_state_address }}/lock"
+      - -backend-config=username=gitlab-ci-token
+      - "-backend-config=password={{ svc06_env_ci_job_token }}"
+      - -backend-config=lock_method=POST
+      - -backend-config=unlock_method=DELETE
+      - -backend-config=retry_wait_min=5
+  args:
+    chdir: "{{ svc06_tf_root }}"
+  environment: "{{ svc06_tf_env }}"
+  register: svc06_tf_init_gitlab
+  changed_when: true
+  when: svc06_use_gitlab_backend | bool
+  no_log: true
+
+# --- guest-variable assembly + apply ----------------------------------------
+- name: "Provisioning | Assert all required guest variables are present (before apply)"
+  ansible.builtin.assert:
+    that:
+      - "svc06_proxmox_node_name is defined and (svc06_proxmox_node_name | trim | length > 0)"
+      - "svc06_template_file_id is defined and (svc06_template_file_id | trim | length > 0)"
+      - "svc06_datastore_id is defined and (svc06_datastore_id | trim | length > 0)"
+      - "svc06_datastore_id != svc06_autodetect_sentinel"
+      - "svc06_zitadel_vmid is defined and (svc06_zitadel_vmid | int) > 0"
+    fail_msg: >-
+      A required guest variable is absent; refusing `terraform apply`. Required:
+      proxmox_node_name, resolved template + datastore, svc06_zitadel_vmid (>0).
+    success_msg: "All required guest variables present; proceeding to terraform apply."
+
+# Bool/number vars: Terraform rejects Jinja's Python True/False (capitalized) for
+# bool inputs — `| string | lower` normalizes them (live-caught in SVC-01). The
+# ZITADEL root currently has no bool -var, but host_index/vmid are forwarded so
+# the computed IP + the inventory IP agree (SVC-01 live finding).
+- name: "Provisioning | terraform apply (ZITADEL LXC, non-interactive, auto-approve)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - apply
+      - -input=false
+      - -auto-approve
+      - "-var=proxmox_node_name={{ svc06_proxmox_node_name }}"
+      - "-var=zitadel_vmid={{ svc06_zitadel_vmid }}"
+      - "-var=zitadel_host_index={{ svc06_zitadel_host_index }}"
+      - "-var=zitadel_template_file_id={{ svc06_template_file_id }}"
+      - "-var=zitadel_datastore_id={{ svc06_datastore_id }}"
+      - "-var=platform_domain={{ svc06_platform_domain }}"
+  args:
+    chdir: "{{ svc06_tf_root }}"
+  environment: "{{ svc06_tf_env }}"
+  register: svc06_tf_apply
+  changed_when: "'0 added, 0 changed, 0 destroyed' not in svc06_tf_apply.stdout"
+  no_log: true
+
+# --- inventory generation + known_hosts (ZITADEL guest) ---------------------
+- name: "Provisioning | Generate the Ansible inventory from Terraform outputs"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc06_venv_python }}"
+      - ansible/inventory/generate_inventory.py
+      - --root
+      - infra/projects/svc-06-identity-provider
+      - --out
+      - "{{ svc06_generated_inventory }}"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  register: svc06_gen_inventory
+  changed_when: true
+
+- name: "Provisioning | Confirm the generated inventory file was written"
+  ansible.builtin.stat:
+    path: "{{ svc06_repo_root }}/{{ svc06_generated_inventory }}"
+  register: svc06_generated_inventory_stat
+
+- name: "Provisioning | Assert the generated inventory exists (else halt before Bootstrap)"
+  ansible.builtin.assert:
+    that:
+      - "svc06_generated_inventory_stat.stat.exists"
+    fail_msg: "generate_inventory.py did not produce {{ svc06_generated_inventory }}; halting before Bootstrap."
+    success_msg: "Generated inventory present: {{ svc06_generated_inventory }}."
+
+- name: "Provisioning | add_host the ZITADEL guest into the in-memory inventory"
+  ansible.builtin.add_host:
+    name: "svc06-20-01"
+    groups:
+      - zitadel
+    ansible_host: "10.0.20.{{ 10 + (svc06_zitadel_host_index | int) }}"
+    ansible_user: root
+    ansible_connection: ssh
+  changed_when: false
+
+- name: "Provisioning | Ensure ~/.ssh exists (0700)"
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+
+- name: "Provisioning | Remove stale known_hosts fingerprints for the ZITADEL IP"
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -R
+      - "10.0.20.{{ 10 + (svc06_zitadel_host_index | int) }}"
+      - -f
+      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
+  register: svc06_knownhosts_purge
+  changed_when: "'updated' in (svc06_knownhosts_purge.stderr | default(''))"
+  failed_when: false
+
+- name: "Provisioning | ssh-keyscan the ZITADEL IP (30s timeout)"
+  ansible.builtin.command:
+    argv: [ssh-keyscan, -T, "30", "10.0.20.{{ 10 + (svc06_zitadel_host_index | int) }}"]
+  register: svc06_keyscan
+  changed_when: false
+  failed_when: >-
+    svc06_keyscan.rc != 0 or (svc06_keyscan.stdout | default('') | trim | length == 0)
+
+- name: "Provisioning | Append current host keys to known_hosts"
+  ansible.builtin.blockinfile:
+    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+    create: true
+    mode: "0600"
+    marker: "# {mark} ANSIBLE MANAGED svc06-20-01"
+    block: "{{ svc06_keyscan.stdout }}"

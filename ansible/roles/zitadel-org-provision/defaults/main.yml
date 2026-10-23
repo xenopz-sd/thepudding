@@ -1,0 +1,81 @@
+---
+# defaults/main.yml — zitadel-org-provision (SVC-06)
+#
+# Idempotently onboards a platform project to ZITADEL SSO: create its
+# organization, default roles, and an OIDC application registration, via the
+# scripts/installer/zitadel_provision.py management-API helper (design.md §3.4,
+# FR-3). The helper is pure-Python/stdlib and idempotent (already-exists =
+# success); this role invokes it through the project venv python, captures the
+# returned OIDC client secrets, and writes them to OpenBao (SVC-07) via the `bao`
+# CLI docker-exec pattern — never a committed .env (integration-boundaries §2).
+
+# --- The project being onboarded ---
+# The platform project slug -> ZITADEL organization name `proj-<slug>`
+# (requirements §4). Supplied per onboarding run.
+zop_project_slug: ""
+zop_org_name: "proj-{{ zop_project_slug }}"
+zop_project_name: "{{ zop_project_slug }}"
+# The OIDC application registered for the project (one app proves the pattern;
+# more are added by extending this list per consumer in a later increment).
+zop_app_name: "{{ zop_project_slug }}-webapp"
+zop_redirect_uris:
+  - "https://{{ zop_project_slug }}.{{ zop_platform_domain }}/oauth/callback"
+zop_roles:
+  - admin
+  - member
+  - viewer
+
+# --- ZITADEL endpoint ---
+zop_platform_domain: "platform.example.test"
+zop_base_url: "https://auth.{{ zop_platform_domain }}"
+
+# --- The provisioning helper (invoked via the project venv python) ---
+zop_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+zop_provision_helper: "scripts/installer/zitadel_provision.py"
+zop_repo_root: "{{ playbook_dir | dirname | dirname }}"
+
+# --- OpenBao (SVC-07) secret storage for the captured OIDC client secret ---
+# The service-account access token the helper authenticates with is read from
+# the ZITADEL_PROVISION_TOKEN env var (NEVER argv) — this role sources it from
+# OpenBao / the environment and passes it in the child-process ENV. The captured
+# client secret is written to OpenBao under secret/proj-<slug>/zitadel/oidc/<app>.
+zop_openbao_addr: ""   # when empty, the OpenBao write is skipped (dev offline)
+zop_openbao_primary_container_name: "openbao-openbao-1"
+zop_openbao_bao_bin: "bao"
+zop_openbao_tls_skip_verify: true
+zop_openbao_kv_mount: "secret"
+zop_openbao_oidc_secret_path: "{{ zop_openbao_kv_mount }}/proj-{{ zop_project_slug }}/zitadel/oidc/{{ zop_app_name }}"
+
+# --- Provisioning token source: OpenBao by default, env override preserved ----
+# The ZITADEL management-API provisioning token is obtained automatically at
+# first-init by the zitadel-server role and stored at the shared-zitadel KV path
+# field `provision_token` (spec: svc06-org-provision-token-wiring, ADR-0016).
+# This role reads it from OpenBao when ZITADEL_PROVISION_TOKEN is empty, and
+# prefers the env override when it is set (manual/CI path). These vars mirror
+# zitadel-server's delegated `bao`-CLI docker-exec read so the same OpenBao
+# source answers from an inventory that holds only localhost.
+zop_openbao_provision_secret_path: "{{ zop_openbao_kv_mount }}/proj-shared-zitadel/zitadel"
+zop_openbao_provision_token_field: "provision_token"
+zop_openbao_cli_host: "10.0.20.10"
+zop_openbao_cli_bao_addr: "https://127.0.0.1:8200"
+zop_openbao_cli_user: "root"
+zop_openbao_cli_python: "/usr/bin/python3"
+
+# --- Dev/mock transport (Traefik-less path) ----------------------------------
+# PRODUCTION: zop_base_url is the Traefik-fronted https://auth.<domain> and the
+# helper runs on the control node reaching ZITADEL through Traefik (SVC-09).
+# DEV/MOCK (no Traefik): ZITADEL publishes NO host port (integration-boundaries
+# §1) — its mgmt API is reachable only at the CONTAINER's own IP:8080 on the
+# `edge` network, from the GUEST. When zop_zitadel_guest_host is set, the role
+# resolves the container IP ON THE GUEST and runs the helper THERE (guest
+# python3), targeting http://<container-ip>:8080 while presenting the
+# external-domain Host header (exactly as svc06-health.yml does). This mirrors
+# the dev path; the token still travels in the child ENV, never argv.
+zop_zitadel_guest_host: ""     # empty -> production Traefik path (run on control node)
+zop_zitadel_container_name: "zitadel-zitadel-1"
+zop_zitadel_http_port: 8080
+zop_zitadel_host_header: "auth.{{ zop_platform_domain }}"
+# Where the stdlib helper is staged on the guest for the dev-path run.
+zop_guest_helper_path: "/tmp/zitadel_provision.py"
+zop_guest_python: "/usr/bin/python3"
+zop_zitadel_guest_ssh_user: "root"

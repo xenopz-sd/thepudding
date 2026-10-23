@@ -1,0 +1,116 @@
+---
+# defaults/main.yml — traefik_install (SVC-09)
+#
+# Installs and configures the shared Traefik reverse proxy / TLS-termination
+# edge (SVC-09) on a Proxmox LXC as a Docker Compose stack, via the generic
+# docker-compose-app role. Templates the static traefik.yml, pins the image,
+# creates and OWNS the real external `edge` Docker network every HTTP service
+# attaches to, and performs an idempotent version-checked install.
+#
+# Spec: .kiro/specs/svc-09-reverse-proxy/ (requirements.md, design.md).
+# Mock stand-ins (self-signed TLS, dashboard-auth-off) are defined here as
+# default-OFF flags and implemented in tasks/ per .kiro/steering/mock-stand-ins.md.
+
+# --- Image pin (tech.md: never track `latest`) ---
+# traefik:v3.6 per the SVC-09 requirements doc §3 (upstream stable is higher;
+# pinned deliberately and flagged in the PR — bump is a conscious follow-up).
+traefik_image: "traefik:v3.6"
+
+# --- Compose stack identity (consumed by docker-compose-app) ---
+traefik_stack_name: "traefik"
+traefik_container_name: "{{ traefik_stack_name }}-traefik-1"
+
+# --- Config / data locations on the target guest ---
+# The static traefik.yml and the dynamic file-provider dir live under here; the
+# acme.json cert store is a Docker NAMED VOLUME (persistent, never tmpfs) that
+# Ansible NEVER writes to (only Traefik itself writes acme.json), so certificates
+# survive playbook re-runs and container restarts (SVC-09 §9 idempotency rule).
+traefik_config_dir: "/etc/traefik"
+traefik_static_config_file: "{{ traefik_config_dir }}/traefik.yml"
+traefik_dynamic_config_dir: "{{ traefik_config_dir }}/dynamic"
+traefik_acme_volume: "traefik-acme"       # named volume -> /acme (holds acme.json)
+traefik_acme_mount: "/acme"
+
+# --- Entrypoints (SVC-09 FR-5) ---
+# web (:80) + websecure (:443) are the external entrypoints; `metrics` is an
+# internal-only entrypoint Prometheus (SVC-17) scrapes — NOT on the public
+# entrypoints (SVC-09 §13).
+traefik_entrypoint_web_port: 80
+traefik_entrypoint_websecure_port: 443
+traefik_entrypoint_metrics_port: 8082
+
+# --- Docker provider (SVC-09 FR-1) ---
+# exposedByDefault:false so a container must opt in with traefik.enable=true; the
+# Docker socket is mounted READ-ONLY (SVC-09 §12) — Traefik observes labels only.
+traefik_docker_socket: "/var/run/docker.sock"
+traefik_exposed_by_default: false
+
+# --- Platform domain (non-secret) used to build router Host() rules + the
+#     internal dashboard hostname. Supplied per env; placeholder default. ---
+traefik_platform_domain: "platform.example.test"
+
+# --- Let's Encrypt / ACME (SVC-09 FR-2) ---
+# The public cert resolver. Non-secret contact e-mail; the DNS-01 provider token
+# (if used) is a day-2 secret fetched from OpenBao, never defaulted here. When
+# no CA is reachable, the self-signed TLS mock below is the interim path.
+traefik_letsencrypt_email: ""
+traefik_acme_storage: "{{ traefik_acme_mount }}/acme.json"
+
+# --- Logging (composition-wiring.md: INFO to stdout; JSON access logs) ---
+traefik_log_level: "INFO"
+traefik_access_log_format: "json"
+
+# =============================================================================
+# MOCK STAND-INS (per .kiro/steering/mock-stand-ins.md) — PERMANENT, DEFAULT OFF
+# -----------------------------------------------------------------------------
+# These are opt-in development/debugging/learning affordances, NOT transitional
+# debt. Production leaves them false and uses the real dependency (SVC-08/EJBCA +
+# Let's Encrypt for TLS, SVC-06/ZITADEL for dashboard forward-auth). They stay in
+# the codebase indefinitely so Traefik can come up and be validated before those
+# dependencies exist, or to isolate a fault. Implemented in tasks (Task 4).
+# =============================================================================
+
+# --- Mock 3: self-signed TLS cert (stand-in for SVC-08/EJBCA + Let's Encrypt) ---
+# When true, generate an internal self-signed cert on the CONTROL NODE
+# (community.crypto, exactly like SVC-07's tls_self_signed.yml) and configure a
+# Traefik file-provider default cert so `websecure` serves it before any CA
+# exists. Default FALSE: production uses the real letsencrypt/EJBCA resolver.
+# Clients must use validate_certs:false against a mock-cert listener (no trust
+# chain). Idempotent (stat-the-target, skip if present — no restart churn).
+traefik_tls_self_signed: false
+traefik_tls_self_signed_cn: "{{ traefik_platform_domain }}"
+# SANs a faithful stand-in for what EJBCA/Let's Encrypt would issue: the Traefik
+# host rules this edge serves, its own hostname, localhost, and the VLAN-20 IP.
+traefik_tls_self_signed_sans:
+  - "DNS:{{ traefik_platform_domain }}"
+  - "DNS:*.{{ traefik_platform_domain }}"
+  - "DNS:traefik.{{ traefik_platform_domain }}"
+  - "DNS:svc09-20-01"
+  - "DNS:localhost"
+  - "IP:10.0.20.10"
+  - "IP:127.0.0.1"
+traefik_tls_self_signed_valid_days: 825
+# Where the mock cert/key are placed on the guest (bind-mounted :ro into the
+# container and referenced by the file provider). Production drops a real cert at
+# the same path and leaves the flag false — nothing else changes.
+traefik_tls_host_dir: "{{ traefik_config_dir }}/tls"
+traefik_tls_cert_file: "{{ traefik_tls_host_dir }}/traefik-cert.pem"
+traefik_tls_key_file: "{{ traefik_tls_host_dir }}/traefik-key.pem"
+
+# --- Mock 4: dashboard forward-auth disabled (stand-in for SVC-06/ZITADEL) ---
+# When true, the dashboard router is bound to an INTERNAL-ONLY route with the
+# ZITADEL forward-auth middleware wired but inert (SVC-06 not deployed yet),
+# NEVER an anonymous :8080 (SVC-09 FR-6/FR-10). Default FALSE: once SVC-06 exists
+# the forward-auth middleware is active and required. The dashboard is never
+# exposed on a raw host port in either mode.
+traefik_dashboard_auth_disabled: false
+# The internal dashboard hostname (Host() rule). Reached via the internal route
+# only; the forward-auth middleware (real once SVC-06 lands) protects it.
+traefik_dashboard_host: "traefik.{{ traefik_platform_domain }}"
+# The ZITADEL forward-auth endpoint the middleware calls once SVC-06 is live.
+# Empty until then; when empty AND the mock is off, the dashboard router fails
+# closed at render (never silently anonymous).
+traefik_dashboard_forward_auth_address: ""
+
+# --- Reconciliation ---
+traefik_state: "present"

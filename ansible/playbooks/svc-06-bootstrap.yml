@@ -1,0 +1,137 @@
+---
+# svc-06-bootstrap.yml — SVC-06 (ZITADEL) Automated Service Installer.
+# Spec: .kiro/specs/svc-06-identity-provider/ (requirements.md, design.md, tasks.md).
+#
+# THIN ORCHESTRATOR: a Day-0 orchestrator for the shared ZITADEL identity
+# provider. Drives five roles, each in a per-phase block/rescue:
+#   svc06_clean_slate (reset branch) / svc06_preflight / svc06_provision /
+#   svc06_bootstrap / svc06_handoff.
+# svc06_provision stands up the BACKING DB (a child svc-01-bootstrap run,
+# project_slug=shared-zitadel) BEFORE the ZITADEL LXC apply (design.md §3.3).
+#
+# Developer B entry point (service-installer.md §2):
+#   ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/svc-06-bootstrap.yml \
+#     -e cluster_env_file=cluster.dev.env \
+#     -e svc06_zitadel_vmid=1103
+#   (dev/offline, no Traefik yet: add -e zitadel_tls_self_signed=true
+#    -e zitadel_mock_edge_network=true)
+#
+# Clean-slate reset:
+#   ... -e clean_slate=true -e clean_slate_confirm=force \
+#       -e svc06_zitadel_vmid=1103 -e svc06_proxmox_host=<real-proxmox-lan-ip>
+- name: SVC-06 (ZITADEL) automated installer — Day-0 orchestrator
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  any_errors_fatal: true
+  vars:
+    # --- PlayLevelVars — cross-role constants only. ---
+    cluster_env_file: cluster.env
+    svc06_repo_root: "{{ playbook_dir | dirname | dirname }}"
+    svc06_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+    svc06_generated_inventory: ansible/inventory/svc-06-identity-provider.generated.yml
+
+    # --- ZITADEL guest identity (svc06_zitadel_vmid REQUIRED via -e). ---
+    svc06_zitadel_vmid: 0
+    svc06_platform_domain: platform.example.test
+
+    # --- Permanent default-off mocks (dev/offline when SVC-09 is absent). ---
+    zitadel_tls_self_signed: false
+    zitadel_mock_edge_network: false
+
+    # --- OpenBao credential storage (the credential-handoff medium). ---
+    # Defaults to the OpenBao (SVC-07) primary's VLAN-20 address (NET-00 host_index
+    # 0 -> 10.0.20.10) so a STANDARD bring-up WIRES the credential handoff by
+    # default: svc06_provision forwards this as `openbao_addr` to the backing-DB
+    # child (SVC-01's write gate) and svc06_bootstrap forwards it as
+    # `zitadel_openbao_addr` to the zitadel.yml run (ZITADEL's read gate) — so the
+    # SAME OpenBao source satisfies BOTH gates and the same app_password flows
+    # writer -> OpenBao -> reader end-to-end. (Before this fix it defaulted to ""
+    # which DISABLED the whole handoff: SVC-01 ALTERed a random password that
+    # ZITADEL never received -> SQLSTATE 28P01 crash loop — see spec
+    # fix-svc06-zitadel-db-app-password-mismatch.) Override to "" ONLY for a
+    # deliberate dev/offline run with an explicit zitadel_db_password_override.
+    svc06_openbao_addr: "10.0.20.10"
+
+    # --- Clean-slate reset controls (off by default). ---
+    clean_slate: false
+    clean_slate_confirm: ""
+
+    # --- Agent Live-Test Authorization (from AGENT_LIVE_AUTHORIZED env). ---
+    agent_live_run: "{{ (lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') | trim) | length > 0 }}"
+    svc06_throwaway_guard: scripts/installer/throwaway_guard.py
+    svc06_throwaway_allowlist: scripts/installer/throwaway-clusters.yml
+
+  tasks:
+    # === Clean-Slate branch — runs ONLY when clean_slate is truthy. ===
+    - name: Clean-Slate reset
+      when: clean_slate | default(false) | bool
+      block:
+        - name: "Clean-Slate | Run the svc06_clean_slate role"
+          ansible.builtin.import_role:
+            name: svc06_clean_slate
+      rescue:
+        - name: Report Clean-Slate reset failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-06 installer FAILED during the Clean-Slate reset:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # === Normal install path — Phases 1→4, skipped entirely on clean_slate. ===
+    - name: "Phase 1 — Preflight & environment validation"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Preflight | Run the svc06_preflight role"
+          ansible.builtin.import_role:
+            name: svc06_preflight
+      rescue:
+        - name: Report Phase 1 (Preflight) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-06 installer FAILED in Phase 1 (Preflight & environment validation):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 2 — Infrastructure provisioning (backing DB + ZITADEL LXC)"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Provisioning | Run the svc06_provision role"
+          ansible.builtin.import_role:
+            name: svc06_provision
+      rescue:
+        - name: Report Phase 2 (Provisioning) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-06 installer FAILED in Phase 2 (Infrastructure provisioning):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 3 — Host hardening & service bootstrap"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Bootstrap | Run the svc06_bootstrap role"
+          ansible.builtin.import_role:
+            name: svc06_bootstrap
+      rescue:
+        - name: Report Phase 3 (Bootstrap) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-06 installer FAILED in Phase 3 (Host hardening & service bootstrap):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 4 — Health sanity & Developer B handoff"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Handoff | Run the svc06_handoff role"
+          ansible.builtin.import_role:
+            name: svc06_handoff
+      rescue:
+        - name: Report Phase 4 (Handoff) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-06 installer FAILED in Phase 4 (Health sanity & handoff):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}

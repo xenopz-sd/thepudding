@@ -80,6 +80,39 @@ variable "host_index" {
   }
 }
 
+variable "peer_host_indices" {
+  description = <<-EOT
+    The set of OTHER host indices already allocated on THIS guest's VLAN —
+    every host_index on this VLAN except this guest's own. Supplied by the
+    calling root from the committed per-VLAN host-index ledger
+    (infra/platform-foundation/host-indices.yaml, the Host_Index_Authority),
+    which is the single source of truth for within-VLAN host-index allocation
+    across independent Terraform roots (a shared VLAN such as 20, or a project
+    VLAN carrying more than one service root).
+
+    Used by the plan-time precondition in preconditions.tf (Guard 4) to detect
+    a within-VLAN host-index collision — two guests on one VLAN computing the
+    same cidrhost("10.0.<vlan_id>.0/24", 10 + host_index) address — and FAIL AT
+    PLAN TIME before any Proxmox resource is created (Requirement 1.2).
+
+    Defaults to an empty list, which is a strict no-op: a single-guest root (or
+    a root that is the sole occupant of its VLAN) passes nothing and applies
+    exactly as before (backward-compatible, Requirement 1.2 backward-compat).
+  EOT
+  type        = list(number)
+  default     = []
+
+  validation {
+    # Pure-input RANGE guard only: every supplied peer index is a zero-based
+    # position and must be >= 0, mirroring host_index's own validation
+    # (Requirement 2.3). Set-level collision detection against var.host_index
+    # is a cross-value check and lives in the preconditions.tf Guard 4, not
+    # here (validation blocks cannot reference other variables).
+    condition     = alltrue([for i in var.peer_host_indices : i >= 0])
+    error_message = "peer_host_indices entries are zero-based positions and must each be >= 0 (Requirement 2.3)."
+  }
+}
+
 variable "instance" {
   description = <<-EOT
     Zero-padded two-digit replica counter for the hostname

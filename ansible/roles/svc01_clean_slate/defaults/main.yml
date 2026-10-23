@@ -1,0 +1,12 @@
+---
+# defaults/main.yml — svc01_clean_slate (SVC-01 installer — clean-slate branch)
+#
+# Cross-phase constants (clean_slate, clean_slate_confirm, cluster_env_file,
+# svc01_repo_root, svc01_venv_python, svc01_tf_root, svc01_cluster_env_helper,
+# svc01_vmid, project_slug) stay play-level. NO secret here.
+
+# Proxmox host SSH address for the reset path (pct runs on the node). Supply the
+# real LAN IP with -e svc01_proxmox_host=<real-proxmox-lan-ip>. Fail-fast if a
+# reset is requested without it. Not needed on the normal install path.
+svc01_proxmox_host: ""
+svc01_proxmox_host_inventory: ansible/inventory/proxmox-hosts.yml

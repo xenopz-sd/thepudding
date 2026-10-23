@@ -48,7 +48,9 @@
     mode: "0755"
   when: openbao_prometheus_enabled | bool
 
-- name: "10.1 — Render the OpenBao Prometheus scrape config (job openbao <= 30 s + openbao_unsealer target, Req 10.2/10.3)"
+- name: >-
+    10.1 — Render the OpenBao Prometheus scrape config
+    (job openbao <= 30 s + openbao_unsealer target, Req 10.2/10.3)
   ansible.builtin.template:
     src: "prometheus-openbao.yml.j2"
     dest: "{{ openbao_prometheus_scrape_config_file }}"

@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: svc01_bootstrap
+  namespace: devinfra
+  author: Developer Services Platform
+  description: SVC-01 installer Phase 3 — common baseline + postgres.yml configurator run (engine-selected).
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

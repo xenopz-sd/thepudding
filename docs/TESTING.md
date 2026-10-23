@@ -37,7 +37,17 @@ its own**.
 
 ---
 
-## Offline tests (no cluster, no CI)
+## Offline tests (no cluster)
+
+> **In CI:** this offline suite is also the automated merge gate. On every merge
+> request targeting `main` (and on `main` after merge) `.gitlab-ci.yml` runs the
+> same checks — the pytest roots, `yamllint`, `ansible-playbook --syntax-check`,
+> and `terraform fmt`/`validate` — so a green pipeline is the offline gate. The
+> commands below are the local equivalents; running them reproduces what CI runs.
+> The authoritative conventions behind the gate (the separate-invocation rule, the
+> offline-by-construction default, the two known-non-defect meta-tests) live in
+> `.kiro/steering/testing-strategy.md` → "Offline gate — how CI runs it"; the
+> pipeline spec is `.kiro/specs/ci-offline-test-pipeline/`.
 
 ### Prerequisites
 
@@ -48,36 +58,59 @@ absolute path rather than relying on shell activation.
 
 ### Run the offline suite
 
+The repository has **four** pytest roots, each shipping its own
+`sys.path`-injecting `conftest.py`. Two of them (`ansible/inventory/tests` and
+`infra/platform-foundation/scripts/tests`) resolve to the same `tests.conftest`
+module name, so collecting all four in ONE `pytest` command raises
+`ImportPathMismatchError`. Run each root as its **own** invocation — this is what
+the CI gate does (one job per root), and why there is no single "run everything"
+command:
+
 <!-- doctest: offline -->
 <!-- cwd: . -->
 ```bash
-PYTHONPATH=infra/platform-foundation/scripts \
-  ~/venv/devinfra/bin/pytest \
-  infra/platform-foundation/scripts/tests/ infra/tests/ -q
+~/venv/devinfra/bin/pytest infra/tests -q
+~/venv/devinfra/bin/pytest tests/installer -q
+~/venv/devinfra/bin/pytest ansible/inventory/tests -q
+~/venv/devinfra/bin/pytest infra/platform-foundation/scripts/tests -q
 ```
 
 **What it covers:**
 
-- the pure-Python VLAN/CIDR/host-IP/hostname **derivation layer**;
-- the **Hypothesis property tests** for those formulas;
-- the **onboarding-script** tests (`onboard_project.py`);
+- the pure-Python VLAN/CIDR/host-IP/hostname **derivation layer** + its
+  **Hypothesis property tests**, and the **onboarding-script** tests;
 - the **static IaC-shape** tests over the Terraform sources;
-- the **offline `terraform fmt`/`validate`/`plan`** checks — these are gated on a
+- the **installer** drift-guards, swap-gate, secret-hygiene and agent-live-wiring
+  tests (`tests/installer`);
+- the **offline `terraform fmt`/`validate`/`plan`** checks — gated on a
   `terraform` binary and **skip cleanly** when it is absent, so the suite stays
   green on a machine with no Terraform installed.
 
-**Expected result shape:** the terraform-gated tests skip when no `terraform`
-binary is present, so a machine without Terraform sees a mix of passes and skips.
-The latest known-good run was **139 passed, 7 skipped**. A run with a `terraform`
-binary present will convert some of those skips into passes.
+**Offline by construction:** the live tier is `requires_infra`-marked and
+deselected by default (`addopts = -m "not requires_infra"` in `pytest.ini`), so
+none of the commands above touch a cluster even with a live `.env` loaded.
+
+**On a feature branch** two `infra/tests` meta-tests
+(`test_git_diff_scope_guard` and
+`TestPreExistingSuiteBaseline::test_no_pre_existing_test_fails`) fail *by
+construction* on any non-documentation branch — the CI gate deselects exactly
+those two on MR pipelines and runs the full suite on `main`. To mirror that
+locally on a feature branch, add `-k "not scope_guard"` (and deselect the
+preservation-baseline test) to the `infra/tests` command. See
+`.kiro/steering/testing-strategy.md` → "Offline gate — how CI runs it".
 
 ### Offline Terraform format / validate / plan loop
 
 `terraform fmt -recursive` is repo-wide, but `init` and `validate` act on a
 **single root module** and are **not recursive** — run them **from inside each
-Terraform root**, once per root. The two roots are `infra/platform-foundation/`
-and `infra/projects/_TEMPLATE/`. Use `init -backend=false` so `validate` can
-install provider schemas without ever touching the GitLab-managed remote state.
+Terraform root**, once per root. The roots are `infra/platform-foundation/`,
+`infra/projects/_TEMPLATE/`, and one per implemented service
+(`infra/projects/svc-01-sql-database/`, `svc-06-identity-provider/`,
+`svc-07-secrets-manager/`, `svc-09-reverse-proxy/`). The CI gate's
+`terraform:fmt-validate` job loops all of them; locally, run the two foundation
+roots below and the service roots the same way. Use `init -backend=false` so
+`validate` installs provider schemas without ever touching the GitLab-managed
+remote state.
 
 Formatting check (repo-wide, from the repo root):
 
@@ -123,6 +156,15 @@ These tests run real `terraform apply`/`destroy` against a Proxmox SDN cluster a
 prove the foundation + project roots provision, coexist with distinct VLANs,
 isolate on `terraform destroy`, and fail correctly when the `SDN.Allocate`
 privilege is missing.
+
+> **Beyond SVC-07.** This walkthrough uses SVC-07 as the reference live/acceptance
+> path. The other implemented services (SVC-01 PostgreSQL, SVC-06 ZITADEL, SVC-09
+> Traefik) each ship their own provision-then-test walkthrough in their
+> `INSTALL-RUNBOOK.md` and their own `requires-infra`/health acceptance — including
+> SVC-06's **zero-human-token** org-provision mint (the provisioning PAT is minted
+> at ZITADEL first-init and stored in OpenBao; see
+> [`svc06-org-provision-token-wiring`](../.kiro/specs/svc06-org-provision-token-wiring/validation.md)).
+> They follow the same interlock + throwaway-guard rules as the SVC-07 tier below.
 
 ## Provision-then-test: the whole path in order
 
@@ -305,12 +347,15 @@ simply never touches them rather than accidentally running them.
 
 ## What actually needs GitLab/CI (and what doesn't)
 
-Neither test tier requires CI. Two *operational workflows* involve GitLab, and
-they are frequently confused with the test tiers — they are separate concerns:
+Neither test tier *requires* CI **to run** — you can run both locally. The
+distinction below is about what a check *depends on*, not where it executes. (The
+offline tier does ALSO run automatically as the CI merge gate — see the "In CI"
+note under [Offline tests](#offline-tests-no-cluster) — but that gate just runs
+the same local commands; it is not a precondition for running them.)
 
 | Concern | Involves GitLab/CI? | Offline / no-CI alternative |
 |---|---|---|
-| **Offline tests** | No | — (already offline) |
+| **Offline tests** | Runs locally AND as the CI merge gate | Run the per-root commands locally — identical to what CI runs |
 | **Live / acceptance tests** | No | Local `.env` + ephemeral cluster |
 | **Project-onboarding MR flow** (`onboard_project.py` *without* `--no-mr`) | Yes — opens a real GitLab merge request | Use `--no-mr` to allocate + append locally and open **no** MR |
 | **Terraform state backend** | Yes — GitLab-managed HTTP state (`terraform init` with `-backend-config`) | Use `terraform init -backend=false` for offline fmt/validate/plan |
@@ -946,6 +991,9 @@ depends on the current registry contents.**
 | [root `README.md`](./README.md) | Quick start, prerequisites, the network topology, and the onboarding flow. |
 | [`infra/platform-foundation/README.md`](../infra/platform-foundation/README.md) | The shared foundation root: Terraform workflow, offline vs. requires-infra tiers, and the full onboarding sequence. |
 | [`infra/projects/_TEMPLATE/README.md`](../infra/projects/_TEMPLATE/README.md) | The per-project Terraform root template. |
+| [SVC-07 install runbook](../infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md) | The reference provision-then-test walkthrough (OpenBao primary + Transit unsealer), consumed by the SVC-07 live-test steps above. |
+| [SVC-06 install runbook](../infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md) | ZITADEL bring-up incl. the zero-human-token org-provision mint (the provisioning PAT is minted at first-init and stored in OpenBao; §A.2). |
+| [SVC-01](../infra/projects/svc-01-sql-database/INSTALL-RUNBOOK.md) / [SVC-09](../infra/projects/svc-09-reverse-proxy/INSTALL-RUNBOOK.md) install runbooks | The other implemented services' provision-then-test walkthroughs (PostgreSQL; Traefik reverse proxy). |
 | `.kiro/specs/<feature>/validation.md` | Per-feature requirement→evidence maps and test-execution results. |
 | [`.kiro/steering/testing-strategy.md`](../.kiro/steering/testing-strategy.md) | The authoritative testing-requirements policy (categories, coverage, determinism). |
 | [`.kiro/steering/documentation-testing.md`](../.kiro/steering/documentation-testing.md) | The doctest tier annotations (`offline` / `requires-infra` / `display-only`) used throughout these docs. |

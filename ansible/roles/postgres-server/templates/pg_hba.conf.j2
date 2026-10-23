@@ -1,0 +1,31 @@
+{#
+  templates/pg_hba.conf.j2 — postgres-server (SVC-01)
+  Restrict connections to localhost + the project's own subnet; require TLS for
+  any non-localhost connection (SVC-01 §12). No secret here.
+#}
+# MANAGED BY ANSIBLE (postgres-server) — DO NOT EDIT BY HAND.
+# SVC-01 pg_hba for project {{ postgres_project_slug }} (VLAN {{ postgres_vlan_id }}).
+# TYPE  DATABASE  USER  ADDRESS                              METHOD
+# Local UNIX-socket connections use `trust`: the socket lives inside the
+# container and is reachable only by in-container processes (filesystem-guarded),
+# and the installer's idempotent DDL (CREATE DATABASE / CREATE ROLE) runs as the
+# superuser over THIS socket with NO password on the argv (passwords stay in the
+# 0600 secret env / OpenBao). A `scram-sha-256` here breaks that bootstrap DDL
+# with `fe_sendauth: no password supplied` (live-caught in SVC-01 Task 12
+# acceptance). Loopback TCP + the project subnet still require scram/TLS below.
+local   all       all                                        trust
+host    all       all   127.0.0.1/32                         scram-sha-256
+host    all       all   ::1/128                              scram-sha-256
+# Project subnet only, TLS required (hostssl) — never the LAN/other VLANs.
+hostssl {{ postgres_db_name }}  {{ postgres_app_role }}  10.0.{{ postgres_vlan_id }}.0/24  scram-sha-256
+hostssl {{ postgres_db_name }}  {{ postgres_exporter_role }}  10.0.{{ postgres_vlan_id }}.0/24  scram-sha-256
+{% if postgres_client_nontls_subnet | default(false) | bool %}
+# OPT-IN (postgres_client_nontls_subnet, default OFF): a non-TLS subnet entry for
+# the app role covering ALL databases — including the `postgres` maintenance DB a
+# cross-guest client (e.g. ZITADEL start-from-init) must reach to verify/create
+# its own database. Enabled ONLY for a dedicated backing instance on the trusted
+# VLAN-{{ postgres_vlan_id }} subnet while no SVC-08/EJBCA cert exists yet; it is
+# turned back off (and the client switched to sslmode=verify-full) once a real CA
+# issues the DB a certificate. Still scram-sha-256 (password), still subnet-scoped.
+host    all  {{ postgres_app_role }}  10.0.{{ postgres_vlan_id }}.0/24  scram-sha-256
+{% endif %}

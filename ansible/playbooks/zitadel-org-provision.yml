@@ -1,0 +1,21 @@
+---
+# zitadel-org-provision.yml — SVC-06 project SSO onboarding (Day-0/Day-2).
+#
+# Runs the zitadel-org-provision role on localhost (the role invokes the pure-
+# Python ZITADEL management-API helper, which reaches the ZITADEL mgmt API over
+# the network — not via SSH to the guest). Idempotently creates a project's
+# organization, default roles, and an OIDC application, capturing the client
+# secret into OpenBao. Invoked by svc06_bootstrap for the first org, and
+# re-usable standalone to onboard any project:
+#
+#   ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/zitadel-org-provision.yml -e zop_project_slug=<slug>
+#
+# The ZITADEL service-account token is read from the ZITADEL_PROVISION_TOKEN env
+# (never argv); the OpenBao admin token from OPENBAO_ADMIN_TOKEN.
+- name: Onboard a project to ZITADEL SSO (org + roles + OIDC app)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  roles:
+    - zitadel-org-provision

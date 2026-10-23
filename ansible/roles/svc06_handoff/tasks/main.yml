@@ -1,0 +1,57 @@
+---
+# tasks/main.yml — svc06_handoff (SVC-06 installer — Phase 4: Handoff)
+#
+# Phase 4 = health sanity + Developer B handoff. Invokes svc06-health.yml as a
+# child configurator play (hosts: zitadel, NATIVELY on the guest) and prints the
+# completion banner. Health knobs bridged via -e. The masterkey/OIDC secrets are
+# referenced BY NAME only in the banner — never shown.
+
+- name: "Handoff | Run the guest health gate as a child configurator play (svc06-health.yml)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc06_generated_inventory }}"
+      - ansible/playbooks/svc06-health.yml
+      - -e
+      - "svc06_zitadel_container_name={{ svc06_zitadel_container_name }}"
+      - -e
+      - "svc06_zitadel_http_port={{ svc06_zitadel_http_port }}"
+      - -e
+      - "svc06_health_retries={{ svc06_health_retries }}"
+      - -e
+      - "svc06_health_delay={{ svc06_health_delay }}"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  register: svc06_health_run
+  changed_when: false
+
+- name: "Handoff | Resolve the absolute Cluster_Env_File path + banner fields"
+  ansible.builtin.set_fact:
+    svc06_cluster_env_abspath: >-
+      {{ (svc06_repo_root ~ '/' ~ cluster_env_file) | ansible.builtin.realpath }}
+    svc06_banner_ip: "10.0.20.{{ 10 + (svc06_zitadel_host_index | default(5) | int) }}"
+    svc06_banner_issuer: "https://auth.{{ svc06_platform_domain }}"
+  changed_when: false
+
+- name: "Handoff | Print the Developer B completion summary banner"
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Service SVC-06 (ZITADEL identity provider) Deployed Successfully!"
+      - "============================================================"
+      - "Status:             healthy"
+      - "Internal endpoint:  {{ svc06_banner_ip }}:{{ svc06_zitadel_http_port }} (VLAN 20, private)"
+      - "OIDC issuer:        {{ svc06_banner_issuer }} (via Traefik)"
+      - "Backing DB:         SVC-01 instance proj-shared-zitadel (own isolated state)"
+      - "Secrets:            ZITADEL_MASTERKEY + OIDC client secrets in OpenBao"
+      - "                    (secret/proj-shared-zitadel/zitadel, by name only — never shown)"
+      - "Config:             {{ svc06_cluster_env_abspath }}"
+      - ""
+      - "Next Steps for Project Developers:"
+      - "  Onboard a project to SSO:"
+      - "    ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \\"
+      - "      ansible/playbooks/zitadel-org-provision.yml -e zop_project_slug=<project-slug>"
+      - "  Consuming services fetch their OIDC client_id/secret from OpenBao at"
+      - "  container start — never a plaintext secret in a repo."
+      - "============================================================"

@@ -16,6 +16,90 @@
 # anywhere — 10.0.20.10 is COMPUTED by the module, not written (Requirement 9.2).
 #
 # ===========================================================================
+# Host_Index_Authority ledger read (fix-vlan-host-index-collision, task 5 / C7)
+# ===========================================================================
+#
+# SVC-07 is one of SEVERAL independent Terraform roots that populate VLAN 20
+# (alongside svc-09-reverse-proxy, svc-06-identity-provider, ...). Each root
+# picks its own host_index from zero with no shared counter, so NET-00 §3's
+# "host_index is unique by for_each construction" guarantee — true for a single
+# root enumerating a whole VLAN — does NOT hold across roots. That cross-root gap
+# is the live VLAN-20 .10 collision (SVC-07 primary vs SVC-09 Traefik both at
+# host_index 0). The fix is the committed per-VLAN ledger
+# (infra/platform-foundation/host-indices.yaml, the Host_Index_Authority): the
+# shared counter that makes host_index unique within a VLAN across roots.
+#
+# This root READS the ledger (it never writes it — read-only input, exactly like
+# projects.yaml, NEVER Terraform state; one-state-per-service is preserved). From
+# it we derive, for each of SVC-07's two VLAN-20 guests, its `peer_host_indices`
+# = every host_index allocated on VLAN 20 EXCEPT its own — threaded into the
+# proxmox-compute module so its Guard-4 plan-time precondition fails CLOSED on a
+# within-VLAN host-index collision before any Proxmox resource is created.
+#
+# SVC-07's two indices are STATEFUL ANCHORS (prevent_destroy, below) and do NOT
+# move: primary stays host_index 0 -> 10.0.20.10, unsealer stays host_index 1 ->
+# 10.0.20.11. The literals `host_index = 0` / `= 1` remain the explicit assigned
+# values on the module calls; the ledger is used (a) to source the peer sets and
+# (b) to assert — robustly, without breaking the apply if the file path differs —
+# that those literals still match the ledger's anchor rows. The
+# cidrhost("10.0.20.0/24", 10 + host_index) formula is UNCHANGED.
+
+locals {
+  # VLAN this root's guests live on (shared-services tier, domain-rules §1). Both
+  # module calls below pass vlan_id = 20; keep it here so the ledger lookup and
+  # the module calls cannot drift apart.
+  svc07_vlan_id = 20
+
+  # The two anchor indices, kept as explicit literals (they are prevent_destroy
+  # stateful anchors — see the lifecycle blocks below). These remain the values
+  # passed to the module; the ledger cross-check asserts they still agree.
+  svc07_primary_host_index  = 0 # -> 10.0.20.10
+  svc07_unsealer_host_index = 1 # -> 10.0.20.11
+
+  # --- Read the Host_Index_Authority ledger (read-only input, never state). ----
+  # Walk back from this per-service root (infra/projects/svc-07-secrets-manager/)
+  # to the platform-foundation root (infra/platform-foundation/), mirroring how
+  # the per-project _TEMPLATE root reads projects.yaml. ROBUSTNESS: if the ledger
+  # file is absent (e.g. a stripped sandbox), fall back to an empty structure so
+  # the apply is NOT broken by a differing path — the derived peer sets then fall
+  # back to the hardcoded VLAN-20 set below, and the module's Guard 4 still runs.
+  svc07_host_index_ledger_path = "${path.module}/../../platform-foundation/host-indices.yaml"
+  svc07_host_index_ledger      = fileexists(local.svc07_host_index_ledger_path) ? yamldecode(file(local.svc07_host_index_ledger_path)) : {}
+
+  # yamldecode renders top-level integer keys as STRINGS, so look up VLAN 20 as
+  # "20". Each VLAN maps to a list of allocation entries; pull every host_index
+  # on VLAN 20. If the ledger is absent/empty, fall back to the design §6 VLAN-20
+  # map so the peer-set wiring is still meaningful offline.
+  svc07_vlan20_entries             = try(local.svc07_host_index_ledger[tostring(local.svc07_vlan_id)], [])
+  svc07_vlan20_indices_from_ledger = [for e in local.svc07_vlan20_entries : e.host_index]
+  svc07_vlan20_indices             = length(local.svc07_vlan20_indices_from_ledger) > 0 ? local.svc07_vlan20_indices_from_ledger : [0, 1, 2, 4, 5, 6, 7, 8, 9, 10]
+
+  # Per-guest peer-set view (design §Data Models / §5.1): all VLAN-20 indices
+  # EXCEPT this guest's own. A guest is never its own peer, so Guard 4's
+  # !contains(peer, self) can only fire on a genuine cross-guest collision.
+  svc07_primary_peer_host_indices  = [for i in local.svc07_vlan20_indices : i if i != local.svc07_primary_host_index]
+  svc07_unsealer_peer_host_indices = [for i in local.svc07_vlan20_indices : i if i != local.svc07_unsealer_host_index]
+}
+
+# Ledger cross-check (robust, non-fatal on a missing file). Assert the two anchor
+# literals still appear in the ledger's VLAN-20 index set when the ledger is
+# present — catching a ledger edit that silently moved an anchor. When the ledger
+# file is absent (path differs / stripped sandbox) the fallback index set is used
+# and the check is a tautology, so the apply is never broken by a path mismatch.
+resource "terraform_data" "svc07_host_index_ledger_check" {
+  lifecycle {
+    precondition {
+      condition     = contains(local.svc07_vlan20_indices, local.svc07_primary_host_index)
+      error_message = "SVC-07 primary host_index ${local.svc07_primary_host_index} (anchor, 10.0.20.10) is not present on VLAN ${local.svc07_vlan_id} in the Host_Index_Authority ledger (infra/platform-foundation/host-indices.yaml). The primary is a stateful prevent_destroy anchor and must keep index 0; reconcile the ledger rather than moving the guest."
+    }
+    precondition {
+      condition     = contains(local.svc07_vlan20_indices, local.svc07_unsealer_host_index)
+      error_message = "SVC-07 unsealer host_index ${local.svc07_unsealer_host_index} (anchor, 10.0.20.11) is not present on VLAN ${local.svc07_vlan_id} in the Host_Index_Authority ledger (infra/platform-foundation/host-indices.yaml). The unsealer is a stateful prevent_destroy anchor and must keep index 1; reconcile the ledger rather than moving the guest."
+    }
+  }
+}
+
+# ===========================================================================
 # PRIMARY OpenBao LXC (svc07-20-01, 10.0.20.10, host_index 0) — task 2.1
 # ===========================================================================
 
@@ -31,8 +115,13 @@ module "primary" {
   service_name = "openbao" # -> tags ["proj-shared-openbao"] (PF §4)
   svc_code     = "svc07"   # -> hostname svc07-20-01 (NET-00 §4)
   vlan_id      = 20        # shared-services VLAN (domain-rules §1)
-  host_index   = 0         # creation index 0 -> 10.0.20.10 (Requirement 9.2)
+  host_index   = 0         # creation index 0 -> 10.0.20.10 (Requirement 9.2) — anchor, unchanged
   instance     = "01"      # singleton -> svc07-20-01
+
+  # Every OTHER VLAN-20 host_index, from the Host_Index_Authority ledger (task 5
+  # / C7). Activates the module's Guard-4 within-VLAN collision precondition for
+  # the primary. No IP change — the primary stays at index 0 -> 10.0.20.10.
+  peer_host_indices = local.svc07_primary_peer_host_indices
 
   ssh_public_keys = var.operator_ssh_public_keys # forward-compat echo (C1); injection happens on the root's guest resource below
 }
@@ -172,8 +261,13 @@ module "unsealer" {
   svc_code     = "svc07"            # stable catalog slot (NET-00 §4)
   component    = "unsealer"         # -> hostname svc07-unsealer-20-01 (NET-00 §4)
   vlan_id      = 20                 # shared-services VLAN (domain-rules §1)
-  host_index   = 1                  # creation index 1 -> 10.0.20.11 (Requirement 9.3)
+  host_index   = 1                  # creation index 1 -> 10.0.20.11 (Requirement 9.3) — anchor, unchanged
   instance     = "01"               # singleton -> svc07-unsealer-20-01
+
+  # Every OTHER VLAN-20 host_index, from the Host_Index_Authority ledger (task 5
+  # / C7). Activates the module's Guard-4 within-VLAN collision precondition for
+  # the unsealer. No IP change — the unsealer stays at index 1 -> 10.0.20.11.
+  peer_host_indices = local.svc07_unsealer_peer_host_indices
 
   ssh_public_keys = var.operator_ssh_public_keys # forward-compat echo (C1); injection happens on the root's guest resource below
 }

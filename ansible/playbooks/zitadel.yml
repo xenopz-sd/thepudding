@@ -1,0 +1,15 @@
+---
+# zitadel.yml — SVC-06 ZITADEL configurator play (Ansible-as-Configurator).
+#
+# Runs the zitadel-server role against the ZITADEL guest (hosts: zitadel, from
+# the generated inventory). Invoked as a child run by svc06_bootstrap. flush
+# handlers at the end so a config/secret-env/cert change recreates the stack.
+- name: Configure the ZITADEL identity provider (SVC-06)
+  hosts: zitadel
+  gather_facts: true
+  become: true
+  roles:
+    - zitadel-server
+  post_tasks:
+    - name: "Flush handlers so ZITADEL restarts with its final config"
+      ansible.builtin.meta: flush_handlers

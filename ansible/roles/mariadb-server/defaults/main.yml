@@ -1,0 +1,35 @@
+---
+# defaults/main.yml — mariadb-server (SVC-01 alternative engine, SKELETON)
+#
+# The strict-EU-governance alternative to postgres-server (MariaDB Foundation,
+# Helsinki — domain-rules §4), selectable via the SVC-01 db_engine=mariadb
+# switch. This is a SKELETON: it stands a dedicated MariaDB up as a Compose stack
+# and creates the project database + a least-privilege app user, enough to
+# validate the engine switch end-to-end once (SVC-01 §14 acceptance), NOT a
+# fully-tuned engine. DB/user creation uses the `mariadb` client via `docker exec`
+# so no new Ansible collection (community.mysql) is pulled in for the skeleton.
+# Passwords are generated at provision and written to OpenBao, same as postgres.
+
+mariadb_image: "mariadb:11"                              # pinned major (never latest)
+
+mariadb_project_slug: ""
+mariadb_vlan_id: 0
+mariadb_host_index: 0
+
+mariadb_db_name: "{{ mariadb_project_slug | regex_replace('-', '_') }}"
+mariadb_app_user: "{{ (mariadb_project_slug | regex_replace('-', '_')) ~ '_app' }}"
+
+mariadb_stack_name: "mariadb"
+mariadb_container_name: "{{ mariadb_stack_name }}-mariadb-1"
+
+mariadb_port: 3306
+mariadb_bind_ip: "10.0.{{ mariadb_vlan_id }}.{{ 10 + (mariadb_host_index | int) }}"
+
+mariadb_data_volume: "mariadb-data"
+mariadb_data_dir: "/var/lib/mysql"
+
+mariadb_openbao_secret_path: "secret/proj-{{ mariadb_project_slug }}/mariadb"
+mariadb_root_password: ""
+mariadb_app_password: ""
+
+mariadb_state: "present"

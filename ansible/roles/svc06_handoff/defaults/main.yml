@@ -1,0 +1,10 @@
+---
+# defaults/main.yml — svc06_handoff (SVC-06 installer — Phase 4)
+#
+# Phase-4 health-gate knobs, consumed by svc06-health.yml (bridged via -e) and
+# the completion banner. NO secret here.
+
+svc06_zitadel_container_name: "zitadel-zitadel-1"
+svc06_zitadel_http_port: 8080
+svc06_health_retries: 30
+svc06_health_delay: 5

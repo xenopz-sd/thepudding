@@ -1,0 +1,83 @@
+---
+# tasks/main.yml — svc06_bootstrap (SVC-06 installer — Phase 3: Bootstrap)
+#
+# Phase-3 "Host hardening & service bootstrap" for ZITADEL:
+#   1. common baseline child run (Docker CE + Compose) on the ZITADEL guest.
+#   2. zitadel.yml configurator child run (zitadel-server role) — deploys the
+#      ZITADEL Compose stack with masterkey + DB creds from OpenBao.
+#   3. (opt-in) zitadel-org-provision child run — idempotently onboards a first
+#      org + OIDC app to prove the OIDC path (FR-3/FR-5).
+# All as child ansible-playbook runs (orchestrator/configurator seam). Secrets
+# (OpenBao admin token, ZITADEL provisioning token) travel in the child ENV,
+# never the argv (no_log).
+
+- name: "Bootstrap | common baseline (Docker + Compose) on the ZITADEL guest"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc06_generated_inventory }}"
+      - ansible/playbooks/common.yml
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  register: svc06_common_run
+  changed_when: "'changed=0' not in (svc06_common_run.stdout | default(''))"
+
+# Deploy the ZITADEL Compose stack via zitadel.yml (hosts: zitadel). The mock
+# flags + OpenBao address + platform domain are bridged across the child-process
+# boundary via -e; the OpenBao admin token travels in the child ENV (no_log).
+- name: "Bootstrap | ZITADEL install (zitadel.yml child run against the generated inventory)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc06_generated_inventory }}"
+      - ansible/playbooks/zitadel.yml
+      - -e
+      - "zitadel_platform_domain={{ svc06_platform_domain }}"
+      - -e
+      - "zitadel_openbao_addr={{ svc06_openbao_addr | default('') }}"
+      - -e
+      - "zitadel_tls_self_signed={{ zitadel_tls_self_signed | default(false) | string | lower }}"
+      - -e
+      - "zitadel_mock_edge_network={{ zitadel_mock_edge_network | default(false) | string | lower }}"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  environment:
+    OPENBAO_ADMIN_TOKEN: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+  register: svc06_zitadel_run
+  changed_when: "'changed=0' not in (svc06_zitadel_run.stdout | default(''))"
+  no_log: true
+
+# Onboard a first org + OIDC app via zitadel-org-provision (opt-in; on by default
+# for a fresh bring-up). The ZITADEL provisioning token + OpenBao admin token
+# travel in the child ENV (no_log). Runs on localhost (the helper reaches the
+# ZITADEL mgmt API over the network, not via SSH to the guest).
+- name: "Bootstrap | Onboard a first org + OIDC app (zitadel-org-provision, opt-in)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - ansible/inventory/localhost.yml
+      - ansible/playbooks/zitadel-org-provision.yml
+      - -e
+      - "zop_project_slug={{ svc06_bootstrap_org_slug }}"
+      - -e
+      - "zop_platform_domain={{ svc06_platform_domain }}"
+      - -e
+      - "zop_openbao_addr={{ svc06_openbao_addr | default('') }}"
+      # Dev/mock path (no Traefik): point org-provision at the ZITADEL guest so
+      # it reaches the mgmt API at the container IP:8080 with the external-domain
+      # Host header (boundaries §1 — no host port). Empty on the production
+      # Traefik path so the helper runs on the control node via https://auth.<d>.
+      - -e
+      - "zop_zitadel_guest_host={{ svc06_zitadel_dev_guest_host | default('') }}"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  environment:
+    ZITADEL_PROVISION_TOKEN: "{{ lookup('ansible.builtin.env', 'ZITADEL_PROVISION_TOKEN') | default('', true) }}"
+    OPENBAO_ADMIN_TOKEN: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+  register: svc06_org_provision_run
+  changed_when: "'changed=0' not in (svc06_org_provision_run.stdout | default(''))"
+  no_log: true
+  when: svc06_run_org_provision | default(true) | bool

@@ -1,0 +1,13 @@
+{#
+  templates/pg-backup.service.j2 — postgres-server (SVC-01)
+  Oneshot service the timer triggers; runs the nightly pg_dump script.
+#}
+# MANAGED BY ANSIBLE (postgres-server) — DO NOT EDIT BY HAND.
+[Unit]
+Description=SVC-01 nightly pg_dump backup for {{ postgres_project_slug }}
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pg_dump_backup.sh

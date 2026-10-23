@@ -1,0 +1,276 @@
+---
+# tasks/main.yml — svc06_preflight (SVC-06 installer — Phase 1: Preflight)
+#
+# Phase-1 "Preflight & environment validation" for ZITADEL. A failure here leaves
+# ZERO Proxmox resources. Clone of svc01_preflight, adapted for the shared
+# ZITADEL service on VLAN 20: asserts the shared VNet p20 exists, and remaps the
+# shared cluster template/datastore keys onto the SVC-06 root's var names
+# (zitadel_template_file_id / zitadel_datastore_id) — keeping cluster_env.py
+# UNCHANGED (established SVC-01/SVC-09 pattern).
+
+# --- Env-file load + validation (cluster_env.py) ----------------------------
+- name: "Preflight | Resolve + validate the cluster env file ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc06_venv_python }}"
+      - "{{ svc06_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  register: svc06_env_resolve
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | Capture the resolved TF_VAR_* mapping for Phase 2"
+  ansible.builtin.set_fact:
+    svc06_tfvars: "{{ svc06_env_resolve.stdout | from_json }}"
+  no_log: true
+
+# The LXC template + datastore are CLUSTER-WIDE facts (shared keys
+# TF_VAR_openbao_template_file_id / TF_VAR_openbao_datastore_id — generic schema
+# rows, not OpenBao-specific). svc06 remaps them onto the SVC-06 root's var names
+# (zitadel_template_file_id / zitadel_datastore_id) in svc06_tf_env. Keeps
+# cluster_env.py UNCHANGED (no per-service key added — SVC-01/SVC-09 pattern).
+- name: "Preflight | Bind resolved cluster parameters to named facts"
+  ansible.builtin.set_fact:
+    svc06_proxmox_endpoint: "{{ svc06_tfvars['TF_VAR_proxmox_endpoint'] }}"
+    svc06_proxmox_api_token: "{{ svc06_tfvars['TF_VAR_proxmox_api_token'] }}"
+    svc06_proxmox_node_name: "{{ svc06_tfvars['TF_VAR_proxmox_node_name'] }}"
+    svc06_template_file_id: "{{ svc06_tfvars['TF_VAR_openbao_template_file_id'] }}"
+    svc06_datastore_id: "{{ svc06_tfvars['TF_VAR_openbao_datastore_id'] }}"
+  no_log: true
+
+- name: "Preflight | Normalize Proxmox endpoint to a canonical base"
+  ansible.builtin.set_fact:
+    svc06_proxmox_endpoint_base: >-
+      {{ svc06_proxmox_endpoint | trim
+         | regex_replace('/+$', '')
+         | regex_replace('/api2/json$', '')
+         | regex_replace('/+$', '') }}
+
+# --- Agent-live throwaway-guard consult (gated, fail-closed, before 1st API) --
+- name: "Preflight | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc06_venv_python }}"
+      - "{{ svc06_throwaway_guard }}"
+      - --service
+      - svc06
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ svc06_throwaway_allowlist }}"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  register: svc06_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+
+- name: "Preflight | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (svc06_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Preflight | Refuse the from-scratch run unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "svc06_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live from-scratch run REFUSED by the throwaway-cluster guard:
+      {{ (svc06_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      Nothing was provisioned and no Proxmox resource was touched or queried.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live from-scratch run."
+  when: agent_live_run | default(false) | bool
+
+# --- Operator SSH public-key injection ---------------------------------------
+- name: "Preflight | Bind + expanduser the operator SSH public-key file path (may be absent)"
+  ansible.builtin.set_fact:
+    svc06_ssh_public_key_file: >-
+      {{ (svc06_tfvars['TF_VAR_operator_ssh_public_key_file'] | default('') | trim) | expanduser }}
+
+- name: "Preflight | Stat the operator SSH public-key file (only when a path is set)"
+  ansible.builtin.stat:
+    path: "{{ svc06_ssh_public_key_file }}"
+  register: svc06_ssh_public_key_stat
+  when: (svc06_ssh_public_key_file | length) > 0
+
+- name: "Preflight | Assert the operator SSH public-key file exists + is readable (fail-fast)"
+  ansible.builtin.assert:
+    that:
+      - "svc06_ssh_public_key_stat.stat.exists | default(false)"
+      - "svc06_ssh_public_key_stat.stat.readable | default(false)"
+    fail_msg: >-
+      The operator SSH public-key file '{{ svc06_ssh_public_key_file }}' does not
+      exist or is not readable. Supply a PUBLIC key file path, or leave it unset
+      to provision the ZITADEL LXC SSH-unreachable.
+    success_msg: "Operator SSH public-key file present + readable."
+  when: (svc06_ssh_public_key_file | length) > 0
+
+- name: "Preflight | Read + JSON-encode the operator SSH public key into a 1-element list"
+  ansible.builtin.set_fact:
+    svc06_operator_ssh_public_keys_json: >-
+      {{ [lookup('ansible.builtin.file', svc06_ssh_public_key_file) | trim] | to_json }}
+  when: (svc06_ssh_public_key_file | length) > 0
+
+- name: "Preflight | Default the operator SSH public-key list to empty when no path is set"
+  ansible.builtin.set_fact:
+    svc06_operator_ssh_public_keys_json: "[]"
+  when: (svc06_ssh_public_key_file | length) == 0
+
+- name: "Preflight | Log the SSH public-key injection decision (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: operator SSH public-key injection:
+      {{ 'WIRED from ' ~ svc06_ssh_public_key_file
+         if (svc06_ssh_public_key_file | length) > 0
+         else 'NONE (ZITADEL LXC will be SSH-unreachable until a key is supplied)' }}
+
+# --- Proxmox reachability, auth, shared VNet p20, datastore autodetect --------
+- name: "Preflight | Verify Proxmox API reachability + authentication (/version)"
+  ansible.builtin.uri:
+    url: "{{ svc06_proxmox_endpoint_base }}/api2/json/version"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ svc06_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ svc06_proxmox_validate_certs }}"
+    status_code: [200]
+  register: svc06_proxmox_version
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | List Proxmox SDN VNets (verify the shared VLAN fabric)"
+  ansible.builtin.uri:
+    url: "{{ svc06_proxmox_endpoint_base }}/api2/json/cluster/sdn/vnets"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ svc06_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ svc06_proxmox_validate_certs }}"
+    status_code: [200]
+  register: svc06_sdn_vnets
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | Extract the set of SDN VNet ids (non-secret)"
+  ansible.builtin.set_fact:
+    svc06_vnet_ids: >-
+      {{ svc06_sdn_vnets.json.data | map(attribute='vnet') | list }}
+
+# Both the ZITADEL guest AND its backing DB attach to the shared VLAN-20 VNet
+# p20 (platform-foundation-owned). Assert it exists; fail closed naming it.
+- name: "Preflight | Assert the shared VNet p20 exists"
+  ansible.builtin.assert:
+    that:
+      - "'p20' in svc06_vnet_ids"
+    fail_msg: >-
+      The shared-services VNet 'p20' is absent from the Proxmox SDN VNets
+      ({{ svc06_vnet_ids }}). Apply the platform-foundation root first (it owns
+      the VLAN-20 zone/VNet), then re-run this installer.
+    success_msg: "Shared VNet 'p20' is present."
+
+- name: "Preflight | Query target-node storage (only when datastore unset)"
+  ansible.builtin.uri:
+    url: "{{ svc06_proxmox_endpoint_base }}/api2/json/nodes/{{ svc06_proxmox_node_name }}/storage"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ svc06_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ svc06_proxmox_validate_certs }}"
+    status_code: [200]
+  register: svc06_node_storage
+  changed_when: false
+  no_log: true
+  when: svc06_datastore_id == svc06_autodetect_sentinel
+
+- name: "Preflight | Extract available storage ids on the target node (non-secret)"
+  ansible.builtin.set_fact:
+    svc06_node_storage_ids: >-
+      {{ svc06_node_storage.json.data | map(attribute='storage') | list }}
+  when: svc06_datastore_id == svc06_autodetect_sentinel
+
+- name: "Preflight | Auto-select datastore (local-zfs preferred, else local-lvm)"
+  ansible.builtin.set_fact:
+    svc06_datastore_id: >-
+      {{ 'local-zfs' if 'local-zfs' in svc06_node_storage_ids
+         else ('local-lvm' if 'local-lvm' in svc06_node_storage_ids
+         else svc06_autodetect_sentinel) }}
+  when: svc06_datastore_id == svc06_autodetect_sentinel
+
+- name: "Preflight | Assert a datastore was resolved or auto-detected"
+  ansible.builtin.assert:
+    that:
+      - "svc06_datastore_id != svc06_autodetect_sentinel"
+    fail_msg: >-
+      No datastore configured and neither 'local-zfs' nor 'local-lvm' is available
+      on node '{{ svc06_proxmox_node_name }}'. Set PROXMOX_DATASTORE_ID in
+      {{ cluster_env_file }} and re-run.
+    success_msg: "Datastore resolved to '{{ svc06_datastore_id }}'."
+
+# --- Local control-node prerequisite + version checks ------------------------
+- name: "Preflight | Locate the terraform binary on PATH"
+  ansible.builtin.command:
+    cmd: terraform version
+  register: svc06_terraform_version
+  changed_when: false
+  failed_when: svc06_terraform_version.rc != 0
+
+- name: "Preflight | List installed Ansible collections"
+  ansible.builtin.command:
+    cmd: ansible-galaxy collection list --format json
+  register: svc06_galaxy_list
+  changed_when: false
+  failed_when: svc06_galaxy_list.rc != 0
+
+- name: "Preflight | Compute the set of installed collection names"
+  ansible.builtin.set_fact:
+    svc06_installed_collections: >-
+      {{ (svc06_galaxy_list.stdout | from_json).values()
+         | map('list') | flatten | unique | list }}
+
+- name: "Preflight | Assert the required Ansible collections are installed"
+  ansible.builtin.assert:
+    that:
+      - "item in svc06_installed_collections"
+    fail_msg: >-
+      Required Ansible collection '{{ item }}' is not installed. Install with:
+      ansible-galaxy collection install -r ansible/requirements.yml
+    success_msg: "Ansible collection '{{ item }}' is installed."
+  loop: "{{ svc06_required_collections }}"
+
+- name: "Preflight | Assert the project venv binaries are present"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: svc06_venv_bin_stat
+  loop: "{{ svc06_required_venv_binaries }}"
+
+- name: "Preflight | Fail naming any missing venv binary"
+  ansible.builtin.assert:
+    that:
+      - "item.stat.exists"
+      - "item.stat.executable | default(false)"
+    fail_msg: "Required project venv binary missing or not executable: {{ item.item }}."
+    success_msg: "venv binary present: {{ item.item }}"
+  loop: "{{ svc06_venv_bin_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: "Preflight | Assert Python >= 3.10"
+  ansible.builtin.assert:
+    that:
+      - "ansible_python_version is version('3.10', '>=')"
+    fail_msg: "Requires Python 3.10+; detected {{ ansible_python_version }}."
+    success_msg: "Python {{ ansible_python_version }} satisfies >= 3.10."
+
+- name: "Preflight | Assert Ansible >= 2.15"
+  ansible.builtin.assert:
+    that:
+      - "ansible_version.full is version('2.15', '>=')"
+    fail_msg: "Requires Ansible 2.15+; detected {{ ansible_version.full }}."
+    success_msg: "Ansible {{ ansible_version.full }} satisfies >= 2.15."

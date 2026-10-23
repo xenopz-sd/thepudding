@@ -725,12 +725,19 @@ bootstrap (§2). This is a full from-scratch bring-up.
 > **Prefer the automated clean-slate over hand-running these §0d/§0e steps.** The
 > SVC-07 installer's `svc07_clean_slate` branch
 > ([A.4](#a4--clean-slate-reset-tear-back-down-to-an-empty-baseline)) drives
-> `clean-slate.yml`, whose `terraform_clean_slate` role now issues
-> **`pct destroy <vmid> --purge`** + `terraform state rm` and then verifies the
-> empty baseline two ways — so the backing volumes are purged automatically and
-> **no manual GUI deletion or separate `docker volume rm` is required**. §0d and
-> §0e below remain as the manual verify-every-step reference for diagnosing what a
-> drifted state looks like and confirming each stage by hand.
+> `clean-slate.yml`, whose `terraform_clean_slate` role issues
+> **`pct destroy <vmid> --purge`** + `terraform state rm` of the guests; the
+> `svc07_clean_slate` branch then runs a **provider-free full-state sweep** that
+> removes every REMAINING state address (the non-guest `terraform_data`
+> book-keeping resources — `terraform_data.svc07_host_index_ledger_check` and the
+> `module.*.terraform_data.input_guards` anchors) and a verification gate that
+> asserts `terraform state list` is **EMPTY**. So the backing volumes are purged
+> automatically **and** the Terraform state is left genuinely empty — **no manual
+> GUI deletion, no separate `docker volume rm`, and no manual
+> `terraform state rm` of the `terraform_data.*` residue is required** (a correct
+> clean-slate needs no state surgery of any kind). §0d and §0e below remain as the
+> manual verify-every-step reference for diagnosing what a drifted state looks like
+> and confirming each stage by hand.
 
 ---
 
@@ -807,28 +814,42 @@ for vmid in 1070 1071; do
 done
 ```
 
-### Step 4 — REMOVE the containers from Terraform state
+### Step 4 — EMPTY the Terraform state (guests AND non-guest book-keeping)
 
 The guests carry `prevent_destroy = true`, so `terraform destroy` would hard-error;
 `terraform state rm` removes the (now non-existent) resources from state so the next
-`apply` cleanly RECREATES them. Tolerate "No matching objects" (already removed).
+`apply` cleanly RECREATES them. A correct clean-slate must empty the WHOLE state —
+not only the two container resources but also the non-guest `terraform_data`
+book-keeping resources (`terraform_data.svc07_host_index_ledger_check` and the
+`module.*.terraform_data.input_guards` anchors), which manage no live Proxmox object
+and are recreated on the next `apply`. Remove them PROVIDER-FREE with
+`terraform state rm` (NEVER `terraform destroy` — a provider-reaching destroy here
+hangs contacting Proxmox and leaves a stale state lock). Tolerate "No matching
+objects" (already removed).
 
 <!-- doctest: requires-infra -->
 <!-- cwd: infra/projects/svc-07-secrets-manager -->
 ```bash
-terraform state rm proxmox_virtual_environment_container.primary  || true
-terraform state rm proxmox_virtual_environment_container.unsealer || true
-# VERIFY: no container resources remain in state (only module.*.input_guards is fine):
-terraform state list | grep container && echo "!! container STILL in state — re-run the state rm" || echo "no container resources in state (good)"
+# Remove EVERY remaining address so `terraform state list` ends up empty. This
+# mirrors the automated full-state sweep the svc07_clean_slate branch now performs.
+for addr in $(terraform state list); do
+  terraform state rm "$addr" || true
+done
+# VERIFY: the state is now EMPTY (no address of any kind remains):
+terraform state list | grep -q . && echo "!! state STILL NON-EMPTY — re-run the sweep" || echo "Terraform state is empty (good)"
 ```
 
-> The `ansible/playbooks/clean-slate.yml` playbook automates Steps 2+4 (per guest,
-> opt-in, mandatory `clean_slate_confirm=<vmid>`), and its `terraform_clean_slate`
-> role now issues **`pct destroy <vmid> --purge`** — so the guest's backing volumes
-> are purged with it and no separate volume-removal step is needed. (The SVC-07
-> installer's `svc07_clean_slate` branch — [A.4](#a4--clean-slate-reset-tear-back-down-to-an-empty-baseline)
-> — drives this same playbook per target.) The manual verify-every-step commands
-> above remain useful when you want to confirm each stage independently.
+> The `ansible/playbooks/clean-slate.yml` playbook automates the guest destroy +
+> container `state rm` (per guest, opt-in, mandatory `clean_slate_confirm=<vmid>`),
+> and its `terraform_clean_slate` role issues **`pct destroy <vmid> --purge`** — so
+> the guest's backing volumes are purged with it and no separate volume-removal step
+> is needed. The SVC-07 installer's `svc07_clean_slate` branch
+> ([A.4](#a4--clean-slate-reset-tear-back-down-to-an-empty-baseline)) drives that
+> playbook per target **and then runs a provider-free full-state sweep** that removes
+> the remaining non-guest `terraform_data.*` addresses, so a completed automated
+> clean-slate leaves `terraform state list` EMPTY with **no manual
+> `terraform state rm` of any residue**. The manual verify-every-step commands above
+> remain useful only when you want to confirm each stage independently.
 
 ### Step 5 — GATE: confirm a TRUE clean slate before provisioning
 
@@ -836,7 +857,10 @@ Do NOT proceed to §1 until ALL of these are true. This is the check that was mi
 every time the bring-up "skipped init":
 
 - [ ] `sudo pct list | grep -E '107[01]'` → **nothing** (no containers).
-- [ ] `terraform state list | grep container` → **nothing** (no container in state).
+- [ ] `terraform state list` → **nothing at all** (the state is EMPTY — no container
+      AND no `terraform_data.*` book-keeping resources; a correct clean-slate leaves
+      zero addresses, which is also what lets the platform clean-slate proceed past
+      its halt-before-fabric check with no manual state surgery).
 - [ ] (there are therefore no Docker volumes — they went with the containers).
 
 Only when all three are empty, proceed to §1 (`terraform apply`). The freshly-created

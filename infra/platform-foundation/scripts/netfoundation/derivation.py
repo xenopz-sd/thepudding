@@ -216,6 +216,19 @@ class HostnameCollisionError(Exception):
     """
 
 
+class HostIndexCollisionError(Exception):
+    """Raised when two guests within a single VLAN share the same host index.
+
+    Surfaced by :func:`assert_unique_host_indices`. On a Shared_VLAN (one
+    populated by more than one independent Terraform root — VLAN 20 today, any
+    project VLAN running >1 service root), two guests computing the same
+    ``host_index`` resolve via ``cidrhost("10.0.<vlan_id>.0/24", 10 + index)``
+    to the *same* host IP — a Collision. A colliding set is rejected rather
+    than silently provisioning two guests on one IP
+    (fix-vlan-host-index-collision Requirements 1.1, 1.2; Property 1).
+    """
+
+
 def _validate_instance(instance: int) -> str:
     """Validate and zero-pad a replica counter to two digits (Req 3.1, 3.3)."""
     if not isinstance(instance, int) or isinstance(instance, bool):
@@ -436,3 +449,139 @@ def assert_unique_hostnames(hostnames: Iterable[str]) -> None:
             "once. Each host must have a unique hostname within its VLAN "
             "(Requirement 3.6)."
         )
+
+
+def assert_unique_host_indices(vlan_id: int, indices: Iterable[int]) -> None:
+    """Assert that the guests on a single VLAN have distinct host indices.
+
+    On a Shared_VLAN each independent Terraform root picks its own
+    ``host_index`` with no shared counter, so two roots can both land on the
+    same index and thus the same host IP
+    (``cidrhost("10.0.<vlan_id>.0/24", 10 + index)``). A colliding set is
+    rejected rather than allowed to silently provision two guests on one IP
+    (fix-vlan-host-index-collision Requirements 1.1, 1.2; Property 1). Intended
+    to be called with all host indices allocated within a single VLAN, drawn
+    from the per-VLAN Host_Index_Authority ledger.
+
+    The guard depends only on the set's contents, not on iteration order or
+    call count: it reaches the same accept/reject verdict (and reports the same
+    colliding index) for any permutation of ``indices`` (Property 3).
+
+    Args:
+        vlan_id: The VLAN whose host indices are being checked (named in the
+            error message so the collision is attributable before any apply).
+        indices: The host indices allocated within that VLAN.
+
+    Raises:
+        HostIndexCollisionError: If any host index appears more than once,
+            naming the VLAN and the repeated index.
+    """
+    seen: set[int] = set()
+    duplicates: set[int] = set()
+    for index in indices:
+        if index in seen:
+            duplicates.add(index)
+        seen.add(index)
+    if duplicates:
+        collided = ", ".join(str(i) for i in sorted(duplicates))
+        raise HostIndexCollisionError(
+            f"Host-index collision on VLAN {vlan_id}: index {collided} is "
+            "assigned to more than one guest. Each guest on a VLAN must have a "
+            "unique host index, since two guests sharing an index resolve to "
+            "the same host IP (fix-vlan-host-index-collision Requirement 1.2)."
+        )
+
+
+def assigned_host_index(
+    ledger: dict[int, Iterable[dict[str, object]]],
+    vlan_id: int,
+    guest_key: object,
+) -> int:
+    """Return a guest's own ``host_index`` on a VLAN, from the parsed ledger.
+
+    The per-root *assigned-index* read view (design §Data Models two-view
+    discipline): a root asks "what is *my* host_index on VLAN N?" and gets the
+    value it threads into ``proxmox-compute``'s ``host_index`` input.
+
+    Pure and side-effect-free: it reads only the already-parsed ``ledger``
+    structure passed in and touches no file, network, or shared state — the
+    file read itself lives in the thin reader layer, exactly as ``projects.yaml``
+    parsing does.
+
+    Args:
+        ledger: The parsed Host_Index_Authority, a dict keyed by ``vlan_id``;
+            each value is a list of entries, each carrying a stable guest key
+            under ``"guest_key"`` and an integer ``host_index`` under
+            ``"host_index"``.
+        vlan_id: The VLAN to look the guest up on.
+        guest_key: The stable machine-facing key identifying the guest.
+
+    Returns:
+        The guest's ``host_index`` on that VLAN.
+
+    Raises:
+        KeyError: If the VLAN is absent from the ledger, or no entry on that
+            VLAN matches ``guest_key`` (fail closed rather than default to a
+            colliding 0).
+    """
+    if vlan_id not in ledger:
+        raise KeyError(
+            f"VLAN {vlan_id} is absent from the host-index ledger; no "
+            f"host_index can be derived for guest {guest_key!r}."
+        )
+    for entry in ledger[vlan_id]:
+        if entry["guest_key"] == guest_key:
+            return int(entry["host_index"])  # type: ignore[call-overload]
+    raise KeyError(
+        f"Guest {guest_key!r} has no host-index entry on VLAN {vlan_id} in the "
+        "host-index ledger."
+    )
+
+
+def peer_host_indices(
+    ledger: dict[int, Iterable[dict[str, object]]],
+    vlan_id: int,
+    guest_key: object,
+) -> list[int]:
+    """Return the sorted host indices of all OTHER guests on a VLAN.
+
+    The per-VLAN *peer-set* read view (design §Data Models two-view
+    discipline): a root asks "what are *all* host indices on VLAN N other than
+    mine?" and gets the set it threads into ``proxmox-compute``'s
+    ``peer_host_indices`` input, where the ``!contains(peer, self)``
+    precondition fails closed on a cross-guest collision.
+
+    The result equals the set of all host indices allocated on that VLAN minus
+    the named guest's own index, so a guest is never its own peer (Property 2).
+    Pure and side-effect-free: reads only the passed-in ``ledger`` structure.
+
+    Args:
+        ledger: The parsed Host_Index_Authority, keyed by ``vlan_id`` (see
+            :func:`assigned_host_index`).
+        vlan_id: The VLAN whose peer set is being derived.
+        guest_key: The stable key of the guest whose own index is excluded.
+
+    Returns:
+        The sorted list of every other guest's ``host_index`` on that VLAN.
+        An empty list when the guest is the VLAN's sole occupant.
+
+    Raises:
+        KeyError: If the VLAN is absent from the ledger, or no entry on that
+            VLAN matches ``guest_key``.
+    """
+    if vlan_id not in ledger:
+        raise KeyError(
+            f"VLAN {vlan_id} is absent from the host-index ledger; no peer set "
+            f"can be derived for guest {guest_key!r}."
+        )
+    entries = list(ledger[vlan_id])
+    if not any(entry["guest_key"] == guest_key for entry in entries):
+        raise KeyError(
+            f"Guest {guest_key!r} has no host-index entry on VLAN {vlan_id} in "
+            "the host-index ledger."
+        )
+    return sorted(
+        int(entry["host_index"])  # type: ignore[call-overload]
+        for entry in entries
+        if entry["guest_key"] != guest_key
+    )

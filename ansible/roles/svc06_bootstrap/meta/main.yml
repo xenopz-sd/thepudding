@@ -1,0 +1,12 @@
+---
+# meta/main.yml — svc06_bootstrap (SVC-06 installer — Phase 3)
+galaxy_info:
+  role_name: svc06_bootstrap
+  author: platform
+  description: >-
+    SVC-06 Phase 3 — common baseline (Docker) on the ZITADEL guest, deploy the
+    ZITADEL Compose stack (zitadel.yml), then idempotently onboard a first org +
+    OIDC app (zitadel-org-provision).
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

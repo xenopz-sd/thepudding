@@ -1,0 +1,12 @@
+---
+# meta/main.yml — svc09_handoff (SVC-09 installer — Phase 4)
+galaxy_info:
+  role_name: svc09_handoff
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-09 (Traefik) installer Phase 4 — health sanity & Developer B handoff:
+    invokes the svc09-health.yml child gate and prints the completion banner.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

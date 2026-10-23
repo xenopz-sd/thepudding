@@ -1,0 +1,252 @@
+---
+# tasks/main.yml — svc09_provision (SVC-09 installer — Phase 2: Provision)
+#
+# Clone of svc07_provision adapted for the Traefik single-guest root:
+#   - backend swap-gate (GitLab HTTP when all three CI keys present, else
+#     local_backend_override.tf) with its single INFO decision log,
+#   - terraform init / apply (Proxmox creds via TF_VAR_* env, no_log),
+#   - generate_inventory.py + existence assert,
+#   - add_host of the single Traefik guest,
+#   - ssh-keygen -R + ssh-keyscan known_hosts reconciliation.
+#
+# NOTE (agent-live meta-guard): this role runs `terraform apply` (a destructive
+# marker) but is LEAF-EXEMPT in test_agent_live_wiring_coverage.py exactly like
+# svc07_provision — the throwaway-guard consult is carried UPSTREAM by
+# svc09_preflight (Phase 1 runs before Phase 2 in the same play).
+
+# --- Backend swap-gate selection --------------------------------------------
+- name: "Provisioning | Read the cluster env file to detect the state-backend signal"
+  ansible.builtin.slurp:
+    src: "{{ svc09_repo_root }}/{{ cluster_env_file }}"
+  register: svc09_env_slurp
+  no_log: true
+
+- name: "Provisioning | Reduce the env file to KEY=VALUE lines"
+  ansible.builtin.set_fact:
+    svc09_env_pairs: >-
+      {{ (svc09_env_slurp.content | b64decode).splitlines()
+         | map('trim')
+         | reject('match', '^\s*#')
+         | select('search', '=')
+         | list }}
+  no_log: true
+
+- name: "Provisioning | Extract the set of env keys (names only, no values)"
+  ansible.builtin.set_fact:
+    svc09_env_keys: >-
+      {{ svc09_env_pairs
+         | map('regex_replace', '^\s*([^=]+?)\s*=.*$', '\1')
+         | list }}
+
+- name: "Provisioning | Decide the Terraform backend (swap gate)"
+  ansible.builtin.set_fact:
+    svc09_use_gitlab_backend: >-
+      {{ ('CI_API_V4_URL' in svc09_env_keys)
+         and ('CI_PROJECT_ID' in svc09_env_keys)
+         and ('CI_JOB_TOKEN' in svc09_env_keys) }}
+
+- name: "Provisioning | Extract GitLab CI state-backend values (GitLab backend only)"
+  ansible.builtin.set_fact:
+    svc09_env_ci_values: >-
+      {{ dict(svc09_env_keys | zip(
+           svc09_env_pairs
+           | map('regex_replace', '^[^=]+=\s*(.*?)\s*$', '\1')
+           | map('regex_replace', '^"(.*)"$', '\1')
+           | list
+         )) }}
+  when: svc09_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Derive the GitLab state address + job token (GitLab backend only)"
+  ansible.builtin.set_fact:
+    svc09_env_gitlab_state_address: >-
+      {{ svc09_env_ci_values['CI_API_V4_URL'] }}/projects/{{
+         svc09_env_ci_values['CI_PROJECT_ID'] }}/terraform/state/svc-09-reverse-proxy
+    svc09_env_ci_job_token: "{{ svc09_env_ci_values['CI_JOB_TOKEN'] }}"
+  when: svc09_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Log the Terraform backend selection (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Terraform backend:
+      {{ 'GitLab HTTP state (svc-09-reverse-proxy) — the Cluster_Env_File '
+         ~ 'configures the GitLab CI state-backend variables'
+         if (svc09_use_gitlab_backend | bool)
+         else 'LOCAL (local_backend_override.tf) — the Cluster_Env_File does not '
+              ~ 'configure the GitLab HTTP backend (solo/offline Developer-B default)' }}
+
+- name: "Provisioning | Ensure local_backend_override.tf is present (local backend)"
+  ansible.builtin.copy:
+    dest: "{{ svc09_tf_root }}/local_backend_override.tf"
+    mode: "0644"
+    content: |
+      # Local, gitignored state backend for a solo/offline apply — overrides the
+      # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+      terraform {
+        backend "local" {}
+      }
+  when: not (svc09_use_gitlab_backend | bool)
+
+- name: "Provisioning | Remove any local_backend_override.tf (GitLab HTTP backend)"
+  ansible.builtin.file:
+    path: "{{ svc09_tf_root }}/local_backend_override.tf"
+    state: absent
+  when: svc09_use_gitlab_backend | bool
+
+- name: "Provisioning | terraform init (local backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+  args:
+    chdir: "{{ svc09_tf_root }}"
+  environment: "{{ svc09_tf_env }}"
+  register: svc09_tf_init_local
+  changed_when: true
+  when: not (svc09_use_gitlab_backend | bool)
+  no_log: true
+
+- name: "Provisioning | terraform init (GitLab HTTP backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+      - "-backend-config=address={{ svc09_env_gitlab_state_address }}"
+      - "-backend-config=lock_address={{ svc09_env_gitlab_state_address }}/lock"
+      - "-backend-config=unlock_address={{ svc09_env_gitlab_state_address }}/lock"
+      - -backend-config=username=gitlab-ci-token
+      - "-backend-config=password={{ svc09_env_ci_job_token }}"
+      - -backend-config=lock_method=POST
+      - -backend-config=unlock_method=DELETE
+      - -backend-config=retry_wait_min=5
+  args:
+    chdir: "{{ svc09_tf_root }}"
+  environment: "{{ svc09_tf_env }}"
+  register: svc09_tf_init_gitlab
+  changed_when: true
+  when: svc09_use_gitlab_backend | bool
+  no_log: true
+
+# --- guest-variable assembly + non-interactive apply ------------------------
+- name: "Provisioning | Assert all required guest variables are present (before apply)"
+  ansible.builtin.assert:
+    that:
+      - "svc09_proxmox_node_name is defined and (svc09_proxmox_node_name | trim | length > 0)"
+      - "svc09_traefik_template_file_id is defined and (svc09_traefik_template_file_id | trim | length > 0)"
+      - "svc09_traefik_datastore_id is defined and (svc09_traefik_datastore_id | trim | length > 0)"
+      - "svc09_traefik_datastore_id != svc09_autodetect_sentinel"
+      - "svc09_traefik_vmid is defined"
+    fail_msg: >-
+      A required guest variable is absent or empty; refusing to run
+      `terraform apply` so no Proxmox resource is created. Required:
+      proxmox_node_name, traefik_template_file_id, a resolved
+      traefik_datastore_id (not the auto-detect sentinel), traefik_vmid.
+    success_msg: "All required guest variables are present; proceeding to terraform apply."
+
+- name: "Provisioning | terraform apply (non-interactive, auto-approve)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - apply
+      - -input=false
+      - -auto-approve
+      - "-var=proxmox_node_name={{ svc09_proxmox_node_name }}"
+      - "-var=traefik_vmid={{ svc09_traefik_vmid }}"
+      - "-var=traefik_template_file_id={{ svc09_traefik_template_file_id }}"
+      - "-var=traefik_datastore_id={{ svc09_traefik_datastore_id }}"
+  args:
+    chdir: "{{ svc09_tf_root }}"
+  environment: "{{ svc09_tf_env }}"
+  register: svc09_tf_apply
+  changed_when: "'0 added, 0 changed, 0 destroyed' not in svc09_tf_apply.stdout"
+  no_log: true
+
+# --- inventory generation + refresh handoff ---------------------------------
+- name: "Provisioning | Generate the Ansible inventory from Terraform outputs"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc09_venv_python }}"
+      - ansible/inventory/generate_inventory.py
+      - --root
+      - infra/projects/svc-09-reverse-proxy
+      - --out
+      - "{{ svc09_generated_inventory }}"
+  args:
+    chdir: "{{ svc09_repo_root }}"
+  register: svc09_gen_inventory
+  changed_when: true
+
+- name: "Provisioning | Confirm the generated inventory file was written"
+  ansible.builtin.stat:
+    path: "{{ svc09_repo_root }}/{{ svc09_generated_inventory }}"
+  register: svc09_generated_inventory_stat
+
+- name: "Provisioning | Assert the generated inventory exists (else halt before Bootstrap)"
+  ansible.builtin.assert:
+    that:
+      - "svc09_generated_inventory_stat.stat.exists"
+    fail_msg: >-
+      generate_inventory.py did not produce {{ svc09_generated_inventory }};
+      halting before the Bootstrap phase and leaving the provisioned guest in
+      place.
+    success_msg: "Generated inventory present: {{ svc09_generated_inventory }}."
+
+- name: "Provisioning | add_host the Traefik guest into the in-memory inventory"
+  ansible.builtin.add_host:
+    name: svc09-20-01
+    groups:
+      - traefik
+    ansible_host: "10.0.20.10"
+    ansible_user: root
+    ansible_connection: ssh
+  changed_when: false
+
+# --- SSH known_hosts reconciliation -----------------------------------------
+- name: "Provisioning | Ensure ~/.ssh exists (0700)"
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+
+- name: "Provisioning | Remove stale known_hosts fingerprints for the guest IP"
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -R
+      - "{{ item }}"
+      - -f
+      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
+  loop: "{{ svc09_guest_ips }}"
+  register: svc09_knownhosts_purge
+  changed_when: "'updated' in (svc09_knownhosts_purge.stderr | default(''))"
+  failed_when: false
+
+- name: "Provisioning | ssh-keyscan the guest IP (per-address 30s timeout)"
+  ansible.builtin.command:
+    argv:
+      - ssh-keyscan
+      - -T
+      - "30"
+      - "{{ item }}"
+  loop: "{{ svc09_guest_ips }}"
+  register: svc09_keyscan
+  changed_when: false
+  failed_when: >-
+    svc09_keyscan.rc != 0
+    or (svc09_keyscan.stdout | default('') | trim | length == 0)
+
+- name: "Provisioning | Append current host keys to known_hosts"
+  ansible.builtin.blockinfile:
+    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+    create: true
+    mode: "0600"
+    marker: "# {mark} SVC-09 installer host keys for {{ item.item }}"
+    block: "{{ item.stdout }}"
+  loop: "{{ svc09_keyscan.results }}"
+  loop_control:
+    label: "{{ item.item }}"

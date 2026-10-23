@@ -1,0 +1,17 @@
+---
+# defaults/main.yml — svc01_provision (SVC-01 installer — Phase 2)
+#
+# Phase-2 phase-specific defaults. svc01_tf_env is evaluated LAZILY against the
+# Phase-1 resolved facts; every consumer sets no_log:true. NO secret here.
+
+svc01_tf_root: "{{ svc01_repo_root }}/infra/projects/svc-01-sql-database"
+
+# Environment passed to the child terraform init/apply. Proxmox endpoint/token
+# via TF_VAR_* (never argv); insecure derived from validate_certs; operator keys
+# JSON list from Phase 1.
+svc01_tf_env:
+  TF_VAR_proxmox_endpoint: >-
+    {{ svc01_proxmox_endpoint_base | default(svc01_proxmox_endpoint) | default('') }}
+  TF_VAR_proxmox_api_token: "{{ svc01_proxmox_api_token | default('') }}"
+  TF_VAR_proxmox_insecure: "{{ (not (svc01_proxmox_validate_certs | bool)) | lower }}"
+  TF_VAR_operator_ssh_public_keys: "{{ svc01_operator_ssh_public_keys_json | default('[]') }}"

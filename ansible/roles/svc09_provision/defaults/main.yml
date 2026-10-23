@@ -1,0 +1,26 @@
+---
+# defaults/main.yml — svc09_provision (SVC-09 installer — Phase 2: Provision)
+#
+# Phase-2 phase-specific defaults. Clone of svc07_provision/defaults adapted for
+# the Traefik single-guest root. svc09_tf_env is evaluated LAZILY against the
+# Phase-1 resolved facts; every consumer sets no_log:true. NO secret value here.
+
+# The SVC-09 Terraform root (absolute, so the child `terraform` process runs in
+# it regardless of the play's cwd).
+svc09_tf_root: "{{ svc09_repo_root }}/infra/projects/svc-09-reverse-proxy"
+
+# Environment passed to the child `terraform` init/apply processes. The Proxmox
+# endpoint/token travel here as TF_VAR_* (never on the command line); every task
+# using this env sets no_log:true. Evaluated lazily against the Phase-1 facts.
+#   * TF_VAR_proxmox_endpoint uses the canonical base set in Phase 1.
+#   * TF_VAR_proxmox_insecure is derived from the single
+#     svc09_proxmox_validate_certs toggle (insecure == NOT validate_certs), so
+#     the provider's TLS verification cannot drift from preflight's.
+#   * TF_VAR_operator_ssh_public_keys is the JSON list the Phase-1 read task
+#     produced ("[]" when no key path was supplied -> strict no-op).
+svc09_tf_env:
+  TF_VAR_proxmox_endpoint: >-
+    {{ svc09_proxmox_endpoint_base | default(svc09_proxmox_endpoint) | default('') }}
+  TF_VAR_proxmox_api_token: "{{ svc09_proxmox_api_token | default('') }}"
+  TF_VAR_proxmox_insecure: "{{ (not (svc09_proxmox_validate_certs | bool)) | lower }}"
+  TF_VAR_operator_ssh_public_keys: "{{ svc09_operator_ssh_public_keys_json | default('[]') }}"

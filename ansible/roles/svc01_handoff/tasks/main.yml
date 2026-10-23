@@ -1,0 +1,57 @@
+---
+# tasks/main.yml — svc01_handoff (SVC-01 installer — Phase 4: Handoff)
+#
+# Phase 4 = health sanity + Developer B handoff. Invokes svc01-health.yml as a
+# child configurator play (hosts: postgres, NATIVELY on the guest) and prints the
+# completion banner. Health knobs are bridged via -e.
+
+- name: "Handoff | Run the guest health gate as a child configurator play (svc01-health.yml)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc01_generated_inventory }}"
+      - ansible/playbooks/svc01-health.yml
+      - -e
+      - "db_engine={{ db_engine | default('postgres') }}"
+      - -e
+      - "svc01_postgres_container_name={{ svc01_postgres_container_name }}"
+      - -e
+      - "svc01_mariadb_container_name={{ svc01_mariadb_container_name }}"
+      - -e
+      - "svc01_health_retries={{ svc01_health_retries }}"
+      - -e
+      - "svc01_health_delay={{ svc01_health_delay }}"
+  args:
+    chdir: "{{ svc01_repo_root }}"
+  register: svc01_health_run
+  changed_when: false
+
+- name: "Handoff | Resolve the absolute Cluster_Env_File path + banner fields"
+  ansible.builtin.set_fact:
+    svc01_cluster_env_abspath: >-
+      {{ (svc01_repo_root ~ '/' ~ cluster_env_file) | ansible.builtin.realpath }}
+    svc01_banner_port: "{{ 3306 if (db_engine | default('postgres')) == 'mariadb' else 5432 }}"
+    svc01_banner_ip: "10.0.{{ vlan_id }}.{{ 10 + (host_index | default(0) | int) }}"
+  changed_when: false
+
+- name: "Handoff | Print the Developer B completion summary banner"
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Service SVC-01 ({{ db_engine | default('postgres') }}) Deployed Successfully!"
+      - "============================================================"
+      - "Project:            {{ project_slug }}"
+      - "Engine:             {{ db_engine | default('postgres') }}"
+      - "Status:             healthy"
+      - "Endpoint:           {{ svc01_banner_ip }}:{{ svc01_banner_port }} (VLAN {{ vlan_id }}, private)"
+      - "Database:           {{ project_slug | regex_replace('-', '_') }}"
+      - "App role:           {{ (project_slug | regex_replace('-', '_')) ~ '_app' }} (least-privilege, no SUPERUSER)"
+      - "Credentials:        stored in OpenBao at secret/proj-{{ project_slug }}/{{ db_engine | default('postgres') }}"
+      - "                    (passwords by name only — never shown)"
+      - "Config:             {{ svc01_cluster_env_abspath }}"
+      - ""
+      - "Next Steps for Project Developers:"
+      - "  App containers fetch the connection credential from OpenBao via their"
+      - "  own Agent at container start — never a plaintext password in a repo."
+      - "============================================================"

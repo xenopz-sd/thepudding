@@ -1,0 +1,100 @@
+---
+# defaults/main.yml — postgres-server (SVC-01)
+#
+# Deploys a dedicated-per-project PostgreSQL instance as a Docker Compose stack
+# (postgres + postgres_exporter sidecar) via the generic docker-compose-app role,
+# then idempotently creates the project database, a least-privilege application
+# role, and any requested extensions via `docker exec ... psql` (NOT the
+# community.postgresql collection — the minimal guest has no psycopg2; the SQL
+# runs inside the container, which has psql + the server). Passwords are generated
+# at provision time and written to OpenBao — never to the committed .env
+# (integration-boundaries §2, security-standards). Spec:
+# .kiro/specs/svc-01-sql-database/.
+
+# --- Image pin (tech.md: never track `latest`) ---
+# pgvector ships only in images built with the extension. The stock `postgres:17`
+# image does NOT carry `vector`, so when pgvector is requested we pin the official
+# `pgvector/pgvector:pg17` image (postgres 17 + pgvector, same server). PostGIS /
+# TimescaleDB would likewise need their own extension-bearing images — see the
+# known-limitation note in the SVC-01 validation (only pgvector is wired here,
+# matching the platform's ML/embeddings primary use case).
+postgres_image_base: "postgres:17"                    # SVC-01 §3 pinned major
+postgres_image_pgvector: "pgvector/pgvector:pg17"     # postgres 17 + pgvector
+postgres_image: "{{ postgres_image_pgvector if (postgres_enable_pgvector | bool) else postgres_image_base }}"
+postgres_exporter_image: "quay.io/prometheuscommunity/postgres-exporter:v0.15.0"
+
+# --- Project identity (supplied by the installer / consuming root) ---
+postgres_project_slug: ""                              # e.g. dronefleet, shared-zitadel
+postgres_vlan_id: 0                                    # the project's VLAN (host IP .1X)
+postgres_host_index: 0
+
+# --- Database identity (derived from the slug; overridable) ---
+postgres_db_name: "{{ postgres_project_slug | regex_replace('-', '_') }}"
+postgres_app_role: "{{ (postgres_project_slug | regex_replace('-', '_')) ~ '_app' }}"
+postgres_exporter_role: "{{ (postgres_project_slug | regex_replace('-', '_')) ~ '_exporter' }}"
+
+# --- Compose stack identity (consumed by docker-compose-app) ---
+postgres_stack_name: "postgres"
+postgres_container_name: "{{ postgres_stack_name }}-postgres-1"
+postgres_exporter_container_name: "{{ postgres_stack_name }}-postgres-exporter-1"
+
+# --- Ports / addressing ---
+postgres_port: 5432
+postgres_exporter_port: 9187
+# The guest's own VLAN IP (NET-00 cidrhost 10.0.<vlan>.1X). The wire-protocol
+# port is bound ONLY to this private VLAN IP (docker-compose-app documented
+# exception) — NEVER 0.0.0.0, NEVER Traefik. Set by the installer from the
+# computed guest IP; defaulted here for a single-host render.
+postgres_bind_ip: "10.0.{{ postgres_vlan_id }}.{{ 10 + (postgres_host_index | int) }}"
+
+# --- Cross-guest-client opt-ins (default OFF — see SVC-06 design §3.3) ---------
+# The strict default serves same-DB, TLS-only clients. A cross-guest client that
+# must reach the `postgres` MAINTENANCE database (e.g. ZITADEL's start-from-init)
+# and/or cannot do TLS yet (no SVC-08/EJBCA cert) needs these, set ONLY for that
+# dedicated backing instance. Both OFF keeps the generic SVC-01 posture intact.
+# - CREATEDB: lets the app role satisfy ZITADEL's init DB-existence/creation step.
+postgres_app_role_createdb: false
+# - A non-TLS, subnet-scoped, scram `pg_hba` line for the app role covering ALL
+#   databases (incl. `postgres`). Trusted VLAN subnet only; retired when a real
+#   cert exists and the client switches to sslmode=verify-full.
+postgres_client_nontls_subnet: false
+
+# --- Data / backup locations on the guest ---
+postgres_data_volume: "postgres-data"                  # named volume -> /var/lib/postgresql/data
+postgres_data_dir: "/var/lib/postgresql/data"
+# Nightly pg_dump staging dir on the guest rootfs; included in the PBS LXC backup
+# (SVC-01 §6). Retained 7 days locally.
+postgres_backup_dir: "/var/backups/postgres"
+postgres_backup_retention_days: 7
+postgres_backup_hour: "02"                              # 02:xx nightly
+postgres_backup_minute: "30"
+
+# --- Sizing-tier config overrides (SVC-01 §6; set by installer from the tier) ---
+postgres_shared_buffers: "256MB"                        # ~25% of small-tier 2 GB; medium bumps up
+postgres_work_mem: "16MB"
+postgres_max_connections: 100
+
+# --- Extensions (per-flag, PostgreSQL only — SVC-01 FR-2) ---
+postgres_enable_pgvector: false
+postgres_enable_postgis: false
+postgres_enable_timescaledb: false
+
+# --- Logging (composition-wiring.md: INFO to stdout) ---
+postgres_log_statement: "ddl"                           # SVC-01 §13 — avoid excessive volume
+
+# =============================================================================
+# SECRETS — generated at provision, written to OpenBao, NEVER committed.
+# -----------------------------------------------------------------------------
+# These resolve at runtime from the OpenBao-sourced values the installer places,
+# or are generated by the role's provision tasks and pushed to OpenBao. The
+# committed default is ALWAYS empty — a real credential value must never live
+# here (security-standards). The OpenBao path is secret/proj-<slug>/postgres.
+# =============================================================================
+postgres_openbao_secret_path: "secret/proj-{{ postgres_project_slug }}/postgres"
+# These are populated at runtime (no_log tasks) — never a literal here.
+postgres_superuser_password: ""
+postgres_app_password: ""
+postgres_exporter_password: ""
+
+# --- Reconciliation ---
+postgres_state: "present"

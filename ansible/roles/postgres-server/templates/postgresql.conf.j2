@@ -1,0 +1,18 @@
+{#
+  templates/postgresql.conf.j2 — postgres-server (SVC-01)
+  Tiered overrides appended via a conf.d include. No secret here.
+#}
+# MANAGED BY ANSIBLE (postgres-server) — DO NOT EDIT BY HAND.
+# SVC-01 PostgreSQL tuning for project {{ postgres_project_slug }}.
+listen_addresses = '*'
+port = {{ postgres_port }}
+max_connections = {{ postgres_max_connections }}
+shared_buffers = '{{ postgres_shared_buffers }}'
+work_mem = '{{ postgres_work_mem }}'
+# TLS for cross-VLAN connections is required by pg_hba (hostssl); the cert is
+# issued by SVC-08/EJBCA (or a local self-signed stand-in) and dropped at the
+# path below out-of-band — referenced by path, not generated here.
+# ssl = on   # enabled once a cert is present at the ssl_cert_file path
+log_statement = '{{ postgres_log_statement }}'
+log_timezone = 'UTC'
+timezone = 'UTC'

@@ -1,0 +1,89 @@
+{#
+  templates/traefik.yml.j2 — traefik_install (SVC-09)
+
+  Traefik v3 STATIC configuration. Rendered onto the guest at
+  {{ traefik_static_config_file }} and bind-mounted :ro into the container.
+  Traefik reads this only at start, so a change notifies `Restart traefik`.
+
+  No secret value is rendered here. The DNS-01 provider token (if used for ACME
+  DNS challenges) and the ZITADEL forward-auth client secret are day-2 secrets
+  fetched from OpenBao by the Agent at container-start time (integration-
+  boundaries §2) and injected as environment variables — never templated here.
+#}
+# MANAGED BY ANSIBLE (traefik_install) — DO NOT EDIT BY HAND.
+# SVC-09 Traefik static configuration. Spec: .kiro/specs/svc-09-reverse-proxy.
+---
+global:
+  checkNewVersion: false
+  # NOTE: `sendAnonymousStatistics` was REMOVED in Traefik v3 — it was a v2 key.
+  # Including it crash-loops v3 with `field not found, node:
+  # sendAnonymousStatistics` (caught live by the SVC-09 health gate). v3 sends no
+  # anonymous statistics by default, so no replacement key is needed.
+
+# INFO to stdout; JSON access logs shipped to Loki (SVC-18) via Promtail once it
+# exists (composition-wiring.md logging rule; SVC-09 §13).
+log:
+  level: "{{ traefik_log_level }}"
+accessLog:
+  format: "{{ traefik_access_log_format }}"
+
+# Native Prometheus metrics on a DEDICATED internal-only entrypoint — never on
+# the public web/websecure entrypoints (SVC-09 §13).
+metrics:
+  prometheus:
+    entryPoint: metrics
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+
+# API/dashboard enabled but NOT insecure (SVC-09 FR-6): `insecure: false` means
+# the dashboard is NEVER served on the raw :8080 host port. It is reachable only
+# via an internal Traefik router (defined by labels on the Traefik container),
+# protected by the ZITADEL forward-auth middleware once SVC-06 is deployed.
+api:
+  dashboard: true
+  insecure: false
+
+entryPoints:
+  web:
+    address: ":{{ traefik_entrypoint_web_port }}"
+    http:
+      # HTTP->HTTPS redirect (SVC-09 FR-4). The ACME HTTP-01 challenge path is
+      # handled by Traefik's ACME resolver before this redirect applies.
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":{{ traefik_entrypoint_websecure_port }}"
+  # Internal-only metrics entrypoint (not reachable from the LAN; scraped by
+  # Prometheus over VLAN 20).
+  metrics:
+    address: ":{{ traefik_entrypoint_metrics_port }}"
+
+providers:
+  # Docker provider auto-discovery (SVC-09 FR-1). exposedByDefault:false so a
+  # container must opt in with traefik.enable=true; the socket is mounted
+  # READ-ONLY in the compose stack (SVC-09 §12) — Traefik observes labels only.
+  docker:
+    endpoint: "unix://{{ traefik_docker_socket }}"
+    exposedByDefault: {{ traefik_exposed_by_default | lower }}
+    network: edge
+  # File provider for the dynamic config (middlewares, and — under the
+  # self-signed TLS mock — the default cert). Watched/hot-reloaded by Traefik.
+  file:
+    directory: "{{ traefik_dynamic_config_dir }}"
+    watch: true
+
+certificatesResolvers:
+  # Public ACME resolver (SVC-09 FR-2). Used when a CA/Let's Encrypt is
+  # reachable. When no CA exists, the self-signed TLS mock
+  # (traefik_tls_self_signed, default off) supplies the interim default cert via
+  # the file provider instead — see .kiro/steering/mock-stand-ins.md.
+  letsencrypt:
+    acme:
+      email: "{{ traefik_letsencrypt_email }}"
+      storage: "{{ traefik_acme_storage }}"
+      httpChallenge:
+        entryPoint: web

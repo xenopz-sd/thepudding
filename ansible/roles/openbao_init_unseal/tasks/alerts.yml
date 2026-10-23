@@ -52,7 +52,9 @@
     - "{{ openbao_alertmanager_route_dir }}"
   when: openbao_alerts_enabled | bool
 
-- name: "10.2 — Render the Prometheus alerting rules (OpenBaoSealed/UnsealerUnreachable/LeaseCountHigh, Req 10.4/10.5/10.6)"
+- name: >-
+    10.2 — Render the Prometheus alerting rules
+    (OpenBaoSealed/UnsealerUnreachable/LeaseCountHigh, Req 10.4/10.5/10.6)
   ansible.builtin.template:
     src: "prometheus-openbao-alerts.yml.j2"
     dest: "{{ openbao_prometheus_alerts_rule_file }}"

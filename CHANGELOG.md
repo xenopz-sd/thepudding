@@ -5,6 +5,129 @@ All notable changes to the Developer Services Platform are documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-10-22
+
+The first substantive feature release since v0.7.x: it stands up **three new
+implemented services** — **SVC-09 (Traefik reverse proxy)**, **SVC-01 (PostgreSQL)**,
+and **SVC-06 (ZITADEL identity provider)** — adds an **automated offline CI
+test/lint gate**, and completes the SVC-06 bring-up end-to-end so a from-scratch
+install onboards its first org with **no human-minted token**
+(`svc06-org-provision-token-wiring`, ADR-0016). Three correctness fixes surfaced
+by the all-services from-scratch validation also land
+(`fix-vlan-host-index-collision` / ADR-0015,
+`fix-svc07-clean-slate-terraform-data-residue`,
+`fix-svc06-zitadel-db-app-password-mismatch`). SVC-07 and the platform
+prerequisites were already released; this release brings the implemented-services
+set to SVC-01/06/07/09 + platform prerequisites. Minor version bump: all additive
+(new services, new CI gate, new feature) plus fixes — no breaking changes.
+
+### Added
+- **SVC-09 — Reverse proxy (Traefik)** (spec `svc-09-reverse-proxy`, ADR-0013): the
+  shared HTTP/HTTPS ingress + TLS-termination edge on one LXC — a `traefik_install`
+  role with a static `traefik.yml` (web/websecure entrypoints, internal metrics,
+  `exposedByDefault: false`, read-only Docker socket, HTTP→HTTPS redirect), Docker-label
+  backend auto-discovery, a persistent `acme` volume, and ownership of the real
+  external `edge` Docker network. Ships two PERMANENT default-off mock stand-ins for
+  its not-yet-built dependencies — self-signed TLS (SVC-08 CA) and a dashboard with
+  forward-auth disabled (SVC-06 SSO) — that fail closed when off and flip to the real
+  path once the dependency lands. Terraform root `infra/projects/svc-09-reverse-proxy/`
+  (own state, `prevent_destroy` acme seatbelt) + `INSTALL-RUNBOOK.md`. Live-validated.
+- **SVC-01 — SQL database (PostgreSQL)** (spec `svc-01-sql-database`): a
+  dedicated-per-project `postgres:17` + `postgres_exporter` stack, delivered as a
+  REUSABLE Terraform root (per-slug state) and a `postgres-server` Ansible role behind
+  a thin `svc-01-bootstrap.yml` 4-phase orchestrator parameterized by `project_slug`.
+  Least-privilege per-project app role, per-flag pgvector/PostGIS/TimescaleDB, nightly
+  `pg_dump` backup, and all credentials stored in OpenBao. A `mariadb-server` skeleton
+  is selectable via `db_engine` (strict-EU alternative). `INSTALL-RUNBOOK.md`.
+  Live-validated on the throwaway cluster.
+- **SVC-06 — Identity provider (ZITADEL)** (spec `svc-06-identity-provider`,
+  ADR-0014): the shared OIDC/SAML SSO backbone — one ZITADEL LXC (image `v4.18.0`) on
+  VLAN 20 fronted by Traefik, backed by its OWN dedicated SVC-01 PostgreSQL instance;
+  masterkey + OIDC client secrets held only in OpenBao; idempotent per-project
+  org/OIDC-app onboarding via a pure-Python management-API helper. Ships two PERMANENT
+  default-off mocks (self-signed TLS, placeholder `edge` network) for dev/offline
+  targets. Stood up end-to-end on the throwaway cluster (OIDC discovery HTTP 200,
+  issuer `https://auth.platform.example.test`). `INSTALL-RUNBOOK.md`.
+- **Automated offline CI test/lint gate** (spec `ci-offline-test-pipeline`): a
+  `.gitlab-ci.yml` that runs the offline verification as a BLOCKING gate on every MR
+  to `main` (and on `main` after merge) — the four pytest roots as SEPARATE invocations
+  (same-named `conftest.py` collision), `yamllint`, `ansible-playbook --syntax-check`,
+  and `terraform fmt -check` + `validate` (`-backend=false`, never touching remote
+  state). Offline by construction (`pytest.ini` `-m "not requires_infra"`); the
+  live/`requires-infra` tier is excluded. The two branch-context meta-tests
+  (`scope_guard`, `no_pre_existing_test_fails`) are deselected only on MR/feature
+  pipelines and run in full on `main`. Toolchain pinned (Python 3.12 + `requirements.txt`,
+  Ansible + Galaxy collections, pinned Terraform). This is the automated realization of
+  the offline gate that `testing-strategy.md`'s trip-wire flagged as warranted.
+- **SVC-06 zero-human-token org-provision** (spec `svc06-org-provision-token-wiring`,
+  ADR-0016): ZITADEL seeds a dedicated `provision-sa` machine user and emits its
+  PAT at first-init; `zitadel-server` stores it in OpenBao
+  (`secret/proj-shared-zitadel/zitadel` field `provision_token`,
+  gen-once/read-back mirroring the masterkey); `zitadel-org-provision` reads it
+  from OpenBao by default, with the `ZITADEL_PROVISION_TOKEN` env override
+  preserved for manual/CI. A from-scratch bring-up onboards the first org + OIDC
+  app with no human-minted token; an idempotent re-run never re-mints. New
+  `infra/tests/test_svc06_provision_token_wiring.py`. Live-validated on the
+  throwaway cluster.
+- **ADR-0016**
+  `.kiro/decisions/0016-zitadel-provisioning-token-is-instance-scoped-by-necessity.md`
+  (+ project-constitution Decision Log row): the provisioning PAT is
+  `IAM_OWNER`-scoped by ZITADEL necessity — creating a new org is instance-level,
+  no narrower grant exists, and FirstInstance has no narrower option. Blast radius
+  bounded by a dedicated non-human machine user + a bounded `Pat.ExpirationDate` +
+  OpenBao-only storage + `no_log` + emit-file scrub.
+- **Implemented-services index + CHANGELOG** updated for the newly-shipped
+  SVC-01/06/09 (and the token-wiring feature): the `docs/README.md` index lists all
+  four implemented services, each linking its `INSTALL-RUNBOOK.md` and spec per
+  `structure.md` (the root README already listed them).
+- **Per-VLAN host-index ledger** `infra/platform-foundation/host-indices.yaml`
+  (ADR-0015) documented in the platform-foundation README.
+
+### Changed
+- **`scripts/installer/zitadel_provision.py`** — switched to the ZITADEL v4
+  organization API paths (`/v2/organizations`, `/v2/organizations/_search`; the old
+  `/management/v1/orgs` returns 404 on v4.18.0), plus non-secret
+  `--host-header`/`--insecure` dev-transport knobs (the access token still travels
+  only in the child-process env, never argv). The production Traefik path is
+  unchanged.
+- **Documentation** — the `docs/README.md` implemented-services index is completed
+  and its topology diagram IP corrected (ZITADEL `10.0.20.15`, not `.10`);
+  `docs/TESTING.md` "where to go deeper" extended to the SVC-01/06/09 runbooks plus
+  a zero-human-token note; the root README SVC-06 row notes the no-human-token
+  onboarding.
+
+### Fixed
+- **SVC-06 ZITADEL backing-DB SASL auth (28P01)** (spec
+  `fix-svc06-zitadel-db-app-password-mismatch`): `svc06_openbao_addr` defaulted to
+  `""`, disabling the whole OpenBao credential handoff while SVC-01 still set a
+  random `shared_zitadel_app` role password — ZITADEL then presented an empty
+  password and crash-looped. Fixed by defaulting `svc06_openbao_addr` to the
+  OpenBao primary `10.0.20.10` at all three layers, plus a fail-fast in
+  `zitadel-server` when OpenBao is wired but the password read is empty.
+  Live-validated.
+- **Service clean-slate left `terraform_data` residue in state** (spec
+  `fix-svc07-clean-slate-terraform-data-residue`): a reported-clean service
+  clean-slate left non-guest `terraform_data` resources (the host-index
+  ledger-check + `input_guards` anchors) in Terraform state, so the platform
+  halt-before-fabric check correctly refused teardown and forced a manual
+  `terraform state rm`. Fixed with a provider-free full-state sweep + a tightened
+  empty-baseline gate across the svc07/svc09/svc01/svc06 clean-slate roles.
+  Live-validated.
+- **VLAN-20 host-index/IP collision** (spec `fix-vlan-host-index-collision`,
+  ADR-0015): SVC-07's OpenBao primary and SVC-09's Traefik both defaulted to
+  `host_index = 0` → both `10.0.20.10`, so Traefik was unreachable when
+  co-deployed. Fixed with a committed per-VLAN host-index ledger
+  (`host-indices.yaml`) feeding a `proxmox-compute` plan-time uniqueness
+  precondition; SVC-09 moved to `host_index = 2` (`10.0.20.12`). General to every
+  multi-root-per-VLAN subnet. Live-validated: all five VLAN-20 guests on distinct
+  IPs.
+
+### Known limitations
+- The SVC-06 provisioning token is `IAM_OWNER`-scoped by ZITADEL necessity
+  (ADR-0016) — a leaked token is instance-admin-capable until its PAT expiry;
+  mitigated by bounded expiry (operator-shortenable), OpenBao-only storage, and a
+  dedicated non-human identity.
+
 ## [0.8.0] - 2026-10-01
 
 A **documentation-only** release that polishes the Developer-B front-door
@@ -568,5 +691,6 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
+[0.9.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.8.0...v0.9.0
 [0.2.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.1.0...v0.2.0
 [0.1.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/releases/v0.1.0

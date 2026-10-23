@@ -148,7 +148,9 @@
       superuser password was supplied. Set the never-committed env var
       '{{ openbao_database_superuser_password_env_var }}' (a gitignored .env or a
       GitLab CI/CD protected+masked variable). It is never defaulted or committed.
-    success_msg: "DB superuser password supplied via {{ openbao_database_superuser_password_env_var }} (value not logged)."
+    success_msg: >-
+      DB superuser password supplied via
+      {{ openbao_database_superuser_password_env_var }} (value not logged).
     quiet: true
   no_log: "{{ openbao_no_log }}"
   when: openbao_database_configure_connection | bool

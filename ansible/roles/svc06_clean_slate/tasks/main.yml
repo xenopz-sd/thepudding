@@ -1,0 +1,259 @@
+---
+# tasks/main.yml — svc06_clean_slate (SVC-06 installer — clean-slate branch)
+#
+# Clone of svc01_clean_slate, EXTENDED to tear down BOTH the ZITADEL guest AND
+# the backing SVC-01 DB (design.md §3.5). Order: agent-live guard consult FIRST
+# (gated), confirmation gate, independent node-name resolve, then:
+#   A. tear down the ZITADEL guest (terraform_clean_slate, single target);
+#   B. orchestrate the SVC-01 backing-DB clean-slate as a CHILD svc-01-bootstrap
+#      run (-e clean_slate=true), so each service's own clean-slate contract
+#      owns its state (not reached across a state boundary);
+# then an empty-baseline verify over BOTH guests.
+
+- name: "Clean-Slate | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc06_venv_python }}"
+      - "{{ svc06_throwaway_guard }}"
+      - --service
+      - svc06
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ svc06_throwaway_allowlist }}"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  register: svc06_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (svc06_throwaway_decision.stdout | default('{}') | from_json).reason | default('no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | Refuse the reset unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "svc06_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live clean-slate REFUSED by the throwaway-cluster guard:
+      {{ (svc06_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      No container was destroyed and no Terraform state was modified.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live clean-slate."
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | Prompt for explicit confirmation (300s timeout; skipped on force)"
+  ansible.builtin.pause:
+    prompt: >-
+      DESTRUCTIVE Clean-Slate reset of SVC-06 (ZITADEL) requested. This will
+      pct-destroy the ZITADEL container {{ svc06_zitadel_vmid }} AND the backing
+      DB container {{ svc06_db_vmid }}, and remove both from Terraform state.
+      Type 'yes' to proceed, anything else to abort
+  register: svc06_clean_slate_prompt
+  when: (clean_slate_confirm | default('')) != 'force'
+
+- name: "Clean-Slate | Resolve whether the reset is confirmed"
+  ansible.builtin.set_fact:
+    svc06_clean_slate_confirmed: >-
+      {{ (clean_slate_confirm | default('')) == 'force'
+         or ((svc06_clean_slate_prompt.user_input | default('') | trim | lower) in ['yes', 'y']) }}
+
+- name: "Clean-Slate | Abort with non-zero exit when not confirmed (destroys nothing)"
+  ansible.builtin.fail:
+    msg: >-
+      Clean-Slate reset ABORTED — confirmation not given. Nothing destroyed.
+      Re-run with 'yes' at the prompt, or -e clean_slate_confirm=force.
+  when: not (svc06_clean_slate_confirmed | bool)
+
+- name: "Clean-Slate | Resolve cluster env for the Proxmox node name"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc06_venv_python }}"
+      - "{{ svc06_cluster_env_helper | default('scripts/installer/cluster_env.py') }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  register: svc06_cs_env_resolve
+  changed_when: false
+  no_log: true
+
+- name: "Clean-Slate | Bind the resolved Proxmox node name (no_log)"
+  ansible.builtin.set_fact:
+    proxmox_node_name: "{{ (svc06_cs_env_resolve.stdout | from_json)['TF_VAR_proxmox_node_name'] }}"
+  no_log: true
+
+- name: "Clean-Slate | Assert the Proxmox host SSH address was supplied"
+  ansible.builtin.assert:
+    that:
+      - "svc06_proxmox_host is defined"
+      - "(svc06_proxmox_host | trim | length) > 0"
+    fail_msg: >-
+      The reset delegates to clean-slate.yml against the Proxmox-host inventory
+      (runs `pct` on the node). Supply -e svc06_proxmox_host=<real-proxmox-lan-ip>.
+      Nothing was destroyed.
+    success_msg: "Proxmox host SSH address supplied for the reset."
+
+# --- A. Tear down the ZITADEL guest (single target) --------------------------
+- name: "Clean-Slate | Assemble the single ZITADEL clean_slate_target"
+  ansible.builtin.set_fact:
+    svc06_clean_slate_targets:
+      - name: "svc06-20-01"
+        terraform_root: infra/projects/svc-06-identity-provider
+        resource_address: proxmox_virtual_environment_container.zitadel
+        node: "{{ proxmox_node_name }}"
+        vmid: "{{ svc06_zitadel_vmid }}"
+
+- name: "Clean-Slate | Delegate the ZITADEL reset to clean-slate.yml"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc06_proxmox_host_inventory }}"
+      - ansible/playbooks/clean-slate.yml
+      - --extra-vars
+      - "ansible_host={{ svc06_proxmox_host }}"
+      - -e
+      - clean_slate_enabled=true
+      - -e
+      - "clean_slate_confirm={{ item.vmid }}"
+      - -e
+      - "{{ {'clean_slate_targets': [item]} | to_json }}"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  loop: "{{ svc06_clean_slate_targets }}"
+  loop_control:
+    label: "{{ item.name }} (vmid {{ item.vmid }})"
+  register: svc06_clean_slate_runs
+  changed_when: "'changed=0' not in (svc06_clean_slate_runs.stdout | default(''))"
+
+# --- B. Orchestrate the backing-DB clean-slate (child svc-01-bootstrap) ------
+# The DB is an SVC-01 instance with its OWN state; invoke ITS clean-slate
+# contract (not a reach across the state boundary). Mirrors the platform
+# clean-slate "orchestrate each service's own clean-slate" rule (ADR-0011).
+- name: "Clean-Slate | Orchestrate the backing-DB clean-slate (child svc-01-bootstrap, no_log)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - ansible/inventory/localhost.yml
+      - ansible/playbooks/svc-01-bootstrap.yml
+      - -e
+      - "cluster_env_file={{ cluster_env_file }}"
+      - -e
+      - clean_slate=true
+      - -e
+      - "clean_slate_confirm={{ clean_slate_confirm | default('') }}"
+      - -e
+      - "project_slug={{ svc06_db_project_slug }}"
+      - -e
+      - "vlan_id={{ svc06_db_vlan_id }}"
+      - -e
+      - "svc01_vmid={{ svc06_db_vmid }}"
+      - -e
+      - "svc01_proxmox_host={{ svc06_proxmox_host }}"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  environment:
+    AGENT_LIVE_AUTHORIZED: "{{ lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED') | default('', true) }}"
+  register: svc06_db_clean_slate
+  changed_when: "'changed=0' not in (svc06_db_clean_slate.stdout | default(''))"
+  no_log: true
+
+# --- Empty-baseline verify over BOTH guests ----------------------------------
+- name: "Clean-Slate | VERIFY — list surviving SVC-06 containers on the host (pct list)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible"
+      - proxmox
+      - -i
+      - "{{ svc06_proxmox_host_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ svc06_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pct list"
+  args:
+    chdir: "{{ svc06_repo_root }}"
+  register: svc06_pct_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the set of surviving SVC-06 container VMIDs"
+  ansible.builtin.set_fact:
+    svc06_surviving_vmids: >-
+      {{ [svc06_zitadel_vmid | string, svc06_db_vmid | string]
+         | select('in', (svc06_pct_list.stdout | default(''))) | list }}
+
+# Zero RESOURCES of ANY kind in the SVC-06 (ZITADEL) Terraform state. The
+# ZITADEL child clean-slate.yml run above destroyed the ZITADEL guest and
+# state-rm'd its container address; the backing-DB clean-slate (child
+# svc-01-bootstrap) empties the SVC-01 state via ITS own now-fixed sweep. But
+# the SVC-06 root still carries the non-guest `module.*.terraform_data.input_guards`
+# anchor (via proxmox-compute), which the container-only state rm leaves behind
+# (the residue bug, spec fix-svc07-clean-slate-terraform-data-residue). A correct
+# clean-slate must leave the ZITADEL `terraform state list` EMPTY, so enumerate
+# every remaining ADDRESS and `terraform state rm` it PROVIDER-FREE (NOT
+# `terraform destroy`, Req 2.5). All ops run on the CONTROL NODE.
+- name: "Clean-Slate | List ALL remaining addresses in the SVC-06 Terraform state (residue sweep)"
+  ansible.builtin.command:
+    argv: [terraform, state, list]
+  args:
+    chdir: "{{ svc06_tf_root }}"
+  register: svc06_residual_state_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the residual (non-guest terraform_data) addresses to remove"
+  ansible.builtin.set_fact:
+    svc06_residual_state_addrs: >-
+      {{ (svc06_residual_state_list.stdout | default('')).splitlines()
+         | map('trim') | select('ne', '') | list }}
+
+- name: "Clean-Slate | Remove ALL remaining state addresses provider-free (terraform state rm)"
+  ansible.builtin.command:
+    argv: [terraform, state, rm, "{{ item }}"]
+  args:
+    chdir: "{{ svc06_tf_root }}"
+  loop: "{{ svc06_residual_state_addrs }}"
+  loop_control:
+    label: "{{ item }}"
+  register: svc06_residual_state_rm
+  changed_when: "'Removed' in (svc06_residual_state_rm.stdout | default(''))"
+  failed_when:
+    - (svc06_residual_state_rm.rc | default(1)) != 0
+    - "'No matching objects' not in (svc06_residual_state_rm.stdout | default(''))"
+    - "'No matching objects' not in (svc06_residual_state_rm.stderr | default(''))"
+
+- name: "Clean-Slate | VERIFY — list the FULL SVC-06 Terraform state after the residue sweep"
+  ansible.builtin.command:
+    argv: [terraform, state, list]
+  args:
+    chdir: "{{ svc06_tf_root }}"
+  register: svc06_state_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the set of surviving SVC-06 state addresses (FULL state)"
+  ansible.builtin.set_fact:
+    svc06_surviving_state_addrs: >-
+      {{ (svc06_state_list.stdout | default('')).splitlines()
+         | map('trim') | select('ne', '') | list }}
+
+- name: "Clean-Slate | GATE — assert an empty baseline (0 containers, 0 ZITADEL state), Req 2.2"
+  ansible.builtin.assert:
+    that:
+      - "(svc06_surviving_vmids | length) == 0"
+      - "(svc06_surviving_state_addrs | length) == 0"
+    fail_msg: >-
+      Clean-Slate reset did NOT reach an empty baseline. Surviving container(s):
+      {{ svc06_surviving_vmids | default([]) | join(', ') | default('none', true) }};
+      surviving ZITADEL state address(es):
+      {{ svc06_surviving_state_addrs | default([]) | join(', ') | default('none', true) }}.
+    success_msg: "Clean-Slate reset complete — zero SVC-06 containers + EMPTY ZITADEL state."

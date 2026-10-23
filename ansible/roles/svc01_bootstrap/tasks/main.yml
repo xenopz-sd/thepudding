@@ -1,0 +1,78 @@
+---
+# tasks/main.yml — svc01_bootstrap (SVC-01 installer — Phase 3: Bootstrap)
+#
+# Phase-3 "Host hardening & service bootstrap": a single guest, a single DB
+# stack.
+#   1. common baseline child run (Docker CE + Compose) on the DB guest.
+#   2. postgres.yml configurator child run (selects postgres-server or
+#      mariadb-server per db_engine), creating the DB + least-priv role +
+#      extensions and storing credentials in OpenBao.
+# Both as child ansible-playbook runs (orchestrator/configurator seam). A
+# non-zero child exit -> this phase's rescue.
+
+- name: "Bootstrap | common baseline (Docker + Compose) on the DB guest"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc01_generated_inventory }}"
+      - ansible/playbooks/common.yml
+  args:
+    chdir: "{{ svc01_repo_root }}"
+  register: svc01_common_run
+  changed_when: "'changed=0' not in (svc01_common_run.stdout | default(''))"
+
+# Deploy the DB stack via a child postgres.yml run (hosts: postgres). The engine
+# role (postgres-server | mariadb-server) is selected inside postgres.yml by
+# db_engine. The project identity + sizing + extension flags + the OpenBao
+# address/token are bridged across the child-process boundary via -e. The OpenBao
+# admin token travels in the child ENVIRONMENT, never on the argv (no_log).
+- name: "Bootstrap | DB install (postgres.yml child run against the generated inventory)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc01_generated_inventory }}"
+      - ansible/playbooks/postgres.yml
+      - -e
+      - "db_engine={{ db_engine | default('postgres') }}"
+      - -e
+      - "postgres_project_slug={{ project_slug }}"
+      - -e
+      - "mariadb_project_slug={{ project_slug }}"
+      - -e
+      - "postgres_vlan_id={{ vlan_id }}"
+      - -e
+      - "mariadb_vlan_id={{ vlan_id }}"
+      - -e
+      - "postgres_host_index={{ host_index | default(0) }}"
+      - -e
+      - "mariadb_host_index={{ host_index | default(0) }}"
+      - -e
+      - "postgres_enable_pgvector={{ enable_pgvector | default(false) }}"
+      - -e
+      - "postgres_enable_postgis={{ enable_postgis | default(false) }}"
+      - -e
+      - "postgres_enable_timescaledb={{ enable_timescaledb | default(false) }}"
+      - -e
+      # Cross-guest-client opt-ins (default OFF; see SVC-06 design §3.3). Forwarded
+      # so a backing-DB instance (e.g. ZITADEL's) can enable them without touching
+      # the generic SVC-01 default posture.
+      - "postgres_app_role_createdb={{ postgres_app_role_createdb | default(false) }}"
+      - -e
+      - "postgres_client_nontls_subnet={{ postgres_client_nontls_subnet | default(false) }}"
+      - -e
+      - "openbao_addr={{ openbao_addr | default('') }}"
+  args:
+    chdir: "{{ svc01_repo_root }}"
+  environment:
+    # The OpenBao admin token for the bao-CLI credential write (postgres-server).
+    # In the child ENV, never argv. Empty when OpenBao storage is not wired for a
+    # given run (the role's write task is gated on an address being present).
+    OPENBAO_ADMIN_TOKEN: >-
+      {{ openbao_admin_token
+         | default(lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN'), true)
+         | default('', true) }}
+  register: svc01_db_run
+  changed_when: "'changed=0' not in (svc01_db_run.stdout | default(''))"
+  no_log: true

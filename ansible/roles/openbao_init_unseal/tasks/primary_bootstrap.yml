@@ -510,7 +510,8 @@
 - name: "6.2 — Delete the GitLab CI/CD protected variable (pipeline)"
   ansible.builtin.uri:
     url: >-
-      {{ openbao_gitlab_api_url }}/projects/{{ openbao_gitlab_project_id }}/variables/{{ openbao_bootstrap_token_env_var }}
+      {{ openbao_gitlab_api_url }}/projects/{{ openbao_gitlab_project_id }}/variables/{{
+      openbao_bootstrap_token_env_var }}
     method: DELETE
     headers:
       PRIVATE-TOKEN: "{{ lookup('ansible.builtin.env', openbao_gitlab_token_env_var, default='') }}"

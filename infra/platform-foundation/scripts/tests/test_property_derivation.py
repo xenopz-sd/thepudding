@@ -37,16 +37,20 @@ from netfoundation.derivation import (
     MAX_PROJECT_VLAN_ID,
     MIN_PROJECT_VLAN_ID,
     HostAddressExhaustionError,
+    HostIndexCollisionError,
     HostnameCollisionError,
     ManagementVlanPlacementError,
     OperatorIpLiteralError,
     VlanExhaustionError,
+    assert_unique_host_indices,
     assert_unique_hostnames,
+    assigned_host_index,
     gateway_ip,
     host_ip,
     hostname,
     next_vlan_id,
     parse_hostname,
+    peer_host_indices,
     proxmox_tag,
     reject_ip_literal,
     reject_management_vlan,
@@ -461,3 +465,190 @@ def test_property_10_host_ip_exhaustion(vlan_id, index):
     assert FIRST_HOST_OFFSET + index > MAX_HOST_OCTET  # precondition of the property
     with pytest.raises(HostAddressExhaustionError):
         host_ip(vlan_id, index)
+
+
+# =========================================================================
+# Feature: fix-vlan-host-index-collision — Correctness Properties 1-4
+# =========================================================================
+#
+# These four property tests cover the pure host-index uniqueness guard
+# (``assert_unique_host_indices`` + ``HostIndexCollisionError``) and the ledger
+# read-views (``assigned_host_index`` / ``peer_host_indices``) added to
+# ``derivation.py`` for the fix-vlan-host-index-collision spec. They sit beside
+# the proxmox-network-foundation properties above, reuse the same ``vlan_ids``
+# strategy and ``PROPERTY_SETTINGS`` (>=100 examples each), and are pure/offline
+# — no file, network, or shared state. Each is tagged with its design property
+# per tasks.md task 2.
+
+
+# --- Reusable strategies for the host-index properties -------------------
+
+# A single host index. Zero-based; kept in a range that never trips the
+# .254 host-address exhaustion guard (that is proxmox-network-foundation's
+# Property 10, not a uniqueness concern here).
+host_indices = st.integers(min_value=0, max_value=MAX_HOST_OCTET - FIRST_HOST_OFFSET)
+
+# A SET of distinct host indices on one VLAN (what a valid ledger holds).
+distinct_index_sets = st.lists(host_indices, min_size=0, max_size=12, unique=True)
+
+
+@st.composite
+def _ledger_vlan_and_target(draw):
+    """Build a parsed single-VLAN ledger plus a target guest key within it.
+
+    Returns ``(vlan_id, ledger, target_key, index_by_key)`` where ``ledger`` is
+    the ``{vlan_id: [entries]}`` shape the read-views consume: each entry a dict
+    with a stable ``"guest_key"`` and an integer ``"host_index"``. Indices are
+    unique within the VLAN (a valid ledger). The recorded keys/indices are
+    Hypothesis-generated, not hand-rolled.
+    """
+    vlan_id = draw(vlan_ids)
+    indices = draw(st.lists(host_indices, min_size=1, max_size=10, unique=True))
+    # A distinct stable key per entry: g0, g1, ... (keys need only be unique).
+    entries = [
+        {"guest_key": f"g{i}", "host_index": idx} for i, idx in enumerate(indices)
+    ]
+    ledger = {vlan_id: entries}
+    index_by_key = {e["guest_key"]: e["host_index"] for e in entries}
+    target_key = draw(st.sampled_from([e["guest_key"] for e in entries]))
+    return vlan_id, ledger, target_key, index_by_key
+
+
+# --- Property 1: Distinct ledger indices accepted; duplicates rejected ---
+
+
+@PROPERTY_SETTINGS
+@given(distinct=distinct_index_sets, vlan_id=vlan_ids, data=st.data())
+def test_fix_collision_property_1_distinct_accepted_duplicates_rejected(
+    distinct, vlan_id, data
+):
+    # Feature: fix-vlan-host-index-collision, Property 1: Distinct ledger indices accepted; duplicates rejected
+    """Feature: fix-vlan-host-index-collision, Property 1: Distinct ledger indices accepted; duplicates rejected
+
+    For any VLAN and any multiset of host indices drawn for it,
+    ``assert_unique_host_indices`` returns normally iff every index is distinct;
+    if any index repeats it raises ``HostIndexCollisionError`` naming the VLAN
+    and the repeated index, before any address is emitted.
+
+    Validates: Requirements 1.1, 1.2
+    """
+    # A fully-distinct set is always accepted (returns None).
+    assert assert_unique_host_indices(vlan_id, distinct) is None
+
+    # Seed a duplicate by repeating one of the existing indices, then shuffle so
+    # the repeat is not trivially adjacent. Only possible when the set is
+    # non-empty.
+    if distinct:
+        repeated = data.draw(st.sampled_from(distinct))
+        colliding = data.draw(st.permutations(list(distinct) + [repeated]))
+        with pytest.raises(HostIndexCollisionError) as excinfo:
+            assert_unique_host_indices(vlan_id, colliding)
+        message = str(excinfo.value)
+        # The error names the VLAN and the repeated index.
+        assert str(vlan_id) in message
+        assert str(repeated) in message
+
+
+# --- Property 2: Peer-set view excludes self and equals the rest ---------
+
+
+@PROPERTY_SETTINGS
+@given(payload=_ledger_vlan_and_target())
+def test_fix_collision_property_2_peer_set_excludes_self(payload):
+    # Feature: fix-vlan-host-index-collision, Property 2: Peer-set view excludes self and equals the rest of the VLAN
+    """Feature: fix-vlan-host-index-collision, Property 2: Peer-set view excludes self and equals the rest of the VLAN
+
+    For any parsed ledger and any guest in a VLAN, the derived
+    ``peer_host_indices`` equals the set of all host indices on that VLAN minus
+    the guest's own index — so a guest is never its own peer.
+
+    Validates: Requirement 1.2
+    """
+    vlan_id, ledger, target_key, index_by_key = payload
+
+    own = assigned_host_index(ledger, vlan_id, target_key)
+    peers = peer_host_indices(ledger, vlan_id, target_key)
+
+    all_indices = set(index_by_key.values())
+    expected_peers = sorted(all_indices - {own})
+
+    # Equals the rest of the VLAN, with self excluded.
+    assert peers == expected_peers
+    assert own not in peers
+    # Since the ledger has distinct indices, the full set is peers + self.
+    assert set(peers) | {own} == all_indices
+    # And the precondition !contains(peer, self) can only fire on a real
+    # cross-guest collision, which a valid ledger never has.
+    assert own not in set(peers)
+
+
+# --- Property 3: Collision detection is order-independent/deterministic ---
+
+
+@PROPERTY_SETTINGS
+@given(indices=st.lists(host_indices, min_size=0, max_size=12), vlan_id=vlan_ids, data=st.data())
+def test_fix_collision_property_3_order_independent_deterministic(
+    indices, vlan_id, data
+):
+    # Feature: fix-vlan-host-index-collision, Property 3: Collision detection is order-independent and deterministic
+    """Feature: fix-vlan-host-index-collision, Property 3: Collision detection is order-independent and deterministic
+
+    For any multiset of host indices and any permutation of it,
+    ``assert_unique_host_indices`` reaches the same accept/reject verdict (and
+    the same reported colliding index on reject) — the verdict depends only on
+    the set's contents, not on iteration order or call count.
+
+    Validates: Requirements 1.1, 1.2
+    """
+
+    def verdict(seq):
+        """Return ('accept', None) or ('reject', sorted-colliding-indices)."""
+        try:
+            assert_unique_host_indices(vlan_id, seq)
+            return ("accept", None)
+        except HostIndexCollisionError as exc:
+            # Recover the set of repeated indices independently of the message
+            # so the comparison is on the reported collision, order-free.
+            seen, dups = set(), set()
+            for i in seq:
+                if i in seen:
+                    dups.add(i)
+                seen.add(i)
+            return ("reject", tuple(sorted(dups)), str(exc))
+
+    perm_a = data.draw(st.permutations(indices))
+    perm_b = data.draw(st.permutations(indices))
+
+    v_a = verdict(perm_a)
+    v_b = verdict(perm_b)
+
+    # Same accept/reject verdict and same reported colliding index set.
+    assert v_a == v_b
+    # Determinism: calling twice on the same permutation is identical too.
+    assert verdict(perm_a) == v_a
+
+
+# --- Property 4: The address formula is preserved ------------------------
+
+
+@PROPERTY_SETTINGS
+@given(vlan_id=vlan_ids, indices=st.lists(host_indices, min_size=1, max_size=12, unique=True))
+def test_fix_collision_property_4_address_formula_preserved(vlan_id, indices):
+    # Feature: fix-vlan-host-index-collision, Property 4: The address formula is preserved
+    """Feature: fix-vlan-host-index-collision, Property 4: The address formula is preserved
+
+    For any vlan_id and any non-colliding host index, the emitted address still
+    equals ``cidrhost("10.0.<vlan_id>.0/24", 10 + host_index)`` exactly as
+    before — the uniqueness guard changes which indices are allowed, never how
+    an allowed index maps to an address.
+
+    Validates: Requirements 1.1, 3.1
+    """
+    # The guard accepts this non-colliding (unique) set...
+    assert assert_unique_host_indices(vlan_id, indices) is None
+
+    # ...and every allowed index still maps via the unchanged cidrhost formula.
+    cidr = subnet_cidr(vlan_id)
+    for index in indices:
+        expected = str(ipaddress.ip_network(cidr)[FIRST_HOST_OFFSET + index])
+        assert host_ip(vlan_id, index) == expected

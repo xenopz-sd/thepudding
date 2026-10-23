@@ -1,0 +1,154 @@
+---
+# svc-09-bootstrap.yml — SVC-09 (Traefik) Automated Service Installer.
+# Spec: .kiro/specs/svc-09-reverse-proxy/ (requirements.md, design.md, tasks.md).
+#
+# THIN ORCHESTRATOR: a Day-0 orchestrator that drives five focused roles, each
+# behind its own per-phase block/rescue that preserves a phase-named `fail`
+# diagnostic:
+#   * svc09_clean_slate — the destructive reset branch (clean_slate | bool)
+#   * svc09_preflight   — Phase 1: env resolve/validate, Proxmox reachability/
+#                         auth, VLAN-20 p20 bridge, datastore autodetect, SSH-key
+#                         injection, agent-live throwaway-guard consult.
+#   * svc09_provision   — Phase 2: backend swap-gate, terraform init/apply,
+#                         generate_inventory.py, add_host, known_hosts.
+#   * svc09_bootstrap   — Phase 3: common baseline + traefik.yml configurator run.
+#   * svc09_handoff     — Phase 4: svc09-health.yml child gate + completion banner.
+# The role internals hold the tasks; this play only sequences and phase-names.
+#
+# DUAL ROLE OF ANSIBLE (integration-boundaries.md §4): this play runs as the
+# Day-0 Workflow ORCHESTRATOR on hosts: localhost. Its roles drive Terraform,
+# generate_inventory.py, and child ansible-playbook runs of the CONFIGURATOR
+# plays (common.yml, traefik.yml, svc09-health.yml) against the VLAN-20 guest. It
+# never parses .tfstate or queries Proxmox for host discovery.
+#
+# Developer B entry point (service-installer.md §2):
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/svc-09-bootstrap.yml \
+#     -e cluster_env_file=cluster.dev.env
+#
+# Clean-slate reset:
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/svc-09-bootstrap.yml \
+#     -e clean_slate=true -e clean_slate_confirm=force
+- name: SVC-09 (Traefik) automated installer — Day-0 orchestrator
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  any_errors_fatal: true
+  vars:
+    # --- PlayLevelVars — cross-phase constants only (phase-specific vars live
+    #     in each role's defaults/main.yml). ---
+
+    # The gitignored KEY=VALUE .env the installer reads Proxmox/provider
+    # parameters from. Overridable with -e cluster_env_file=...
+    cluster_env_file: cluster.env
+    # Repository root (two levels up from .../ansible/playbooks/).
+    svc09_repo_root: "{{ playbook_dir | dirname | dirname }}"
+    # Project venv python (dev-workflow.md invocation rule).
+    svc09_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+    # The generated inventory path (repo-relative), written by provision and
+    # consumed by bootstrap's + handoff's child ansible-playbook runs as `-i`.
+    svc09_generated_inventory: ansible/inventory/svc-09-reverse-proxy.generated.yml
+    # Fixed SVC-09 guest VMID (the installer assigns it, not operator-supplied).
+    svc09_traefik_vmid: 1090
+    # The single SVC-09 guest IP (computed by NET-00 cidrhost 10.0.20.0/24 +10).
+    # Non-secret; read by provision (known_hosts) and handoff.
+    svc09_guest_ips:
+      - "10.0.20.10"
+    # Clean-slate reset controls (off by default).
+    clean_slate: false
+    clean_slate_confirm: ""
+    # Platform domain for the Traefik Host() rules + dashboard URL banner.
+    traefik_platform_domain: platform.example.test
+    # --- Mock stand-in flags (mock-stand-ins.md) — DEFAULT OFF, bridged to the
+    #     traefik.yml child run by svc09_bootstrap. Opt in with -e for a
+    #     Traefik-less-CA / no-SSO Day-0 bring-up. ---
+    traefik_tls_self_signed: false
+    traefik_dashboard_auth_disabled: false
+    traefik_letsencrypt_email: ""
+    traefik_dashboard_forward_auth_address: ""
+    # Agent Live-Test Authorization: truthy ONLY when AGENT_LIVE_AUTHORIZED is set
+    # (non-empty) in the process environment. Gates the throwaway-guard consult in
+    # svc09_preflight and svc09_clean_slate. Read from the ENVIRONMENT, never a
+    # committed default.
+    agent_live_run: "{{ (lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') | trim) | length > 0 }}"
+    # Throwaway-cluster guard + allowlist paths (repo-relative), read by both the
+    # preflight and clean_slate guard consults.
+    svc09_throwaway_guard: scripts/installer/throwaway_guard.py
+    svc09_throwaway_allowlist: scripts/installer/throwaway-clusters.yml
+
+  tasks:
+    # === Clean-Slate branch — runs ONLY when clean_slate is truthy. ===
+    - name: Clean-Slate reset
+      when: clean_slate | default(false) | bool
+      block:
+        - name: "Clean-Slate | Run the svc09_clean_slate role"
+          ansible.builtin.import_role:
+            name: svc09_clean_slate
+      rescue:
+        - name: Report Clean-Slate reset failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-09 installer FAILED during the Clean-Slate reset:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # === Normal install path — Phases 1→4, skipped entirely on clean_slate. ===
+
+    - name: "Phase 1 — Preflight & environment validation"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Preflight | Run the svc09_preflight role"
+          ansible.builtin.import_role:
+            name: svc09_preflight
+      rescue:
+        - name: Report Phase 1 (Preflight) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-09 installer FAILED in Phase 1 (Preflight & environment validation):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 2 — Infrastructure provisioning"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Provisioning | Run the svc09_provision role"
+          ansible.builtin.import_role:
+            name: svc09_provision
+      rescue:
+        - name: Report Phase 2 (Provisioning) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-09 installer FAILED in Phase 2 (Infrastructure provisioning):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 3 — Host hardening & service bootstrap"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Bootstrap | Run the svc09_bootstrap role"
+          ansible.builtin.import_role:
+            name: svc09_bootstrap
+      rescue:
+        - name: Report Phase 3 (Bootstrap) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-09 installer FAILED in Phase 3 (Host hardening & service bootstrap):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 4 — Health sanity & Developer B handoff"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Handoff | Run the svc09_handoff role"
+          ansible.builtin.import_role:
+            name: svc09_handoff
+      rescue:
+        - name: Report Phase 4 (Handoff) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-09 installer FAILED in Phase 4 (Health sanity & handoff):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}

@@ -259,10 +259,69 @@
          | select('in', (svc07_pct_list.stdout | default('')))
          | list }}
 
-# (b) Zero SVC-07 CONTAINER RESOURCES in Terraform state. `terraform state
-# list` runs on the CONTROL NODE (state lives there). Filter to the two
-# container resource addresses; survivors are parsed from stdout.
-- name: "Clean-Slate | VERIFY — list SVC-07 container resources in Terraform state"
+# (b) Zero RESOURCES of ANY kind in the SVC-07 Terraform state. The child
+# clean-slate.yml runs above already `pct destroy`'d the two guests and
+# `terraform state rm`'d their container addresses. But the SVC-07 root also
+# carries NON-guest `terraform_data` book-keeping resources that manage no live
+# Proxmox object — the root-level ledger-check
+# (`terraform_data.svc07_host_index_ledger_check`) and the per-module
+# `module.{primary,unsealer}.terraform_data.input_guards` anchors — which the
+# container-only state rm leaves behind (the residue bug, spec
+# fix-svc07-clean-slate-terraform-data-residue). A correct clean-slate must
+# leave `terraform state list` EMPTY so a from-scratch re-install and the
+# platform fabric teardown both proceed with no manual `terraform state rm`.
+#
+# So, PROVIDER-FREE, enumerate every ADDRESS that remains in state and
+# `terraform state rm` each one. `terraform state rm` of a `terraform_data`
+# address does NOT contact the Proxmox provider (no plan/refresh), so this
+# avoids the provider-hang / stale-state-lock hazard a `terraform destroy`
+# would cause (design root cause #4, Req 2.5). These are inert anchors that a
+# normal `terraform apply` recreates, so removing them changes nothing at
+# apply time (Req 3.5). All ops run on the CONTROL NODE (state lives there).
+- name: "Clean-Slate | List ALL remaining addresses in the SVC-07 Terraform state (residue sweep)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+  args:
+    chdir: "{{ svc07_tf_root }}"
+  register: svc07_residual_state_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the residual (non-guest terraform_data) addresses to remove"
+  ansible.builtin.set_fact:
+    svc07_residual_state_addrs: >-
+      {{ (svc07_residual_state_list.stdout | default('')).splitlines()
+         | map('trim') | select('ne', '') | list }}
+
+# Provider-free `terraform state rm` of every remaining address (idempotent —
+# tolerates an already-absent address / an empty residual set on a re-run). No
+# `terraform destroy`, no provider contact (Req 2.5, 3.4).
+- name: "Clean-Slate | Remove ALL remaining state addresses provider-free (terraform state rm)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - rm
+      - "{{ item }}"
+  args:
+    chdir: "{{ svc07_tf_root }}"
+  loop: "{{ svc07_residual_state_addrs }}"
+  loop_control:
+    label: "{{ item }}"
+  register: svc07_residual_state_rm
+  changed_when: "'Removed' in (svc07_residual_state_rm.stdout | default(''))"
+  failed_when:
+    - (svc07_residual_state_rm.rc | default(1)) != 0
+    - "'No matching objects' not in (svc07_residual_state_rm.stdout | default(''))"
+    - "'No matching objects' not in (svc07_residual_state_rm.stderr | default(''))"
+
+# Re-list the FULL state AFTER the sweep: the gate judges emptiness by the
+# WHOLE `terraform state list` (zero addresses), not merely by whether the two
+# container addresses are absent (Req 2.2 — the tightened gate).
+- name: "Clean-Slate | VERIFY — list the FULL SVC-07 Terraform state after the residue sweep"
   ansible.builtin.command:
     argv:
       - terraform
@@ -274,18 +333,17 @@
   changed_when: false
   failed_when: false
 
-- name: "Clean-Slate | Compute the set of surviving SVC-07 state addresses"
+- name: "Clean-Slate | Compute the set of surviving SVC-07 state addresses (FULL state)"
   ansible.builtin.set_fact:
     svc07_surviving_state_addrs: >-
-      {{ ['proxmox_virtual_environment_container.primary',
-          'proxmox_virtual_environment_container.unsealer']
-         | select('in', (svc07_state_list.stdout | default('')))
-         | list }}
+      {{ (svc07_state_list.stdout | default('')).splitlines()
+         | map('trim') | select('ne', '') | list }}
 
-# Final gate (Req 7.7, 7.8): both survivor sets MUST be empty. If either
-# is non-empty the installer halts with a non-zero exit, naming each
-# surviving resource by container ID or Terraform state address.
-- name: "Clean-Slate | GATE — assert an empty baseline (0 containers, 0 state), Req 7.7/7.8"
+# Final gate (Req 7.7, 7.8, 2.2): both survivor sets MUST be empty. The state
+# survivor set is now the FULL state list, so a reported-clean reset is a
+# genuinely empty state. If either is non-empty the installer halts with a
+# non-zero exit, naming each surviving resource by container ID or state address.
+- name: "Clean-Slate | GATE — assert an empty baseline (0 containers, 0 state), Req 7.7/7.8/2.2"
   ansible.builtin.assert:
     that:
       - "(svc07_surviving_vmids | length) == 0"
@@ -299,7 +357,8 @@
       reset until both are empty before re-installing.
     success_msg: >-
       Clean-Slate reset complete — zero SVC-07 containers on the host and
-      zero SVC-07 container resources in Terraform state.
+      an EMPTY SVC-07 Terraform state (guests + non-guest terraform_data
+      book-keeping resources all removed).
 
 - name: "Clean-Slate | Report the reset completed to an empty baseline"
   ansible.builtin.debug:

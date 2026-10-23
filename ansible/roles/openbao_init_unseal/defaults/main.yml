@@ -349,7 +349,8 @@ openbao_database_superuser_password_env_var: "OPENBAO_DB_SUPERUSER_PASSWORD"
 # substitution tokens (NOT Jinja) — the actual password is passed separately via
 # the `password=` field so it never appears in the URL or the audit log.
 openbao_database_connection_url: >-
-  postgresql://{{ '{{username}}' }}:{{ '{{password}}' }}@{{ openbao_database_host }}:{{ openbao_database_port }}/{{ openbao_database_name }}?sslmode={{ openbao_database_sslmode }}
+  postgresql://{{ '{{username}}' }}:{{ '{{password}}' }}@{{ openbao_database_host }}:{{ openbao_database_port }}/{{
+  openbao_database_name }}?sslmode={{ openbao_database_sslmode }}
 
 # The list of dynamic-role NAMES the connection is allowed to serve. Empty by
 # default (roles are created per-project at onboarding, task 9.1); a wildcard or
@@ -365,7 +366,9 @@ openbao_database_allowed_roles: ["*"]
 # substitutions, not Jinja.
 openbao_database_creation_statements_rw:
   - >-
-    CREATE ROLE "{{ '{{name}}' }}" WITH LOGIN PASSWORD '{{ '{{password}}' }}' VALID UNTIL '{{ '{{expiration}}' }}' NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION;
+    CREATE ROLE "{{ '{{name}}' }}" WITH LOGIN PASSWORD '{{ '{{password}}' }}'
+    VALID UNTIL '{{ '{{expiration}}' }}'
+    NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION;
   - >-
     GRANT CONNECT ON DATABASE "{{ openbao_database_name }}" TO "{{ '{{name}}' }}";
   - >-

@@ -1,0 +1,262 @@
+---
+# tasks/main.yml — svc09_clean_slate (SVC-09 installer — clean-slate branch)
+#
+# Clone of svc07_clean_slate adapted for the single Traefik guest. The enclosing
+# `when: clean_slate` gate and the block/rescue phase-naming stay in the thin
+# orchestrator play; this role owns the branch BODY only:
+#   - agent-live throwaway-guard consult (FIRST, gated, fail-closed),
+#   - confirmation gating (pause 300s unless clean_slate_confirm=force),
+#   - independent cluster_env.py node-name resolution (no_log),
+#   - Proxmox-host-address assertion,
+#   - single-target assembly (the Traefik LXC vmid),
+#   - child clean-slate.yml run (invoking the generic terraform_clean_slate role
+#     — does NOT reimplement destroy logic),
+#   - two-way empty-baseline verification gate (pct list + terraform state list).
+
+# --- Agent-live throwaway-cluster authorization gate (FIRST, gated) ----------
+- name: "Clean-Slate | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc09_venv_python }}"
+      - "{{ svc09_throwaway_guard }}"
+      - --service
+      - svc09
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ svc09_throwaway_allowlist }}"
+  args:
+    chdir: "{{ svc09_repo_root }}"
+  register: svc09_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (svc09_throwaway_decision.stdout | default('{}') | from_json).reason | default('no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | Refuse the reset unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "svc09_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live clean-slate REFUSED by the throwaway-cluster guard:
+      {{ (svc09_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      No container was destroyed and no Terraform state was modified. Arm the run
+      only against a throwaway cluster listed in throwaway-clusters.yml with
+      AGENT_LIVE_AUTHORIZED set.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live clean-slate."
+  when: agent_live_run | default(false) | bool
+
+# --- Confirmation gating -----------------------------------------------------
+- name: "Clean-Slate | Prompt for explicit confirmation (300s timeout; skipped on force)"
+  ansible.builtin.pause:
+    prompt: >-
+      DESTRUCTIVE Clean-Slate reset of SVC-09 requested. This will pct-destroy
+      the Traefik container ({{ svc09_traefik_vmid }}) and remove it from
+      Terraform state. Type 'yes' to proceed, anything else to abort
+  register: svc09_clean_slate_prompt
+  when: (clean_slate_confirm | default('')) != 'force'
+
+- name: "Clean-Slate | Resolve whether the reset is confirmed"
+  ansible.builtin.set_fact:
+    svc09_clean_slate_confirmed: >-
+      {{ (clean_slate_confirm | default('')) == 'force'
+         or ((svc09_clean_slate_prompt.user_input | default('') | trim | lower) in ['yes', 'y']) }}
+
+- name: "Clean-Slate | Abort with non-zero exit when not confirmed (destroys nothing)"
+  ansible.builtin.fail:
+    msg: >-
+      Clean-Slate reset ABORTED — confirmation was not given (received a
+      non-affirmative or empty/timed-out response). No container was destroyed
+      and no Terraform state was modified. Re-run with an affirmative 'yes' at the
+      prompt, or pass -e clean_slate_confirm=force to skip the prompt.
+  when: not (svc09_clean_slate_confirmed | bool)
+
+# --- Delegated reset + verification gate -------------------------------------
+# Phase 1 does NOT run on a clean-slate invocation, so proxmox_node_name is not
+# resolved by preflight. Resolve it independently from the same cluster env.
+- name: "Clean-Slate | Resolve cluster env for the Proxmox node name ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc09_venv_python }}"
+      - "{{ svc09_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ svc09_repo_root }}"
+  register: svc09_cs_env_resolve
+  changed_when: false
+  no_log: true
+
+- name: "Clean-Slate | Bind the resolved Proxmox node name (no_log)"
+  ansible.builtin.set_fact:
+    proxmox_node_name: "{{ (svc09_cs_env_resolve.stdout | from_json)['TF_VAR_proxmox_node_name'] }}"
+  no_log: true
+
+- name: "Clean-Slate | Assert the Proxmox host SSH address was supplied"
+  ansible.builtin.assert:
+    that:
+      - "svc09_proxmox_host is defined"
+      - "(svc09_proxmox_host | trim | length) > 0"
+    fail_msg: >-
+      The Clean-Slate reset delegates to clean-slate.yml against the Proxmox-host
+      inventory ({{ svc09_proxmox_host_inventory }}), which runs `pct` on the node
+      over SSH. Supply the real Proxmox LAN IP with
+      -e svc09_proxmox_host=<real-proxmox-lan-ip>. Nothing was destroyed.
+    success_msg: "Proxmox host SSH address supplied for the reset."
+
+- name: "Clean-Slate | Assemble the single SVC-09 clean_slate_target"
+  ansible.builtin.set_fact:
+    svc09_clean_slate_targets:
+      - name: svc09-20-01
+        terraform_root: infra/projects/svc-09-reverse-proxy
+        resource_address: proxmox_virtual_environment_container.traefik
+        node: "{{ proxmox_node_name }}"
+        vmid: "{{ svc09_traefik_vmid }}"
+
+- name: "Clean-Slate | Delegate the reset to clean-slate.yml (one child run per target)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc09_proxmox_host_inventory }}"
+      - ansible/playbooks/clean-slate.yml
+      - --extra-vars
+      - "ansible_host={{ svc09_proxmox_host }}"
+      - -e
+      - clean_slate_enabled=true
+      - -e
+      - "clean_slate_confirm={{ item.vmid }}"
+      - -e
+      - "{{ {'clean_slate_targets': [item]} | to_json }}"
+  args:
+    chdir: "{{ svc09_repo_root }}"
+  loop: "{{ svc09_clean_slate_targets }}"
+  loop_control:
+    label: "{{ item.name }} (vmid {{ item.vmid }})"
+  register: svc09_clean_slate_runs
+  changed_when: "'changed=0' not in (svc09_clean_slate_runs.stdout | default(''))"
+
+# ---- Verification gate (empty baseline, two ways) ---------------------------
+- name: "Clean-Slate | VERIFY — list any surviving SVC-09 container on the host (pct list)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible"
+      - proxmox
+      - -i
+      - "{{ svc09_proxmox_host_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ svc09_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pct list"
+  args:
+    chdir: "{{ svc09_repo_root }}"
+  register: svc09_pct_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the set of surviving SVC-09 container VMIDs"
+  ansible.builtin.set_fact:
+    svc09_surviving_vmids: >-
+      {{ [svc09_traefik_vmid | string]
+         | select('in', (svc09_pct_list.stdout | default('')))
+         | list }}
+
+# Zero RESOURCES of ANY kind in the SVC-09 Terraform state. The child
+# clean-slate.yml run above already `pct destroy`'d the Traefik guest and
+# `terraform state rm`'d its container address. But the SVC-09 root also carries
+# NON-guest `terraform_data` book-keeping resources that manage no live Proxmox
+# object — the root-level ledger-drift guard (`terraform_data.ledger_index_assert`)
+# and `module.traefik.terraform_data.input_guards` — which the container-only
+# state rm leaves behind (the residue bug, spec
+# fix-svc07-clean-slate-terraform-data-residue). A correct clean-slate must leave
+# `terraform state list` EMPTY. So, PROVIDER-FREE, enumerate every remaining
+# ADDRESS and `terraform state rm` it (NOT `terraform destroy` — that would
+# contact the provider and risk a hang / stale lock, Req 2.5). All ops run on
+# the CONTROL NODE (state lives there).
+- name: "Clean-Slate | List ALL remaining addresses in the SVC-09 Terraform state (residue sweep)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+  args:
+    chdir: "{{ svc09_tf_root }}"
+  register: svc09_residual_state_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the residual (non-guest terraform_data) addresses to remove"
+  ansible.builtin.set_fact:
+    svc09_residual_state_addrs: >-
+      {{ (svc09_residual_state_list.stdout | default('')).splitlines()
+         | map('trim') | select('ne', '') | list }}
+
+- name: "Clean-Slate | Remove ALL remaining state addresses provider-free (terraform state rm)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - rm
+      - "{{ item }}"
+  args:
+    chdir: "{{ svc09_tf_root }}"
+  loop: "{{ svc09_residual_state_addrs }}"
+  loop_control:
+    label: "{{ item }}"
+  register: svc09_residual_state_rm
+  changed_when: "'Removed' in (svc09_residual_state_rm.stdout | default(''))"
+  failed_when:
+    - (svc09_residual_state_rm.rc | default(1)) != 0
+    - "'No matching objects' not in (svc09_residual_state_rm.stdout | default(''))"
+    - "'No matching objects' not in (svc09_residual_state_rm.stderr | default(''))"
+
+- name: "Clean-Slate | VERIFY — list the FULL SVC-09 Terraform state after the residue sweep"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+  args:
+    chdir: "{{ svc09_tf_root }}"
+  register: svc09_state_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the set of surviving SVC-09 state addresses (FULL state)"
+  ansible.builtin.set_fact:
+    svc09_surviving_state_addrs: >-
+      {{ (svc09_state_list.stdout | default('')).splitlines()
+         | map('trim') | select('ne', '') | list }}
+
+- name: "Clean-Slate | GATE — assert an empty baseline (0 containers, 0 state), Req 2.2"
+  ansible.builtin.assert:
+    that:
+      - "(svc09_surviving_vmids | length) == 0"
+      - "(svc09_surviving_state_addrs | length) == 0"
+    fail_msg: >-
+      Clean-Slate reset did NOT reach an empty baseline. Surviving SVC-09
+      container(s): {{ svc09_surviving_vmids | default([]) | join(', ') | default('none', true) }};
+      surviving Terraform state address(es):
+      {{ svc09_surviving_state_addrs | default([]) | join(', ') | default('none', true) }}.
+      Investigate on the Proxmox host / in Terraform state and re-run the reset
+      until both are empty before re-installing.
+    success_msg: >-
+      Clean-Slate reset complete — zero SVC-09 containers on the host and an
+      EMPTY SVC-09 Terraform state (guest + non-guest terraform_data resources
+      all removed).
+
+- name: "Clean-Slate | Report the reset completed to an empty baseline"
+  ansible.builtin.debug:
+    msg: >-
+      SVC-09 Clean-Slate reset complete: the Traefik container
+      ({{ svc09_traefik_vmid }}) destroyed (or already absent) and removed from
+      Terraform state. The baseline is empty; a fresh install can now run.

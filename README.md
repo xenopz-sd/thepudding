@@ -79,6 +79,9 @@ The first release ships the platform foundation and the first shared service.
 | **Platform prerequisites** | ✅ Released | Bootstraps the `terraform@pve` identity and token, the base LXC/VM template, the Proxmox SDN VLAN zone and shared VLAN 20, and the host L3 gateway / firewall / routing. | [Install runbook](./infra/platform-foundation/INSTALL-RUNBOOK.md) | [`platform-prerequisites-bootstrap`](./.kiro/specs/platform-prerequisites-bootstrap/) |
 | **Network foundation** | ✅ Released | Per-project VLAN onboarding with computed VLAN IDs, subnets, host IPs and hostnames, backed by an append-only `projects.yaml` registry. | [Foundation README](./infra/platform-foundation/README.md) | [`platform-prerequisites-bootstrap`](./.kiro/specs/platform-prerequisites-bootstrap/) |
 | **SVC-07 — Secrets manager** ([OpenBao](https://openbao.org)) | ✅ Released | OpenBao primary plus a Transit auto-unsealer on two LXCs, with automated install, init/unseal, onboarding and live contract tests. | [Install runbook](./infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md) | [`svc-07-secrets-manager`](./.kiro/specs/svc-07-secrets-manager/) |
+| **SVC-09 — Reverse proxy** ([Traefik](https://traefik.io)) | ✅ Built | The shared HTTP/HTTPS ingress + TLS-termination edge on one LXC: Docker-label auto-discovery, HTTP→HTTPS redirect, an internal-only SSO-gated dashboard, and ownership of the shared `edge` network. Ships default-off mock stand-ins for the not-yet-built CA (SVC-08) and SSO (SVC-06). | [Install runbook](./infra/projects/svc-09-reverse-proxy/INSTALL-RUNBOOK.md) | [`svc-09-reverse-proxy`](./.kiro/specs/svc-09-reverse-proxy/) |
+| **SVC-01 — SQL database** ([PostgreSQL](https://www.postgresql.org)) | ✅ Built | The dedicated-per-project relational database, delivered as a reusable Terraform root + Ansible role: `postgres:17` + a `postgres_exporter` sidecar, a least-privilege per-project app role, per-flag pgvector/PostGIS/TimescaleDB, nightly `pg_dump`, and credentials stored in OpenBao. MariaDB is a selectable strict-EU alternative. | [Install runbook](./infra/projects/svc-01-sql-database/INSTALL-RUNBOOK.md) | [`svc-01-sql-database`](./.kiro/specs/svc-01-sql-database/) |
+| **SVC-06 — Identity provider** ([ZITADEL](https://zitadel.com)) | ✅ Built | The shared OIDC/SAML SSO backbone: one ZITADEL LXC on VLAN 20 fronted by Traefik, backed by its own dedicated SVC-01 PostgreSQL instance; masterkey + OIDC client secrets in OpenBao; idempotent per-project org/OIDC-app onboarding via a pure-Python management-API helper, with the provisioning token auto-minted at first-init and stored in OpenBao so a from-scratch bring-up onboards the first org with no human-minted token. | [Install runbook](./infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md) | [`svc-06-identity-provider`](./.kiro/specs/svc-06-identity-provider/) |
 
 ## Quick start
 
@@ -233,9 +236,9 @@ Services are delivered in tiers from the [service catalog](./00-developer-servic
 
 | Area | Tier-1 services (default technology) |
 |---|---|
-| Data | SVC-01 SQL — PostgreSQL · SVC-02 Cache — Redis 🚩 · SVC-03 Object storage — Garage |
-| Identity & secrets | SVC-06 IDP — ZITADEL · **SVC-07 Secrets — OpenBao ✅** |
-| Networking | SVC-09 Reverse proxy — Traefik · SVC-11 Mesh VPN — NetBird |
+| Data | **SVC-01 SQL — PostgreSQL ✅** · SVC-02 Cache — Redis 🚩 · SVC-03 Object storage — Garage |
+| Identity & secrets | **SVC-06 IDP — ZITADEL ✅** · **SVC-07 Secrets — OpenBao ✅** |
+| Networking | **SVC-09 Reverse proxy — Traefik ✅** · SVC-11 Mesh VPN — NetBird |
 | CI/CD | SVC-13 CI runners — GitLab Runner 🚩 · SVC-14 Registry — Zot 🚩 |
 | Observability | SVC-17 Prometheus + Grafana · SVC-18 Loki |
 | Messaging | SVC-21 MQTT — Mosquitto |
@@ -253,8 +256,9 @@ Services are delivered in tiers from the [service catalog](./00-developer-servic
 | [Requirements](./requirements/) | Platform foundation, network plan and per-service requirements |
 | [Platform install runbook](./infra/platform-foundation/INSTALL-RUNBOOK.md) | Prerequisites bring-up, reset and troubleshooting |
 | [SVC-07 install runbook](./infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md) | OpenBao provision-then-test |
+| [SVC-06 install runbook](./infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md) | ZITADEL (+ backing DB) provision-then-test |
 | [Maintainer README](./docs/README.md) | The in-depth Developer-A guide: quick starts, principles, network foundation, onboarding, docs map |
-| [TESTING.md](./docs/TESTING.md) | Offline and live test tiers |
+| [TESTING.md](./docs/TESTING.md) | Offline and live test tiers, and the CI offline merge gate (`.gitlab-ci.yml`) |
 | [Steering docs](./.kiro/steering/) | Constitution, tech choices, structure, security standards |
 | [Specs](./.kiro/specs/) | Per-feature requirements, design, tasks, validation |
 

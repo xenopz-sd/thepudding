@@ -1,0 +1,18 @@
+---
+# meta/main.yml — mariadb-server (SVC-01 alternative engine skeleton)
+galaxy_info:
+  role_name: mariadb-server
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-01 strict-EU-governance alternative engine (MariaDB) skeleton, selectable
+    via db_engine=mariadb. Stands a dedicated MariaDB Compose stack up and creates
+    the project database + least-privilege app user — enough to validate the
+    engine switch, not a fully-tuned engine.
+  license: MIT
+  min_ansible_version: "2.14"
+  galaxy_tags:
+    - mariadb
+    - database
+    - svc01
+dependencies: []

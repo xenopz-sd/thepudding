@@ -1,0 +1,451 @@
+---
+# tasks/main.yml — zitadel-server (SVC-06)
+#
+# Deploys the shared ZITADEL identity provider as a Docker Compose stack. HTTP
+# ingress is via Traefik labels ONLY (no published host port — integration-
+# boundaries §1). The masterkey + backing-DB password come from OpenBao (SVC-07)
+# via the `bao` CLI docker-exec pattern and are written to a 0600 secret env on
+# the guest, layered onto the stack via docker-compose-app `extra_env_files` —
+# never the committed .env.
+#
+# Order:
+#   1. Idempotency version-check guard.
+#   2. (opt-in mock) self-signed TLS cert (control-node generation).
+#   3. (opt-in mock) placeholder `edge` network when Traefik is absent.
+#   4. Resolve the masterkey (gen-once + persist to OpenBao) + DB password.
+#   5. Ensure dirs; write the 0600 secret env.
+#   6. Deploy the Compose stack via docker-compose-app (Traefik labels, no host
+#      port, extra_env_files secret env).
+
+# --- 1. IDEMPOTENCY: version-check guard ------------------------------------
+- name: "ZITADEL | Inspect any running container at the pinned image (idempotency guard)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "--format={{ '{{' }}index .Config.Image{{ '}}' }}"
+      - "{{ zitadel_container_name }}"
+  register: zitadel_running_image
+  failed_when: false
+  changed_when: false
+
+- name: "ZITADEL | Set fact — already at the pinned image?"
+  ansible.builtin.set_fact:
+    zitadel_already_at_pinned_version: >-
+      {{ (zitadel_running_image.rc == 0)
+         and ((zitadel_running_image.stdout | default('') | trim) == zitadel_image) }}
+  changed_when: false
+
+# --- 2. (opt-in mock) self-signed TLS cert ----------------------------------
+# NOT gated on the version guard — a crash-looping host missing its cert must
+# still get one. The include itself is gated on the mock flag.
+- name: "ZITADEL | Include the self-signed TLS mock (opt-in, dev/offline only)"
+  ansible.builtin.include_tasks: tls_self_signed.yml
+  when: zitadel_tls_self_signed | bool
+
+# --- 3. (opt-in mock) placeholder edge network ------------------------------
+# When SVC-09/Traefik is NOT on this host, create a LOCAL placeholder `edge`
+# network so the Compose stack's `networks: ["edge"]` resolves. OFF when the real
+# Traefik owns `edge`. Idempotent (create-if-absent). Clone of SVC-07's
+# openbao_mock_edge_network.
+- name: "ZITADEL | MOCK-NET: create the placeholder Traefik `edge` network (opt-in dev stand-in)"
+  community.docker.docker_network:
+    name: "{{ zitadel_traefik_network }}"
+    state: present
+  when: zitadel_mock_edge_network | bool
+
+# --- 4. Masterkey + DB password from OpenBao --------------------------------
+# The masterkey is generated ONCE (32 random bytes, base64) and persisted to
+# OpenBao; on every subsequent run it is READ back (never regenerated — a changed
+# masterkey corrupts the instance, requirements §6). The DB password is READ from
+# the SVC-01 backing-DB secret OpenBao already holds. When zitadel_openbao_addr
+# is empty (dev/offline), a locally-generated ephemeral masterkey + the supplied
+# DB password are used so the stack can still start for testing (the OpenBao
+# round-trip is the production path).
+
+# Bind the OpenBao admin token (from the role ENV, never argv) to a single
+# no_log fact so the bao-CLI argv lines below stay short and the token is
+# isolated behind one no_log task.
+- name: "ZITADEL | Bind the OpenBao admin token from the environment (no_log)"
+  ansible.builtin.set_fact:
+    zitadel_bao_token: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+  no_log: true
+  changed_when: false
+
+# Read any existing masterkey from OpenBao (check-then-generate idempotency).
+- name: "ZITADEL | Read any existing masterkey from OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zitadel_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zitadel_bao_token,
+          zitadel_openbao_primary_container_name, zitadel_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (zitadel_openbao_tls_skip_verify | bool) else [])
+         + ['-field=masterkey', zitadel_openbao_secret_path] }}
+  delegate_to: "{{ zitadel_openbao_cli_host }}"
+  # Pin the delegate's connection vars: the OpenBao guest is addressed by IP and
+  # is NOT a defined inventory host in this play, so without an explicit
+  # interpreter ansible runs interpreter DISCOVERY on it, whose warning output
+  # corrupts the module JSON result ("No start of json char found").
+  vars:
+    ansible_user: "{{ zitadel_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zitadel_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zitadel_masterkey_read
+  failed_when: false
+  changed_when: false
+  no_log: true
+  when: zitadel_openbao_addr | length > 0
+
+# Generate a fresh masterkey only when none exists yet (or when OpenBao is not
+# wired — dev/offline ephemeral). ZITADEL requires the masterkey to be EXACTLY 32
+# bytes (`masterkey must be 32 bytes` — live-caught, SVC-06 Task 18). A 32-char
+# ASCII (letters+digits) string is already 32 bytes, so it is used VERBATIM — NOT
+# base64-encoded (b64encode would inflate 32 chars to 44 bytes and ZITADEL rejects
+# it). The stored/read value is likewise the raw 32-char key.
+- name: "ZITADEL | Generate a masterkey when absent (no_log)"
+  ansible.builtin.set_fact:
+    zitadel_masterkey: >-
+      {{ (zitadel_masterkey_read.stdout | default('') | trim)
+         if ((zitadel_openbao_addr | length > 0)
+              and (zitadel_masterkey_read.rc | default(1) == 0)
+              and ((zitadel_masterkey_read.stdout | default('') | trim) | length > 0))
+         else lookup('ansible.builtin.password', '/dev/null length=32 chars=ascii_letters,digits') }}
+  no_log: true
+
+# Persist a freshly-generated masterkey to OpenBao (check-then-write: only when
+# OpenBao is wired AND no masterkey was already stored). The value travels via
+# stdin, never the argv. no_log.
+- name: "ZITADEL | Persist the masterkey to OpenBao when newly generated (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-i', '-e', 'BAO_ADDR=' ~ zitadel_openbao_cli_bao_addr,
+          '-e', 'BAO_TOKEN=' ~ zitadel_bao_token,
+          zitadel_openbao_primary_container_name, zitadel_openbao_bao_bin, 'kv', 'put']
+         + (['-tls-skip-verify'] if (zitadel_openbao_tls_skip_verify | bool) else [])
+         + [zitadel_openbao_secret_path, 'masterkey=' ~ zitadel_masterkey] }}
+  delegate_to: "{{ zitadel_openbao_cli_host }}"
+  vars:
+    ansible_user: "{{ zitadel_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zitadel_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zitadel_masterkey_write
+  changed_when: true
+  no_log: true
+  when:
+    - zitadel_openbao_addr | length > 0
+    - (zitadel_masterkey_read.rc | default(1)) != 0
+      or ((zitadel_masterkey_read.stdout | default('') | trim) | length == 0)
+
+# Read the backing-DB app-role password from OpenBao (written by the SVC-01
+# backing-DB bootstrap under secret/proj-shared-zitadel/postgres). When OpenBao
+# is not wired (dev/offline), fall back to an explicitly-supplied password var.
+- name: "ZITADEL | Read the backing-DB password from OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zitadel_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zitadel_bao_token,
+          zitadel_openbao_primary_container_name, zitadel_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (zitadel_openbao_tls_skip_verify | bool) else [])
+         + ['-field=app_password', zitadel_openbao_kv_mount ~ '/proj-' ~ zitadel_db_slug ~ '/postgres'] }}
+  delegate_to: "{{ zitadel_openbao_cli_host }}"
+  vars:
+    ansible_user: "{{ zitadel_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zitadel_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zitadel_db_password_read
+  failed_when: false
+  changed_when: false
+  no_log: true
+  when: zitadel_openbao_addr | length > 0
+
+# FAIL FAST when OpenBao is WIRED but the backing-DB password read came back
+# empty/failed. Without this, the bind below silently falls through to the
+# (empty) zitadel_db_password_override, ZITADEL presents an empty password, and
+# Postgres rejects shared_zitadel_app with SQLSTATE 28P01 — the crash deferred,
+# the real cause masked (requirements 1.3 / 2.3,
+# fix-svc06-zitadel-db-app-password-mismatch). Surface it HERE, naming the exact
+# KV path + field expected, instead of a downstream SASL crash loop. The message
+# names only the path/field (non-secret); the secret value is never echoed.
+# Gated so the deliberate OFFLINE path (zitadel_openbao_addr empty + explicit
+# zitadel_db_password_override) is untouched.
+- name: "ZITADEL | Fail fast when the OpenBao backing-DB password read is empty while wired"
+  ansible.builtin.fail:
+    msg: >-
+      ZITADEL backing-DB password retrieval FAILED: OpenBao is wired
+      (zitadel_openbao_addr={{ zitadel_openbao_addr }}) but the `app_password`
+      read from
+      {{ zitadel_openbao_kv_mount }}/proj-{{ zitadel_db_slug }}/postgres
+      (field app_password) returned empty or errored
+      (rc={{ zitadel_db_password_read.rc | default('n/a') }}). The SVC-01
+      backing-DB bootstrap must have STORED app_password at that KV path for the
+      shared_zitadel_app role; refusing to bind an empty password (which would
+      crash ZITADEL with a Postgres SQLSTATE 28P01 SASL rejection). Confirm the
+      backing-DB child svc-01-bootstrap ran with a NON-empty openbao_addr so the
+      same OpenBao source wrote the password ZITADEL reads here, and that the
+      OPENBAO_ADMIN_TOKEN is present in the environment.
+  when:
+    - zitadel_openbao_addr | length > 0
+    - (zitadel_db_password_read.rc | default(1)) != 0
+      or ((zitadel_db_password_read.stdout | default('') | trim) | length == 0)
+
+- name: "ZITADEL | Bind the backing-DB password fact (no_log)"
+  ansible.builtin.set_fact:
+    zitadel_db_password: >-
+      {{ (zitadel_db_password_read.stdout | default('') | trim)
+         if ((zitadel_openbao_addr | length > 0)
+              and (zitadel_db_password_read.rc | default(1) == 0)
+              and ((zitadel_db_password_read.stdout | default('') | trim) | length > 0))
+         else (zitadel_db_password_override | default('')) }}
+  no_log: true
+
+# --- 5. Dirs + 0600 secret env ----------------------------------------------
+- name: "ZITADEL | Ensure the config directory exists"
+  ansible.builtin.file:
+    path: /etc/zitadel
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+# The PAT-emit dir is mounted into the ZITADEL container at PATPATH's dirname;
+# ZITADEL (running as zitadel_container_uid) writes the first-init PAT there, so
+# the guest dir must be owned by that uid/gid (same handling as the TLS mock).
+- name: "ZITADEL | Ensure the first-init PAT-emit directory exists (zitadel uid/gid, 0700)"
+  ansible.builtin.file:
+    path: "{{ zitadel_provision_pat_host_dir }}"
+    state: directory
+    owner: "{{ zitadel_container_uid }}"
+    group: "{{ zitadel_container_gid }}"
+    mode: "0700"
+
+- name: "ZITADEL | Write the 0600 runtime secret env on the guest (no_log)"
+  ansible.builtin.template:
+    src: zitadel.secret.env.j2
+    dest: "{{ zitadel_secret_env_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart zitadel
+
+# --- 6. Deploy the Compose stack via docker-compose-app ---------------------
+# ZITADEL is HTTP-exposed via Traefik labels ONLY — NO published host port
+# (integration-boundaries §1). The masterkey + DB password come from the 0600
+# secret env layered via extra_env_files; the non-secret .env carries config.
+- name: "ZITADEL | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ zitadel_stack_name }}"
+    dca_services:
+      - name: zitadel
+        image: "{{ zitadel_image }}"
+        restart: "unless-stopped"
+        # ZITADEL start command: run migrations + start in one step, reading the
+        # masterkey from the env (ZITADEL_MASTERKEY), config from env vars.
+        command: >-
+          start-from-init --masterkeyFromEnv
+        # NO `ports:` — HTTP ingress is via Traefik labels only (FR-7).
+        # The 0600 secret env (masterkey + DB passwords) layered on top of the
+        # non-secret .env.
+        extra_env_files:
+          - "{{ zitadel_secret_env_path }}"
+        # Mount the guest PAT-emit dir at the container path ZITADEL writes the
+        # first-init PAT to (ZITADEL_FIRSTINSTANCE_PATPATH's dirname). ZITADEL
+        # writes the provisioning machine user's PAT here ONCE at first-init;
+        # the role reads it from the guest, persists to OpenBao, then scrubs it.
+        volumes:
+          - "{{ zitadel_provision_pat_host_dir }}:{{ zitadel_provision_pat_emit_path | dirname }}"
+        networks:
+          - "{{ zitadel_traefik_network }}"
+        # Traefik ingress (SVC-09): register via Docker labels; Traefik's docker
+        # provider discovers the backend on the `edge` network. websecure
+        # entrypoint, TLS on, h2c backend scheme on 8080.
+        labels:
+          - "traefik.enable=true"
+          - "traefik.docker.network={{ zitadel_traefik_network }}"
+          - "traefik.http.routers.{{ zitadel_traefik_router }}.rule=Host(`{{ zitadel_external_domain }}`)"
+          - "traefik.http.routers.{{ zitadel_traefik_router }}.entrypoints=websecure"
+          - "traefik.http.routers.{{ zitadel_traefik_router }}.tls=true"
+          - "traefik.http.services.{{ zitadel_traefik_router }}.loadbalancer.server.port={{ zitadel_http_port }}"
+          - "traefik.http.services.{{ zitadel_traefik_router }}.loadbalancer.server.scheme=h2c"
+    dca_volumes: []
+    dca_networks:
+      - name: "{{ zitadel_traefik_network }}"
+        external: true
+    dca_env:
+      # NON-secret ZITADEL config only (composition-wiring.md). The masterkey +
+      # DB passwords are in the 0600 secret env (extra_env_files), NOT here.
+      # External endpoint — MUST match the Traefik-fronted public endpoint
+      # exactly (requirements §6/§12).
+      ZITADEL_EXTERNALDOMAIN: "{{ zitadel_external_domain }}"
+      ZITADEL_EXTERNALPORT: "{{ zitadel_external_port }}"
+      ZITADEL_EXTERNALSECURE: "{{ zitadel_external_secure | string | lower }}"
+      ZITADEL_PORT: "{{ zitadel_http_port }}"
+      # TLS is terminated by Traefik, so ZITADEL itself serves plaintext h2c on
+      # the edge network (TLS disabled at the ZITADEL layer; Traefik does TLS).
+      ZITADEL_TLS_ENABLED: "false"
+      # Backing database (the SVC-01 shared-zitadel instance). Host/port/db/user
+      # are non-secret; the passwords are in the secret env.
+      ZITADEL_DATABASE_POSTGRES_HOST: "{{ zitadel_db_host }}"
+      ZITADEL_DATABASE_POSTGRES_PORT: "{{ zitadel_db_port }}"
+      ZITADEL_DATABASE_POSTGRES_DATABASE: "{{ zitadel_db_name }}"
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: "{{ zitadel_db_user }}"
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: "disable"
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: "{{ zitadel_db_admin_user }}"
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: "disable"
+      # Observability (requirements §13): Prometheus metrics endpoint on.
+      ZITADEL_METRICS_ENABLED: "{{ zitadel_metrics_enabled | string | lower }}"
+      # --- FirstInstance provisioning machine user + PAT emit (ADR-0016) ---
+      # Non-secret config only: ZITADEL seeds a dedicated MACHINE user at
+      # first-init (necessarily IAM_OWNER — the narrowest grant that can create
+      # orgs) and writes its PAT to PATPATH (inside the container) ONCE on the
+      # first init against an empty DB. The emitted PAT is the ONLY secret and is
+      # read off the guest mount, stored in OpenBao, then scrubbed — it is never
+      # rendered here. On a re-run against an initialized DB, FirstInstance is
+      # skipped and no new PAT is written (the OpenBao-stored token is durable).
+      ZITADEL_FIRSTINSTANCE_PATPATH: "{{ zitadel_provision_pat_emit_path }}"
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: "{{ zitadel_provision_sa_username }}"
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: "{{ zitadel_provision_sa_name }}"
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "{{ zitadel_provision_pat_expiration }}"
+    dca_state: "{{ zitadel_state }}"
+  when: not zitadel_already_at_pinned_version
+
+# --- 7. Provisioning token: obtain-once at first-init + persist to OpenBao ---
+# Mirrors the masterkey check-then-write idempotency pattern (§4) EXACTLY in
+# structure, but runs AFTER the Compose deploy because the PAT is EMITTED BY the
+# ZITADEL container during first-init setup (not generated by the role). On a
+# re-run against an already-initialized DB, ZITADEL skips FirstInstance and
+# writes no new PAT — so the OpenBao-stored token is the durable source and the
+# read-back below short-circuits the obtain/persist/scrub (Req 3: no re-mint).
+# All token-handling tasks are no_log; the value never touches the argv; gated on
+# zitadel_openbao_addr so the deliberate dev/offline path is untouched.
+
+# (1) Read any existing provision_token from OpenBao (check-then-write guard).
+- name: "ZITADEL | Read any existing provision_token from OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zitadel_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zitadel_bao_token,
+          zitadel_openbao_primary_container_name, zitadel_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (zitadel_openbao_tls_skip_verify | bool) else [])
+         + ['-field=' ~ zitadel_provision_token_field, zitadel_openbao_secret_path] }}
+  delegate_to: "{{ zitadel_openbao_cli_host }}"
+  vars:
+    ansible_user: "{{ zitadel_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zitadel_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zitadel_provision_token_read
+  failed_when: false
+  changed_when: false
+  no_log: true
+  when: zitadel_openbao_addr | length > 0
+
+# Set a non-secret fact: does a usable provision_token already live in OpenBao?
+# (The stored VALUE is never bound to a non-no_log fact; only this boolean.)
+- name: "ZITADEL | Set fact — provision_token already stored in OpenBao?"
+  ansible.builtin.set_fact:
+    zitadel_provision_token_stored: >-
+      {{ (zitadel_openbao_addr | length > 0)
+         and (zitadel_provision_token_read.rc | default(1) == 0)
+         and ((zitadel_provision_token_read.stdout | default('') | trim) | length > 0) }}
+  changed_when: false
+
+# (2) Stat the first-init emit file on the guest — ONLY when no stored token.
+# ZITADEL writes it during setup; give it a bounded wait so a slow first-init
+# does not false-negative. Skipped entirely on a re-run that already has a token.
+- name: "ZITADEL | Wait for the first-init PAT emit file (only when no stored token)"
+  ansible.builtin.wait_for:
+    path: "{{ zitadel_provision_pat_host_dir }}/{{ zitadel_provision_pat_emit_path | basename }}"
+    state: present
+    timeout: 120
+  register: zitadel_provision_emit_wait
+  failed_when: false
+  when:
+    - zitadel_openbao_addr | length > 0
+    - not (zitadel_provision_token_stored | bool)
+
+- name: "ZITADEL | Stat the first-init PAT emit file on the guest"
+  ansible.builtin.stat:
+    path: "{{ zitadel_provision_pat_host_dir }}/{{ zitadel_provision_pat_emit_path | basename }}"
+  register: zitadel_provision_emit_stat
+  changed_when: false
+  when:
+    - zitadel_openbao_addr | length > 0
+    - not (zitadel_provision_token_stored | bool)
+
+# (3) Obtain-once: read the emitted PAT from the guest — ONLY when no stored
+# token AND the emit file exists. The raw PAT is the file contents; trim it.
+- name: "ZITADEL | Read the first-init PAT from the emit file (obtain-once, no_log)"
+  ansible.builtin.slurp:
+    src: "{{ zitadel_provision_pat_host_dir }}/{{ zitadel_provision_pat_emit_path | basename }}"
+  register: zitadel_provision_emit_slurp
+  no_log: true
+  when:
+    - zitadel_openbao_addr | length > 0
+    - not (zitadel_provision_token_stored | bool)
+    - zitadel_provision_emit_stat.stat.exists | default(false)
+
+- name: "ZITADEL | Bind the obtained provision_token fact (no_log)"
+  ansible.builtin.set_fact:
+    zitadel_provision_token: "{{ (zitadel_provision_emit_slurp.content | b64decode | trim) }}"
+  no_log: true
+  when:
+    - zitadel_openbao_addr | length > 0
+    - not (zitadel_provision_token_stored | bool)
+    - zitadel_provision_emit_stat.stat.exists | default(false)
+
+# (4) Persist the obtained PAT to OpenBao (stdin via `-`, NEVER argv). Gated on
+# "OpenBao wired AND no token already stored AND a PAT was obtained" so a re-run
+# can never overwrite/rotate an existing provision_token (Req 3.1 idempotency).
+- name: "ZITADEL | Persist the obtained provision_token to OpenBao (stdin, no_log)"
+  ansible.builtin.shell:
+    cmd: >-
+      printf '%s' "$ZITADEL_PROVISION_TOKEN_VALUE" | docker exec -i
+      -e BAO_ADDR={{ zitadel_openbao_cli_bao_addr | quote }}
+      -e BAO_TOKEN={{ zitadel_bao_token | quote }}
+      {{ zitadel_openbao_primary_container_name | quote }}
+      {{ zitadel_openbao_bao_bin | quote }} kv patch
+      {{ '-tls-skip-verify' if (zitadel_openbao_tls_skip_verify | bool) else '' }}
+      {{ zitadel_openbao_secret_path | quote }}
+      {{ zitadel_provision_token_field }}=-
+  environment:
+    ZITADEL_PROVISION_TOKEN_VALUE: "{{ zitadel_provision_token }}"
+  delegate_to: "{{ zitadel_openbao_cli_host }}"
+  vars:
+    ansible_user: "{{ zitadel_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zitadel_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zitadel_provision_token_write
+  changed_when: true
+  no_log: true
+  when:
+    - zitadel_openbao_addr | length > 0
+    - not (zitadel_provision_token_stored | bool)
+    - zitadel_provision_emit_stat.stat.exists | default(false)
+
+# (5) Scrub the on-guest emit file once it is safely in OpenBao — the token's
+# only durable home is OpenBao (Req 2.3 / 5.4). Runs only after a successful
+# persist of a freshly-obtained token.
+- name: "ZITADEL | Scrub the first-init PAT emit file after persisting to OpenBao"
+  ansible.builtin.file:
+    path: "{{ zitadel_provision_pat_host_dir }}/{{ zitadel_provision_pat_emit_path | basename }}"
+    state: absent
+  when:
+    - zitadel_openbao_addr | length > 0
+    - not (zitadel_provision_token_stored | bool)
+    - zitadel_provision_emit_stat.stat.exists | default(false)
+
+# (6) Fail fast when OpenBao is WIRED but neither a stored token NOR a freshly
+# emitted PAT is available — mirrors the backing-DB-password fail-fast. Names the
+# KV path+field and the emit path expected; echoes NO secret value.
+- name: "ZITADEL | Fail fast when wired but no provision_token can be obtained or read"
+  ansible.builtin.fail:
+    msg: >-
+      ZITADEL provisioning-token retrieval FAILED: OpenBao is wired
+      (zitadel_openbao_addr={{ zitadel_openbao_addr }}) but NEITHER a stored
+      `{{ zitadel_provision_token_field }}` field exists at
+      {{ zitadel_openbao_secret_path }} NOR did ZITADEL emit a first-init PAT at
+      {{ zitadel_provision_pat_host_dir }}/{{ zitadel_provision_pat_emit_path | basename }}
+      (container path {{ zitadel_provision_pat_emit_path }}). On a FIRST init the
+      FirstInstance machine user ({{ zitadel_provision_sa_username }}) must write
+      its PAT to that path; on a re-run the token must already be stored. Confirm
+      the ZITADEL stack reached its setup phase (start-from-init) with the
+      ZITADEL_FIRSTINSTANCE_* env present and the emit dir mounted, and that the
+      OPENBAO_ADMIN_TOKEN is present in the environment. No secret value is shown.
+  when:
+    - zitadel_openbao_addr | length > 0
+    - not (zitadel_provision_token_stored | bool)
+    - not (zitadel_provision_emit_stat.stat.exists | default(false))

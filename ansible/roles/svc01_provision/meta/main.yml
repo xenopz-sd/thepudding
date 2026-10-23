@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: svc01_provision
+  namespace: devinfra
+  author: Developer Services Platform
+  description: SVC-01 installer Phase 2 — provisioning (per-slug state, terraform apply, inventory, known_hosts).
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

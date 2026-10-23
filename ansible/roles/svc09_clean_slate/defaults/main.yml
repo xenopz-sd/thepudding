@@ -1,0 +1,17 @@
+---
+# defaults/main.yml — svc09_clean_slate (SVC-09 installer — clean-slate branch)
+#
+# Clean-slate phase-specific defaults. Cross-phase constants (clean_slate,
+# clean_slate_confirm, cluster_env_file, svc09_repo_root, svc09_venv_python,
+# svc09_tf_root, svc09_cluster_env_helper, svc09_traefik_vmid) stay as play-level
+# vars. NO secret value ever lives here. Clone of svc07_clean_slate/defaults.
+
+# Proxmox host SSH address for the Clean_Slate_Reset path. The delegated
+# clean-slate.yml runs `pct` ON THE NODE, so it targets the Proxmox-host
+# inventory, whose ansible_host is a committed placeholder overridden at run
+# time. Supply the real LAN IP with `-e svc09_proxmox_host=<real-proxmox-lan-ip>`.
+# Unset by default; the clean-slate branch fails fast (naming this var) if a
+# reset is requested without it. Not needed on the normal install path.
+svc09_proxmox_host: ""
+# The Proxmox-host inventory clean-slate.yml expects (pct runs on the node).
+svc09_proxmox_host_inventory: ansible/inventory/proxmox-hosts.yml

@@ -1,0 +1,30 @@
+---
+# meta/main.yml — traefik_install
+galaxy_info:
+  role_name: traefik_install
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Installs and configures Traefik (SVC-09), the shared reverse proxy / TLS
+    termination edge, on a Proxmox LXC as a Docker Compose stack. Templates the
+    static traefik.yml, pins the image, creates and owns the real external `edge`
+    Docker network, and performs an idempotent version-checked install.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - traefik
+    - reverse-proxy
+    - ingress
+    - svc09
+
+# No cross-role dependencies. The Compose stack is templated via the existing
+# docker-compose-app role, invoked by this role via include_role, not as a hard
+# meta dependency here.
+dependencies: []

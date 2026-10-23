@@ -1,0 +1,13 @@
+---
+# meta/main.yml — svc09_clean_slate (SVC-09 installer — clean-slate branch)
+galaxy_info:
+  role_name: svc09_clean_slate
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-09 (Traefik) installer clean-slate reset: agent-live throwaway-guard
+    consult, confirmation gate, delegated terraform_clean_slate destroy of the
+    Traefik LXC, two-way empty-baseline verification.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

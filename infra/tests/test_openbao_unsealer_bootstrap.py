@@ -208,6 +208,18 @@ class TestAutomationReachability:
     ``openbao.yml``) land. _Requirements: 2.1; bugfix Regression Test Req (a)._
     """
 
+    @pytest.mark.skipif(
+        not _INVENTORY.is_file(),
+        reason=(
+            "the SVC-07 inventory is GENERATED at apply time by "
+            "generate_inventory.py (terraform output -> "
+            "svc-07-secrets-manager.generated.yml) and is gitignored, so it is "
+            "absent on a clean checkout / in CI. This sanity anchor only "
+            "inspects that generated artifact's group split; skip cleanly when "
+            "it has not been generated (offline-by-construction: absent "
+            "generated input => skipped, never a FileNotFoundError failure)."
+        ),
+    )
     def test_inventory_places_unsealer_in_its_own_group(self):
         """Sanity anchor: the generated inventory really does split the two hosts.
 
@@ -215,6 +227,9 @@ class TestAutomationReachability:
         ``hosts: openbao`` play cannot reach the unsealer because it lives in the
         separate ``openbao-unsealer`` group. (Stays green before and after the fix;
         it pins the inventory shape the reachability assertions rely on.)
+
+        Skipped when the generated inventory is absent (clean checkout / CI);
+        see the ``skipif`` reason above.
         """
         assert _inventory_group_has_host(_UNSEALER_GROUP, _UNSEALER_HOST), (
             f"expected {_UNSEALER_HOST!r} under inventory group "

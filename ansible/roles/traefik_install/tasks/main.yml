@@ -1,0 +1,194 @@
+---
+# tasks/main.yml — traefik_install (SVC-09)
+#
+# Installs/configures the shared Traefik edge as a Docker Compose stack via the
+# generic docker-compose-app role. Owns the real external `edge` Docker network.
+# Spec: .kiro/specs/svc-09-reverse-proxy/ (requirements.md, design.md).
+#
+# Order:
+#   1. Idempotency version-check guard (skip templating/up on an already-pinned
+#      running container -> changed=0 on a converged host).
+#   2. (opt-in mock) self-signed TLS material — Task 4, included here gated.
+#   3. Ensure config/dynamic/tls dirs on the guest.
+#   4. Create + OWN the real external `edge` Docker network (FR-11).
+#   5. Template the static traefik.yml and the dynamic file-provider config.
+#   6. Deploy the Compose stack via docker-compose-app.
+
+# --- 1. IDEMPOTENCY: version-check guard -------------------------------------
+# Detect an already-running Traefik container at the pinned image BEFORE
+# templating/bringing up the stack, so a second run against an already-installed
+# host is a no-op that reports changed=0 (SVC-09 §9).
+- name: "Traefik | Inspect any running container at the pinned image (idempotency guard)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "--format={{ '{{' }}index .Config.Image{{ '}}' }}"
+      - "{{ traefik_container_name }}"
+  register: traefik_running_image
+  failed_when: false
+  changed_when: false
+
+- name: "Traefik | Set fact — already at the pinned image?"
+  ansible.builtin.set_fact:
+    traefik_already_at_pinned_version: >-
+      {{ (traefik_running_image.rc | default(1)) == 0
+         and (traefik_running_image.stdout | default('') | trim) == traefik_image }}
+  changed_when: false
+
+- name: "Traefik | Report idempotent no-op when already at the pinned image"
+  ansible.builtin.debug:
+    msg: >-
+      Traefik container {{ traefik_container_name }} is already running at
+      {{ traefik_image }}; install is a no-op (changed=0).
+  when: traefik_already_at_pinned_version
+
+# --- 2. (opt-in) self-signed TLS mock — Task 4 -------------------------------
+# PERMANENT, DEFAULT-OFF dev stand-in for SVC-08/EJBCA + Let's Encrypt. Gated on
+# traefik_tls_self_signed; deliberately NOT gated on the version-check guard so a
+# crash-looping / half-installed host still gets its cert. See
+# tasks/tls_self_signed.yml and .kiro/steering/mock-stand-ins.md.
+- name: "Traefik | Generate mock self-signed TLS material (opt-in dev stand-in)"
+  ansible.builtin.include_tasks: tls_self_signed.yml
+  when: traefik_tls_self_signed | bool
+
+# --- 2b. Compose the dashboard router labels (mock-vs-real selector) ---------
+# The dashboard is reached ONLY via an internal Traefik router (never anonymous
+# :8080, FR-6). Two postures, selected by the default-off mock flag:
+#   * mock on  (traefik_dashboard_auth_disabled=true): internal-only route with
+#     the ZITADEL forward-auth middleware wired but INERT (SVC-06 absent).
+#   * mock off (production): the forward-auth middleware is active and REQUIRED;
+#     if no forward-auth address is configured AND the mock is off, fail closed
+#     at render below (never silently anonymous).
+# Either way the labels bind the dashboard to the internal host rule and the
+# api@internal service; neither posture publishes a host port.
+- name: "Traefik | Fail closed if the dashboard would be unauthenticated (mock off, no forward-auth)"
+  ansible.builtin.assert:
+    that:
+      - (traefik_dashboard_forward_auth_address | default('') | length > 0)
+    fail_msg: >-
+      The Traefik dashboard would be exposed with NO authentication: the
+      ZITADEL forward-auth address (traefik_dashboard_forward_auth_address) is
+      empty AND the dashboard-auth mock is off. Deploy SVC-06 (ZITADEL) and set
+      the forward-auth address, OR explicitly opt into the development stand-in
+      with `-e traefik_dashboard_auth_disabled=true` (internal-only route, auth
+      inert — see .kiro/steering/mock-stand-ins.md). Never left anonymous.
+    success_msg: "Traefik dashboard will be protected by ZITADEL forward-auth."
+  when: not (traefik_dashboard_auth_disabled | bool)
+
+- name: "Traefik | Compose the dashboard router labels"
+  ansible.builtin.set_fact:
+    traefik_dashboard_labels: >-
+      {{
+        [
+          'traefik.enable=true',
+          'traefik.http.routers.dashboard.rule=Host(`' ~ traefik_dashboard_host ~ '`)',
+          'traefik.http.routers.dashboard.entrypoints=websecure',
+          'traefik.http.routers.dashboard.service=api@internal',
+          'traefik.http.routers.dashboard.tls=true',
+        ]
+        + (
+          ['traefik.http.routers.dashboard.middlewares=dashboard-auth@file']
+          if not (traefik_dashboard_auth_disabled | bool)
+          else []
+        )
+      }}
+  changed_when: false
+
+# --- 3. Ensure config directories on the guest -------------------------------
+- name: "Traefik | Ensure the config + dynamic + tls directories exist"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  loop:
+    - "{{ traefik_config_dir }}"
+    - "{{ traefik_dynamic_config_dir }}"
+    - "{{ traefik_tls_host_dir }}"
+  when: not traefik_already_at_pinned_version
+
+# --- 4. Create + OWN the real external `edge` Docker network (FR-11) ---------
+# Traefik is the authoritative owner of the shared external `edge` network every
+# HTTP service attaches to. community.docker.docker_network is create-if-absent
+# and reports changed=0 on a converged host (idempotent). This REPLACES the
+# SVC-07 placeholder mock (openbao_mock_edge_network) in production: once Traefik
+# owns `edge`, that placeholder must never be enabled on this host (coexistence
+# caveat, .kiro/steering/mock-stand-ins.md Mock 2).
+- name: "Traefik | Create and own the real external `edge` Docker network (FR-11)"
+  community.docker.docker_network:
+    name: edge
+    state: present
+
+# --- 5. Template static + dynamic config -------------------------------------
+- name: "Traefik | Template the static traefik.yml"
+  ansible.builtin.template:
+    src: traefik.yml.j2
+    dest: "{{ traefik_static_config_file }}"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Restart traefik
+
+- name: "Traefik | Template the dynamic file-provider config (middlewares + mock TLS default cert)"
+  ansible.builtin.template:
+    src: dynamic.yml.j2
+    dest: "{{ traefik_dynamic_config_dir }}/dynamic.yml"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Restart traefik
+
+# --- 6. Deploy the Compose stack via docker-compose-app ----------------------
+# Traefik IS the ingress edge, so it DOES bind host ports :80/:443 — the single
+# justified exception to the docker-compose-app "no host ports" rule (SVC-09
+# requirements §12 cross-cutting / integration-boundaries §1: Traefik is the
+# ingress, not a backend). The Docker socket is mounted READ-ONLY (SVC-09 §12).
+# The acme.json cert store is a NAMED VOLUME (persistent); Ansible never writes
+# it. The static config + dynamic dir + (mock) tls dir are bind-mounted :ro.
+- name: "Traefik | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ traefik_stack_name }}"
+    dca_services:
+      - name: traefik
+        image: "{{ traefik_image }}"
+        restart: "unless-stopped"
+        # Ingress edge: bind the two external entrypoints to the host. This is
+        # the documented FR-7 exception — Traefik is the ingress, not a backend.
+        ports:
+          - "{{ traefik_entrypoint_web_port }}:{{ traefik_entrypoint_web_port }}"
+          - "{{ traefik_entrypoint_websecure_port }}:{{ traefik_entrypoint_websecure_port }}"
+        volumes:
+          # Read-only Docker socket — Traefik observes labels only (SVC-09 §12).
+          - "{{ traefik_docker_socket }}:{{ traefik_docker_socket }}:ro"
+          # Static config + dynamic file-provider dir, read-only.
+          - "{{ traefik_static_config_file }}:/etc/traefik/traefik.yml:ro"
+          - "{{ traefik_dynamic_config_dir }}:/etc/traefik/dynamic:ro"
+          # (mock) self-signed TLS material, read-only — present only when the
+          # mock is enabled; harmless to mount an empty dir otherwise.
+          - "{{ traefik_tls_host_dir }}:/etc/traefik/tls:ro"
+          # Persistent acme.json cert store — a NAMED VOLUME, never tmpfs. Only
+          # Traefik writes it; it survives restarts/re-runs (SVC-09 §7/§9).
+          - "{{ traefik_acme_volume }}:{{ traefik_acme_mount }}"
+        networks: ["edge"]
+        # Dashboard router + (inert until SVC-06) forward-auth middleware are
+        # applied as labels on the Traefik container itself. Internal-only route,
+        # never anonymous :8080 (FR-6/FR-10). Rendered by the mock/real selector.
+        labels: "{{ traefik_dashboard_labels }}"
+    dca_volumes:
+      - "{{ traefik_acme_volume }}"
+    # `edge` is created+owned by THIS role above (external: true here means
+    # docker-compose-app attaches to the pre-existing network rather than
+    # creating a compose-scoped one).
+    dca_networks:
+      - { name: "edge", external: true }
+    dca_env:
+      # Non-secret config only (composition-wiring.md). The ACME contact e-mail
+      # is non-secret; the DNS-01 provider token + ZITADEL client secret are
+      # fetched from OpenBao at container start, never templated here.
+      TRAEFIK_LOG_LEVEL: "{{ traefik_log_level }}"
+    dca_state: "{{ traefik_state }}"
+  when: not traefik_already_at_pinned_version

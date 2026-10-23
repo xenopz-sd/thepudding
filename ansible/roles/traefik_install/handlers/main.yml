@@ -1,0 +1,17 @@
+---
+# handlers/main.yml — traefik_install
+#
+# Concrete restart handler. When the static traefik.yml, the dynamic file-provider
+# config, or the TLS material changes, reconcile the Traefik stack with a forced
+# recreate via community.docker.docker_compose_v2 (PF §9 — declarative, not a
+# shell `docker compose up`). Traefik re-reads its static config only at start,
+# so a static-config change must recreate the container; the dynamic file
+# provider is hot-reloaded by Traefik itself and does not strictly need this, but
+# a recreate is harmless and keeps the handler single-purpose.
+
+- name: Restart traefik
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ traefik_stack_name }}"
+    project_name: "{{ traefik_stack_name }}"
+    state: present
+    recreate: always

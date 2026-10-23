@@ -1,0 +1,134 @@
+---
+# tasks/tls_self_signed.yml — zitadel-server (Mock 5)
+#
+# ============================================================================
+# MOCK self-signed TLS material — OPT-IN, NOT FOR PRODUCTION (mock-stand-ins.md)
+# ----------------------------------------------------------------------------
+# Production TLS for ZITADEL is terminated by Traefik (SVC-09) with a real
+# Let's Encrypt / EJBCA cert — ZITADEL itself serves plaintext h2c on the edge
+# network and does NOT hold a cert. SVC-09 may not be deployed on a dev/offline
+# target, so this file generates a SELF-SIGNED cert + key as a MOCK stand-in so
+# the OIDC endpoint can be served/tested over HTTPS directly. When Traefik is
+# live, leave zitadel_tls_self_signed=false — Traefik does TLS and nothing here
+# runs. Permanent, opt-in affordance, NOT transitional debt.
+#
+# WHERE IT RUNS: the community.crypto modules require the Python `cryptography`
+# library where they run. The ZITADEL LXC is minimal and does NOT ship it;
+# the Ansible CONTROL NODE's venv already has it (dependency of community.crypto).
+# So the cert + key are generated ON THE CONTROL NODE (delegate_to: localhost,
+# run_once) into a per-run temp dir, then COPIED to the guest with the ZITADEL
+# container's uid/gid. This adds NO package to the guest. (Clone of SVC-07's
+# openbao_install/tasks/tls_self_signed.yml.)
+#
+# IDEMPOTENCY: stat the TARGET cert first and only (re)generate when ABSENT, so a
+# converged host is left untouched (no copy, no restart). SECRETS: the key is
+# generated into a 0700 control-node temp dir, copied 0640 to the guest, and the
+# control-node temp copy is REMOVED at the end; key tasks are no_log.
+# ============================================================================
+
+- name: "ZITADEL MOCK-TLS: ensure the TLS host directory exists (zitadel uid/gid, 0750)"
+  ansible.builtin.file:
+    path: "{{ zitadel_tls_host_dir }}"
+    state: directory
+    owner: "{{ zitadel_container_uid }}"
+    group: "{{ zitadel_container_gid }}"
+    mode: "0750"
+
+- name: "ZITADEL MOCK-TLS: stat the target cert to decide whether generation is needed"
+  ansible.builtin.stat:
+    path: "{{ zitadel_tls_cert_file | regex_replace('^' + zitadel_tls_dir, zitadel_tls_host_dir) }}"
+  register: zitadel_mock_tls_cert_stat
+  changed_when: false
+
+- name: "ZITADEL MOCK-TLS: set fact — (re)generate only when the target cert is absent"
+  ansible.builtin.set_fact:
+    zitadel_mock_tls_generate: "{{ not (zitadel_mock_tls_cert_stat.stat.exists | default(false)) }}"
+  changed_when: false
+
+- name: "ZITADEL MOCK-TLS: report that a present cert is kept (idempotent, no restart)"
+  ansible.builtin.debug:
+    msg: >-
+      A mock TLS cert already exists at
+      {{ zitadel_tls_cert_file | regex_replace('^' + zitadel_tls_dir, zitadel_tls_host_dir) }};
+      keeping it (no regenerate, no restart). Delete it on the target to force
+      regeneration.
+  when: not zitadel_mock_tls_generate
+
+- name: "ZITADEL MOCK-TLS: create a control-node temp dir for cert generation"
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: "zitadel-mock-tls-"
+  register: zitadel_mock_tls_tmp
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  when: zitadel_mock_tls_generate
+
+- name: "ZITADEL MOCK-TLS: generate the private key on the control node"
+  community.crypto.openssl_privatekey:
+    path: "{{ zitadel_mock_tls_tmp.path }}/key.pem"
+    type: RSA
+    size: 4096
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  no_log: true
+  when: zitadel_mock_tls_generate
+
+- name: "ZITADEL MOCK-TLS: build a CSR carrying the external-domain SANs (control node)"
+  community.crypto.openssl_csr:
+    path: "{{ zitadel_mock_tls_tmp.path }}/zitadel.csr"
+    privatekey_path: "{{ zitadel_mock_tls_tmp.path }}/key.pem"
+    common_name: "{{ zitadel_tls_self_signed_cn }}"
+    subject_alt_name: "{{ zitadel_tls_self_signed_sans }}"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: zitadel_mock_tls_generate
+
+- name: "ZITADEL MOCK-TLS: self-sign the certificate from the CSR (control node)"
+  community.crypto.x509_certificate:
+    path: "{{ zitadel_mock_tls_tmp.path }}/cert.pem"
+    privatekey_path: "{{ zitadel_mock_tls_tmp.path }}/key.pem"
+    csr_path: "{{ zitadel_mock_tls_tmp.path }}/zitadel.csr"
+    provider: selfsigned
+    selfsigned_not_after: "+{{ zitadel_tls_self_signed_valid_days }}d"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: zitadel_mock_tls_generate
+
+- name: "ZITADEL MOCK-TLS: install the private key on the target (zitadel uid/gid, 0640)"
+  ansible.builtin.copy:
+    src: "{{ zitadel_mock_tls_tmp.path }}/key.pem"
+    dest: "{{ zitadel_tls_key_file | regex_replace('^' + zitadel_tls_dir, zitadel_tls_host_dir) }}"
+    owner: "{{ zitadel_container_uid }}"
+    group: "{{ zitadel_container_gid }}"
+    mode: "0640"
+  no_log: true
+  when: zitadel_mock_tls_generate
+  notify: Restart zitadel
+
+- name: "ZITADEL MOCK-TLS: install the certificate on the target (zitadel uid/gid, 0644)"
+  ansible.builtin.copy:
+    src: "{{ zitadel_mock_tls_tmp.path }}/cert.pem"
+    dest: "{{ zitadel_tls_cert_file | regex_replace('^' + zitadel_tls_dir, zitadel_tls_host_dir) }}"
+    owner: "{{ zitadel_container_uid }}"
+    group: "{{ zitadel_container_gid }}"
+    mode: "0644"
+  when: zitadel_mock_tls_generate
+  notify: Restart zitadel
+
+- name: "ZITADEL MOCK-TLS: remove the control-node temp dir (scrub key material)"
+  ansible.builtin.file:
+    path: "{{ zitadel_mock_tls_tmp.path }}"
+    state: absent
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  when: zitadel_mock_tls_generate

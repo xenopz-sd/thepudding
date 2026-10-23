@@ -384,7 +384,7 @@ graph TD
     end
 
     subgraph shared["VLAN 20 — shared services (10.0.20.0/24)"]
-        SSO["SSO / identity provider<br/>svc06-20-01 · 10.0.20.10"]
+        SSO["SSO / identity provider<br/>svc06-20-01 · 10.0.20.15"]
     end
 
     subgraph proj["VLAN 100 — project 'dronefleet' (10.0.100.0/24)"]
@@ -498,7 +498,10 @@ runbook (the provision-then-test walkthrough) and a link to its spec.
 
 | Service | Install runbook | Spec |
 |---|---|---|
+| **SVC-01 — SQL database (PostgreSQL)** | [`INSTALL-RUNBOOK.md`](../infra/projects/svc-01-sql-database/INSTALL-RUNBOOK.md) | [`svc-01-sql-database`](../.kiro/specs/svc-01-sql-database/) |
+| **SVC-06 — Identity provider (ZITADEL)** | [`INSTALL-RUNBOOK.md`](../infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md) | [`svc-06-identity-provider`](../.kiro/specs/svc-06-identity-provider/) · [`svc06-org-provision-token-wiring`](../.kiro/specs/svc06-org-provision-token-wiring/) |
 | **SVC-07 — Secrets manager (OpenBao)** | [`INSTALL-RUNBOOK.md`](../infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md) | [`svc-07-secrets-manager`](../.kiro/specs/svc-07-secrets-manager/) · [`svc-07-automated-installer`](../.kiro/specs/svc-07-automated-installer/) · [`svc07-installer-simplification`](../.kiro/specs/svc07-installer-simplification/) |
+| **SVC-09 — Reverse proxy (Traefik)** | [`INSTALL-RUNBOOK.md`](../infra/projects/svc-09-reverse-proxy/INSTALL-RUNBOOK.md) | [`svc-09-reverse-proxy`](../.kiro/specs/svc-09-reverse-proxy/) |
 
 ### Platform prerequisites
 

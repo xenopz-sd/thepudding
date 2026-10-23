@@ -119,6 +119,28 @@ _LEAF_EXEMPT = {
     "ansible/roles/terraform_clean_slate/tasks/reset_target.yml",
     "ansible/roles/svc07_provision/tasks/main.yml",
     "ansible/roles/platform_api/tasks/main.yml",
+    # svc09_provision is the SVC-09 Phase-2 APPLY mechanism (`terraform apply`),
+    # guarded UPSTREAM exactly like svc07_provision: in
+    # ansible/playbooks/svc-09-bootstrap.yml the svc09_preflight role (Phase 1)
+    # runs BEFORE svc09_provision (Phase 2) in the SAME play and carries the gated
+    # guard consult for the armed from-scratch path. Provision has no
+    # cluster-identity/guard context distinct from preflight, so it is exempt here
+    # (mirrors svc07_provision).
+    "ansible/roles/svc09_provision/tasks/main.yml",
+    # svc01_provision is the SVC-01 Phase-2 APPLY mechanism (`terraform apply`),
+    # guarded UPSTREAM exactly like svc07_provision: svc01_preflight (Phase 1)
+    # carries the gated throwaway-guard consult before svc01_provision (Phase 2)
+    # in ansible/playbooks/svc-01-bootstrap.yml. Provision has no
+    # cluster-identity/guard context distinct from preflight, so it is exempt here.
+    "ansible/roles/svc01_provision/tasks/main.yml",
+    # svc06_provision is the SVC-06 Phase-2 APPLY mechanism: it runs a child
+    # svc-01-bootstrap for the backing DB (that child carries its OWN guard in
+    # svc01_preflight) plus a ZITADEL `terraform apply`. Its own guard consult is
+    # carried UPSTREAM by svc06_preflight (Phase 1) in svc-06-bootstrap.yml — same
+    # upstream-guard pattern as svc07_provision / svc01_provision. Exempt here.
+    # (svc06_clean_slate is NOT exempt — it carries the gated consult directly and
+    # is role-scanned like svc01_clean_slate / svc07_clean_slate.)
+    "ansible/roles/svc06_provision/tasks/main.yml",
 }
 
 # --------------------------------------------------------------------------- #
@@ -151,6 +173,24 @@ _LEAF_EXEMPT = {
 _PLAYBOOK_LEAF_EXEMPT = {
     "ansible/playbooks/svc-07-bootstrap.yml",
     "ansible/playbooks/clean-slate.yml",
+    # svc-09-bootstrap.yml drives its mutations via import_role (svc09_provision's
+    # `terraform apply`, svc09_clean_slate's child clean-slate.yml). Its guard
+    # consult is NOT in the playbook — it is carried by svc09_preflight (Phase 1,
+    # the from-scratch guard) and svc09_clean_slate (the reset branch), BOTH of
+    # which the role scan already flags/checks. Exempt for the same reason as
+    # svc-07-bootstrap.yml.
+    "ansible/playbooks/svc-09-bootstrap.yml",
+    # svc-01-bootstrap.yml drives its mutations via import_role (svc01_provision's
+    # `terraform apply`, svc01_clean_slate's child clean-slate.yml); its guard
+    # consult is carried upstream by svc01_preflight + svc01_clean_slate (both
+    # role-scanned). Exempt for the same reason as svc-07-bootstrap.yml.
+    "ansible/playbooks/svc-01-bootstrap.yml",
+    # svc-06-bootstrap.yml drives its mutations via import_role (svc06_provision's
+    # child svc-01-bootstrap + ZITADEL `terraform apply`, svc06_clean_slate's
+    # child teardowns); its guard consult is carried upstream by svc06_preflight +
+    # svc06_clean_slate (both role-scanned). Exempt for the same reason as
+    # svc-07-bootstrap.yml / svc-01-bootstrap.yml.
+    "ansible/playbooks/svc-06-bootstrap.yml",
 }
 
 

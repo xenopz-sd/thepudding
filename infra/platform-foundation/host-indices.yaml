@@ -1,0 +1,130 @@
+# infra/platform-foundation/host-indices.yaml
+#
+# Host-index registry (the Host_Index_Authority) — the authoritative per-VLAN
+# record of which host_index each guest occupies WITHIN a VLAN. This is the
+# single in-repo source of host-index truth for any VLAN populated by more than
+# one independent Terraform root (VLAN 20 today; any project VLAN running >1
+# service root). See design.md §3.1 (option A2) / §Data Models and the
+# "VLAN-20 host-index map" section of .kiro/specs/fix-vlan-host-index-collision.
+#
+# WHY THIS FILE EXISTS. NET-00 §3 assigns a host IP as
+# cidrhost("10.0.<vlan_id>.0/24", 10 + host_index), where host_index is "that
+# host's position in Terraform's for_each/count over the VLAN's service list".
+# That is unique-by-construction only when ONE Terraform root enumerates every
+# host in a VLAN. On a shared VLAN each service is a SEPARATE root computing its
+# host_index from zero with no shared counter — so two roots both default to 0
+# and collide on .10 (live-confirmed: SVC-07 primary and SVC-09 Traefik both at
+# 10.0.20.10). This ledger is the shared counter: it makes host_index unique
+# within a VLAN across independent roots.
+#
+# THE FORMULA IS UNCHANGED. This file changes only HOW host_index is made unique
+# across roots; cidrhost("10.0.<vlan_id>.0/24", 10 + host_index) is exactly as
+# before. host_index n  ->  10.0.<vlan_id>.(10 + n).
+#
+# READ-ONLY INPUT, NEVER STATE. Like projects.yaml, this is committed
+# (gitignore-free), read-only input to each Terraform root (via yamldecode() /
+# a CI-injected -var) and to the Python derivation layer — it is NOT Terraform
+# state. One state per service is preserved (integration-boundaries.md §5); this
+# ledger never merges service states.
+#
+# APPEND-ONLY, DIFF-REVIEWABLE. Entries are added in reviewable MRs and are not
+# re-picked: a collision is visible in the diff that introduces it, and the
+# Python guard (assert_unique_host_indices) + the proxmox-compute
+# peer_host_indices plan-time precondition both fail CLOSED on a within-VLAN
+# duplicate before any Proxmox resource is created.
+#
+# TWO READ VIEWS OVER THIS FILE (see design.md §Data Models, mirroring
+# projects.yaml's two-view discipline):
+#   Assigned_Index_View  = a root asks "what is MY host_index on VLAN N?" and
+#                          reads its own entry (threaded into proxmox-compute's
+#                          host_index).
+#   Peer_Set_View        = a root asks "what are ALL host indices on VLAN N
+#                          except mine?" and reads that set (threaded into
+#                          proxmox-compute's peer_host_indices precondition).
+#
+# Field schema:
+#   <vlan_id>   integer top-level key (e.g. 20). Each VLAN maps to a list of
+#               allocation entries.
+#   Each entry:
+#     svc_code    string, the stable catalog service-slot code (e.g. "svc07").
+#                 Keyed on the SVC-NN slot, so a technology swap within a slot
+#                 never changes the key (NET-00 §4).
+#     component   string, optional — distinguishes multiple guests of one
+#                 service (e.g. "unsealer", "backing-db"). Omit for the
+#                 service's primary/sole guest.
+#     instance    integer, the per-(svc_code,component) instance ordinal,
+#                 1-based (matches the <instance> in <svc-code>-<vlan_id>-<NN>).
+#     host_index  integer >= 0, this guest's position within the VLAN.
+#                 IP = cidrhost("10.0.<vlan_id>.0/24", 10 + host_index).
+#     anchor      bool, optional (default false). true = a stateful,
+#                 prevent_destroy guest whose index is NEVER reassigned.
+#     status      string, "allocated" (a built/placed guest) or "reserved"
+#                 (headroom held for a not-yet-specced service so a future
+#                 bring-up draws a distinct index instead of defaulting to 0).
+
+# VLAN 20 — shared platform services (domain-rules §1). Populated by SEPARATE
+# Terraform roots (svc-07-secrets-manager, svc-09-reverse-proxy,
+# svc-06-identity-provider, ...). Gateway .1 and the .2-.9 reserved band
+# (NET-00 §3) are untouched; host allocation starts at index 0 -> .10.
+20:
+  # --- SVC-07 OpenBao: ANCHORS — stateful secret store (prevent_destroy),
+  #     indices NEVER reassigned. These two are already correct live. ---
+  - svc_code: svc07           # OpenBao primary
+    instance: 1
+    host_index: 0             # -> 10.0.20.10
+    anchor: true
+    status: allocated
+  - svc_code: svc07           # OpenBao unsealer (holds the Transit key)
+    component: unsealer
+    instance: 1
+    host_index: 1             # -> 10.0.20.11
+    anchor: true
+    status: allocated
+
+  # --- SVC-09 Traefik: the guest that CURRENTLY COLLIDES. It defaulted to
+  #     host_index 0 (10.0.20.10) alongside the SVC-07 primary. Moved to the
+  #     first free low index 2 (10.0.20.12); index 3 left as a small gap
+  #     (.13 was informally referenced as an SVC-01-test occupant). ---
+  - svc_code: svc09           # Traefik reverse proxy
+    instance: 1
+    host_index: 2             # -> 10.0.20.12  (MOVED from 0)
+    status: allocated
+
+  # --- SVC-06 identity provider: already-distinct pair, unchanged. ---
+  - svc_code: svc01           # backing DB (SVC-01 Postgres instance) for ZITADEL
+    component: shared-zitadel
+    instance: 1
+    host_index: 4             # -> 10.0.20.14
+    status: allocated
+  - svc_code: svc06           # ZITADEL
+    instance: 1
+    host_index: 5             # -> 10.0.20.15
+    status: allocated
+
+  # --- RESERVED HEADROOM for the remaining Tier-1 shared services. Recorded as
+  #     reservations so a future bring-up draws a distinct index by looking
+  #     here, NOT by defaulting to 0. Exact values are finalized when each
+  #     service is specced. ---
+  - svc_code: svc13           # GitLab Runner
+    instance: 1
+    host_index: 6             # -> 10.0.20.16
+    status: reserved
+  - svc_code: svc14           # Zot registry
+    instance: 1
+    host_index: 7             # -> 10.0.20.17
+    status: reserved
+  - svc_code: svc17-18        # observability — Prometheus
+    component: prometheus
+    instance: 1
+    host_index: 8             # -> 10.0.20.18
+    status: reserved
+  - svc_code: svc17-18        # observability — Grafana
+    component: grafana
+    instance: 1
+    host_index: 9             # -> 10.0.20.19
+    status: reserved
+  - svc_code: svc17-18        # observability — Loki
+    component: loki
+    instance: 1
+    host_index: 10            # -> 10.0.20.20
+    status: reserved

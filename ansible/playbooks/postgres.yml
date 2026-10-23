@@ -1,0 +1,26 @@
+---
+# postgres.yml — SVC-01 DB configurator playbook (feature: svc-01-sql-database).
+#
+# CONFIGURATOR play (integration-boundaries.md §4): runs `hosts: postgres`
+# NATIVELY on the DB LXC (reached via the generated inventory). Invoked by the
+# svc01_bootstrap role as a child run; also runnable standalone. Selects the
+# engine role by db_engine (postgres-server | mariadb-server) — the SVC-01 FR-7
+# engine switch. Bind-only: no task logic here (it lives in the roles).
+- name: Provision the SVC-01 database (engine-selected)
+  hosts: postgres
+  become: true
+  tasks:
+    - name: Install + configure PostgreSQL (default engine)
+      ansible.builtin.import_role:
+        name: postgres-server
+      when: (db_engine | default('postgres')) == 'postgres'
+      tags: ["install"]
+
+    - name: Install + configure MariaDB (strict-EU alternative engine)
+      ansible.builtin.import_role:
+        name: mariadb-server
+      when: (db_engine | default('postgres')) == 'mariadb'
+      tags: ["install"]
+
+    - name: Flush handlers so the DB restarts with its final config
+      ansible.builtin.meta: flush_handlers

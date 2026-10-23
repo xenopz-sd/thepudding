@@ -1,0 +1,391 @@
+---
+# tasks/main.yml — postgres-server (SVC-01)
+#
+# Deploys a dedicated-per-project PostgreSQL stack and creates the project DB +
+# least-privilege app role + requested extensions idempotently. Passwords are
+# generated at provision, written to OpenBao, and injected into the container via
+# a 0600 runtime env file on the guest (NEVER the committed docker-compose-app
+# .env, which is non-secret). Spec: .kiro/specs/svc-01-sql-database/.
+#
+# Order:
+#   1. Idempotency version-check guard.
+#   2. Generate passwords (no_log) + persist to OpenBao.
+#   3. Ensure dirs; template postgresql.conf / pg_hba.conf + the 0600 secret env.
+#   4. Deploy the Compose stack via docker-compose-app (postgres + exporter).
+#   5. Idempotent DB / app-role / exporter-role / extensions via `docker exec psql`.
+#   6. Install the nightly pg_dump backup script + systemd timer.
+
+# --- 1. IDEMPOTENCY: version-check guard ------------------------------------
+- name: "Postgres | Inspect any running container at the pinned image (idempotency guard)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "--format={{ '{{' }}index .Config.Image{{ '}}' }}"
+      - "{{ postgres_container_name }}"
+  register: postgres_running_image
+  failed_when: false
+  changed_when: false
+
+- name: "Postgres | Set fact — already at the pinned image?"
+  ansible.builtin.set_fact:
+    postgres_already_at_pinned_version: >-
+      {{ (postgres_running_image.rc | default(1)) == 0
+         and (postgres_running_image.stdout | default('') | trim) == postgres_image }}
+  changed_when: false
+
+# --- 2. Generate passwords (no_log) + persist to OpenBao --------------------
+# IDEMPOTENT credential handling (check-then-write, same pattern as zitadel-server's
+# masterkey): a RE-RUN must NOT rotate the DB passwords, or every client already
+# holding the old password (e.g. ZITADEL) breaks with
+# `password authentication failed` (live-caught, SVC-06 Task 18). So first READ any
+# passwords already stored in OpenBao and REUSE them; only generate fresh ones when
+# none exist yet. The read runs on the OpenBao guest via the same delegated bao-CLI
+# docker-exec pattern as the write below (container-local BAO_ADDR, token in env,
+# no_log, pinned-interpreter delegate). Skipped when OpenBao is not wired (offline).
+- name: "Postgres | Read any existing DB credentials from OpenBao (no_log)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      - "BAO_ADDR={{ postgres_openbao_cli_bao_addr | default('https://127.0.0.1:8200') }}"
+      - -e
+      - "BAO_TOKEN={{ openbao_token | default(lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN'), true) }}"
+      - "{{ postgres_openbao_cli_container | default('openbao-openbao-1') }}"
+      - bao
+      - kv
+      - get
+      - "{{ postgres_openbao_tls_skip_verify | default(true) | ternary('-tls-skip-verify', '') }}"
+      - -format=json
+      - "secret/proj-{{ postgres_project_slug }}/postgres"
+  delegate_to: "{{ postgres_openbao_cli_host | default(groups['openbao'][0] | default('10.0.20.10')) }}"
+  vars:
+    ansible_user: "{{ postgres_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ postgres_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: postgres_openbao_read
+  failed_when: false
+  changed_when: false
+  no_log: true
+  when:
+    - (openbao_addr | default(lookup('ansible.builtin.env', 'OPENBAO_ADDR'), true) | default('', true)) | length > 0
+
+# Bind any passwords that already exist in OpenBao so the generate step reuses them.
+- name: "Postgres | Reuse existing OpenBao passwords when present (no_log)"
+  ansible.builtin.set_fact:
+    postgres_superuser_password: "{{ _pg_bao.superuser_password | default(postgres_superuser_password) }}"
+    postgres_app_password: "{{ _pg_bao.app_password | default(postgres_app_password) }}"
+    postgres_exporter_password: "{{ _pg_bao.exporter_password | default(postgres_exporter_password) }}"
+  vars:
+    _pg_bao: >-
+      {{ (postgres_openbao_read.stdout | default('') | trim | from_json).data.data
+         if ((postgres_openbao_read.rc | default(1) == 0)
+              and ((postgres_openbao_read.stdout | default('') | trim) | length > 0))
+         else {} }}
+  no_log: true
+  changed_when: false
+  when:
+    - (openbao_addr | default(lookup('ansible.builtin.env', 'OPENBAO_ADDR'), true) | default('', true)) | length > 0
+
+# Generate cryptographically-random passwords for the superuser, the app role,
+# and the exporter role — ONLY for any not already supplied/reused above. These are
+# SECRETS: generated into no_log facts, written ONLY to OpenBao and the 0600 runtime
+# env below, never to a committed file.
+- name: "Postgres | Generate DB passwords (no_log)"
+  ansible.builtin.set_fact:
+    postgres_superuser_password: >-
+      {{ postgres_superuser_password
+         or lookup('community.general.random_string', length=32, special=false) }}
+    postgres_app_password: >-
+      {{ postgres_app_password
+         or lookup('community.general.random_string', length=32, special=false) }}
+    postgres_exporter_password: >-
+      {{ postgres_exporter_password
+         or lookup('community.general.random_string', length=32, special=false) }}
+  no_log: true
+  changed_when: false
+
+# Persist to OpenBao under secret/proj-<slug>/postgres (integration-boundaries §2).
+# Day-2, consuming containers fetch these via their own OpenBao Agent; here the
+# installer stores them at provision. We use the `bao` CLI via `docker exec`
+# against the SVC-07 primary (the SAME mechanism the platform already uses to
+# talk to OpenBao — e.g. the openbao onboard role), rather than adding a new
+# community.hashi_vault collection dependency. The admin token travels in the
+# command ENVIRONMENT (BAO_TOKEN), never on the argv; no_log on the whole task.
+# Gated on an OpenBao address being available (OPENBAO_ADDR / openbao_addr): when
+# OpenBao is not reachable (e.g. an offline unit render) the write is skipped and
+# the generated passwords remain only in the 0600 runtime env on the guest.
+- name: "Postgres | Persist DB credentials to OpenBao via the bao CLI (no_log)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - -e
+      # BAO_ADDR is the address as seen FROM INSIDE the OpenBao container's own
+      # network namespace, which is the container-local loopback — NOT the
+      # external VLAN address in `openbao_addr` (that is used only for gating and
+      # for selecting the delegate guest). Inside the container the external
+      # 10.0.20.x:8200 refuses the connection; the listener answers on 127.0.0.1.
+      - "BAO_ADDR={{ postgres_openbao_cli_bao_addr | default('https://127.0.0.1:8200') }}"
+      - -e
+      - "BAO_TOKEN={{ openbao_token | default(lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN'), true) }}"
+      - "{{ postgres_openbao_cli_container | default('openbao-openbao-1') }}"
+      - bao
+      - kv
+      - put
+      - "{{ postgres_openbao_tls_skip_verify | default(true) | ternary('-tls-skip-verify', '') }}"
+      - "secret/proj-{{ postgres_project_slug }}/postgres"
+      - "superuser_password={{ postgres_superuser_password }}"
+      - "app_role={{ postgres_app_role }}"
+      - "app_password={{ postgres_app_password }}"
+      - "exporter_role={{ postgres_exporter_role }}"
+      - "exporter_password={{ postgres_exporter_password }}"
+      - "db_name={{ postgres_db_name }}"
+      - "host={{ postgres_bind_ip }}"
+      - "port={{ postgres_port }}"
+  delegate_to: "{{ postgres_openbao_cli_host | default(groups['openbao'][0] | default('10.0.20.10')) }}"
+  # The delegate (the OpenBao guest) is addressed by IP and is NOT necessarily a
+  # defined inventory host in the child postgres.yml play — so pin its connection
+  # vars explicitly. Without a pinned interpreter, ansible runs interpreter
+  # DISCOVERY on the delegate, whose warning output corrupts the module's JSON
+  # result ("No start of json char found"). root + the operator key match how the
+  # platform reaches every VLAN-20 guest.
+  vars:
+    ansible_user: "{{ postgres_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ postgres_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: postgres_openbao_write
+  changed_when: "'Success' in (postgres_openbao_write.stdout | default('')) or postgres_openbao_write.rc == 0"
+  no_log: true
+  when:
+    - not postgres_already_at_pinned_version
+    - (openbao_addr | default(lookup('ansible.builtin.env', 'OPENBAO_ADDR'), true) | default('', true)) | length > 0
+
+# --- 3. Dirs + config + 0600 secret env -------------------------------------
+- name: "Postgres | Ensure the config + backup directories exist"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  loop:
+    - "/etc/postgresql"
+    - "{{ postgres_backup_dir }}"
+
+# 0644 (world-readable), NOT 0640: these are NON-secret config files bind-mounted
+# read-only into the container, where postgres runs as the unprivileged `postgres`
+# user (uid 999) — not root. At 0640 root:root the container user cannot read them
+# and the server aborts with `could not open configuration file ... Permission
+# denied` (live-caught in SVC-01 Task 12 acceptance). No secret lives in these
+# files (passwords are in the 0600 postgres.secret.env / OpenBao), so 0644 is safe.
+- name: "Postgres | Template postgresql.conf + pg_hba.conf (0644 — container reads as postgres uid)"
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: "postgresql.conf.j2", dest: "/etc/postgresql/postgresql.conf" }
+    - { src: "pg_hba.conf.j2", dest: "/etc/postgresql/pg_hba.conf" }
+  notify: Restart postgres
+
+# The 0600 runtime env the container reads POSTGRES_PASSWORD from. This is a
+# SECRET-bearing file written to the guest at 0600 (NOT the repo, NOT the
+# docker-compose-app non-secret .env). no_log — it carries the superuser password.
+- name: "Postgres | Write the 0600 runtime secret env on the guest (no_log)"
+  ansible.builtin.copy:
+    dest: "/etc/postgresql/postgres.secret.env"
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      POSTGRES_PASSWORD={{ postgres_superuser_password }}
+      POSTGRES_DB={{ postgres_db_name }}
+  no_log: true
+  notify: Restart postgres
+
+# --- 4. Deploy the Compose stack via docker-compose-app ---------------------
+# postgres + postgres_exporter sidecar. The wire-protocol port is bound ONLY to
+# the guest's private VLAN IP (docker-compose-app documented exception) — never
+# 0.0.0.0, never Traefik (SVC-01 §12). The superuser password comes from the
+# 0600 runtime env above, mounted as an additional env_file; the non-secret
+# docker-compose-app .env carries only config.
+- name: "Postgres | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ postgres_stack_name }}"
+    dca_services:
+      - name: postgres
+        image: "{{ postgres_image }}"
+        restart: "unless-stopped"
+        # Private VLAN-bound wire-protocol port (NOT Traefik/LAN ingress): bound
+        # to the guest VLAN IP only. The documented docker-compose-app exception.
+        ports:
+          - "{{ postgres_bind_ip }}:{{ postgres_port }}:5432"
+        # Layer the 0600 secret-bearing runtime env (POSTGRES_PASSWORD) ON TOP of
+        # the non-secret .env. The value lives only in this 0600 guest file (and
+        # OpenBao), never in the committed .env — integration-boundaries §2. The
+        # official postgres image requires POSTGRES_PASSWORD at first init or it
+        # refuses to start (live-caught in SVC-01 Task 12 acceptance).
+        extra_env_files:
+          - "/etc/postgresql/postgres.secret.env"
+        # The non-secret .env plus the 0600 secret env (superuser password).
+        volumes:
+          - "{{ postgres_data_volume }}:{{ postgres_data_dir }}"
+          - "/etc/postgresql/postgresql.conf:/etc/postgresql/postgresql.conf:ro"
+          - "/etc/postgresql/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro"
+        command: >-
+          postgres -c config_file=/etc/postgresql/postgresql.conf
+          -c hba_file=/etc/postgresql/pg_hba.conf
+      - name: postgres-exporter
+        image: "{{ postgres_exporter_image }}"
+        restart: "unless-stopped"
+        # Exporter listens on 9187 on the private VLAN IP for Prometheus scraping.
+        ports:
+          - "{{ postgres_bind_ip }}:{{ postgres_exporter_port }}:9187"
+        networks: []
+    dca_volumes:
+      - "{{ postgres_data_volume }}"
+    dca_networks: []
+    dca_env:
+      # NON-secret config only (composition-wiring.md). POSTGRES_PASSWORD is NOT
+      # here — it is in the 0600 /etc/postgresql/postgres.secret.env the role
+      # wrote (secret-bearing, mode 0600), referenced by the compose stack.
+      POSTGRES_DB: "{{ postgres_db_name }}"
+      POSTGRES_LOG_STATEMENT: "{{ postgres_log_statement }}"
+    dca_state: "{{ postgres_state }}"
+  when: not postgres_already_at_pinned_version
+
+# --- 5. Idempotent DB / role / extensions via `docker exec ... psql` --------
+# DELIBERATELY NOT the community.postgresql modules: those execute on the TARGET
+# guest and require `psycopg2` + the collection THERE, but the minimal LXC does
+# not ship them (and the platform does not install Python libs on guests — the
+# same reason SVC-07 generates its cert on the control node, not the guest).
+# Instead we run idempotent SQL INSIDE the postgres container via `docker exec`:
+# the container already has `psql`, the server, and the superuser over the local
+# socket (peer/trust for `postgres` locally — no password needed, so none is
+# passed on the argv). This keeps the guest dependency-free and the superuser
+# password off every command line. The app/exporter role passwords ARE passed
+# (ALTER ROLE ... PASSWORD) — those tasks are no_log and pass the value via the
+# container's stdin, never the argv.
+
+# The DB container must accept connections before any DDL. Wait on pg_isready.
+- name: "Postgres | Wait for the server to accept connections (pg_isready)"
+  ansible.builtin.command:
+    argv: [docker, exec, "{{ postgres_container_name }}", pg_isready, -U, postgres]
+  register: postgres_ready
+  until: "postgres_ready.rc == 0"
+  retries: 30
+  delay: 5
+  changed_when: false
+
+# Create the project database (idempotent: skip if it already exists).
+- name: "Postgres | Create the project database (idempotent)"
+  ansible.builtin.shell:
+    cmd: >-
+      docker exec {{ postgres_container_name }} psql -U postgres -tAc
+      "SELECT 1 FROM pg_database WHERE datname='{{ postgres_db_name }}'"
+      | grep -q 1
+      || docker exec {{ postgres_container_name }} psql -U postgres -c
+      "CREATE DATABASE {{ postgres_db_name }}"
+  register: postgres_db_create
+  changed_when: "'CREATE DATABASE' in (postgres_db_create.stdout | default(''))"
+
+# Create / update the least-privilege app role (NOSUPERUSER, scoped). The
+# password is piped via stdin (never argv); the DO block is idempotent (create
+# only if absent), then ALTER sets the attributes + password every run (so a
+# rotation re-applies). no_log — the stdin carries the app password.
+- name: "Postgres | Create/update the least-privilege app role (no SUPERUSER, no_log)"
+  ansible.builtin.shell:
+    cmd: |
+      docker exec -i {{ postgres_container_name }} psql -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{{ postgres_app_role }}') THEN
+          CREATE ROLE {{ postgres_app_role }} LOGIN;
+        END IF;
+      END $$;
+      ALTER ROLE {{ postgres_app_role }}
+        WITH LOGIN NOSUPERUSER
+        {{ postgres_app_role_createdb | default(false) | bool | ternary('CREATEDB', 'NOCREATEDB') }}
+        NOCREATEROLE PASSWORD '{{ postgres_app_password }}';
+      GRANT CONNECT, CREATE, TEMPORARY ON DATABASE {{ postgres_db_name }} TO {{ postgres_app_role }};
+      SQL
+  register: postgres_app_role_create
+  changed_when: true
+  no_log: true
+
+# Create / update the read-only exporter role (NOSUPERUSER). no_log — stdin
+# carries the exporter password.
+- name: "Postgres | Create/update the read-only exporter role (no_log)"
+  ansible.builtin.shell:
+    cmd: |
+      docker exec -i {{ postgres_container_name }} psql -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{{ postgres_exporter_role }}') THEN
+          CREATE ROLE {{ postgres_exporter_role }} LOGIN;
+        END IF;
+      END $$;
+      ALTER ROLE {{ postgres_exporter_role }}
+        WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{{ postgres_exporter_password }}';
+      GRANT CONNECT ON DATABASE {{ postgres_db_name }} TO {{ postgres_exporter_role }};
+      SQL
+  register: postgres_exporter_role_create
+  changed_when: true
+  no_log: true
+
+# Enable requested extensions (per-flag), idempotent via CREATE EXTENSION IF NOT
+# EXISTS, run against the project database.
+- name: "Postgres | Enable requested extensions (per-flag, idempotent)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ postgres_container_name }}"
+      - psql
+      - -U
+      - postgres
+      - -d
+      - "{{ postgres_db_name }}"
+      - -v
+      - ON_ERROR_STOP=1
+      - -c
+      - "CREATE EXTENSION IF NOT EXISTS {{ item.name }}"
+  loop:
+    - { name: "vector", enabled: "{{ postgres_enable_pgvector }}" }
+    - { name: "postgis", enabled: "{{ postgres_enable_postgis }}" }
+    - { name: "timescaledb", enabled: "{{ postgres_enable_timescaledb }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - item.enabled | bool
+  changed_when: true
+
+# --- 6. Nightly pg_dump backup script + systemd timer -----------------------
+- name: "Postgres | Install the nightly pg_dump backup script"
+  ansible.builtin.template:
+    src: pg_dump_backup.sh.j2
+    dest: /usr/local/bin/pg_dump_backup.sh
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: "Postgres | Install the pg_dump backup service + timer units"
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/etc/systemd/system/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: "pg-backup.service.j2", dest: "pg-backup.service" }
+    - { src: "pg-backup.timer.j2", dest: "pg-backup.timer" }
+  notify: Reload systemd for postgres backup units
+
+- name: "Postgres | Enable + start the nightly backup timer"
+  ansible.builtin.systemd:
+    name: pg-backup.timer
+    enabled: true
+    state: started
+    daemon_reload: true

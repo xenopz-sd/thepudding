@@ -1,0 +1,18 @@
+---
+# handlers/main.yml — postgres-server (SVC-01)
+#
+# Restart the Postgres Compose stack when the templated config or compose file
+# changes, via community.docker.docker_compose_v2 (declarative, not a shell
+# `docker compose up` — PF §9). Reload systemd when the nightly-dump timer units
+# are (re)rendered.
+
+- name: Restart postgres
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ postgres_stack_name }}"
+    project_name: "{{ postgres_stack_name }}"
+    state: present
+    recreate: always
+
+- name: Reload systemd for postgres backup units
+  ansible.builtin.systemd:
+    daemon_reload: true

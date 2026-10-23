@@ -1,0 +1,13 @@
+---
+# defaults/main.yml — svc06_clean_slate (SVC-06 installer — clean-slate branch)
+#
+# Cross-phase constants (clean_slate, clean_slate_confirm, cluster_env_file,
+# svc06_repo_root, svc06_venv_python, svc06_tf_root, svc06_zitadel_vmid,
+# svc06_db_* from svc06_provision defaults) stay play-level / provision-role.
+# NO secret here.
+
+# Proxmox host SSH address for the reset path (pct runs on the node). Supply the
+# real LAN IP with -e svc06_proxmox_host=<real-proxmox-lan-ip>. Fail-fast if a
+# reset is requested without it. Not needed on the normal install path.
+svc06_proxmox_host: ""
+svc06_proxmox_host_inventory: ansible/inventory/proxmox-hosts.yml

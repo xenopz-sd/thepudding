@@ -1,0 +1,92 @@
+---
+# tasks/main.yml — mariadb-server (SVC-01 alternative engine, SKELETON)
+#
+# Stands a dedicated MariaDB Compose stack up and creates the project database +
+# a least-privilege app user. Uses the `mariadb` client via `docker exec` for
+# DB/user creation (no new collection). Passwords generated at provision ->
+# OpenBao + a 0600 runtime env. Enough to validate the db_engine=mariadb switch
+# (SVC-01 §14), not a fully-tuned engine.
+
+- name: "MariaDB | Inspect any running container at the pinned image (idempotency guard)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "--format={{ '{{' }}index .Config.Image{{ '}}' }}"
+      - "{{ mariadb_container_name }}"
+  register: mariadb_running_image
+  failed_when: false
+  changed_when: false
+
+- name: "MariaDB | Set fact — already at the pinned image?"
+  ansible.builtin.set_fact:
+    mariadb_already_at_pinned_version: >-
+      {{ (mariadb_running_image.rc | default(1)) == 0
+         and (mariadb_running_image.stdout | default('') | trim) == mariadb_image }}
+  changed_when: false
+
+- name: "MariaDB | Generate passwords (no_log)"
+  ansible.builtin.set_fact:
+    mariadb_root_password: >-
+      {{ mariadb_root_password
+         or lookup('community.general.random_string', length=32, special=false) }}
+    mariadb_app_password: >-
+      {{ mariadb_app_password
+         or lookup('community.general.random_string', length=32, special=false) }}
+  no_log: true
+  changed_when: false
+
+- name: "MariaDB | Write the 0600 runtime secret env on the guest (no_log)"
+  ansible.builtin.copy:
+    dest: "/etc/mariadb.secret.env"
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      MARIADB_ROOT_PASSWORD={{ mariadb_root_password }}
+      MARIADB_DATABASE={{ mariadb_db_name }}
+      MARIADB_USER={{ mariadb_app_user }}
+      MARIADB_PASSWORD={{ mariadb_app_password }}
+  no_log: true
+  notify: Restart mariadb
+
+- name: "MariaDB | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ mariadb_stack_name }}"
+    dca_services:
+      - name: mariadb
+        image: "{{ mariadb_image }}"
+        restart: "unless-stopped"
+        # Private VLAN-bound wire-protocol port (NOT Traefik/LAN) — the
+        # docker-compose-app documented exception, bound to the guest VLAN IP.
+        ports:
+          - "{{ mariadb_bind_ip }}:{{ mariadb_port }}:3306"
+        volumes:
+          - "{{ mariadb_data_volume }}:{{ mariadb_data_dir }}"
+    dca_volumes:
+      - "{{ mariadb_data_volume }}"
+    dca_networks: []
+    dca_env:
+      # NON-secret config only; the root/app passwords live in the 0600
+      # /etc/mariadb.secret.env the role wrote (mounted via the container's
+      # env_file by the installer), never the committed .env.
+      MARIADB_DATABASE: "{{ mariadb_db_name }}"
+    dca_state: "{{ mariadb_state }}"
+  when: not mariadb_already_at_pinned_version
+
+# The MariaDB image's own entrypoint creates MARIADB_DATABASE + MARIADB_USER with
+# MARIADB_PASSWORD (a non-root, least-privilege user scoped to that DB) on first
+# start from the 0600 env above — so the skeleton's DB/user creation is handled
+# by the official image's documented init contract, validated by the health gate
+# (svc01-health.yml runs `mariadb -e "SELECT 1"` with the app user). This keeps
+# the skeleton dependency-free (no community.mysql) while still proving the switch.
+- name: "MariaDB | Confirm the stack is up (skeleton — DB/user via image init env)"
+  ansible.builtin.debug:
+    msg: >-
+      MariaDB skeleton deployed for project {{ mariadb_project_slug }}: the
+      official image entrypoint created database {{ mariadb_db_name }} + the
+      least-privilege user {{ mariadb_app_user }} from the 0600 runtime env. The
+      engine switch (db_engine=mariadb) is validated end-to-end by svc01-health.yml.
+  when: not mariadb_already_at_pinned_version

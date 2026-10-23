@@ -1,0 +1,140 @@
+---
+# tasks/tls_self_signed.yml — traefik_install (SVC-09)
+#
+# ============================================================================
+# MOCK self-signed TLS material — OPT-IN, NOT FOR PRODUCTION (Mock 3)
+# ----------------------------------------------------------------------------
+# Stand-in for the SVC-08 (EJBCA) internal CA + Let's Encrypt, which issue
+# Traefik's real certificates. Neither exists yet, so this generates a
+# SELF-SIGNED cert + key as a stand-in purely so Traefik's `websecure`
+# entrypoint can serve HTTPS and be validated now. When a real resolver exists,
+# leave traefik_tls_self_signed=false and the `letsencrypt`/EJBCA resolver issues
+# real certs — nothing else changes.
+#
+# This mirrors SVC-07's openbao_install/tasks/tls_self_signed.yml exactly:
+#   WHERE IT RUNS: the community.crypto modules run on the ANSIBLE CONTROL NODE
+#     (delegate_to: localhost) which has the Python `cryptography` lib; the
+#     minimal Traefik LXC does not. The cert + key are generated into a per-run
+#     control-node temp dir, copied to the guest's tls dir, and the control-node
+#     temp copy is scrubbed.
+#   IDEMPOTENCY: the whole generate+copy block is skipped if the target cert
+#     already exists (stat first), so a present cert is left untouched — no copy,
+#     no `Restart traefik`, no churn.
+#   SECRETS DISCIPLINE: the private key is a secret — generated 0600 on the
+#     control node, copied 0640 owned by root on the guest (read via the :ro
+#     mount), never committed, never logged (key tasks set no_log).
+#
+# LIFECYCLE (.kiro/steering/mock-stand-ins.md): PERMANENT, opt-in dev stand-in,
+# NOT transitional debt. Never deleted "once SVC-08 lands"; simply not selected
+# in production (flag defaults false).
+# ============================================================================
+
+- name: "MOCK-TLS: ensure the Traefik TLS host directory exists (0750)"
+  ansible.builtin.file:
+    path: "{{ traefik_tls_host_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+# --- IDEMPOTENCY: skip the whole generate+copy block when a cert already exists ---
+- name: "MOCK-TLS: stat the target cert to decide whether generation is needed"
+  ansible.builtin.stat:
+    path: "{{ traefik_tls_cert_file }}"
+  register: traefik_mock_tls_cert_stat
+  changed_when: false
+
+- name: "MOCK-TLS: set fact — (re)generate only when the target cert is absent"
+  ansible.builtin.set_fact:
+    traefik_mock_tls_generate: "{{ not (traefik_mock_tls_cert_stat.stat.exists | default(false)) }}"
+  changed_when: false
+
+- name: "MOCK-TLS: report that a present cert is kept (idempotent, no restart)"
+  ansible.builtin.debug:
+    msg: >-
+      A mock TLS cert already exists at {{ traefik_tls_cert_file }}; keeping it
+      (no regenerate, no `Restart traefik`). Delete it on the target to force
+      regeneration.
+  when: not traefik_mock_tls_generate
+
+# --- Generate on the CONTROL NODE (has `cryptography`); once for the whole run ---
+- name: "MOCK-TLS: create a control-node temp dir for cert generation"
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: "traefik-mock-tls-"
+  register: traefik_mock_tls_tmp
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  when: traefik_mock_tls_generate
+
+- name: "MOCK-TLS: generate the private key on the control node (stand-in for the CA)"
+  community.crypto.openssl_privatekey:
+    path: "{{ traefik_mock_tls_tmp.path }}/key.pem"
+    type: RSA
+    size: 4096
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  no_log: true
+  when: traefik_mock_tls_generate
+
+- name: "MOCK-TLS: build a CSR carrying the edge SANs (control node)"
+  community.crypto.openssl_csr:
+    path: "{{ traefik_mock_tls_tmp.path }}/traefik.csr"
+    privatekey_path: "{{ traefik_mock_tls_tmp.path }}/key.pem"
+    common_name: "{{ traefik_tls_self_signed_cn }}"
+    subject_alt_name: "{{ traefik_tls_self_signed_sans }}"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: traefik_mock_tls_generate
+
+- name: "MOCK-TLS: self-sign the certificate from the CSR (control node)"
+  community.crypto.x509_certificate:
+    path: "{{ traefik_mock_tls_tmp.path }}/cert.pem"
+    privatekey_path: "{{ traefik_mock_tls_tmp.path }}/key.pem"
+    csr_path: "{{ traefik_mock_tls_tmp.path }}/traefik.csr"
+    provider: selfsigned
+    selfsigned_not_after: "+{{ traefik_tls_self_signed_valid_days }}d"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: traefik_mock_tls_generate
+
+# --- Copy the generated material to the TARGET LXC ---
+- name: "MOCK-TLS: install the private key on the target (root, 0640)"
+  ansible.builtin.copy:
+    src: "{{ traefik_mock_tls_tmp.path }}/key.pem"
+    dest: "{{ traefik_tls_key_file }}"
+    owner: root
+    group: root
+    mode: "0640"
+  no_log: true
+  when: traefik_mock_tls_generate
+  notify: Restart traefik
+
+- name: "MOCK-TLS: install the certificate on the target (root, 0644)"
+  ansible.builtin.copy:
+    src: "{{ traefik_mock_tls_tmp.path }}/cert.pem"
+    dest: "{{ traefik_tls_cert_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: traefik_mock_tls_generate
+  notify: Restart traefik
+
+# --- Scrub the control-node temp material (key must not linger off-target) ---
+- name: "MOCK-TLS: remove the control-node temp dir (scrub key material)"
+  ansible.builtin.file:
+    path: "{{ traefik_mock_tls_tmp.path }}"
+    state: absent
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  when: traefik_mock_tls_generate

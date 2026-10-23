@@ -47,10 +47,11 @@ resource "terraform_data" "input_guards" {
   # inputs is a no-op (idempotency, Req 4.6/8.1). The `input` records the
   # guarded values purely for readability in `terraform plan` output.
   input = {
-    vlan_id    = var.vlan_id
-    host_index = var.host_index
-    hostname   = local.hostname
-    last_octet = 10 + var.host_index
+    vlan_id           = var.vlan_id
+    host_index        = var.host_index
+    hostname          = local.hostname
+    last_octet        = 10 + var.host_index
+    peer_host_indices = var.peer_host_indices
   }
 
   lifecycle {
@@ -114,6 +115,35 @@ resource "terraform_data" "input_guards" {
     precondition {
       condition     = can(regex("^svc[0-9]{2}(-[a-z0-9]([a-z0-9-]*[a-z0-9])?)?-${var.vlan_id}-[0-9]{2}$", local.hostname))
       error_message = "Requirement 3.6 (within-VLAN hostname collision): computed hostname '${local.hostname}' is not a well-formed '<svc-code>[-<component>]-${var.vlan_id}-<instance>' name carrying the -<vlan_id>-<instance> discriminator that keeps hosts distinct within VLAN ${var.vlan_id}. NOTE: full cross-instance set-uniqueness within the VLAN is enforced at the calling layer (project-root fan-out) and by the Python assert_unique_hostnames guard, since a single module instance sees only its own hostname."
+    }
+
+    # ---------------------------------------------------------------------
+    # Guard 4 — Within-VLAN host-index (host-IP) collision (Requirement 1.2).
+    #
+    # This is the IP-side analogue of the `peer_*` seat Guard 3's note above
+    # describes as "intentionally shaped to receive". Where Guard 3 can only
+    # assert single-instance hostname well-formedness (a single module instance
+    # cannot see its peers), this guard CLOSES the cross-root gap for the host
+    # index: the calling root threads in `peer_host_indices` — every OTHER
+    # host_index already allocated on this guest's VLAN, read from the committed
+    # per-VLAN ledger (host-indices.yaml, the Host_Index_Authority) — so the set
+    # the single instance was missing is supplied externally.
+    #
+    # On a shared VLAN (20) or a project VLAN populated by more than one
+    # independent Terraform root, no single `terraform plan` sees the other
+    # roots' indices, so host_index uniqueness is NOT guaranteed by for_each
+    # ordering (the origin of the live VLAN-20 .10 collision between SVC-07's
+    # primary and SVC-09's Traefik). This precondition makes that collision a
+    # hard PLAN-TIME failure, before any Proxmox resource is created, in the one
+    # module that already computes the IP via
+    # cidrhost("10.0.<vlan_id>.0/24", 10 + host_index).
+    #
+    # An empty peer set (the default) makes this a strict no-op — a single-guest
+    # root behaves exactly as before (backward-compatible).
+    # ---------------------------------------------------------------------
+    precondition {
+      condition     = !contains(var.peer_host_indices, var.host_index)
+      error_message = "Requirement 1.2 (within-VLAN host-index collision): host_index ${var.host_index} on VLAN ${var.vlan_id} (IP 10.0.${var.vlan_id}.${10 + var.host_index}) collides with another guest already allocated that index on this VLAN — a within-VLAN host-IP collision across independent Terraform roots. Rejected at plan time before any Proxmox resource is created. Pick a distinct host_index for this guest from the per-VLAN host-index ledger (infra/platform-foundation/host-indices.yaml)."
     }
   }
 }

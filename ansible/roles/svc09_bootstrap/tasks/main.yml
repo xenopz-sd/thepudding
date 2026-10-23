@@ -1,0 +1,57 @@
+---
+# tasks/main.yml — svc09_bootstrap (SVC-09 installer — Phase 3: Bootstrap)
+#
+# Phase-3 "Host hardening & service bootstrap". Far simpler than SVC-07 (no
+# unsealer, no seal-token handoff, no admin-token mint): a single guest, a single
+# Compose stack.
+#   1. common baseline child run (Docker CE + Compose + hardening) on the guest.
+#   2. traefik_install child configurator run (static config + real `edge` net +
+#      Compose stack) against the generated inventory.
+# Both as child ansible-playbook runs (orchestrator/configurator seam,
+# integration-boundaries.md §4). A non-zero child exit -> this phase's rescue.
+#
+# Mock pass-through: when the operator opts into the self-signed TLS mock
+# (traefik_tls_self_signed) and/or the dashboard-auth mock
+# (traefik_dashboard_auth_disabled) via -e on the orchestrator, those flags are
+# bridged to the child traefik.yml run below so the Traefik-less-CA / no-SSO
+# Day-0 bring-up works (mock-stand-ins.md). Default off -> production posture.
+
+# --- Task 8.1 — Common baseline child run -----------------------------------
+- name: "Bootstrap | common baseline (Docker + Compose) on the Traefik guest"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc09_generated_inventory }}"
+      - ansible/playbooks/common.yml
+  args:
+    chdir: "{{ svc09_repo_root }}"
+  register: svc09_common_run
+  changed_when: "'changed=0' not in (svc09_common_run.stdout | default(''))"
+
+# --- Task 8.2 — Traefik install child configurator run ----------------------
+# Deploys the Traefik Compose stack via a child traefik.yml run (hosts: traefik)
+# so the configurator play targets the freshly-generated inventory as its own
+# `-i`. The mock flags are bridged with -e so a Traefik-less-CA / no-SSO Day-0
+# bring-up works when the operator opts in. A child non-zero exit -> rescue.
+- name: "Bootstrap | Traefik install (traefik.yml child run against the generated inventory)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc09_generated_inventory }}"
+      - ansible/playbooks/traefik.yml
+      - -e
+      - "traefik_tls_self_signed={{ traefik_tls_self_signed | default(false) }}"
+      - -e
+      - "traefik_dashboard_auth_disabled={{ traefik_dashboard_auth_disabled | default(false) }}"
+      - -e
+      - "traefik_platform_domain={{ traefik_platform_domain | default('platform.example.test') }}"
+      - -e
+      - "traefik_letsencrypt_email={{ traefik_letsencrypt_email | default('') }}"
+      - -e
+      - "traefik_dashboard_forward_auth_address={{ traefik_dashboard_forward_auth_address | default('') }}"
+  args:
+    chdir: "{{ svc09_repo_root }}"
+  register: svc09_traefik_run
+  changed_when: "'changed=0' not in (svc09_traefik_run.stdout | default(''))"

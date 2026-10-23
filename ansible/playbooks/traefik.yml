@@ -1,0 +1,29 @@
+---
+# Traefik provisioning playbook (SVC-09 — feature: svc-09-reverse-proxy).
+#
+# CONFIGURATOR play (integration-boundaries.md §4): runs `hosts: traefik`
+# NATIVELY on the Traefik LXC, reached via the generated inventory the installer
+# wrote (ansible/inventory/svc-09-reverse-proxy.generated.yml). Invoked by the
+# svc09_bootstrap role as a child ansible-playbook run; also runnable standalone:
+#   ~/venv/devinfra/bin/ansible-playbook -i <generated-inventory> \
+#     ansible/playbooks/traefik.yml
+#
+# Bind-only: NO role/task logic here (it lives in traefik_install). A single
+# `tasks:` section (not a plain `roles:` list) so a `meta: flush_handlers` sits
+# BETWEEN the install role and end-of-play, letting the `Restart traefik` handler
+# fire deterministically once the static config + (mock) TLS material are in
+# place, rather than only at end-of-play.
+- name: Provision Traefik reverse proxy (SVC-09)
+  hosts: traefik
+  become: true
+  tasks:
+    - name: Install + configure Traefik (static config, real edge network, Compose stack)
+      ansible.builtin.import_role:
+        name: traefik_install
+      tags: ["install"]
+
+    # Flush the Restart traefik handler queued by the install role's config/
+    # cert tasks NOW so the container picks up the static config before the
+    # health gate (Phase 4) polls it.
+    - name: Flush handlers so Traefik restarts with its final config
+      ansible.builtin.meta: flush_handlers

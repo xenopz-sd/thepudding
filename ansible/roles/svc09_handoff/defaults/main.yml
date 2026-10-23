@@ -1,0 +1,28 @@
+---
+# defaults/main.yml — svc09_handoff (SVC-09 installer — Phase 4: Handoff)
+#
+# Phase-4 health-gate knobs, consumed by the child play svc09-health.yml (invoked
+# by this role via `ansible-playbook -i {{ svc09_generated_inventory }}
+# svc09-health.yml`, integration-boundaries.md §4) and by the handoff banner.
+# Cross-phase constants (svc09_generated_inventory, svc09_repo_root,
+# cluster_env_file, traefik_platform_domain) are play-level vars. NO secret here.
+
+# The Traefik container name on the guest (docker-compose-app names it
+# <stack>-<service>-1 = traefik-traefik-1). Kept in sync with
+# traefik_install/defaults (traefik_container_name).
+svc09_traefik_container_name: "traefik-traefik-1"
+
+# The internal metrics entrypoint port the health gate pings on the guest (the
+# Traefik ping/metrics endpoint is reached locally, not via the public route).
+svc09_traefik_metrics_port: 8082
+
+# TLS skip-verify for any HTTPS health probe against the self-signed mock cert
+# during Day-0 bootstrap (no real CA yet). The health gate must NOT assume a real
+# CA, so it uses validate_certs:false under the mock.
+svc09_traefik_tls_skip_verify: true
+
+# Two-stage recreate-robust health gate retry budget: retries × delay seconds per
+# stage. Traefik starts fast, but keep headroom for the recreate window + SSH/
+# docker latency.
+svc09_health_retries: 24
+svc09_health_delay: 5

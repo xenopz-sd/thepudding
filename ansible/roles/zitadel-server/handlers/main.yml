@@ -1,0 +1,12 @@
+---
+# handlers/main.yml — zitadel-server (SVC-06)
+
+# Reconcile the Compose stack with a forced recreate so a config/secret-env or
+# cert change is picked up. Mirrors the postgres-server / traefik_install
+# restart handler.
+- name: Restart zitadel
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ zitadel_stack_name }}"
+    project_name: "{{ zitadel_stack_name }}"
+    state: present
+    recreate: always

@@ -1,0 +1,91 @@
+---
+# svc06-health.yml — SVC-06 ZITADEL health gate (Phase 4 child play).
+#
+# Runs NATIVELY on the ZITADEL guest (hosts: zitadel). Two stages:
+#   Stage 1: the ZITADEL container is Running (docker inspect).
+#   Stage 2: the OIDC discovery document resolves — GET
+#            https://127.0.0.1:8080/.well-known/openid-configuration returns 200
+#            with a valid issuer. validate_certs:false (the self-signed mock or
+#            Traefik-terminated TLS is tolerated; no CA assumed on the guest).
+# Non-secret; no banner here (the handoff role prints it).
+- name: SVC-06 ZITADEL health gate
+  hosts: zitadel
+  gather_facts: false
+  become: true
+  vars:
+    svc06_zitadel_container_name: "zitadel-zitadel-1"
+    svc06_zitadel_http_port: 8080
+    svc06_health_retries: 30
+    svc06_health_delay: 5
+  tasks:
+    # --- Stage 1: container Running ---
+    - name: "Health | Inspect the ZITADEL container state"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "--format={{ '{{' }}.State.Status{{ '}}' }}"
+          - "{{ svc06_zitadel_container_name }}"
+      register: svc06_zitadel_state
+      changed_when: false
+      retries: "{{ svc06_health_retries }}"
+      delay: "{{ svc06_health_delay }}"
+      until: "(svc06_zitadel_state.stdout | default('') | trim) == 'running'"
+
+    - name: "Health | Assert the ZITADEL container is Running"
+      ansible.builtin.assert:
+        that:
+          - "(svc06_zitadel_state.stdout | default('') | trim) == 'running'"
+        fail_msg: "ZITADEL container {{ svc06_zitadel_container_name }} is not running."
+        success_msg: "ZITADEL container is running."
+
+    # --- Stage 2: OIDC discovery resolves (200 + valid issuer) ---
+    # ZITADEL publishes NO host port — ingress is Traefik-only (integration-
+    # boundaries §1), so `127.0.0.1:8080` on the GUEST is refused (live-caught,
+    # SVC-06 Task 18). In the Traefik-less dev/mock path the discovery doc is
+    # reached at the CONTAINER's own network IP:8080 from the guest. ZITADEL serves
+    # plaintext h2c there; `uri` negotiates HTTP/1.1 fine for the GET. (Once SVC-09
+    # is live, the real external check is the Traefik route; this guest-side gate
+    # verifies the app itself is serving independent of ingress.) The ZITADEL image
+    # is distroless (no shell/curl), so an in-container exec is NOT an option.
+    - name: "Health | Resolve the ZITADEL container's network IP"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - >-
+            --format={{ '{{' }}range .NetworkSettings.Networks{{ '}}' }}{{ '{{' }}.IPAddress{{ '}}' }}
+            {{ '{{' }}end{{ '}}' }}
+          - "{{ svc06_zitadel_container_name }}"
+      register: svc06_zitadel_ipaddr
+      changed_when: false
+      retries: "{{ svc06_health_retries }}"
+      delay: "{{ svc06_health_delay }}"
+      until: "(svc06_zitadel_ipaddr.stdout | default('') | trim | length) > 0"
+
+    - name: "Health | Bind the ZITADEL container IP"
+      ansible.builtin.set_fact:
+        svc06_zitadel_ip: "{{ (svc06_zitadel_ipaddr.stdout | trim).split() | first }}"
+
+    - name: "Health | GET the OIDC discovery document (/.well-known/openid-configuration)"
+      ansible.builtin.uri:
+        url: >-
+          http://{{ svc06_zitadel_ip }}:{{ svc06_zitadel_http_port }}/.well-known/openid-configuration
+        method: GET
+        return_content: true
+        validate_certs: false
+        status_code: [200]
+        headers:
+          Host: "auth.{{ zitadel_platform_domain | default('platform.example.test') }}"
+      register: svc06_oidc_discovery
+      changed_when: false
+      retries: "{{ svc06_health_retries }}"
+      delay: "{{ svc06_health_delay }}"
+      until: "svc06_oidc_discovery.status | default(0) == 200"
+
+    - name: "Health | Assert the discovery document carries an issuer"
+      ansible.builtin.assert:
+        that:
+          - "'issuer' in (svc06_oidc_discovery.json | default({}))"
+        fail_msg: "OIDC discovery document did not contain an 'issuer' field."
+        success_msg: "OIDC discovery OK — issuer {{ (svc06_oidc_discovery.json | default({})).issuer | default('?') }}."

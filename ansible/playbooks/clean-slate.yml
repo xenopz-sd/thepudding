@@ -16,7 +16,11 @@
 #     ansible/playbooks/clean-slate.yml \
 #     --extra-vars "ansible_host=<real-proxmox-lan-ip>" \
 #     -e clean_slate_enabled=true -e clean_slate_confirm=1070 \
-#     -e '{"clean_slate_targets":[{"name":"svc07-20-01","terraform_root":"infra/projects/svc-07-secrets-manager","resource_address":"proxmox_virtual_environment_container.primary","node":"shrimp","vmid":1070}]}'
+#     -e '{"clean_slate_targets":[{"name":"svc07-20-01",
+#          "terraform_root":"infra/projects/svc-07-secrets-manager",
+#          "resource_address":"proxmox_virtual_environment_container.primary",
+#          "node":"shrimp","vmid":1070}]}'
+#   (the -e JSON is one line in practice; wrapped here only for line length)
 - name: Canonical clean-slate reset of Terraform-provisioned Proxmox guests
   hosts: proxmox
   become: true

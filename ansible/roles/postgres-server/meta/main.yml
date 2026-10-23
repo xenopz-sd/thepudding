@@ -1,0 +1,19 @@
+---
+# meta/main.yml — postgres-server (SVC-01)
+galaxy_info:
+  role_name: postgres-server
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Deploys a dedicated-per-project PostgreSQL (SVC-01) as a Docker Compose stack
+    (postgres + postgres_exporter) on a Proxmox LXC, creates the project database
+    + a least-privilege app role + requested extensions idempotently via
+    community.postgresql, schedules a nightly pg_dump, and stores generated
+    passwords in OpenBao.
+  license: MIT
+  min_ansible_version: "2.14"
+  galaxy_tags:
+    - postgresql
+    - database
+    - svc01
+dependencies: []

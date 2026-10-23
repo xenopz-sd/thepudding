@@ -1,0 +1,74 @@
+---
+# tasks/main.yml — svc09_handoff (SVC-09 installer — Phase 4: Handoff)
+#
+# Phase 4 = health sanity + Developer B completion handoff. Invoked from the thin
+# orchestrator play as `import_role: svc09_handoff` inside the Phase-4
+# block/rescue. Clone of svc07_handoff adapted for Traefik.
+#
+# The health gate runs as the CHILD configurator play svc09-health.yml
+# (hosts: traefik, NATIVELY on the guest), invoked here with
+# `ansible-playbook -i {{ svc09_generated_inventory }} svc09-health.yml`
+# (integration-boundaries.md §4). The health knobs are THIS role's defaults,
+# bridged across the child-process boundary via -e (the child play does not load
+# this role's defaults). The completion banner has no guest dependency and runs
+# on the orchestrator.
+
+- name: "Handoff | Run the guest health gate as a child configurator play (svc09-health.yml)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc09_generated_inventory }}"
+      - ansible/playbooks/svc09-health.yml
+      - -e
+      - "svc09_traefik_container_name={{ svc09_traefik_container_name }}"
+      - -e
+      - "svc09_traefik_metrics_port={{ svc09_traefik_metrics_port }}"
+      - -e
+      - "svc09_traefik_tls_skip_verify={{ svc09_traefik_tls_skip_verify }}"
+      - -e
+      - "svc09_health_retries={{ svc09_health_retries }}"
+      - -e
+      - "svc09_health_delay={{ svc09_health_delay }}"
+  args:
+    chdir: "{{ svc09_repo_root }}"
+  register: svc09_health_run
+  changed_when: false
+
+# --- Completion summary banner ----------------------------------------------
+- name: "Handoff | Resolve the absolute Cluster_Env_File path"
+  ansible.builtin.set_fact:
+    svc09_cluster_env_abspath: >-
+      {{ (svc09_repo_root ~ '/' ~ cluster_env_file) | ansible.builtin.realpath }}
+
+# Precompute banner fields so the debug lines stay within the 120-char limit.
+- name: "Handoff | Compose banner fields (domain, dashboard URL, TLS posture)"
+  ansible.builtin.set_fact:
+    svc09_banner_domain: "{{ traefik_platform_domain | default('platform.example.test') }}"
+    svc09_banner_tls: >-
+      {{ 'self-signed MOCK cert (traefik_tls_self_signed=true)'
+         if (traefik_tls_self_signed | default(false) | bool)
+         else 'real resolver (letsencrypt/EJBCA)' }}
+  changed_when: false
+
+- name: "Handoff | Print the Developer B completion summary banner"
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Service SVC-09 (Traefik) Deployed Successfully!"
+      - "============================================================"
+      - "Service:            SVC-09 (Traefik reverse proxy / TLS termination)"
+      - "Status:             healthy"
+      - "Internal endpoint:  https://10.0.20.10 (VLAN-20); web:80 / websecure:443"
+      - "Edge network:       `edge` external Docker network (owned by Traefik)"
+      - "Dashboard:          https://traefik.{{ svc09_banner_domain }}/dashboard/"
+      - "                    (internal-only route; ZITADEL auth once SVC-06 live)"
+      - "TLS:                {{ svc09_banner_tls }}"
+      - "Config:             {{ svc09_cluster_env_abspath }}"
+      - ""
+      - "Next Steps for Project Developers:"
+      - "  Any HTTP/HTTPS service registers with Traefik via Docker labels:"
+      - "    traefik.enable=true"
+      - "    traefik.http.routers.<name>.rule=Host(`<svc>.{{ svc09_banner_domain }}`)"
+      - "  and attaching to the external `edge` network."
+      - "============================================================"

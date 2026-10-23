@@ -1,0 +1,39 @@
+---
+# defaults/main.yml — svc06_bootstrap (SVC-06 installer — Phase 3)
+#
+# Phase-3 defaults. Cross-phase constants (cluster_env_file, svc06_repo_root,
+# svc06_generated_inventory, svc06_platform_domain) are play-level. NO secret
+# here.
+
+# Whether to run the org-provision step as part of bootstrap. On by default — a
+# fresh bring-up onboards a first/throwaway org to prove the OIDC path end-to-end
+# (FR-3/FR-5). The org slug to provision is svc06_bootstrap_org_slug.
+svc06_run_org_provision: true
+
+# The project slug onboarded to ZITADEL SSO during bootstrap (its org becomes
+# proj-<slug>, its OIDC app <slug>-webapp). A throwaway slug on a from-scratch
+# acceptance run; a real project slug in production onboarding.
+svc06_bootstrap_org_slug: "svc06-smoke"
+
+# The OpenBao address the zitadel-server role reads the masterkey/DB-password
+# from (and writes the masterkey to). Forwarded as `zitadel_openbao_addr` to the
+# zitadel.yml run — ZITADEL's OpenBao READ gate. Defaults to the SVC-07 OpenBao
+# primary's VLAN-20 address (NET-00 host_index 0 -> 10.0.20.10) so a standard
+# bring-up WIRES the handoff by default; this is the SAME value svc06_provision
+# forwards to the backing-DB child as `openbao_addr` (SVC-01's WRITE gate), so
+# both gates resolve to the same OpenBao source and the same app_password flows
+# end-to-end. (Was "" — which disabled the read and left ZITADEL presenting an
+# empty password -> SQLSTATE 28P01; see fix-svc06-zitadel-db-app-password-mismatch.)
+# Override to "" ONLY for a deliberate dev/offline run with an explicit
+# zitadel_db_password_override.
+svc06_openbao_addr: "10.0.20.10"
+
+# Dev/mock org-provision reachability (Traefik-less path). When the self-signed
+# TLS mock is on (zitadel_tls_self_signed=true — i.e. SVC-09/Traefik is NOT
+# deployed), org-provision cannot reach ZITADEL through Traefik, so it is pointed
+# at the ZITADEL GUEST and runs the helper there against the container IP:8080
+# with the external-domain Host header (see zitadel-org-provision dev path).
+# Defaults to the ZITADEL guest's computed VLAN-20 IP (host_index 5 ->
+# 10.0.20.15) when the mock is on; empty on the production Traefik path so
+# org-provision runs on the control node via https://auth.<domain>.
+svc06_zitadel_dev_guest_host: "{{ '10.0.20.15' if (zitadel_tls_self_signed | default(false) | bool) else '' }}"

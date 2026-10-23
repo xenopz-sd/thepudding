@@ -1,0 +1,314 @@
+---
+# tasks/main.yml — svc09_preflight (SVC-09 installer — Phase 1: Preflight)
+#
+# Phase-1 "Preflight & environment validation". A failure here leaves ZERO
+# Proxmox resources and unmodified TF state. Clone of svc07_preflight adapted for
+# the Traefik single-guest root (one guest IP, Traefik TF_VAR names).
+#
+# Owns: cluster_env.py resolve + validate (no_log), TF_VAR_* binding, endpoint
+# canonical-base normalization, agent-live throwaway-guard consult (gated),
+# operator SSH-public-key injection + INFO decision log, Proxmox /version
+# reachability + auth, VLAN-20 `p20` SDN VNet check, datastore autodetect, local
+# prereq/version checks. Publishes the facts consumed by svc09_provision.
+
+# --- Env-file load + validation (delegates to cluster_env.py) ---------------
+- name: "Preflight | Resolve + validate the cluster env file ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc09_venv_python }}"
+      - "{{ svc09_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ svc09_repo_root }}"
+  register: svc09_env_resolve
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | Capture the resolved TF_VAR_* mapping for Phase 2"
+  ansible.builtin.set_fact:
+    svc09_tfvars: "{{ svc09_env_resolve.stdout | from_json }}"
+  no_log: true
+
+# The LXC template + datastore are CLUSTER-WIDE facts (every service boots the
+# same stock Debian template on the same datastore), so cluster_env.py resolves
+# them under the shared canonical keys TF_VAR_openbao_template_file_id /
+# TF_VAR_openbao_datastore_id (the schema's generic "LXC template" / "Datastore"
+# rows — not OpenBao-specific despite the historical key name). svc09 consumes
+# those shared keys here and remaps them onto the Traefik root's own var names
+# (traefik_template_file_id / traefik_datastore_id) in svc09_tf_env. This keeps
+# the shared cluster_env.py contract UNCHANGED (no per-service key added).
+- name: "Preflight | Bind resolved cluster parameters to named facts"
+  ansible.builtin.set_fact:
+    svc09_proxmox_endpoint: "{{ svc09_tfvars['TF_VAR_proxmox_endpoint'] }}"
+    svc09_proxmox_api_token: "{{ svc09_tfvars['TF_VAR_proxmox_api_token'] }}"
+    svc09_proxmox_node_name: "{{ svc09_tfvars['TF_VAR_proxmox_node_name'] }}"
+    svc09_traefik_template_file_id: "{{ svc09_tfvars['TF_VAR_openbao_template_file_id'] }}"
+    svc09_traefik_datastore_id: "{{ svc09_tfvars['TF_VAR_openbao_datastore_id'] }}"
+  no_log: true
+
+# Normalize the resolved endpoint to a canonical base URL ONCE, before the
+# preflight uri tasks append /api2/json and before Phase 2 hands it to the
+# bpg/proxmox provider. Mirrors scripts/installer/endpoint.py::canonical_base
+# (pinned by tests/installer/test_endpoint.py) — keep the chain in sync.
+- name: "Preflight | Normalize Proxmox endpoint to a canonical base"
+  ansible.builtin.set_fact:
+    svc09_proxmox_endpoint_base: >-
+      {{ svc09_proxmox_endpoint | trim
+         | regex_replace('/+$', '')
+         | regex_replace('/api2/json$', '')
+         | regex_replace('/+$', '') }}
+
+# =========================================================== #
+# Agent Live-Test Authorization guard consult (gated).         #
+# ----------------------------------------------------------- #
+# All three tasks are `when: agent_live_run` — an ordinary      #
+# operator run (AGENT_LIVE_AUTHORIZED unset) skips them and is  #
+# byte-for-byte unchanged. FAIL-CLOSED, BEFORE ANY PROXMOX CALL:#
+# positioned after the cluster-env resolve but before the first #
+# /version call, so an armed from-scratch run against a NON-    #
+# allowlisted identity is REFUSED before any Proxmox resource   #
+# is touched or queried. Same three-task consult pattern as     #
+# svc07_preflight / svc07_clean_slate (the reference wiring the  #
+# agent-live meta-drift-guard enforces for every service).     #
+# =========================================================== #
+- name: "Preflight | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc09_venv_python }}"
+      - "{{ svc09_throwaway_guard }}"
+      - --service
+      - svc09
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ svc09_throwaway_allowlist }}"
+  args:
+    chdir: "{{ svc09_repo_root }}"
+  register: svc09_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+
+- name: "Preflight | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (svc09_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Preflight | Refuse the from-scratch run unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "svc09_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live from-scratch run REFUSED by the throwaway-cluster guard:
+      {{ (svc09_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      Nothing was provisioned and no Proxmox resource was touched or queried.
+      Arm the run only against a throwaway cluster listed in
+      throwaway-clusters.yml with AGENT_LIVE_AUTHORIZED set.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live from-scratch run."
+  when: agent_live_run | default(false) | bool
+
+# --- Operator SSH public-key injection (feed TF_VAR_operator_ssh_public_keys) -
+- name: "Preflight | Bind + expanduser the operator SSH public-key file path (may be absent)"
+  ansible.builtin.set_fact:
+    svc09_ssh_public_key_file: >-
+      {{ (svc09_tfvars['TF_VAR_operator_ssh_public_key_file'] | default('') | trim) | expanduser }}
+
+- name: "Preflight | Stat the operator SSH public-key file (only when a path is set)"
+  ansible.builtin.stat:
+    path: "{{ svc09_ssh_public_key_file }}"
+  register: svc09_ssh_public_key_stat
+  when: (svc09_ssh_public_key_file | length) > 0
+
+- name: "Preflight | Assert the operator SSH public-key file exists + is readable (fail-fast)"
+  ansible.builtin.assert:
+    that:
+      - "svc09_ssh_public_key_stat.stat.exists | default(false)"
+      - "svc09_ssh_public_key_stat.stat.readable | default(false)"
+    fail_msg: >-
+      The operator SSH public-key file '{{ svc09_ssh_public_key_file }}'
+      (PROXMOX_SSH_PUBLIC_KEY_FILE / TF_VAR_operator_ssh_public_key_file in
+      {{ cluster_env_file }}) does not exist or is not readable. Supply a path to
+      your PUBLIC key file (e.g. ~/.ssh/id_ed25519.pub) — PUBLIC key only, never a
+      private key — or leave it unset to provision the Traefik LXC without an
+      authorized key (it will be SSH-unreachable).
+    success_msg: "Operator SSH public-key file present + readable: {{ svc09_ssh_public_key_file }}"
+  when: (svc09_ssh_public_key_file | length) > 0
+
+- name: "Preflight | Read + JSON-encode the operator SSH public key into a 1-element list"
+  ansible.builtin.set_fact:
+    svc09_operator_ssh_public_keys_json: >-
+      {{ [lookup('ansible.builtin.file', svc09_ssh_public_key_file) | trim] | to_json }}
+  when: (svc09_ssh_public_key_file | length) > 0
+
+- name: "Preflight | Default the operator SSH public-key list to empty when no path is set"
+  ansible.builtin.set_fact:
+    svc09_operator_ssh_public_keys_json: "[]"
+  when: (svc09_ssh_public_key_file | length) == 0
+
+- name: "Preflight | Log the SSH public-key injection decision (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: operator SSH public-key injection:
+      {{ 'WIRED from ' ~ svc09_ssh_public_key_file
+         ~ ' -> TF_VAR_operator_ssh_public_keys (1 key; applied at guest CREATION only)'
+         if (svc09_ssh_public_key_file | length) > 0
+         else 'NONE (PROXMOX_SSH_PUBLIC_KEY_FILE unset -> empty [] list -> the Traefik LXC will be '
+              ~ 'SSH-unreachable; supply a .pub path to enable Ansible reachability)' }}
+
+# --- Proxmox reachability, auth, p20 bridge, datastore autodetect ------------
+- name: "Preflight | Verify Proxmox API reachability + authentication (/version)"
+  ansible.builtin.uri:
+    url: "{{ svc09_proxmox_endpoint_base }}/api2/json/version"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ svc09_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ svc09_proxmox_validate_certs }}"
+    status_code: [200]
+  register: svc09_proxmox_version
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | List Proxmox SDN VNets (verify VLAN-20 fabric)"
+  ansible.builtin.uri:
+    url: "{{ svc09_proxmox_endpoint_base }}/api2/json/cluster/sdn/vnets"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ svc09_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ svc09_proxmox_validate_certs }}"
+    status_code: [200]
+  register: svc09_sdn_vnets
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | Extract the set of SDN VNet ids (non-secret)"
+  ansible.builtin.set_fact:
+    svc09_vnet_ids: >-
+      {{ svc09_sdn_vnets.json.data | map(attribute='vnet') | list }}
+
+- name: "Preflight | Assert the p20 VLAN-20 bridge exists"
+  ansible.builtin.assert:
+    that:
+      - "'p20' in svc09_vnet_ids"
+    fail_msg: >-
+      The VLAN-20 bridge 'p20' is absent from the Proxmox SDN VNets
+      ({{ svc09_vnet_ids }}). Apply the platform-foundation root first to create
+      the VLAN-20 fabric, then re-run this installer.
+    success_msg: "VLAN-20 bridge 'p20' is present."
+
+- name: "Preflight | Query target-node storage (only when datastore unset)"
+  ansible.builtin.uri:
+    url: >-
+      {{ svc09_proxmox_endpoint_base }}/api2/json/nodes/{{ svc09_proxmox_node_name }}/storage
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ svc09_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ svc09_proxmox_validate_certs }}"
+    status_code: [200]
+  register: svc09_node_storage
+  changed_when: false
+  no_log: true
+  when: svc09_traefik_datastore_id == svc09_autodetect_sentinel
+
+- name: "Preflight | Extract available storage ids on the target node (non-secret)"
+  ansible.builtin.set_fact:
+    svc09_node_storage_ids: >-
+      {{ svc09_node_storage.json.data | map(attribute='storage') | list }}
+  when: svc09_traefik_datastore_id == svc09_autodetect_sentinel
+
+- name: "Preflight | Auto-select datastore (local-zfs preferred, else local-lvm)"
+  ansible.builtin.set_fact:
+    svc09_traefik_datastore_id: >-
+      {{ 'local-zfs' if 'local-zfs' in svc09_node_storage_ids
+         else ('local-lvm' if 'local-lvm' in svc09_node_storage_ids
+         else svc09_autodetect_sentinel) }}
+  when: svc09_traefik_datastore_id == svc09_autodetect_sentinel
+
+- name: "Preflight | Assert a datastore was resolved or auto-detected"
+  ansible.builtin.assert:
+    that:
+      - "svc09_traefik_datastore_id != svc09_autodetect_sentinel"
+    fail_msg: >-
+      No datastore was configured and neither 'local-zfs' nor 'local-lvm' is
+      available on node '{{ svc09_proxmox_node_name }}' (found:
+      {{ svc09_node_storage_ids | default([]) }}). Set the datastore variable
+      explicitly (PROXMOX_DATASTORE_ID or TF_VAR_traefik_datastore_id) in
+      {{ cluster_env_file }} and re-run this installer.
+    success_msg: "Datastore resolved to '{{ svc09_traefik_datastore_id }}'."
+
+# --- Local control-node prerequisite + version checks ------------------------
+- name: "Preflight | Locate the terraform binary on PATH"
+  ansible.builtin.command:
+    cmd: terraform version
+  register: svc09_terraform_version
+  changed_when: false
+  failed_when: svc09_terraform_version.rc != 0
+
+- name: "Preflight | List installed Ansible collections"
+  ansible.builtin.command:
+    cmd: ansible-galaxy collection list --format json
+  register: svc09_galaxy_list
+  changed_when: false
+  failed_when: svc09_galaxy_list.rc != 0
+
+- name: "Preflight | Compute the set of installed collection names"
+  ansible.builtin.set_fact:
+    svc09_installed_collections: >-
+      {{ (svc09_galaxy_list.stdout | from_json).values()
+         | map('list') | flatten | unique | list }}
+
+- name: "Preflight | Assert the required Ansible collections are installed"
+  ansible.builtin.assert:
+    that:
+      - "item in svc09_installed_collections"
+    fail_msg: >-
+      Required Ansible collection '{{ item }}' is not installed. Install the
+      platform collections with:
+      ansible-galaxy collection install -r ansible/requirements.yml
+    success_msg: "Ansible collection '{{ item }}' is installed."
+  loop: "{{ svc09_required_collections }}"
+
+- name: "Preflight | Assert the project venv binaries are present"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: svc09_venv_bin_stat
+  loop: "{{ svc09_required_venv_binaries }}"
+
+- name: "Preflight | Fail naming any missing venv binary"
+  ansible.builtin.assert:
+    that:
+      - "item.stat.exists"
+      - "item.stat.executable | default(false)"
+    fail_msg: >-
+      Required project venv binary is missing or not executable: {{ item.item }}.
+      Create/repair the devinfra virtualenv (~/venv/devinfra/) before running
+      this installer.
+    success_msg: "venv binary present: {{ item.item }}"
+  loop: "{{ svc09_venv_bin_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: "Preflight | Assert Python >= 3.10 on the control node"
+  ansible.builtin.assert:
+    that:
+      - "ansible_python_version is version('3.10', '>=')"
+    fail_msg: >-
+      Detected Python {{ ansible_python_version }}, but this installer requires
+      Python 3.10 or later.
+    success_msg: "Python {{ ansible_python_version }} satisfies >= 3.10."
+
+- name: "Preflight | Assert Ansible >= 2.15 on the control node"
+  ansible.builtin.assert:
+    that:
+      - "ansible_version.full is version('2.15', '>=')"
+    fail_msg: >-
+      Detected Ansible {{ ansible_version.full }}, but this installer requires
+      Ansible 2.15 or later.
+    success_msg: "Ansible {{ ansible_version.full }} satisfies >= 2.15."

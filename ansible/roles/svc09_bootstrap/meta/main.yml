@@ -1,0 +1,13 @@
+---
+# meta/main.yml — svc09_bootstrap (SVC-09 installer — Phase 3)
+galaxy_info:
+  role_name: svc09_bootstrap
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-09 (Traefik) installer Phase 3 — host hardening & service bootstrap:
+    common baseline child run (Docker + Compose) then the traefik.yml configurator
+    child run (static config, real edge network, Compose stack).
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

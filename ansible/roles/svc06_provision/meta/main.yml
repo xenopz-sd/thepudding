@@ -1,0 +1,12 @@
+---
+# meta/main.yml — svc06_provision (SVC-06 installer — Phase 2)
+galaxy_info:
+  role_name: svc06_provision
+  author: platform
+  description: >-
+    SVC-06 Phase 2 — provision the ZITADEL backing DB (child svc-01-bootstrap)
+    then the ZITADEL LXC (terraform apply), generate the Ansible inventory, and
+    reconcile known_hosts.
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

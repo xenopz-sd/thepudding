@@ -57,6 +57,18 @@ services:
 {% if svc.env_file | default(true) %}
     env_file:
       - .env
+{% if svc.extra_env_files is defined and svc.extra_env_files | length > 0 %}
+{#   Opt-in ONLY: additional env_file paths APPENDED after the non-secret .env.
+     A later env_file wins on key conflicts (Compose merge order), so a service
+     MAY layer a 0600 secret-bearing runtime env (written to the guest, NEVER the
+     repo) on top of the non-secret .env — e.g. SVC-01 Postgres' POSTGRES_PASSWORD
+     in /etc/postgresql/postgres.secret.env. No secret VALUE is rendered here; only
+     the PATH is emitted (integration-boundaries §2 — the value lives in the 0600
+     file / OpenBao, not in this committed template). #}
+{% for extra in svc.extra_env_files %}
+      - "{{ extra }}"
+{% endfor %}
+{% endif %}
 {% endif %}
 {% if svc.volumes is defined and svc.volumes | length > 0 %}
     volumes:

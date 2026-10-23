@@ -1,0 +1,13 @@
+---
+# meta/main.yml — zitadel-org-provision (SVC-06)
+galaxy_info:
+  role_name: zitadel_org_provision
+  author: platform
+  description: >-
+    Idempotently provisions a platform project's ZITADEL organization, default
+    roles, and OIDC application registration via the scripts/installer/
+    zitadel_provision.py management-API helper, capturing the OIDC client secret
+    into OpenBao (SVC-07).
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

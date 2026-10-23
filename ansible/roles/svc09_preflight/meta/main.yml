@@ -1,0 +1,13 @@
+---
+# meta/main.yml — svc09_preflight (SVC-09 installer — Phase 1)
+galaxy_info:
+  role_name: svc09_preflight
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-09 (Traefik) installer Phase 1 — preflight & environment validation:
+    cluster.env resolve/validate, Proxmox reachability/auth, VLAN-20 p20 bridge,
+    datastore autodetect, SSH-key injection, agent-live throwaway-guard consult.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

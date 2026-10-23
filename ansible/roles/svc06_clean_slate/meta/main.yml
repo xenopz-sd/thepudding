@@ -1,0 +1,11 @@
+---
+# meta/main.yml — svc06_clean_slate (SVC-06 installer — clean-slate branch)
+galaxy_info:
+  role_name: svc06_clean_slate
+  author: platform
+  description: >-
+    SVC-06 clean-slate reset — tear down the ZITADEL guest AND orchestrate the
+    SVC-01 backing-DB clean-slate, verifying an empty baseline.
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

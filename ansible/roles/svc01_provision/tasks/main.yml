@@ -1,0 +1,260 @@
+---
+# tasks/main.yml — svc01_provision (SVC-01 installer — Phase 2: Provision)
+#
+# Clone of svc09_provision adapted for the reusable per-project DB root. The KEY
+# difference: the GitLab state name is PER-INSTANCE — `<project_slug>-svc01-postgres`
+# — so each project's DB gets isolated state (one reusable root, many instances;
+# integration-boundaries §5). The slug is interpolated into both the local
+# backend selection and the GitLab state address.
+#
+# NOTE (agent-live meta-guard): this role runs `terraform apply` but is
+# LEAF-EXEMPT — the throwaway-guard consult is carried UPSTREAM by svc01_preflight.
+
+# Per-instance state name derived from the project slug (state isolation).
+- name: "Provisioning | Derive the per-instance GitLab state name"
+  ansible.builtin.set_fact:
+    svc01_state_name: "{{ project_slug }}-svc01-postgres"
+  changed_when: false
+
+# --- Backend swap-gate selection --------------------------------------------
+- name: "Provisioning | Read the cluster env file to detect the state-backend signal"
+  ansible.builtin.slurp:
+    src: "{{ svc01_repo_root }}/{{ cluster_env_file }}"
+  register: svc01_env_slurp
+  no_log: true
+
+- name: "Provisioning | Reduce the env file to KEY=VALUE lines"
+  ansible.builtin.set_fact:
+    svc01_env_pairs: >-
+      {{ (svc01_env_slurp.content | b64decode).splitlines()
+         | map('trim')
+         | reject('match', '^\s*#')
+         | select('search', '=')
+         | list }}
+  no_log: true
+
+- name: "Provisioning | Extract the set of env keys (names only, no values)"
+  ansible.builtin.set_fact:
+    svc01_env_keys: >-
+      {{ svc01_env_pairs | map('regex_replace', '^\s*([^=]+?)\s*=.*$', '\1') | list }}
+
+- name: "Provisioning | Decide the Terraform backend (swap gate)"
+  ansible.builtin.set_fact:
+    svc01_use_gitlab_backend: >-
+      {{ ('CI_API_V4_URL' in svc01_env_keys)
+         and ('CI_PROJECT_ID' in svc01_env_keys)
+         and ('CI_JOB_TOKEN' in svc01_env_keys) }}
+
+- name: "Provisioning | Extract GitLab CI state-backend values (GitLab backend only)"
+  ansible.builtin.set_fact:
+    svc01_env_ci_values: >-
+      {{ dict(svc01_env_keys | zip(
+           svc01_env_pairs
+           | map('regex_replace', '^[^=]+=\s*(.*?)\s*$', '\1')
+           | map('regex_replace', '^"(.*)"$', '\1')
+           | list)) }}
+  when: svc01_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Derive the per-slug GitLab state address + job token (GitLab backend only)"
+  ansible.builtin.set_fact:
+    svc01_env_gitlab_state_address: >-
+      {{ svc01_env_ci_values['CI_API_V4_URL'] }}/projects/{{
+         svc01_env_ci_values['CI_PROJECT_ID'] }}/terraform/state/{{ svc01_state_name }}
+    svc01_env_ci_job_token: "{{ svc01_env_ci_values['CI_JOB_TOKEN'] }}"
+  when: svc01_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Log the Terraform backend selection (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Terraform backend:
+      {{ 'GitLab HTTP state (' ~ svc01_state_name ~ ') — the Cluster_Env_File '
+         ~ 'configures the GitLab CI state-backend variables'
+         if (svc01_use_gitlab_backend | bool)
+         else 'LOCAL (local_backend_override.tf) — solo/offline Developer-B default; '
+              ~ 'per-instance state ' ~ svc01_state_name }}
+
+- name: "Provisioning | Ensure local_backend_override.tf is present (local backend)"
+  ansible.builtin.copy:
+    dest: "{{ svc01_tf_root }}/local_backend_override.tf"
+    mode: "0644"
+    content: |
+      # Local, gitignored state backend for a solo/offline apply — overrides the
+      # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+      terraform {
+        backend "local" {}
+      }
+  when: not (svc01_use_gitlab_backend | bool)
+
+- name: "Provisioning | Remove any local_backend_override.tf (GitLab HTTP backend)"
+  ansible.builtin.file:
+    path: "{{ svc01_tf_root }}/local_backend_override.tf"
+    state: absent
+  when: svc01_use_gitlab_backend | bool
+
+- name: "Provisioning | terraform init (local backend)"
+  ansible.builtin.command:
+    argv: [terraform, init, -input=false, -reconfigure]
+  args:
+    chdir: "{{ svc01_tf_root }}"
+  environment: "{{ svc01_tf_env }}"
+  register: svc01_tf_init_local
+  changed_when: true
+  when: not (svc01_use_gitlab_backend | bool)
+  no_log: true
+
+- name: "Provisioning | terraform init (GitLab HTTP backend, per-slug state)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+      - "-backend-config=address={{ svc01_env_gitlab_state_address }}"
+      - "-backend-config=lock_address={{ svc01_env_gitlab_state_address }}/lock"
+      - "-backend-config=unlock_address={{ svc01_env_gitlab_state_address }}/lock"
+      - -backend-config=username=gitlab-ci-token
+      - "-backend-config=password={{ svc01_env_ci_job_token }}"
+      - -backend-config=lock_method=POST
+      - -backend-config=unlock_method=DELETE
+      - -backend-config=retry_wait_min=5
+  args:
+    chdir: "{{ svc01_tf_root }}"
+  environment: "{{ svc01_tf_env }}"
+  register: svc01_tf_init_gitlab
+  changed_when: true
+  when: svc01_use_gitlab_backend | bool
+  no_log: true
+
+# --- guest-variable assembly + apply ----------------------------------------
+- name: "Provisioning | Assert all required guest variables are present (before apply)"
+  ansible.builtin.assert:
+    that:
+      - "svc01_proxmox_node_name is defined and (svc01_proxmox_node_name | trim | length > 0)"
+      - "svc01_template_file_id is defined and (svc01_template_file_id | trim | length > 0)"
+      - "svc01_datastore_id is defined and (svc01_datastore_id | trim | length > 0)"
+      - "svc01_datastore_id != svc01_autodetect_sentinel"
+      - "svc01_vmid is defined"
+      - "project_slug is defined and (project_slug | trim | length > 0)"
+      - "vlan_id is defined"
+    fail_msg: >-
+      A required guest variable is absent; refusing `terraform apply`. Required:
+      project_slug, vlan_id, proxmox_node_name, template, resolved datastore, svc01_vmid.
+    success_msg: "All required guest variables present; proceeding to terraform apply."
+
+- name: "Provisioning | terraform apply (non-interactive, auto-approve)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - apply
+      - -input=false
+      - -auto-approve
+      - "-var=project_slug={{ project_slug }}"
+      - "-var=vlan_id={{ vlan_id }}"
+      - "-var=db_engine={{ db_engine | default('postgres') }}"
+      - "-var=tier={{ tier | default('small') }}"
+      # Host_Index_Authority wiring (fix-vlan-host-index-collision, C9). On a VLAN
+      # carrying >1 service root (VLAN 20, or a project VLAN with >1 guest) the
+      # caller MUST pass the ledger-assigned host_index — e.g. the shared-zitadel
+      # backing DB passes host_index=4 (from svc06_provision), NOT the bare
+      # default 0. A standalone single-guest project leaves host_index at its
+      # default 0 (-> .10) and the SVC-01 root derives an empty peer set (no-op).
+      # ledger_component names this guest's own ledger self-key `component` so the
+      # root excludes exactly this guest's index from the derived peer set
+      # (shared-zitadel backing DB => "shared-zitadel"; empty for a plain project
+      # DB, which matches a ledger row with no component). The `-e host_index=` /
+      # `-e ledger_component=` override contract is the documented way a caller
+      # supplies these.
+      - "-var=host_index={{ host_index | default(0) }}"
+      - "-var=ledger_component={{ ledger_component | default('') }}"
+      - "-var=proxmox_node_name={{ svc01_proxmox_node_name }}"
+      - "-var=svc01_vmid={{ svc01_vmid }}"
+      - "-var=svc01_template_file_id={{ svc01_template_file_id }}"
+      - "-var=svc01_datastore_id={{ svc01_datastore_id }}"
+      # Terraform bool vars require lowercase true/false; Jinja renders Python
+      # booleans as True/False (capitalized), which terraform rejects with
+      # "a bool is required; to convert from string, use lowercase". `| lower`
+      # normalizes them. (Live-caught in SVC-01 Task 12 acceptance.)
+      - "-var=enable_pgvector={{ enable_pgvector | default(false) | string | lower }}"
+      - "-var=enable_postgis={{ enable_postgis | default(false) | string | lower }}"
+      - "-var=enable_timescaledb={{ enable_timescaledb | default(false) | string | lower }}"
+      - "-var=app_subnet_cidr={{ app_subnet_cidr | default('') }}"
+      - "-var=enable_firewall_rules={{ enable_firewall_rules | default(false) | string | lower }}"
+  args:
+    chdir: "{{ svc01_tf_root }}"
+  environment: "{{ svc01_tf_env }}"
+  register: svc01_tf_apply
+  changed_when: "'0 added, 0 changed, 0 destroyed' not in svc01_tf_apply.stdout"
+  no_log: true
+
+# --- inventory generation + known_hosts -------------------------------------
+- name: "Provisioning | Generate the Ansible inventory from Terraform outputs"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc01_venv_python }}"
+      - ansible/inventory/generate_inventory.py
+      - --root
+      - infra/projects/svc-01-sql-database
+      - --out
+      - "{{ svc01_generated_inventory }}"
+  args:
+    chdir: "{{ svc01_repo_root }}"
+  register: svc01_gen_inventory
+  changed_when: true
+
+- name: "Provisioning | Confirm the generated inventory file was written"
+  ansible.builtin.stat:
+    path: "{{ svc01_repo_root }}/{{ svc01_generated_inventory }}"
+  register: svc01_generated_inventory_stat
+
+- name: "Provisioning | Assert the generated inventory exists (else halt before Bootstrap)"
+  ansible.builtin.assert:
+    that:
+      - "svc01_generated_inventory_stat.stat.exists"
+    fail_msg: "generate_inventory.py did not produce {{ svc01_generated_inventory }}; halting before Bootstrap."
+    success_msg: "Generated inventory present: {{ svc01_generated_inventory }}."
+
+- name: "Provisioning | add_host the DB guest into the in-memory inventory"
+  ansible.builtin.add_host:
+    name: "svc01-{{ vlan_id }}-01"
+    groups:
+      - postgres
+    ansible_host: "10.0.{{ vlan_id }}.{{ 10 + (host_index | default(0) | int) }}"
+    ansible_user: root
+    ansible_connection: ssh
+  changed_when: false
+
+- name: "Provisioning | Ensure ~/.ssh exists (0700)"
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+
+- name: "Provisioning | Remove stale known_hosts fingerprints for the guest IP"
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -R
+      - "10.0.{{ vlan_id }}.{{ 10 + (host_index | default(0) | int) }}"
+      - -f
+      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
+  register: svc01_knownhosts_purge
+  changed_when: "'updated' in (svc01_knownhosts_purge.stderr | default(''))"
+  failed_when: false
+
+- name: "Provisioning | ssh-keyscan the guest IP (30s timeout)"
+  ansible.builtin.command:
+    argv: [ssh-keyscan, -T, "30", "10.0.{{ vlan_id }}.{{ 10 + (host_index | default(0) | int) }}"]
+  register: svc01_keyscan
+  changed_when: false
+  failed_when: >-
+    svc01_keyscan.rc != 0 or (svc01_keyscan.stdout | default('') | trim | length == 0)
+
+- name: "Provisioning | Append current host keys to known_hosts"
+  ansible.builtin.blockinfile:
+    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+    create: true
+    mode: "0600"
+    marker: "# {mark} SVC-01 installer host keys for {{ project_slug }}"
+    block: "{{ svc01_keyscan.stdout }}"

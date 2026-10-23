@@ -1,0 +1,8 @@
+---
+# handlers/main.yml — mariadb-server (SVC-01 alternative engine skeleton)
+- name: Restart mariadb
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ mariadb_stack_name }}"
+    project_name: "{{ mariadb_stack_name }}"
+    state: present
+    recreate: always

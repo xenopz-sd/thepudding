@@ -1,0 +1,12 @@
+---
+# meta/main.yml — zitadel-server (SVC-06)
+galaxy_info:
+  role_name: zitadel_server
+  author: platform
+  description: >-
+    Deploys the shared ZITADEL identity provider (SVC-06) as a Docker Compose
+    stack via docker-compose-app, with its masterkey + backing-DB connection
+    sourced from OpenBao (SVC-07) and HTTP ingress via Traefik (SVC-09).
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

@@ -1,0 +1,109 @@
+---
+# defaults/main.yml — svc06_provision (SVC-06 installer — Phase 2)
+#
+# Phase-2 defaults for the SVC-06 (ZITADEL) provision role. The ZITADEL guest's
+# own Terraform env (svc06_tf_env / svc06_tf_root) is added in Task 15/17; THIS
+# file (landed in Task 14) establishes the authoritative parameter set for the
+# ZITADEL BACKING DATABASE, which SVC-06 provisions by CONSUMING the SVC-01
+# reusable root (design.md §3.3) — it does NOT embed a DB module block in the
+# SVC-06 root.
+#
+# WHY a child SVC-01 bootstrap (not a module block in the SVC-06 root):
+# SVC-01's per-instance Terraform state isolation (`<slug>-svc01-postgres`) is
+# what makes a `terraform destroy` of one DB safe (integration-boundaries §5).
+# Embedding the DB as a module block inside the SVC-06 root would fold the DB
+# into the `svc-06-identity-provider` state, collapsing that isolation. So
+# svc06_provision runs `svc-01-bootstrap.yml` as a CHILD orchestration for the
+# backing DB FIRST, with the parameters below, giving the ZITADEL DB its own
+# isolated state `shared-zitadel-svc01-postgres`. The ZITADEL DB simply IS an
+# SVC-01 instance (domain-rules §3: SVC-01 is dedicated-per-project; here the
+# "project" is the shared ZITADEL backing store).
+
+# --- ZITADEL backing-DB SVC-01 instance parameters (single source of truth) ---
+# The project slug for the backing DB. Distinct from any real project slug, so
+# its SVC-01 state name `shared-zitadel-svc01-postgres` is unique and isolated
+# (Terraform state isolation, cross-cutting §3). Lowercase/hyphenated, <=20 chars
+# (PF §4 slug rule; "shared-zitadel" is 14 chars).
+svc06_db_project_slug: "shared-zitadel"
+
+# The backing DB lives on the shared-services VLAN 20 alongside ZITADEL itself
+# (both are shared platform services — domain-rules §1). Its VNet `p20` is the
+# platform-foundation-owned precondition.
+svc06_db_vlan_id: 20
+
+# Engine + extensions: ZITADEL requires PostgreSQL 14-18 (requirements §12);
+# `postgres:17` (the SVC-01 default) satisfies this. ZITADEL does NOT need
+# pgvector/PostGIS/TimescaleDB, so all extension flags stay OFF.
+svc06_db_engine: "postgres"
+svc06_db_enable_pgvector: false
+svc06_db_enable_postgis: false
+svc06_db_enable_timescaledb: false
+
+# Sizing: the SVC-01 "small" tier (1 vCPU / 2 GB / 20 GB) is the ZITADEL
+# backing-store starting point (requirements §5 NFR sizing).
+svc06_db_tier: "small"
+
+# Host index + VMID: DISTINCT from the ZITADEL guest and from every other
+# VLAN-20 guest, so the computed IP (10.0.20.1<host_index+... >) and the VMID do
+# not collide. host_index 4 -> 10.0.20.14 (svc07 .10/.11, svc09 .12 are the
+# known VLAN-20 occupants; .14 is clear). The single per-VLAN source of truth is
+# the host-index ledger infra/platform-foundation/host-indices.yaml. The ZITADEL
+# guest itself takes a different host_index (svc06_zitadel_host_index, Task 15/17).
+svc06_db_host_index: 4
+svc06_db_vmid: 1102
+
+# The app-subnet CIDR the SVC-01 firewall rule (opt-in, default off) would scope
+# the DB's 5432 to — the ZITADEL guest's own subnet. On the shared VLAN the whole
+# 10.0.20.0/24 is the scope; the firewall rule stays off by default (ADR-0008
+# posture, same as SVC-01).
+svc06_db_app_subnet_cidr: "10.0.20.0/24"
+
+# ZITADEL is a cross-guest client of this backing DB (its start-from-init opens an
+# admin connection to the `postgres` maintenance DB). Turn ON the two default-OFF
+# postgres-server client opt-ins (SVC-06 design §3.3) for THIS instance only:
+#   - CREATEDB on the app role (ZITADEL init DB-existence/creation step),
+#   - a non-TLS subnet pg_hba line (no SVC-08 cert yet; sslmode=disable).
+# Generic SVC-01 projects never set these. Both revert when a real cert lands.
+svc06_db_app_role_createdb: true
+svc06_db_client_nontls_subnet: true
+
+# --- OpenBao credential-handoff address (SVC-01 WRITE gate) ------------------
+# Forwarded to the backing-DB child svc-01-bootstrap as `openbao_addr`, which
+# gates postgres-server's OpenBao READ-reuse + WRITE of the app_password. MUST be
+# non-empty on a real bring-up so SVC-01 STORES the password it ALTERs onto the
+# shared_zitadel_app role — otherwise SVC-01 sets a random password that is never
+# stored and ZITADEL can never retrieve it (SQLSTATE 28P01). Defaults to the
+# SVC-07 OpenBao primary's VLAN-20 address (NET-00 host_index 0 -> 10.0.20.10) —
+# the SAME value svc06_bootstrap forwards as `zitadel_openbao_addr` (the READ
+# gate), so both ends resolve to one OpenBao source. Override to "" ONLY for a
+# deliberate dev/offline run. (Spec: fix-svc06-zitadel-db-app-password-mismatch.)
+svc06_openbao_addr: "10.0.20.10"
+
+# --- ZITADEL guest Terraform root + env (Phase-2 apply) ----------------------
+# The ZITADEL LXC's own Terraform root. The backing DB (above) is a SEPARATE
+# SVC-01 instance applied by a child svc-01-bootstrap run BEFORE this apply.
+svc06_tf_root: "{{ svc06_repo_root }}/infra/projects/svc-06-identity-provider"
+
+# The ZITADEL guest takes a DISTINCT host_index + VMID from the backing DB (which
+# is host_index 4 / vmid 1102). host_index 5 -> 10.0.20.15.
+svc06_zitadel_host_index: 5
+
+# Environment passed to the child terraform init/apply for the ZITADEL root.
+# Endpoint/token via TF_VAR_* (never argv); insecure derived from validate_certs;
+# operator keys JSON list from Phase 1. Evaluated lazily against Phase-1 facts;
+# every consumer sets no_log:true.
+svc06_tf_env:
+  TF_VAR_proxmox_endpoint: >-
+    {{ svc06_proxmox_endpoint_base | default(svc06_proxmox_endpoint) | default('') }}
+  TF_VAR_proxmox_api_token: "{{ svc06_proxmox_api_token | default('') }}"
+  TF_VAR_proxmox_insecure: "{{ (not (svc06_proxmox_validate_certs | bool)) | lower }}"
+  TF_VAR_operator_ssh_public_keys: "{{ svc06_operator_ssh_public_keys_json | default('[]') }}"
+
+# ZITADEL guest VMID (REQUIRED via -e svc06_zitadel_vmid). Distinct from the
+# backing DB's svc06_db_vmid (1102). The orchestrator default is 1103.
+svc06_zitadel_vmid: 0
+
+# Platform domain the ZITADEL Traefik ingress serves under (non-secret). Passed
+# to the ZITADEL root's platform_domain var + the zitadel-server/org-provision
+# roles so the external domain + OIDC issuer all agree.
+svc06_platform_domain: "platform.example.test"

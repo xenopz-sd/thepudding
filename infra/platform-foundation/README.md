@@ -26,6 +26,7 @@ touch shared or other-project resources (NET-00 §6, PF §4, Requirement 6.3).
 | `registry.tf` | Reads `projects.yaml` via `yamldecode()`; exposes the `slug_to_vlan_id` map and a `registry_hash`. |
 | `sdn.tf` | Exactly **one** `proxmox_sdn_zone_vlan` + exactly **one** `proxmox_sdn_applier`, plus the **shared-services VLAN-20** VNet + subnet (`p20`, tag 20 / `10.0.20.0/24` gw `.1`). **Zero** *per-project* VNets/subnets (those are per-project-root-owned, VLAN 100–254). |
 | `projects.yaml` | Append-only VLAN-ID registry (the single in-repo source of VLAN-ID truth). |
+| `host-indices.yaml` | The per-VLAN **Host_Index_Authority** ledger (ADR-0015): the committed, diff-reviewable record of which `host_index` each shared-VLAN-20 service occupies, so independent service Terraform roots on the same VLAN cannot collide on a host IP. Read as input (like `projects.yaml`), never shared Terraform state. See [`.kiro/decisions/0015-per-vlan-host-index-authority.md`](../../.kiro/decisions/0015-per-vlan-host-index-authority.md). |
 | `scripts/onboard_project.py` | Onboarding CLI: allocates the next VLAN ID and opens a GitLab MR. Never mutates live infra. |
 
 The SDN built-in IPAM/DHCP is deliberately left **disabled** (it is Proxmox

@@ -1,0 +1,141 @@
+---
+# svc-01-bootstrap.yml — SVC-01 (SQL Database) Automated Service Installer.
+# Spec: .kiro/specs/svc-01-sql-database/ (requirements.md, design.md, tasks.md).
+#
+# THIN ORCHESTRATOR: a Day-0 orchestrator for a DEDICATED-PER-PROJECT database.
+# Parameterized by `-e project_slug=...` (+ vlan_id, tier, db_engine), so the
+# SAME playbook stands a Postgres (or MariaDB) up for any project. Drives five
+# roles, each in a per-phase block/rescue:
+#   svc01_clean_slate (reset branch) / svc01_preflight / svc01_provision /
+#   svc01_bootstrap / svc01_handoff.
+#
+# Developer B entry point (service-installer.md §2):
+#   ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/svc-01-bootstrap.yml \
+#     -e cluster_env_file=cluster.dev.env \
+#     -e project_slug=dronefleet -e vlan_id=100 -e svc01_vmid=1101
+#
+# Clean-slate reset:
+#   ... -e clean_slate=true -e clean_slate_confirm=force \
+#       -e project_slug=dronefleet -e vlan_id=100 -e svc01_vmid=1101 \
+#       -e svc01_proxmox_host=<real-proxmox-lan-ip>
+- name: SVC-01 (SQL Database) automated installer — Day-0 orchestrator
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  any_errors_fatal: true
+  vars:
+    # --- PlayLevelVars — cross-role constants only. ---
+    cluster_env_file: cluster.env
+    svc01_repo_root: "{{ playbook_dir | dirname | dirname }}"
+    svc01_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+    svc01_generated_inventory: ansible/inventory/svc-01-sql-database.generated.yml
+
+    # --- Per-project parameters (REQUIRED via -e, except the defaulted ones). ---
+    # project_slug + vlan_id + svc01_vmid are the per-instance identity; the
+    # installer refuses to apply without them (svc01_provision asserts).
+    project_slug: ""
+    vlan_id: 0
+    svc01_vmid: 0
+    # host_index: on a VLAN carrying >1 service root (VLAN 20, or a project VLAN
+    # with >1 guest) pass the ledger-assigned index via `-e host_index=N` (e.g. 4
+    # for the shared-zitadel backing DB). A standalone single-guest project leaves
+    # the default 0 (-> .10). ledger_component names this guest's own ledger
+    # self-key `component` (e.g. "shared-zitadel") so the SVC-01 root excludes
+    # exactly this guest from the derived VLAN peer set; empty for a plain project
+    # DB. Both are the documented `-e ...=` override contract into svc01_provision.
+    host_index: 0
+    ledger_component: ""
+    tier: small
+    db_engine: postgres
+    enable_pgvector: false
+    enable_postgis: false
+    enable_timescaledb: false
+    app_subnet_cidr: ""
+    enable_firewall_rules: false
+
+    # --- OpenBao credential storage (optional; the bao-CLI write is gated on an
+    #     address being present). ---
+    openbao_addr: ""
+
+    # --- Clean-slate reset controls (off by default). ---
+    clean_slate: false
+    clean_slate_confirm: ""
+
+    # --- Agent Live-Test Authorization (from AGENT_LIVE_AUTHORIZED env). ---
+    agent_live_run: "{{ (lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') | trim) | length > 0 }}"
+    svc01_throwaway_guard: scripts/installer/throwaway_guard.py
+    svc01_throwaway_allowlist: scripts/installer/throwaway-clusters.yml
+
+  tasks:
+    # === Clean-Slate branch — runs ONLY when clean_slate is truthy. ===
+    - name: Clean-Slate reset
+      when: clean_slate | default(false) | bool
+      block:
+        - name: "Clean-Slate | Run the svc01_clean_slate role"
+          ansible.builtin.import_role:
+            name: svc01_clean_slate
+      rescue:
+        - name: Report Clean-Slate reset failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-01 installer FAILED during the Clean-Slate reset:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # === Normal install path — Phases 1→4, skipped entirely on clean_slate. ===
+    - name: "Phase 1 — Preflight & environment validation"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Preflight | Run the svc01_preflight role"
+          ansible.builtin.import_role:
+            name: svc01_preflight
+      rescue:
+        - name: Report Phase 1 (Preflight) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-01 installer FAILED in Phase 1 (Preflight & environment validation):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 2 — Infrastructure provisioning"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Provisioning | Run the svc01_provision role"
+          ansible.builtin.import_role:
+            name: svc01_provision
+      rescue:
+        - name: Report Phase 2 (Provisioning) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-01 installer FAILED in Phase 2 (Infrastructure provisioning):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 3 — Host hardening & service bootstrap"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Bootstrap | Run the svc01_bootstrap role"
+          ansible.builtin.import_role:
+            name: svc01_bootstrap
+      rescue:
+        - name: Report Phase 3 (Bootstrap) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-01 installer FAILED in Phase 3 (Host hardening & service bootstrap):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 4 — Health sanity & Developer B handoff"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Handoff | Run the svc01_handoff role"
+          ansible.builtin.import_role:
+            name: svc01_handoff
+      rescue:
+        - name: Report Phase 4 (Handoff) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-01 installer FAILED in Phase 4 (Health sanity & handoff):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}

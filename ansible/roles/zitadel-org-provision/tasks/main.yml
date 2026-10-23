@@ -1,0 +1,269 @@
+---
+# tasks/main.yml — zitadel-org-provision (SVC-06)
+#
+# Idempotently onboard a project to ZITADEL SSO via the pure-Python
+# management-API helper (scripts/installer/zitadel_provision.py), then capture
+# the returned OIDC client secret into OpenBao. The ZITADEL service-account
+# access token is read from the environment (ZITADEL_PROVISION_TOKEN) and passed
+# to the helper in the CHILD-PROCESS ENV — NEVER on the argv (security-standards;
+# the helper itself has no --token flag). The captured client secret is written
+# to OpenBao via the `bao` CLI docker-exec pattern — never a committed .env.
+
+# --- Guard: a project slug is required ---------------------------------------
+- name: "ZITADEL-org | Assert a project slug was supplied"
+  ansible.builtin.assert:
+    that:
+      - zop_project_slug | trim | length > 0
+    fail_msg: "zop_project_slug is required (the project being onboarded to ZITADEL SSO)."
+    success_msg: "Onboarding project '{{ zop_project_slug }}' to ZITADEL (org {{ zop_org_name }})."
+
+# --- Resolve the ZITADEL provisioning token (OpenBao default, env override) --
+# Resolution order (spec svc06-org-provision-token-wiring C2):
+#   1. ZITADEL_PROVISION_TOKEN env (manual/CI override) — wins when non-empty.
+#   2. else OpenBao field `provision_token` at secret/proj-shared-zitadel/zitadel
+#      (the automated first-init mint stored by zitadel-server), read via the
+#      delegated `bao`-CLI docker-exec — only when the env token is empty AND
+#      OpenBao is wired.
+# Fail fast naming BOTH sources if neither yields a token. All token-handling
+# tasks are no_log; the value never touches the argv.
+
+# (1) Bind the env override (no_log).
+- name: "ZITADEL-org | Bind the ZITADEL_PROVISION_TOKEN env override (no_log)"
+  ansible.builtin.set_fact:
+    zop_env_token: "{{ lookup('ansible.builtin.env', 'ZITADEL_PROVISION_TOKEN') | default('', true) }}"
+  no_log: true
+  changed_when: false
+
+# Bind the OpenBao admin token (from the role ENV, never argv) so the delegated
+# bao read below can authenticate. Isolated behind one no_log task.
+- name: "ZITADEL-org | Bind the OpenBao admin token for the token read (no_log)"
+  ansible.builtin.set_fact:
+    zop_bao_token: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+  no_log: true
+  changed_when: false
+
+# (2) Read provision_token from OpenBao — ONLY when the env override is empty
+# AND OpenBao is wired. Delegated to the OpenBao primary guest (same pinning as
+# zitadel-server's masterkey read). no_log, failed_when:false.
+- name: "ZITADEL-org | Read provision_token from OpenBao when env override is empty (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zop_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zop_bao_token,
+          zop_openbao_primary_container_name, zop_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (zop_openbao_tls_skip_verify | bool) else [])
+         + ['-field=' ~ zop_openbao_provision_token_field, zop_openbao_provision_secret_path] }}
+  delegate_to: "{{ zop_openbao_cli_host }}"
+  vars:
+    # Force SSH: the play is hosts:localhost connection:local, so a delegate to
+    # an IP that is not an inventory host would otherwise inherit connection:local
+    # and run docker ON THE CONTROL NODE (wrong daemon). Force a real SSH hop.
+    ansible_connection: ssh
+    ansible_user: "{{ zop_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zop_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zop_bao_token_read
+  failed_when: false
+  changed_when: false
+  no_log: true
+  when:
+    - (zop_env_token | trim | length) == 0
+    - zop_openbao_addr | length > 0
+
+# (3) Resolve: env override wins; else the OpenBao-read value.
+- name: "ZITADEL-org | Resolve the provisioning token (env override else OpenBao, no_log)"
+  ansible.builtin.set_fact:
+    zop_provision_token: >-
+      {{ zop_env_token
+         if ((zop_env_token | trim | length) > 0)
+         else (zop_bao_token_read.stdout | default('') | trim) }}
+  no_log: true
+  changed_when: false
+
+# (4) Fail fast naming BOTH sources checked if neither yielded a token. no_log,
+# no value echoed.
+- name: "ZITADEL-org | Assert a provisioning token resolved (fail fast, names both sources)"
+  ansible.builtin.assert:
+    that:
+      - zop_provision_token | length > 0
+    fail_msg: >-
+      No ZITADEL provisioning token could be resolved. Checked BOTH sources:
+      (1) the ZITADEL_PROVISION_TOKEN environment variable (empty), and
+      (2) OpenBao field `{{ zop_openbao_provision_token_field }}` at
+      {{ zop_openbao_provision_secret_path }}
+      (zop_openbao_addr={{ zop_openbao_addr | default('') }} —
+      {{ 'wired' if (zop_openbao_addr | length > 0) else 'NOT wired, OpenBao read skipped' }}).
+      Either supply the never-committed ZITADEL_PROVISION_TOKEN env override, or
+      ensure a from-scratch zitadel-server run minted + stored the token at that
+      OpenBao path. No secret value is shown.
+    success_msg: "ZITADEL provisioning token resolved (value not logged)."
+    quiet: true
+  no_log: true
+
+# --- Resolve the run mode: production (Traefik, control node) vs dev (guest) --
+- name: "ZITADEL-org | Set fact — dev/mock guest-run path active?"
+  ansible.builtin.set_fact:
+    zop_dev_guest_run: "{{ (zop_zitadel_guest_host | default('') | trim | length) > 0 }}"
+  changed_when: false
+
+# ===== DEV/MOCK PATH: run the helper ON THE GUEST at the container IP:8080 =====
+# ZITADEL has no host port (boundaries §1); its mgmt API is reachable only at the
+# container's edge-network IP from the guest. Resolve that IP on the guest, stage
+# the stdlib helper there, and run it with --host-header + --insecure.
+- name: "ZITADEL-org | DEV: resolve the ZITADEL container IP on the guest"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "--format={{ zop_cip_go_format }}"
+      - "{{ zop_zitadel_container_name }}"
+  delegate_to: "{{ zop_zitadel_guest_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zop_zitadel_guest_ssh_user }}"
+    ansible_python_interpreter: "{{ zop_guest_python }}"
+    # Folds to a single line; the fold point lands exactly on the one
+    # space in the original value, so the rendered Go template is
+    # byte-identical to "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}".
+    zop_cip_go_format: >-
+      {{ '{{' }}range .NetworkSettings.Networks{{ '}}' }}{{ '{{' }}.IPAddress{{ '}}' }}
+      {{ '{{' }}end{{ '}}' }}
+  register: zop_zitadel_cip
+  changed_when: false
+  when: zop_dev_guest_run | bool
+
+- name: "ZITADEL-org | DEV: stage the stdlib provisioning helper on the guest"
+  ansible.builtin.copy:
+    src: "{{ zop_repo_root }}/{{ zop_provision_helper }}"
+    dest: "{{ zop_guest_helper_path }}"
+    mode: "0700"
+  delegate_to: "{{ zop_zitadel_guest_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zop_zitadel_guest_ssh_user }}"
+    ansible_python_interpreter: "{{ zop_guest_python }}"
+  when: zop_dev_guest_run | bool
+
+- name: "ZITADEL-org | DEV: provision via the helper on the guest (container IP + Host header, no_log)"
+  ansible.builtin.command:
+    argv:
+      - "{{ zop_guest_python }}"
+      - "{{ zop_guest_helper_path }}"
+      - --base-url
+      - "http://{{ (zop_zitadel_cip.stdout | default('') | trim).split() | first }}:{{ zop_zitadel_http_port }}"
+      - --host-header
+      - "{{ zop_zitadel_host_header }}"
+      - --org
+      - "{{ zop_org_name }}"
+      - --project
+      - "{{ zop_project_name }}"
+      - --app
+      - "{{ zop_app_name }}"
+      - "--redirect-uri={{ zop_redirect_uris | first }}"
+  delegate_to: "{{ zop_zitadel_guest_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zop_zitadel_guest_ssh_user }}"
+    ansible_python_interpreter: "{{ zop_guest_python }}"
+  environment:
+    ZITADEL_PROVISION_TOKEN: "{{ zop_provision_token }}"
+  register: zop_provision_run_guest
+  changed_when: >-
+    (zop_provision_run_guest.stdout | default('{}') | from_json).oidc_app.already_existed | default(true) == false
+  no_log: true
+  when: zop_dev_guest_run | bool
+
+- name: "ZITADEL-org | DEV: scrub the staged helper from the guest"
+  ansible.builtin.file:
+    path: "{{ zop_guest_helper_path }}"
+    state: absent
+  delegate_to: "{{ zop_zitadel_guest_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zop_zitadel_guest_ssh_user }}"
+    ansible_python_interpreter: "{{ zop_guest_python }}"
+  changed_when: false
+  when: zop_dev_guest_run | bool
+
+# ===== PRODUCTION PATH: run the helper on the control node via Traefik =====
+- name: "ZITADEL-org | Provision org/roles/OIDC-app via the helper (idempotent, no_log)"
+  ansible.builtin.command:
+    argv:
+      - "{{ zop_venv_python }}"
+      - "{{ zop_provision_helper }}"
+      - --base-url
+      - "{{ zop_base_url }}"
+      - --org
+      - "{{ zop_org_name }}"
+      - --project
+      - "{{ zop_project_name }}"
+      - --app
+      - "{{ zop_app_name }}"
+      - "--redirect-uri={{ zop_redirect_uris | first }}"
+  args:
+    chdir: "{{ zop_repo_root }}"
+  environment:
+    # The access token travels in the child ENV, never the argv (the helper
+    # reads ZITADEL_PROVISION_TOKEN). no_log on this task keeps it out of logs.
+    ZITADEL_PROVISION_TOKEN: "{{ zop_provision_token }}"
+  register: zop_provision_run_prod
+  changed_when: >-
+    (zop_provision_run_prod.stdout | default('{}') | from_json).oidc_app.already_existed | default(true) == false
+  no_log: true
+  when: not (zop_dev_guest_run | bool)
+
+# Unify the result from whichever path ran, for downstream parse/write.
+- name: "ZITADEL-org | Bind the provisioning run result (no_log)"
+  ansible.builtin.set_fact:
+    zop_provision_run: "{{ zop_provision_run_guest if (zop_dev_guest_run | bool) else zop_provision_run_prod }}"
+  no_log: true
+  changed_when: false
+
+# --- Parse the result (non-secret fields only exposed in a debug) ------------
+- name: "ZITADEL-org | Parse the provisioning result (no_log)"
+  ansible.builtin.set_fact:
+    zop_result: "{{ zop_provision_run.stdout | default('{}') | from_json }}"
+  no_log: true
+  changed_when: false
+
+- name: "ZITADEL-org | INFO — provisioning outcome (non-secret)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: ZITADEL onboarding for {{ zop_project_slug }}:
+      org {{ zop_result.org.id | default('?') }}
+      (created={{ zop_result.org.created | default('?') }}),
+      project {{ zop_result.project.id | default('?') }}
+      (created={{ zop_result.project.created | default('?') }}),
+      roles_created={{ zop_result.roles_created | default([]) }},
+      oidc_app already_existed={{ zop_result.oidc_app.already_existed | default('?') }}.
+
+# --- Capture the OIDC client secret into OpenBao (only when newly created) ---
+# ZITADEL returns a client secret ONLY at creation time; on a re-run the app
+# already exists and no secret is emitted (so there is nothing new to store —
+# the first run already persisted it). Gated on OpenBao being wired AND a secret
+# actually being present. no_log — the exec carries the client secret + token.
+- name: "ZITADEL-org | Bind the OpenBao admin token from the environment (no_log)"
+  ansible.builtin.set_fact:
+    zop_bao_token: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+  no_log: true
+  changed_when: false
+
+- name: "ZITADEL-org | Persist the new OIDC client_id/secret to OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zop_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zop_bao_token,
+          zop_openbao_primary_container_name, zop_openbao_bao_bin, 'kv', 'put']
+         + (['-tls-skip-verify'] if (zop_openbao_tls_skip_verify | bool) else [])
+         + [zop_openbao_oidc_secret_path,
+            'client_id=' ~ (zop_result.oidc_app.client_id | default('')),
+            'client_secret=' ~ (zop_result.oidc_app.client_secret | default(''))] }}
+  delegate_to: "{{ zop_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zop_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zop_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zop_oidc_secret_write
+  changed_when: true
+  no_log: true
+  when:
+    - zop_openbao_addr | length > 0
+    - not (zop_result.oidc_app.already_existed | default(true) | bool)
+    - (zop_result.oidc_app.client_secret | default('')) | length > 0

@@ -1,0 +1,112 @@
+---
+# svc01-health.yml — SVC-01 installer Phase-4 health gate (CHILD configurator play)
+#
+# The child play svc01_handoff invokes via
+# `ansible-playbook -i {{ svc01_generated_inventory }} svc01-health.yml`
+# (integration-boundaries.md §4). Runs `hosts: postgres` NATIVELY on the DB LXC.
+#
+# Two-stage recreate-robust gate (mirrors svc07/svc09):
+#   Stage 1 — `docker inspect <container>` until the DB container is Running.
+#   Stage 2 — engine-appropriate readiness INSIDE the container:
+#     * postgres -> `pg_isready` then `psql -c "SELECT 1"` as the superuser over
+#       the container's local socket (proves the server accepts queries).
+#     * mariadb  -> `mariadb -e "SELECT 1"` as the app user from the 0600 env
+#       (proves the engine switch stood a working MariaDB up — FR-7 validation).
+# No Traefik, no CA assumptions (wire protocol). Knob vars come from
+# svc01_handoff/defaults via -e.
+- name: SVC-01 database health gate
+  hosts: postgres
+  gather_facts: false
+  any_errors_fatal: true
+
+  vars:
+    svc01_db_container: >-
+      {{ svc01_mariadb_container_name if (db_engine | default('postgres')) == 'mariadb'
+         else svc01_postgres_container_name }}
+
+  tasks:
+    - name: "Health | Stage 1 — wait for the DB container to exist and be running"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ svc01_db_container }}"
+      register: svc01_db_container_running
+      failed_when: false
+      changed_when: false
+      until: >-
+        (svc01_db_container_running.rc | default(1)) == 0
+        and (svc01_db_container_running.stdout | default('') | trim | length > 0)
+        and ((svc01_db_container_running.stdout | trim)[0] == '[')
+        and ((svc01_db_container_running.stdout | from_json)[0].State.Running | default(false) | bool)
+      retries: "{{ svc01_health_retries | default(24) | int }}"
+      delay: "{{ svc01_health_delay | default(5) | int }}"
+
+    - name: "Health | Assert Stage 1 — the DB container became running within the deadline"
+      ansible.builtin.assert:
+        that: >-
+          (svc01_db_container_running.rc | default(1)) == 0
+          and (svc01_db_container_running.stdout | default('') | trim | length > 0)
+          and ((svc01_db_container_running.stdout | trim)[0] == '[')
+          and ((svc01_db_container_running.stdout | from_json)[0].State.Running | default(false) | bool)
+        fail_msg: >-
+          The DB container ({{ svc01_db_container }}) never became running within
+          {{ (svc01_health_retries | default(24) | int) * (svc01_health_delay | default(5) | int) }} seconds.
+          Inspect `docker logs {{ svc01_db_container }}` on the guest.
+        success_msg: "DB container is running (Stage 1 gate passed)."
+
+    # Stage 2 (postgres) — pg_isready then SELECT 1.
+    - name: "Health | Stage 2 (postgres) — pg_isready + SELECT 1 until ready"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ svc01_postgres_container_name }}"
+          - pg_isready
+          - -U
+          - postgres
+      register: svc01_pg_ready
+      failed_when: false
+      changed_when: false
+      until: "svc01_pg_ready.rc == 0"
+      retries: "{{ svc01_health_retries | default(24) | int }}"
+      delay: "{{ svc01_health_delay | default(5) | int }}"
+      when: (db_engine | default('postgres')) == 'postgres'
+
+    - name: "Health | Assert Stage 2 (postgres) — the server is ready"
+      ansible.builtin.assert:
+        that:
+          - "svc01_pg_ready.rc == 0"
+        fail_msg: >-
+          PostgreSQL did not become ready (pg_isready) within the deadline. The
+          container is running (Stage 1 passed) but the server is not accepting
+          connections — check `docker logs {{ svc01_postgres_container_name }}`.
+        success_msg: "PostgreSQL is ready (Stage 2 gate passed)."
+      when: (db_engine | default('postgres')) == 'postgres'
+
+    # Stage 2 (mariadb) — healthcheck/ping the server (FR-7 switch validation).
+    - name: "Health | Stage 2 (mariadb) — healthcheck ping until ready"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ svc01_mariadb_container_name }}"
+          - healthcheck.sh
+          - --connect
+      register: svc01_maria_ready
+      failed_when: false
+      changed_when: false
+      until: "svc01_maria_ready.rc == 0"
+      retries: "{{ svc01_health_retries | default(24) | int }}"
+      delay: "{{ svc01_health_delay | default(5) | int }}"
+      when: (db_engine | default('postgres')) == 'mariadb'
+
+    - name: "Health | Assert Stage 2 (mariadb) — the server is ready"
+      ansible.builtin.assert:
+        that:
+          - "svc01_maria_ready.rc == 0"
+        fail_msg: >-
+          MariaDB did not become ready within the deadline. Check
+          `docker logs {{ svc01_mariadb_container_name }}`.
+        success_msg: "MariaDB is ready (Stage 2 gate passed) — engine switch validated."
+      when: (db_engine | default('postgres')) == 'mariadb'

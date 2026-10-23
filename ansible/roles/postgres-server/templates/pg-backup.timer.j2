@@ -1,0 +1,14 @@
+{#
+  templates/pg-backup.timer.j2 — postgres-server (SVC-01)
+  Nightly schedule for the pg_dump backup (SVC-01 §6 default: nightly).
+#}
+# MANAGED BY ANSIBLE (postgres-server) — DO NOT EDIT BY HAND.
+[Unit]
+Description=SVC-01 nightly pg_dump backup timer for {{ postgres_project_slug }}
+
+[Timer]
+OnCalendar=*-*-* {{ postgres_backup_hour }}:{{ postgres_backup_minute }}:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

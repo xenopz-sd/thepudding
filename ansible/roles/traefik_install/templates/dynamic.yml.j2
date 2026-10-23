@@ -1,0 +1,53 @@
+{#
+  templates/dynamic.yml.j2 — traefik_install (SVC-09)
+
+  Traefik v3 DYNAMIC configuration, served via the file provider and
+  hot-reloaded by Traefik (no restart needed). Carries:
+    * the `dashboard-auth` forward-auth middleware (to ZITADEL once SVC-06 is
+      live; the middleware is referenced by the dashboard router only when the
+      dashboard-auth mock is OFF), and
+    * under the self-signed TLS mock, the default certificate `websecure` serves
+      before any CA exists (stand-in for SVC-08/EJBCA + Let's Encrypt).
+
+  No secret is rendered here. The forward-auth client secret (once SVC-06 is
+  wired) is injected as an environment variable fetched from OpenBao, not here.
+#}
+# MANAGED BY ANSIBLE (traefik_install) — DO NOT EDIT BY HAND.
+# SVC-09 Traefik dynamic configuration. Spec: .kiro/specs/svc-09-reverse-proxy.
+---
+http:
+  middlewares:
+{% if traefik_dashboard_forward_auth_address | default('') | length > 0 %}
+    # ZITADEL forward-auth for the dashboard (SVC-06). Active once SVC-06 is
+    # deployed and the address is set; the dashboard router references this
+    # middleware only when the dashboard-auth mock is OFF.
+    dashboard-auth:
+      forwardAuth:
+        address: "{{ traefik_dashboard_forward_auth_address }}"
+        trustForwardHeader: true
+{% else %}
+    # SVC-06 (ZITADEL) not deployed yet: the forward-auth address is empty, so
+    # the middleware is defined as an inert no-op placeholder. The dashboard-auth
+    # mock (traefik_dashboard_auth_disabled=true) keeps the dashboard on an
+    # internal-only route WITHOUT referencing this middleware; production (mock
+    # off) fails closed at render until a real address is configured. This inert
+    # entry exists only so the file parses while SVC-06 is pending.
+    dashboard-auth-pending:
+      ipAllowList:
+        sourceRange:
+          - "127.0.0.1/32"
+{% endif %}
+
+{% if traefik_tls_self_signed | default(false) | bool %}
+# MOCK TLS (opt-in, default off) — stand-in for SVC-08/EJBCA + Let's Encrypt.
+# The default certificate `websecure` serves before any CA exists. Chains to no
+# known CA, so every TLS client must use validate_certs:false (honest about
+# scope — not a real PKI identity). Dropped automatically once a real resolver
+# issues trusted certs (flag defaults false). See .kiro/steering/mock-stand-ins.md.
+tls:
+  stores:
+    default:
+      defaultCertificate:
+        certFile: "/etc/traefik/tls/{{ traefik_tls_cert_file | basename }}"
+        keyFile: "/etc/traefik/tls/{{ traefik_tls_key_file | basename }}"
+{% endif %}
