@@ -1,0 +1,14 @@
+---
+# meta/main.yml — obs_provision (SVC-17/18 installer — Phase 2)
+galaxy_info:
+  role_name: obs_provision
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-17/18 (Observability: Prometheus + Grafana + Loki) installer Phase 2 —
+    infrastructure provisioning: Terraform backend swap-gate, terraform
+    init/apply, generate_inventory.py + three-guest existence assert, add_host
+    for all three guests, known_hosts refresh for the three VLAN-20 IPs.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

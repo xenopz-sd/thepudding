@@ -1,0 +1,163 @@
+---
+# tasks/scrape_targets.yml — observability_stack (SVC-17/18) — TASK 5.1
+#
+# Generate the Prometheus `file_sd_configs` target files for the V1_Scrape_Set
+# from the Terraform-produced dynamic inventory (FR-8/FR-11/FR-12, design §3.4).
+# One `service-<service>.yaml` file per Built_Service that is actually present
+# in the loaded inventory; a service not present yields NO file (degrade, not
+# fail — "scrape what exists"). The files are GENERATED, never hand-edited; the
+# shipped prometheus.yml.j2 `platform-services` job discovers them via the
+# service-*.yaml glob.
+#
+# Included from tasks/prometheus.yml (the Prometheus guest owns the targets
+# dir). The targets dir itself is ensured by tasks/prometheus.yml before this.
+#
+# INTEGRATION BOUNDARY (integration-boundaries §4): the ONLY source of guest IPs
+# and service_roles here is the Ansible inventory the installer already rendered
+# from each service's `terraform output -json` via generate_inventory.py. This
+# task never reads a .tfstate file and never queries Proxmox — it reads
+# groups[...] / hostvars[...] only.
+#
+# NO secret value is handled here — IPs, ports, paths, and labels are all
+# non-secret scrape config.
+
+# =============================================================================
+# 1. Resolve the inventory index (service_role -> hostname -> {ip, project})
+# -----------------------------------------------------------------------------
+# Built from the live inventory for every service_role named in the built-service
+# table. A host's `project` label is derived from its group membership: the one
+# group it belongs to (other than its own service_role group and the Ansible
+# pseudo-groups `all`/`ungrouped`) is its project_slug group — generate_inventory.py
+# emits a project_slug group carrying the host with empty hostvars. A shared
+# service's host sits in the `shared` group -> project "shared"; a dedicated
+# service's host sits in its own slug group -> that slug.
+#
+# Skipped entirely when observability_inventory_index is already non-empty: an
+# offline render / the task-5.2 test injects a FIXTURE index directly. This keeps
+# the file-mediated inventory the single runtime source (integration-boundaries
+# §4) while leaving the pure "index -> files" transform unit-testable.
+# =============================================================================
+- name: "Observability (targets) | Initialise the inventory-index accumulator"
+  ansible.builtin.set_fact:
+    _obs_index_acc: {}
+  when: (observability_inventory_index | default({}) | length) == 0
+
+# The set of service_role group names that are NOT project groups — used to
+# subtract from a host's group membership so the remaining group is its project.
+- name: "Observability (targets) | Note the known service_role group names"
+  ansible.builtin.set_fact:
+    _obs_service_role_groups: >-
+      {{ observability_builtin_scrape_targets | map(attribute='service_role') | unique | list }}
+  when: (observability_inventory_index | default({}) | length) == 0
+
+# Accumulate one service_role at a time via an included helper (keeps the
+# per-host project derivation readable rather than a brittle one-line Jinja).
+- name: "Observability (targets) | Index each service_role's present guests"
+  ansible.builtin.include_tasks: scrape_targets_index_role.yml
+  loop: "{{ _obs_service_role_groups }}"
+  loop_control:
+    loop_var: _obs_role
+    label: "{{ _obs_role }}"
+  when: (observability_inventory_index | default({}) | length) == 0
+
+- name: "Observability (targets) | Publish the resolved inventory index"
+  ansible.builtin.set_fact:
+    observability_inventory_index: "{{ _obs_index_acc }}"
+  when: (observability_inventory_index | default({}) | length) == 0
+
+# =============================================================================
+# 2. Enrich the built-service table with the discovered hosts (degrade filter)
+# -----------------------------------------------------------------------------
+# For each built-service row, resolve its hosts from the index. The index already
+# carries each host's derived `project`; a row whose `project` is a LITERAL
+# (anything other than the "__from_inventory__" sentinel) overrides every host's
+# project with that literal, while "__from_inventory__" keeps the per-host
+# derived project (SVC-01 is dedicated-per-project). A row whose service_role is
+# absent or empty in the index contributes an EMPTY hosts list and is DROPPED
+# (degrade — no file for an absent service, design §3.4).
+# =============================================================================
+- name: "Observability (targets) | Reset the render accumulator"
+  ansible.builtin.set_fact:
+    observability_render_targets: []
+
+- name: "Observability (targets) | Resolve present built-services (degrade on missing)"
+  ansible.builtin.set_fact:
+    observability_render_targets: >-
+      {{
+        observability_render_targets + [
+          target_item | combine({ 'hosts': _obs_row_hosts })
+        ]
+      }}
+  loop: "{{ observability_builtin_scrape_targets }}"
+  loop_control:
+    loop_var: target_item
+    label: "{{ target_item.service }}"
+  vars:
+    # The index's { hostname -> {ip, project} } map for this row's service_role.
+    _obs_row_index: "{{ observability_inventory_index[target_item.service_role] | default({}) }}"
+    # One {ip, project} entry per present host. For a literal project, override;
+    # for the "__from_inventory__" sentinel, keep the index-derived per-host value.
+    _obs_row_hosts: >-
+      {{
+        _obs_row_index.values() | list
+        | map('combine',
+              {} if (target_item.project == '__from_inventory__')
+              else {'project': target_item.project})
+        | list
+      }}
+  # DEGRADE: only accumulate a row that actually has >= 1 present host; a row for
+  # a not-yet-built service (absent/empty service_role group) is skipped, so no
+  # target file is ever emitted for it (design §3.4 "scrape what exists").
+  when: (_obs_row_index | length) > 0
+
+# =============================================================================
+# 3. Render one target file per present built-service; purge stale files
+# -----------------------------------------------------------------------------
+# Each present row -> {{ observability_scrape_targets_file_prefix }}<service>.yaml
+# in the targets dir, via templates/targets/service-target.yaml.j2. Then remove
+# any service-*.yaml whose service is NOT in the present set, so a service that
+# has since been torn down stops being scraped (degrade both ways, idempotent).
+# =============================================================================
+- name: "Observability (targets) | Render the file_sd target file per present service"
+  ansible.builtin.template:
+    src: targets/service-target.yaml.j2
+    dest: "{{ _obs_targets_dir }}/{{ _obs_file_prefix }}{{ row.service }}.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ observability_render_targets | default([]) }}"
+  loop_control:
+    loop_var: row
+    label: "{{ row.service }}"
+  vars:
+    target_spec: "{{ row }}"
+    _obs_targets_dir: "{{ observability_prometheus_targets_dir }}"
+    _obs_file_prefix: "{{ observability_scrape_targets_file_prefix }}"
+  notify: Restart prometheus
+
+# --- Discover already-rendered service-*.yaml files on the guest -------------
+- name: "Observability (targets) | Find existing generated service target files"
+  ansible.builtin.find:
+    paths: "{{ observability_prometheus_targets_dir }}"
+    patterns: "{{ observability_scrape_targets_file_prefix }}*.yaml"
+    file_type: file
+  register: _obs_existing_target_files
+
+# --- Purge stale target files for services no longer present (degrade) -------
+- name: "Observability (targets) | Remove stale target files for absent services"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _obs_existing_target_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  vars:
+    _obs_present_filenames: >-
+      {{
+        observability_render_targets | default([])
+        | map(attribute='service')
+        | map('regex_replace', '^(.*)$', observability_scrape_targets_file_prefix ~ '\1.yaml')
+        | list
+      }}
+  when: (item.path | basename) not in _obs_present_filenames
+  notify: Restart prometheus

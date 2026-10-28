@@ -1,0 +1,29 @@
+---
+# handlers/main.yml — node_exporter (SVC-17, fleet-wide)
+#
+# Two handlers covering the two deployment modes:
+#   * sidecar   -> reconcile the Compose stack with a forced recreate so the
+#                  container picks up changed collector flags (passed via the
+#                  rendered .env / compose command). node_exporter re-reads
+#                  flags only at start.
+#   * host_unit -> reload systemd + restart the node_exporter.service unit when
+#                  the unit file changes (unprivileged-LXC exception).
+
+- name: Restart node_exporter
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ node_exporter_stack_name }}"
+    project_name: "{{ node_exporter_stack_name }}"
+    state: present
+    recreate: always
+  when: node_exporter_mode == "sidecar"
+
+- name: Reload systemd for node_exporter
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: node_exporter_mode == "host_unit"
+
+- name: Restart node_exporter unit
+  ansible.builtin.systemd:
+    name: node_exporter.service
+    state: restarted
+  when: node_exporter_mode == "host_unit"

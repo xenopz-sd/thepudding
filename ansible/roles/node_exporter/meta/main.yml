@@ -1,0 +1,35 @@
+---
+# meta/main.yml — node_exporter (SVC-17, fleet-wide)
+galaxy_info:
+  role_name: node_exporter
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Deploys Prometheus node_exporter (SVC-17) fleet-wide on every Proxmox
+    VM/LXC so the observability_stack can scrape host metrics on :9100 (FR-2).
+    Default is a Docker Compose sidecar (via docker-compose-app) with the host
+    /,/proc,/sys bind-mounted read-only and --path.rootfs=/host; an opt-in
+    host-level systemd unit (node_exporter_mode: host_unit) covers the
+    unprivileged-LXC exception where the containerised sidecar cannot faithfully
+    read host /proc,/sys. Image pinned; internal only (no Traefik, scraped on
+    VLAN 20, port bound to the guest's own VLAN IP).
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - observability
+    - prometheus
+    - nodeexporter
+    - metrics
+    - svc17
+
+# No cross-role dependencies. The Compose stack (sidecar mode) is templated via
+# the existing docker-compose-app role, invoked by this role via include_role,
+# not as a hard meta dependency here — mirrors promtail_agent / traefik_install.
+dependencies: []

@@ -1,0 +1,14 @@
+---
+# meta/main.yml — obs_handoff (SVC-17/18 installer — Phase 4)
+galaxy_info:
+  role_name: obs_handoff
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-17/18 (observability stack) installer Phase 4 — health sanity &
+    Developer B handoff: invokes the svc-17-18-health.yml child gate across the
+    three guests (Prometheus + Alertmanager, Grafana, Loki), asserts the four
+    built-service scrape targets report up==1, and prints the completion banner.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

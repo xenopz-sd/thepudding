@@ -1,0 +1,115 @@
+---
+# tasks/prometheus.yml — observability_stack (SVC-17/18) — Prometheus guest
+#
+# Deploys the Prometheus + Alertmanager Compose stack on svc17-prometheus-20-01
+# (10.0.20.18) via the generic docker-compose-app role. TASK 4.2 renders the
+# Prometheus-guest config (prometheus.yml using file_sd only, alertmanager.yml
+# routing tree, and the baseline alert rules) onto the guest and bind-mounts it
+# into the stack.
+#
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements FR-1/FR-7/FR-8/FR-12;
+# design §3.2). The Scrape_Target_Files that live under the targets dir are
+# GENERATED from the dynamic inventory in task 5.1 (file_sd, never hand-edited);
+# this task renders the targets DIR + the static/alerting config that reads it.
+#
+# NO secret value is rendered here. The v1 default Alertmanager receiver is a
+# UI-only null receiver, so no receiver credential is needed; if a real receiver
+# is later added, its credential is fetched from OpenBao via the delegated
+# bao-CLI docker-exec pattern (no_log: true), never templated into these files.
+
+# --- 1. Ensure the config / targets / rules / alertmanager dirs on the guest -
+- name: "Observability (prometheus) | Ensure the config directories exist"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ observability_prometheus_config_dir }}"
+    - "{{ observability_prometheus_targets_dir }}"
+    - "{{ observability_prometheus_rules_dir }}"
+    - "{{ observability_alertmanager_config_dir }}"
+
+# --- 2. Render the Prometheus static config (file_sd only, FR-8/FR-12) -------
+- name: "Observability (prometheus) | Render prometheus.yml (file_sd_configs only)"
+  ansible.builtin.template:
+    src: prometheus.yml.j2
+    dest: "{{ observability_prometheus_config_dir }}/prometheus.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart prometheus
+
+# --- 3. Render the baseline alert rules (promtool check rules-clean, FR-7) ---
+# Deferred GPU/cert rules render only behind their flag (dcgm_metrics_deferred /
+# observability_cert_expiry_alert_enabled) so the rendered file stays clean.
+- name: "Observability (prometheus) | Render the baseline alert rules"
+  ansible.builtin.template:
+    src: rules/baseline.rules.yml.j2
+    dest: "{{ observability_prometheus_rules_dir }}/baseline.rules.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart prometheus
+
+# --- 4. Render the Alertmanager config (routing tree, FR-7) ------------------
+- name: "Observability (prometheus) | Render alertmanager.yml (routing tree)"
+  ansible.builtin.template:
+    src: alertmanager.yml.j2
+    dest: "{{ observability_alertmanager_config_dir }}/alertmanager.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart prometheus
+
+# --- 4b. Generate the file_sd scrape-target files (task 5.1, FR-8/FR-11/FR-12) -
+# One service-<service>.yaml per Built_Service present in the generated dynamic
+# inventory (SVC-01/06/07/09); a service not present yields no file (degrade —
+# design §3.4). Generated from the inventory, never hand-edited. Must run before
+# the Compose stack comes up so the targets exist when Prometheus first loads.
+- name: "Observability (prometheus) | Generate the file_sd scrape-target files"
+  ansible.builtin.include_tasks: scrape_targets.yml
+
+# --- 5. Deploy the Compose stack via docker-compose-app ----------------------
+# prom/prometheus + prom/alertmanager (pinned), persistent named volumes for the
+# TSDB + Alertmanager state, the rendered config dirs bind-mounted :ro, internal
+# only (no host port; VLAN-20 reachable on :9090/:9093). Prometheus is pointed
+# at its config + a file_sd-friendly flag set; Alertmanager at its config.
+- name: "Observability (prometheus) | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ observability_prometheus_stack_name }}"
+    dca_services:
+      - name: prometheus
+        image: "{{ observability_prometheus_image }}"
+        restart: "unless-stopped"
+        command:
+          - "--config.file=/etc/prometheus/prometheus.yml"
+          - "--storage.tsdb.path=/prometheus"
+          - "--storage.tsdb.retention.time={{ observability_metrics_retention }}"
+          - "--web.enable-lifecycle"
+        volumes:
+          # Rendered static config + rules + generated targets, read-only.
+          - "{{ observability_prometheus_config_dir }}:/etc/prometheus:ro"
+          # Persistent TSDB (named volume, never tmpfs).
+          - "{{ observability_prometheus_tsdb_volume }}:/prometheus"
+      - name: alertmanager
+        image: "{{ observability_alertmanager_image }}"
+        restart: "unless-stopped"
+        command:
+          - "--config.file=/etc/alertmanager/alertmanager.yml"
+          - "--storage.path=/alertmanager"
+        volumes:
+          - "{{ observability_alertmanager_config_dir }}:/etc/alertmanager:ro"
+          - "{{ observability_alertmanager_state_volume }}:/alertmanager"
+    dca_volumes:
+      - "{{ observability_prometheus_tsdb_volume }}"
+      - "{{ observability_alertmanager_state_volume }}"
+    dca_env:
+      # Non-secret config only (composition-wiring.md). Secrets (e.g. a future
+      # Alertmanager receiver webhook) are fetched from OpenBao at container
+      # start, never templated here.
+      PROMETHEUS_RETENTION: "{{ observability_metrics_retention }}"
+    dca_state: "{{ observability_state }}"

@@ -172,6 +172,33 @@ openbao_traefik_network: "edge"
 # transitional debt to remove.
 openbao_mock_edge_network: false
 
+# --- Cross-guest Traefik route (the real production ingress path, ADR-0018) ---
+# Fed to the traefik_route role's `traefik_route_enabled`: the real cross-guest
+# route is the DEFAULT production posture (mirrors observability_stack's
+# obs_grafana_traefik_route_enabled). When true the OpenBao role delegates the
+# Route_Fragment onto the Traefik_Guest's file-provider dir; the mock-edge path
+# (openbao_mock_edge_network, above) is the default-off dev/offline alternative.
+openbao_traefik_route_enabled: true
+
+# Path ON THE TRAEFIK GUEST where OpenBao's PUBLIC mock cert is delegated (mock
+# path only) so Traefik can VERIFY the backend https hop against it. A sibling
+# dir under the file-provider dir Traefik reads. Public cert, non-secret.
+openbao_mock_ca_delegate_dest: "/etc/traefik/dynamic/ca/openbao-mock-ca.crt"
+
+# Fed to the traefik_route call's `route_backend_root_cas`. Non-empty (the
+# delegated mock CA path) ONLY when OpenBao uses the self-signed mock cert
+# (openbao_tls_self_signed true); EMPTY in production so the route emits no
+# serversTransport and Traefik verifies the real CA-issued cert against its
+# SYSTEM TRUST STORE. This is the swap-gate: dev trusts the mock CA, prod uses
+# the system store — verification is real in BOTH postures, nothing skipped.
+openbao_route_backend_root_cas: "{{ openbao_mock_ca_delegate_dest if (openbao_tls_self_signed | bool) else '' }}"
+
+# Delegate target for both the Route_Fragment and the mock-CA cert copy — the
+# Traefik_Guest (SVC-09). Per ADR-0015 Traefik moved to host_index 2 ->
+# 10.0.20.12. Local openbao_-named var so the call site never hand-picks the IP;
+# fed to traefik_route's `traefik_guest_host` and the Component 3b delegate.
+openbao_traefik_guest_host: "10.0.20.12"
+
 # --- Compose stack names / directories (one per LXC role) ---
 openbao_stack_name: "openbao"
 openbao_unsealer_stack_name: "openbao-unsealer"

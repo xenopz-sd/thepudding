@@ -1,0 +1,474 @@
+---
+# tasks/main.yml — obs_preflight (SVC-17/18 installer — Phase 1: Preflight)
+#
+# Phase-1 "Preflight & environment validation". A failure here leaves ZERO
+# Proxmox resources and unmodified TF state. Clone of svc09_preflight adapted for
+# the three-guest observability root (Prometheus/Grafana/Loki) — three template/
+# datastore/vmid facts instead of one, plus a promtool availability check.
+#
+# Owns: cluster_env.py resolve + validate (no_log), TF_VAR_* binding, endpoint
+# canonical-base normalization, agent-live throwaway-guard consult (gated),
+# operator SSH-public-key injection + INFO decision log, Proxmox /version
+# reachability + auth, VLAN-20 `p20` SDN VNet check, datastore autodetect,
+# local prereq/version checks (incl. promtool). Publishes the facts consumed by
+# obs_provision.
+
+# --- Env-file load + validation (delegates to cluster_env.py) ---------------
+- name: "Preflight | Resolve + validate the cluster env file ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ obs_venv_python }}"
+      - "{{ obs_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ obs_repo_root }}"
+  register: obs_env_resolve
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | Capture the resolved TF_VAR_* mapping for Phase 2"
+  ansible.builtin.set_fact:
+    obs_tfvars: "{{ obs_env_resolve.stdout | from_json }}"
+  no_log: true
+
+# The LXC template + datastore are CLUSTER-WIDE facts (every service boots the
+# same stock Debian template on the same datastore), so cluster_env.py resolves
+# them under the shared canonical keys TF_VAR_openbao_template_file_id /
+# TF_VAR_openbao_datastore_id (the schema's generic "LXC template" / "Datastore"
+# rows — not OpenBao-specific despite the historical key name). SVC-17/18 places
+# THREE guests but the shared cluster_env.py contract exposes ONE template +
+# ONE datastore for the whole cluster, so the single shared value is bound to
+# ALL THREE guest facts here (prometheus/grafana/loki) and remapped onto the
+# observability root's per-guest var names in obs_tf_env (Phase 2). This keeps
+# the shared cluster_env.py contract UNCHANGED (no per-service/per-guest key
+# added) — the SVC-01/06/07/09 precedent, extended to three guests.
+- name: "Preflight | Bind resolved cluster parameters to named facts"
+  ansible.builtin.set_fact:
+    obs_proxmox_endpoint: "{{ obs_tfvars['TF_VAR_proxmox_endpoint'] }}"
+    obs_proxmox_api_token: "{{ obs_tfvars['TF_VAR_proxmox_api_token'] }}"
+    obs_proxmox_node_name: "{{ obs_tfvars['TF_VAR_proxmox_node_name'] }}"
+    obs_prometheus_template_file_id: "{{ obs_tfvars['TF_VAR_openbao_template_file_id'] }}"
+    obs_grafana_template_file_id: "{{ obs_tfvars['TF_VAR_openbao_template_file_id'] }}"
+    obs_loki_template_file_id: "{{ obs_tfvars['TF_VAR_openbao_template_file_id'] }}"
+    obs_prometheus_datastore_id: "{{ obs_tfvars['TF_VAR_openbao_datastore_id'] }}"
+    obs_grafana_datastore_id: "{{ obs_tfvars['TF_VAR_openbao_datastore_id'] }}"
+    obs_loki_datastore_id: "{{ obs_tfvars['TF_VAR_openbao_datastore_id'] }}"
+  no_log: true
+
+# Normalize the resolved endpoint to a canonical base URL ONCE, before the
+# preflight uri tasks append /api2/json and before Phase 2 hands it to the
+# bpg/proxmox provider. Mirrors scripts/installer/endpoint.py::canonical_base
+# (pinned by tests/installer/test_endpoint.py) — keep the chain in sync.
+- name: "Preflight | Normalize Proxmox endpoint to a canonical base"
+  ansible.builtin.set_fact:
+    obs_proxmox_endpoint_base: >-
+      {{ obs_proxmox_endpoint | trim
+         | regex_replace('/+$', '')
+         | regex_replace('/api2/json$', '')
+         | regex_replace('/+$', '') }}
+
+# =========================================================== #
+# OpenBao admin-token resolution (FR-15 secret bridging).      #
+# ----------------------------------------------------------- #
+# The Grafana Break_Glass_Admin seed/read in the Phase-3        #
+# observability.yml child run authenticate to OpenBao with      #
+# OPENBAO_ADMIN_TOKEN (observability_bao_token looks it up from #
+# the child ENV). Historically the orchestrator bridged it ONLY #
+# from the process environment (lookup('env', ...)), so the     #
+# documented ONE-COMMAND bring-up — whose token lives in the    #
+# cluster env file, loaded into a FACT by cluster_env.py (which #
+# does NOT pass the token through) — sent an EMPTY token to the  #
+# child, and the delegated `bao kv put` failed 403 permission    #
+# denied (masked by no_log). See                                #
+# .kiro/specs/fix-obs-bootstrap-first-run-transient/.            #
+#                                                               #
+# Resolve the token ONCE here, with precedence process-env ->    #
+# cluster env file (the single source of truth,                 #
+# service-installer.md I1), into a no_log fact consumed by       #
+# obs_bootstrap's child-run ENV and the fail-closed gate below.  #
+# The file read tolerates optional surrounding quotes + trailing #
+# whitespace (present-after-trim, mirroring cluster_env.py). The #
+# VALUE is never echoed — only the resolution SOURCE is logged.  #
+# =========================================================== #
+# Slurp + extract the VALUE (no_log). The raw env-file content and the resolved
+# token value are both secret-bearing, so both tasks are no_log — matching the
+# obs_env_slurp / obs_env_pairs secret-register convention.
+- name: "Preflight | Slurp the cluster env file for the OpenBao admin token (no_log)"
+  ansible.builtin.slurp:
+    src: "{{ (obs_repo_root ~ '/' ~ cluster_env_file) if (cluster_env_file is not match('^/')) else cluster_env_file }}"
+  register: obs_cluster_env_slurp
+  no_log: true
+
+- name: "Preflight | Resolve the OpenBao admin token (process-env first, else the cluster env file) (no_log)"
+  ansible.builtin.set_fact:
+    # Secret VALUE fact (no_log). Also captures, in the SAME no_log task, the
+    # non-secret booleans the diagnostics below consume, so those diagnostics
+    # never need to name the token env var themselves (they reference only these
+    # derived facts — the grafana.yml non-secret-projection convention).
+    obs_openbao_admin_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         if ((lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim) | length > 0)
+         else ((obs_cluster_env_slurp.content | b64decode
+                 | regex_findall('(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*[\"\']?([^\"\'\r\n]*?)[\"\']?[ \t]*$')
+                 | first | default('') | trim)) }}
+    obs_openbao_token_from_env: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim | length) > 0 }}
+  no_log: true
+
+# NON-SECRET projections (only a boolean "present?" and a source LABEL, derived
+# from the no_log facts above — no value, no token env-var name referenced here),
+# so the diagnostic INFO + the fail-closed gate below carry no no_log yet never
+# touch the token value. Mirrors grafana.yml's observability_grafana_admin_needs_seed.
+- name: "Preflight | Project the admin-token presence + source (non-secret, no value)"
+  ansible.builtin.set_fact:
+    obs_openbao_token_present: "{{ (obs_openbao_admin_token | default('') | trim | length) > 0 }}"
+    obs_openbao_token_source: >-
+      {{ 'none'
+         if ((obs_openbao_admin_token | default('') | trim | length) == 0)
+         else ('process-env' if (obs_openbao_token_from_env | bool) else 'cluster-env-file') }}
+  no_log: true
+  changed_when: false
+
+- name: "Preflight | INFO — OpenBao admin-token resolution source (never the value)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: OpenBao admin-token resolution source = {{ obs_openbao_token_source }}
+      {{ '(' ~ cluster_env_file ~ ')' if obs_openbao_token_source == 'cluster-env-file' else '' }}
+      — the token value is never echoed.
+
+- name: "Preflight | Fail closed if OpenBao is wired but no admin token is resolvable"
+  ansible.builtin.assert:
+    that:
+      - obs_openbao_token_present | bool
+    fail_msg: >-
+      OpenBao is wired for the SVC-17/18 bring-up (obs_openbao_addr=
+      '{{ obs_openbao_addr }}') but no admin token could be resolved. The Grafana
+      Break_Glass_Admin secret seed/read authenticate to OpenBao with this token;
+      without it the delegated bao-CLI kv put/get fail with HTTP 403. Remedy: set
+      the token in your cluster env file ({{ cluster_env_file }}) — the single
+      source of truth — or export it into the environment before launching the
+      installer. (Run dev/offline with obs_openbao_addr empty to skip the OpenBao
+      secret reads entirely.) The token value is never echoed.
+    success_msg: "OpenBao admin token resolved for the Grafana secret seed/read."
+    quiet: true
+  when: (obs_openbao_addr | default('') | trim) | length > 0
+
+# =========================================================== #
+# Agent Live-Test Authorization guard consult (gated).         #
+# ----------------------------------------------------------- #
+# All three tasks are `when: agent_live_run` — an ordinary      #
+# operator run (AGENT_LIVE_AUTHORIZED unset) skips them and is  #
+# byte-for-byte unchanged. FAIL-CLOSED, BEFORE ANY PROXMOX CALL:#
+# positioned after the cluster-env resolve but before the first #
+# /version call, so an armed from-scratch run against a NON-    #
+# allowlisted identity is REFUSED before any Proxmox resource   #
+# is touched or queried. Same three-task consult pattern as     #
+# svc07/svc09_preflight (the reference wiring the agent-live    #
+# meta-drift-guard enforces for every service).                #
+# --service obs: the throwaway_guard --service arg is           #
+# service-agnostic (the allowlist is cluster-IDENTITY-only,     #
+# endpoint+node — it carries NO per-service rows), so `obs`     #
+# requires no throwaway-clusters.yml entry; listing a cluster   #
+# authorizes every service against it when the interlock arms.  #
+# =========================================================== #
+- name: "Preflight | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ obs_venv_python }}"
+      - "{{ obs_throwaway_guard }}"
+      - --service
+      - obs
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ obs_throwaway_allowlist }}"
+  args:
+    chdir: "{{ obs_repo_root }}"
+  register: obs_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+
+- name: "Preflight | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (obs_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Preflight | Refuse the from-scratch run unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "obs_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live from-scratch run REFUSED by the throwaway-cluster guard:
+      {{ (obs_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      Nothing was provisioned and no Proxmox resource was touched or queried.
+      Arm the run only against a throwaway cluster listed in
+      throwaway-clusters.yml with AGENT_LIVE_AUTHORIZED set.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live from-scratch run."
+  when: agent_live_run | default(false) | bool
+
+# --- Operator SSH public-key injection (feed TF_VAR_operator_ssh_public_keys) -
+- name: "Preflight | Bind + expanduser the operator SSH public-key file path (may be absent)"
+  ansible.builtin.set_fact:
+    obs_ssh_public_key_file: >-
+      {{ (obs_tfvars['TF_VAR_operator_ssh_public_key_file'] | default('') | trim) | expanduser }}
+
+- name: "Preflight | Stat the operator SSH public-key file (only when a path is set)"
+  ansible.builtin.stat:
+    path: "{{ obs_ssh_public_key_file }}"
+  register: obs_ssh_public_key_stat
+  when: (obs_ssh_public_key_file | length) > 0
+
+- name: "Preflight | Assert the operator SSH public-key file exists + is readable (fail-fast)"
+  ansible.builtin.assert:
+    that:
+      - "obs_ssh_public_key_stat.stat.exists | default(false)"
+      - "obs_ssh_public_key_stat.stat.readable | default(false)"
+    fail_msg: >-
+      The operator SSH public-key file '{{ obs_ssh_public_key_file }}'
+      (PROXMOX_SSH_PUBLIC_KEY_FILE / TF_VAR_operator_ssh_public_key_file in
+      {{ cluster_env_file }}) does not exist or is not readable. Supply a path to
+      your PUBLIC key file (e.g. ~/.ssh/id_ed25519.pub) — PUBLIC key only, never a
+      private key — or leave it unset to provision the three observability LXCs
+      without an authorized key (they will be SSH-unreachable).
+    success_msg: "Operator SSH public-key file present + readable: {{ obs_ssh_public_key_file }}"
+  when: (obs_ssh_public_key_file | length) > 0
+
+- name: "Preflight | Read + JSON-encode the operator SSH public key into a 1-element list"
+  ansible.builtin.set_fact:
+    obs_operator_ssh_public_keys_json: >-
+      {{ [lookup('ansible.builtin.file', obs_ssh_public_key_file) | trim] | to_json }}
+  when: (obs_ssh_public_key_file | length) > 0
+
+- name: "Preflight | Default the operator SSH public-key list to empty when no path is set"
+  ansible.builtin.set_fact:
+    obs_operator_ssh_public_keys_json: "[]"
+  when: (obs_ssh_public_key_file | length) == 0
+
+- name: "Preflight | Log the SSH public-key injection decision (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: operator SSH public-key injection:
+      {{ 'WIRED from ' ~ obs_ssh_public_key_file
+         ~ ' -> TF_VAR_operator_ssh_public_keys (1 key; applied to all three guests at CREATION only)'
+         if (obs_ssh_public_key_file | length) > 0
+         else 'NONE (PROXMOX_SSH_PUBLIC_KEY_FILE unset -> empty [] list -> the three observability LXCs '
+              ~ 'will be SSH-unreachable; supply a .pub path to enable Ansible reachability)' }}
+
+# --- Proxmox reachability, auth, p20 bridge, datastore autodetect ------------
+- name: "Preflight | Verify Proxmox API reachability + authentication (/version)"
+  ansible.builtin.uri:
+    url: "{{ obs_proxmox_endpoint_base }}/api2/json/version"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ obs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ obs_proxmox_validate_certs }}"
+    status_code: [200]
+  register: obs_proxmox_version
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | List Proxmox SDN VNets (verify VLAN-20 fabric)"
+  ansible.builtin.uri:
+    url: "{{ obs_proxmox_endpoint_base }}/api2/json/cluster/sdn/vnets"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ obs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ obs_proxmox_validate_certs }}"
+    status_code: [200]
+  register: obs_sdn_vnets
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | Extract the set of SDN VNet ids (non-secret)"
+  ansible.builtin.set_fact:
+    obs_vnet_ids: >-
+      {{ obs_sdn_vnets.json.data | map(attribute='vnet') | list }}
+
+- name: "Preflight | Assert the p20 VLAN-20 bridge exists"
+  ansible.builtin.assert:
+    that:
+      - "'p20' in obs_vnet_ids"
+    fail_msg: >-
+      The VLAN-20 bridge 'p20' is absent from the Proxmox SDN VNets
+      ({{ obs_vnet_ids }}). Apply the platform-foundation root first to create
+      the VLAN-20 fabric, then re-run this installer.
+    success_msg: "VLAN-20 bridge 'p20' is present."
+
+# Datastore autodetect. The three guests share one cluster-wide datastore value
+# (bound above from the single shared cluster key), so the node-storage query +
+# auto-select runs ONCE and the resolved id is applied to all three guest facts.
+# (Guarded on the prometheus fact as the representative; all three carry the
+# same value.)
+- name: "Preflight | Query target-node storage (only when datastore unset)"
+  ansible.builtin.uri:
+    url: >-
+      {{ obs_proxmox_endpoint_base }}/api2/json/nodes/{{ obs_proxmox_node_name }}/storage
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ obs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ obs_proxmox_validate_certs }}"
+    status_code: [200]
+  register: obs_node_storage
+  changed_when: false
+  no_log: true
+  when: obs_prometheus_datastore_id == obs_autodetect_sentinel
+
+- name: "Preflight | Extract available storage ids on the target node (non-secret)"
+  ansible.builtin.set_fact:
+    obs_node_storage_ids: >-
+      {{ obs_node_storage.json.data | map(attribute='storage') | list }}
+  when: obs_prometheus_datastore_id == obs_autodetect_sentinel
+
+- name: "Preflight | Auto-select datastore (local-zfs preferred, else local-lvm) for all three guests"
+  ansible.builtin.set_fact:
+    obs_prometheus_datastore_id: >-
+      {{ 'local-zfs' if 'local-zfs' in obs_node_storage_ids
+         else ('local-lvm' if 'local-lvm' in obs_node_storage_ids
+         else obs_autodetect_sentinel) }}
+    obs_grafana_datastore_id: >-
+      {{ 'local-zfs' if 'local-zfs' in obs_node_storage_ids
+         else ('local-lvm' if 'local-lvm' in obs_node_storage_ids
+         else obs_autodetect_sentinel) }}
+    obs_loki_datastore_id: >-
+      {{ 'local-zfs' if 'local-zfs' in obs_node_storage_ids
+         else ('local-lvm' if 'local-lvm' in obs_node_storage_ids
+         else obs_autodetect_sentinel) }}
+  when: obs_prometheus_datastore_id == obs_autodetect_sentinel
+
+- name: "Preflight | Assert a datastore was resolved or auto-detected"
+  ansible.builtin.assert:
+    that:
+      - "obs_prometheus_datastore_id != obs_autodetect_sentinel"
+      - "obs_grafana_datastore_id != obs_autodetect_sentinel"
+      - "obs_loki_datastore_id != obs_autodetect_sentinel"
+    fail_msg: >-
+      No datastore was configured and neither 'local-zfs' nor 'local-lvm' is
+      available on node '{{ obs_proxmox_node_name }}' (found:
+      {{ obs_node_storage_ids | default([]) }}). Set the datastore variable
+      explicitly (PROXMOX_DATASTORE_ID or TF_VAR_openbao_datastore_id) in
+      {{ cluster_env_file }} and re-run this installer.
+    success_msg: >-
+      Datastore resolved to '{{ obs_prometheus_datastore_id }}' for all three guests.
+
+# --- Local control-node prerequisite + version checks ------------------------
+- name: "Preflight | Locate the terraform binary on PATH"
+  ansible.builtin.command:
+    cmd: terraform version
+  register: obs_terraform_version
+  changed_when: false
+  failed_when: obs_terraform_version.rc != 0
+
+- name: "Preflight | List installed Ansible collections"
+  ansible.builtin.command:
+    cmd: ansible-galaxy collection list --format json
+  register: obs_galaxy_list
+  changed_when: false
+  failed_when: obs_galaxy_list.rc != 0
+
+- name: "Preflight | Compute the set of installed collection names"
+  ansible.builtin.set_fact:
+    obs_installed_collections: >-
+      {{ (obs_galaxy_list.stdout | from_json).values()
+         | map('list') | flatten | unique | list }}
+
+- name: "Preflight | Assert the required Ansible collections are installed"
+  ansible.builtin.assert:
+    that:
+      - "item in obs_installed_collections"
+    fail_msg: >-
+      Required Ansible collection '{{ item }}' is not installed. Install the
+      platform collections with:
+      ansible-galaxy collection install -r ansible/requirements.yml
+    success_msg: "Ansible collection '{{ item }}' is installed."
+  loop: "{{ obs_required_collections }}"
+
+- name: "Preflight | Assert the project venv binaries are present"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: obs_venv_bin_stat
+  loop: "{{ obs_required_venv_binaries }}"
+
+- name: "Preflight | Fail naming any missing venv binary"
+  ansible.builtin.assert:
+    that:
+      - "item.stat.exists"
+      - "item.stat.executable | default(false)"
+    fail_msg: >-
+      Required project venv binary is missing or not executable: {{ item.item }}.
+      Create/repair the devinfra virtualenv (~/venv/devinfra/) before running
+      this installer.
+    success_msg: "venv binary present: {{ item.item }}"
+  loop: "{{ obs_venv_bin_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# --- promtool availability (SVC-17/18-specific prerequisite) -----------------
+# SVC-17/18 needs promtool to validate the generated prometheus.yml + alert
+# rules (`promtool check config` / `check rules`, requirements §10 lint stage).
+# promtool is NOT a venv binary; it ships inside the pinned prom/prometheus
+# Docker image. Accept EITHER a host-level promtool on PATH OR the pinned image
+# available via docker — fail fast with a remedy if neither is reachable.
+- name: "Preflight | Probe for a host-level promtool on PATH"
+  ansible.builtin.command:
+    cmd: promtool --version
+  register: obs_promtool_host
+  changed_when: false
+  failed_when: false
+
+- name: "Preflight | Probe the pinned prom/prometheus image for promtool (docker fallback)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - run
+      - --rm
+      - --entrypoint
+      - promtool
+      - "{{ obs_prometheus_image }}"
+      - --version
+  register: obs_promtool_docker
+  changed_when: false
+  failed_when: false
+  when: obs_promtool_host.rc != 0
+
+- name: "Preflight | Assert promtool is reachable (host PATH or pinned docker image)"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (obs_promtool_host.rc == 0)
+        or ((obs_promtool_docker.rc | default(1)) == 0)
+    fail_msg: >-
+      promtool is not available. SVC-17/18 validates the generated prometheus.yml
+      and alert rules with `promtool check`. Install promtool on PATH (from the
+      Prometheus release tarball), OR ensure the pinned image
+      '{{ obs_prometheus_image }}' is pullable so `docker run --entrypoint
+      promtool {{ obs_prometheus_image }}` works, then re-run this installer.
+    success_msg: >-
+      promtool is reachable
+      ({{ 'host PATH' if obs_promtool_host.rc == 0 else 'pinned prom/prometheus docker image' }}).
+
+- name: "Preflight | Assert Python >= 3.10 on the control node"
+  ansible.builtin.assert:
+    that:
+      - "ansible_python_version is version('3.10', '>=')"
+    fail_msg: >-
+      Detected Python {{ ansible_python_version }}, but this installer requires
+      Python 3.10 or later.
+    success_msg: "Python {{ ansible_python_version }} satisfies >= 3.10."
+
+- name: "Preflight | Assert Ansible >= 2.15 on the control node"
+  ansible.builtin.assert:
+    that:
+      - "ansible_version.full is version('2.15', '>=')"
+    fail_msg: >-
+      Detected Ansible {{ ansible_version.full }}, but this installer requires
+      Ansible 2.15 or later.
+    success_msg: "Ansible {{ ansible_version.full }} satisfies >= 2.15."

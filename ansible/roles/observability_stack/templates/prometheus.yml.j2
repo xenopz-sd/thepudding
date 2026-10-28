@@ -1,0 +1,113 @@
+{#
+  templates/prometheus.yml.j2 — observability_stack (SVC-17) — Prometheus STATIC
+  configuration for the Prometheus + Alertmanager guest (svc17-prometheus-20-01,
+  10.0.20.18). Rendered onto the guest at
+  {{ observability_prometheus_config_dir }}/prometheus.yml and bind-mounted :ro
+  into the prom/prometheus container. Prometheus hot-reloads on SIGHUP / restart.
+
+  Spec: .kiro/specs/svc-17-18-observability/ (requirements FR-1, FR-8, FR-12;
+  design §3.2, §3.4). Task 4.2.
+
+  HARD RULE (FR-8): scrape targets are discovered ONLY via `file_sd_configs`
+  pointing at {{ observability_prometheus_targets_dir }}/*.yaml — there are NO
+  inline static target lists for the monitored services. The target files
+  themselves are GENERATED from the dynamic inventory (task 5.1), never
+  hand-edited. The single exception is Prometheus's OWN :9090 self-scrape, which
+  is legitimately a localhost static target (FR-12 self-monitoring, and it cannot
+  discover itself from a file it has not loaded yet). Grafana / Loki /
+  Alertmanager self-scrape via file_sd like every other target.
+
+  No secret value is rendered here — scrape endpoints, labels, intervals, and the
+  Alertmanager address are all non-secret config. Any scrape bearer token lives
+  in a never-committed credentials_file referenced BY PATH inside a generated
+  target file, never inlined here.
+#}
+# MANAGED BY ANSIBLE (observability_stack / task 4.2) — DO NOT EDIT BY HAND.
+# SVC-17 Prometheus static config. Spec: .kiro/specs/svc-17-18-observability.
+# Targets are discovered via file_sd_configs only (FR-8); self-scrape of :9090
+# is the sole inline static target (FR-12).
+---
+global:
+  # FR-1: default 15 s scrape cadence; low-churn exporters use their own longer
+  # interval set in the generated target file / per-job override below.
+  scrape_interval: "{{ observability_prometheus_global_scrape_interval }}"
+  scrape_timeout: "{{ observability_prometheus_global_scrape_timeout }}"
+  evaluation_interval: "{{ observability_prometheus_evaluation_interval }}"
+  external_labels:
+    platform: "devinfra"
+    vlan: "20"
+
+# FR-7: alert rules are loaded from the rules drop-in directory; the baseline
+# rules (baseline.rules.yml) plus any per-service rule fragments contributed by
+# other services (e.g. SVC-07's prometheus-openbao-alerts) land here.
+rule_files:
+  - "{{ observability_prometheus_rules_dir }}/*.yml"
+
+# Alerting -> the co-located Alertmanager on this same guest (:9093). Internal,
+# VLAN-20 only; no auth on the loopback-to-sidecar hop.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - "{{ observability_alertmanager_scrape_host }}:{{ observability_alertmanager_port }}"
+
+scrape_configs:
+  # --- Prometheus self-scrape (FR-12) — the ONLY inline static target --------
+  # Prometheus scrapes its own :9090/metrics via localhost; it cannot discover
+  # itself from a file_sd file it has not yet loaded, so a localhost static here
+  # is both correct and the single sanctioned inline exception to FR-8.
+  - job_name: "prometheus"
+    scrape_interval: "{{ observability_prometheus_self_scrape_interval }}"
+    static_configs:
+      - targets:
+          - "localhost:{{ observability_prometheus_port }}"
+        labels:
+          project: "shared"
+          service: "prometheus"
+
+  # --- Everything else via file_sd_configs (FR-8) ----------------------------
+  # One job per logical target class; each reads the generated target files in
+  # the targets dir. A target file that does not exist yet simply yields no
+  # targets for that job (degrade, not fail — design §3.4). The V1_Scrape_Set
+  # (SVC-01/06/07/09) and the stack self-targets (grafana/loki/alertmanager) are
+  # all emitted as generated files by task 5.1; nothing is hard-coded here.
+  - job_name: "observability-stack"
+    # Stack self-monitoring (FR-12): grafana/loki/alertmanager targets.
+    file_sd_configs:
+      - files:
+          - "{{ observability_prometheus_targets_dir }}/stack-*.yaml"
+        refresh_interval: "{{ observability_prometheus_file_sd_refresh_interval }}"
+
+  - job_name: "platform-services"
+    # The V1_Scrape_Set + any future service target files (FR-8, FR-11). Each
+    # generated file carries its own project/service labels; a per-target
+    # scrape_interval may be set in the file for low-churn exporters (FR-1 30 s).
+    # Prometheus applies this `tls_config` ONLY to `https` targets, so it affects
+    # just the one HTTPS target in the V1_Scrape_Set (SVC-07 OpenBao,
+    # __scheme__: https at /v1/sys/metrics) — postgres/traefik/zitadel are plain
+    # HTTP and are completely untouched. insecure_skip_verify is the homelab
+    # mock-cert posture (no platform CA until SVC-08/EJBCA); without it the
+    # OpenBao scrape fails with `x509: certificate signed by unknown authority`.
+    # Production tightening: flip the role default
+    # observability_platform_services_tls_skip_verify to false AND add a real CA
+    # bundle (ca_file: <path>) here — mirroring the platform mock-cert philosophy.
+    tls_config:
+      insecure_skip_verify: {{ observability_platform_services_tls_skip_verify | bool | lower }}
+    file_sd_configs:
+      - files:
+          - "{{ observability_prometheus_targets_dir }}/service-*.yaml"
+        refresh_interval: "{{ observability_prometheus_file_sd_refresh_interval }}"
+
+  - job_name: "node"
+    # Fleet node_exporter targets (FR-2), generated per host.
+    file_sd_configs:
+      - files:
+          - "{{ observability_prometheus_targets_dir }}/node-*.yaml"
+        refresh_interval: "{{ observability_prometheus_file_sd_refresh_interval }}"
+
+  - job_name: "cadvisor"
+    # Fleet cAdvisor targets (FR-3), generated per Docker host.
+    file_sd_configs:
+      - files:
+          - "{{ observability_prometheus_targets_dir }}/cadvisor-*.yaml"
+        refresh_interval: "{{ observability_prometheus_file_sd_refresh_interval }}"

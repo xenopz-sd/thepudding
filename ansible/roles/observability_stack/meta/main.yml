@@ -1,0 +1,36 @@
+---
+# meta/main.yml — observability_stack (SVC-17/18)
+galaxy_info:
+  role_name: observability_stack
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Configures the three-guest SVC-17/18 observability stack (Prometheus +
+    Alertmanager, Grafana, Loki) on VLAN 20, each deployed as a Docker Compose
+    stack via the generic docker-compose-app role. tasks/main.yml dispatches
+    per guest by the service_role from the generated inventory
+    (prometheus / grafana / loki). Config rendering (prometheus.yml /
+    alertmanager.yml / Grafana provisioning / loki-config.yaml) is implemented in
+    tasks 4.2/4.3/4.4; this role currently carries the skeleton + per-guest
+    dispatch + the three default-off mock flags.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - observability
+    - prometheus
+    - grafana
+    - loki
+    - svc17
+    - svc18
+
+# No cross-role dependencies. Each Compose stack is templated via the existing
+# docker-compose-app role, invoked by this role via include_role (not a hard
+# meta dependency here) — mirrors traefik_install / openbao_install.
+dependencies: []

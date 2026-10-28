@@ -223,10 +223,114 @@
   no_log: true
   notify: Restart zitadel
 
-# --- 6. Deploy the Compose stack via docker-compose-app ---------------------
-# ZITADEL is HTTP-exposed via Traefik labels ONLY — NO published host port
-# (integration-boundaries §1). The masterkey + DB password come from the 0600
-# secret env layered via extra_env_files; the non-secret .env carries config.
+# ============================================================================
+# 6. CROSS-GUEST INGRESS PATH SELECTION (task 1.2) — real route vs dev/offline
+#    mock-edge. Traefik (SVC-09, 10.0.20.12) runs on a SEPARATE guest from
+#    ZITADEL (10.0.20.15); a host-local `edge` network can never bridge two
+#    guests and Traefik never reads another guest's Docker labels, so the REAL
+#    cross-guest path (default, R3.1) is: publish the VLAN20_Port + delegate a
+#    Traefik file-provider Route_Fragment onto the Traefik_Guest. The mock-edge
+#    path (default-off, permanent per mock-stand-ins.md, R3.2) keeps the old
+#    local-`edge` + Docker-label discovery for a co-located dev box only.
+#    ZITADEL serves cleartext h2c (ZITADEL_TLS_ENABLED=false), so the backend
+#    hop has NO TLS and NO backend cert — the Route_Mechanism's optional
+#    serversTransport vars are left EMPTY (the Grafana shape + `h2c` scheme), so
+#    there is NO serversTransport block and NO mock-CA delegate (simpler than
+#    SVC-07). The two paths are MUTUALLY EXCLUSIVE.
+# ============================================================================
+
+# --- 6a. INFO swap-gate decision (R3.3) -------------------------------------
+# composition-wiring.md §"Swap-Gate Pattern" step 4 / mock-stand-ins.md: emit an
+# INFO line stating WHICH ingress path was selected and WHY, so the real-route
+# vs mock-edge choice is visible in the play output. (The traefik_route role
+# emits its own INFO too; this one names the ZITADEL-side VLAN20_Port + h2c
+# backend decision.) Mirrors grafana.yml 6a / openbao (a).
+- name: "ZITADEL | Cross-guest ingress swap-gate decision (INFO, R3.3)"
+  ansible.builtin.debug:
+    msg: >-
+      ZITADEL cross-guest ingress (swap-gate):
+      zitadel_mock_edge_network={{ zitadel_mock_edge_network }}
+      -> {{
+        ('MOCK_EDGE (dev/offline, co-located Traefik ONLY — permanent default-off '
+          ~ 'placeholder per mock-stand-ins.md): attach the ZITADEL stack to the local '
+          ~ '`' ~ zitadel_traefik_network ~ '` network + emit Traefik discovery labels; '
+          ~ 'NO VLAN20_Port, NO file-provider route. NEVER use on a host where SVC-09 '
+          ~ 'owns the real `edge` (ADR-0013).')
+        if (zitadel_mock_edge_network | bool)
+        else ('REAL cross-guest file-provider route (default production posture, R3.1): '
+          ~ 'publish the VLAN20_Port ' ~ zitadel_bind_ip ~ ':' ~ (zitadel_http_port | string)
+          ~ ' (bound to ZITADEL''s own VLAN-20 IP, never 0.0.0.0/LAN — R2.1/R2.2) and '
+          ~ 'delegate a Traefik Route_Fragment onto the Traefik_Guest, backend '
+          ~ 'h2c://' ~ zitadel_bind_ip ~ ':' ~ (zitadel_http_port | string)
+          ~ ' (cleartext h2c hop — ZITADEL_TLS_ENABLED=false — so NO backend cert, '
+          ~ 'NO serversTransport, NO CA delegate); NO cross-guest `edge` network, '
+          ~ 'NO Docker labels (Traefik on another guest cannot read them).')
+      }}
+  changed_when: false
+
+# --- 6b. Compose the ZITADEL Traefik ingress labels (MOCK-EDGE PATH ONLY) ----
+# Only meaningful when Traefik's Docker provider is on the SAME daemon (the
+# co-located dev box). On the real cross-guest path these labels are inert
+# (Traefik is on another guest) and are NOT attached. These are the six
+# existing traefik.* labels (incl. the h2c backend-scheme label) moved into a
+# set_fact so they are path-selectable. Mirrors grafana.yml 6b / openbao (b).
+- name: "ZITADEL | Compose the ZITADEL Traefik ingress labels (mock-edge path only)"
+  ansible.builtin.set_fact:
+    zitadel_traefik_labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network={{ zitadel_traefik_network }}"
+      - "traefik.http.routers.{{ zitadel_traefik_router }}.rule=Host(`{{ zitadel_external_domain }}`)"
+      - "traefik.http.routers.{{ zitadel_traefik_router }}.entrypoints=websecure"
+      - "traefik.http.routers.{{ zitadel_traefik_router }}.tls=true"
+      - "traefik.http.services.{{ zitadel_traefik_router }}.loadbalancer.server.port={{ zitadel_http_port }}"
+      # ZITADEL serves plaintext h2c; tell the Docker provider the backend is h2c.
+      - "traefik.http.services.{{ zitadel_traefik_router }}.loadbalancer.server.scheme=h2c"
+  changed_when: false
+  when: zitadel_mock_edge_network | bool
+
+# --- 6c. Render + delegate the ZITADEL Route_Fragment (REAL PATH) -----------
+# Consume the reusable (already h2c-ready) traefik_route role to drop
+# zitadel-route.yml onto the Traefik_Guest's watched file-provider dir.
+# route_tls=true + the fragment's `tls: {}` (default store) means the
+# LAN->Traefik hop TERMINATES AT TRAEFIK via SVC-09's file-provider default
+# cert; the backend hop is cleartext h2c (ZITADEL's own ZITADEL_TLS_ENABLED=false
+# listener) — the `h2c://` scheme rides through the server url VERBATIM (proven
+# by the role's test_h2c_scheme_rides_verbatim_belt_and_suspenders). Because the
+# hop is cleartext there is NO backend cert to verify, so route_servers_transport
+# _name / route_backend_root_cas are NOT passed (left empty — the default-inert
+# path, exactly the Grafana shape): the fragment carries NO serversTransport
+# block. The role fails closed (R3.4) if the backend url / delegate target is
+# unresolved. Skipped entirely on the mock-edge path (mutually exclusive).
+- name: "ZITADEL | Render + delegate the ZITADEL cross-guest Route_Fragment (real path)"
+  ansible.builtin.include_role:
+    name: traefik_route
+  vars:
+    traefik_route_enabled: "{{ zitadel_traefik_route_enabled | bool }}"
+    route_name: "zitadel"
+    route_host_rule: "{{ zitadel_external_domain }}"
+    route_backend_url: "h2c://{{ zitadel_bind_ip }}:{{ zitadel_http_port }}"
+    route_entrypoint: "websecure"
+    route_tls: true
+    # Delegate target = the Traefik_Guest (ADR-0015, 10.0.20.12) so the route
+    # fragment lands on the SVC-09 guest with no edit. NO serversTransport vars:
+    # the cleartext h2c hop has no backend cert to verify.
+    traefik_guest_host: "{{ zitadel_traefik_guest_host }}"
+  when: not (zitadel_mock_edge_network | bool)
+
+# --- 6d. Deploy the Compose stack via docker-compose-app --------------------
+# ZITADEL is a single Compose stack on its own guest. The ingress discovery
+# wiring (ports / networks / labels / dca_networks) is PATH-SELECTED, mirroring
+# grafana.yml 6d / openbao (d). REAL path (default): publish the VLAN20_Port
+# bound to ZITADEL's OWN VLAN-20 IP ({{ zitadel_bind_ip }}:{{ zitadel_http_port }},
+# the same private-VLAN-bound-port form Grafana/the SVC-07 unsealer use — never
+# 0.0.0.0/LAN, R2.1/R2.2) and reach it via the delegated file-provider route;
+# NO `edge`, NO labels. MOCK-EDGE path: NO published port, attach to the local
+# `edge` + emit the six labels. Everything else — image, `command:
+# start-from-init --masterkeyFromEnv`, restart, the PAT-emit volume mount,
+# extra_env_files, dca_volumes, and the full dca_env (incl.
+# ZITADEL_TLS_ENABLED=false + the ZITADEL_DATABASE_POSTGRES_* /
+# ZITADEL_FIRSTINSTANCE_* blocks) — is UNCHANGED (only the ingress wiring is
+# path-selected).
 - name: "ZITADEL | Deploy the Compose stack (docker-compose-app)"
   ansible.builtin.include_role:
     name: docker-compose-app
@@ -240,7 +344,15 @@
         # masterkey from the env (ZITADEL_MASTERKEY), config from env vars.
         command: >-
           start-from-init --masterkeyFromEnv
-        # NO `ports:` — HTTP ingress is via Traefik labels only (FR-7).
+        # REAL path: publish the VLAN20_Port bound to the guest's own VLAN-20 IP
+        # ({{ zitadel_bind_ip }}), consumed only by Traefik over VLAN 20 — never
+        # 0.0.0.0, never a host-wide/LAN port (R2.1/R2.2). MOCK-EDGE path:
+        # publish nothing ([]), discovery is via the `edge` labels instead.
+        ports: >-
+          {{ []
+             if (zitadel_mock_edge_network | bool)
+             else [zitadel_bind_ip ~ ':' ~ (zitadel_http_port | string)
+                    ~ ':' ~ (zitadel_http_port | string)] }}
         # The 0600 secret env (masterkey + DB passwords) layered on top of the
         # non-secret .env.
         extra_env_files:
@@ -251,23 +363,22 @@
         # the role reads it from the guest, persists to OpenBao, then scrubs it.
         volumes:
           - "{{ zitadel_provision_pat_host_dir }}:{{ zitadel_provision_pat_emit_path | dirname }}"
-        networks:
-          - "{{ zitadel_traefik_network }}"
-        # Traefik ingress (SVC-09): register via Docker labels; Traefik's docker
-        # provider discovers the backend on the `edge` network. websecure
-        # entrypoint, TLS on, h2c backend scheme on 8080.
-        labels:
-          - "traefik.enable=true"
-          - "traefik.docker.network={{ zitadel_traefik_network }}"
-          - "traefik.http.routers.{{ zitadel_traefik_router }}.rule=Host(`{{ zitadel_external_domain }}`)"
-          - "traefik.http.routers.{{ zitadel_traefik_router }}.entrypoints=websecure"
-          - "traefik.http.routers.{{ zitadel_traefik_router }}.tls=true"
-          - "traefik.http.services.{{ zitadel_traefik_router }}.loadbalancer.server.port={{ zitadel_http_port }}"
-          - "traefik.http.services.{{ zitadel_traefik_router }}.loadbalancer.server.scheme=h2c"
+        # REAL path: NO cross-guest `edge` attachment (it cannot span guests).
+        # MOCK-EDGE path: attach to the local `edge` for co-located discovery.
+        networks: >-
+          {{ [zitadel_traefik_network] if (zitadel_mock_edge_network | bool) else [] }}
+        # Traefik discovery labels apply ONLY on the mock-edge path (Traefik's
+        # Docker provider must be on the SAME daemon to read them). On the real
+        # cross-guest path the file-provider Route_Fragment supersedes them.
+        labels: >-
+          {{ zitadel_traefik_labels if (zitadel_mock_edge_network | bool) else [] }}
     dca_volumes: []
-    dca_networks:
-      - name: "{{ zitadel_traefik_network }}"
-        external: true
+    # REAL path: no external `edge` dependency (the file-provider route handles
+    # cross-guest ingress). MOCK-EDGE path: `edge` is created+owned by SVC-09
+    # (traefik_install); attach to it (external: true).
+    dca_networks: >-
+      {{ [{'name': zitadel_traefik_network, 'external': true}]
+         if (zitadel_mock_edge_network | bool) else [] }}
     dca_env:
       # NON-secret ZITADEL config only (composition-wiring.md). The masterkey +
       # DB passwords are in the 0600 secret env (extra_env_files), NOT here.
@@ -289,8 +400,27 @@
       ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: "disable"
       ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: "{{ zitadel_db_admin_user }}"
       ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: "disable"
-      # Observability (requirements §13): Prometheus metrics endpoint on.
-      ZITADEL_METRICS_ENABLED: "{{ zitadel_metrics_enabled | string | lower }}"
+      # Observability (requirements §13). ZITADEL v4.18.0 has TWO metrics config
+      # blocks in defaults.yaml, and the NEW one takes precedence:
+      #   * LEGACY  Metrics.Type (env ZITADEL_METRICS_TYPE) — marked Deprecated,
+      #     default `otel`.
+      #   * NEW     Instrumentation.Metric.Exporter.Type
+      #     (env ZITADEL_INSTRUMENTATION_METRIC_EXPORTER_TYPE) — default `none`,
+      #     with option `prometheus` ("Exposes metrics via an HTTP endpoint for
+      #     Prometheus to scrape").
+      # Because the NEW Instrumentation block takes precedence and defaults to
+      # `none`, it DISABLES /debug/metrics — which is why setting only the
+      # deprecated ZITADEL_METRICS_TYPE=otel still returned HTTP 404 (up == 0).
+      # LIVE-CONFIRMED on the throwaway cluster (ZITADEL v4.18.0): setting
+      # ZITADEL_INSTRUMENTATION_METRIC_EXPORTER_TYPE=prometheus and recreating the
+      # container flipped /debug/metrics 404 -> 200 serving real Prometheus data
+      # (go_gc_duration_seconds etc.). This supersedes the earlier
+      # ZITADEL_METRICS_TYPE=otel-only attempt. The MUST-HAVE is the new
+      # instrumentation key = prometheus; the deprecated key is kept ALSO (both
+      # present is harmless) to document intent across the deprecation. Ref:
+      # ZITADEL v4.18.0 defaults.yaml. Content rephrased for licensing compliance.
+      ZITADEL_INSTRUMENTATION_METRIC_EXPORTER_TYPE: "{{ zitadel_metrics_exporter_type }}"
+      ZITADEL_METRICS_TYPE: "{{ zitadel_metrics_type }}"
       # --- FirstInstance provisioning machine user + PAT emit (ADR-0016) ---
       # Non-secret config only: ZITADEL seeds a dedicated MACHINE user at
       # first-init (necessarily IAM_OWNER — the narrowest grant that can create

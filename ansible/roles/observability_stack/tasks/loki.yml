@@ -1,0 +1,87 @@
+---
+# tasks/loki.yml — observability_stack (SVC-17/18) — Loki guest
+#
+# Deploys the Loki Compose stack on svc18-loki-20-01 (10.0.20.20) via the generic
+# docker-compose-app role. Renders loki-config.yaml (monolithic mode, local
+# filesystem store, 30-day retention, per-tenant/per-label ingestion + query
+# limits — FR-10), then hands the stack off to docker-compose-app.
+#
+# Config render (task 4.4): monolithic (single-binary, target=all), local
+# filesystem store (single-store TSDB schema v13 for the pinned Loki 3.x image),
+# 30-day retention via the compactor ({{ observability_logs_retention }}), and
+# the per-label ingestion + query limits from defaults/main.yml
+# (observability_loki_* vars). See templates/loki-config.yaml.j2.
+#
+# Compose hand-off: grafana/loki (pinned), a persistent chunk/index named volume,
+# the rendered config bind-mounted :ro, and an internal-only push API on
+# :{{ observability_loki_port }} published to the guest's VLAN-20 IP ONLY (never
+# 0.0.0.0, no host-wide port, NO Traefik labels) so Promtail agents on the other
+# guests can push over VLAN 20 (requirements FR-13 / §3.2).
+
+# --- 1. Ensure the config directory on the guest -----------------------------
+- name: "Observability (loki) | Ensure the config directory exists"
+  ansible.builtin.file:
+    path: "{{ observability_loki_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+# --- 2. Render loki-config.yaml (monolithic, 30d retention, per-label limits) -
+# Loki reads this only at start, so a change notifies `Restart loki`.
+# Mode 0644 (world-readable), NOT 0640: this file is bind-mounted :ro into the
+# grafana/loki container, which runs as a NON-ROOT UID (10001). A 0640 root:root
+# file is unreadable by that container UID, crash-looping Loki with
+# "open /etc/loki/loki-config.yaml: permission denied". The config is non-secret.
+- name: "Observability (loki) | Render loki-config.yaml"
+  ansible.builtin.template:
+    src: loki-config.yaml.j2
+    dest: "{{ observability_loki_config_dir }}/loki-config.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart loki
+
+# --- 3. Deploy the Compose stack via docker-compose-app ----------------------
+# grafana/loki (pinned), persistent chunk/index volume, the rendered config
+# bind-mounted :ro, `-config.file` pointed at it. The push/query API is
+# published to the guest's VLAN-20 IP ONLY — this is the documented
+# docker-compose-app private-VLAN-bound-port exception (same pattern as the
+# SVC-07 unsealer): no 0.0.0.0 bind, no Traefik labels, no LAN/host-wide
+# exposure, so it does not violate PF FR-7 — it is the internal cross-LXC log
+# push path Promtail uses over VLAN 20.
+- name: "Observability (loki) | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ observability_loki_stack_name }}"
+    dca_services:
+      - name: loki
+        image: "{{ observability_loki_image }}"
+        restart: "unless-stopped"
+        command:
+          - "-config.file=/etc/loki/loki-config.yaml"
+        # PRIVATE VLAN-20-bound port (NOT Traefik/LAN ingress). Bound to this
+        # guest's own VLAN-20 IP only so Promtail on the OTHER guests can push
+        # logs cross-LXC; never 0.0.0.0, never a host-wide port, never Traefik.
+        ports:
+          - "{{ ansible_host }}:{{ observability_loki_port }}:{{ observability_loki_port }}"
+        volumes:
+          # Rendered config, read-only.
+          - "{{ observability_loki_config_dir }}/loki-config.yaml:/etc/loki/loki-config.yaml:ro"
+          # Persistent chunk/index store — a NAMED VOLUME, never tmpfs. Mounted
+          # at the config's path_prefix (/loki) so chunks/index/compactor data
+          # survive restarts/re-runs.
+          - "{{ observability_loki_data_volume }}:/loki"
+        # NO Traefik labels, NO 0.0.0.0/LAN port — internal (VLAN-20-only) by the
+        # bound `ports:` above; Promtail reaches it over VLAN 20.
+    dca_volumes:
+      - "{{ observability_loki_data_volume }}"
+    # Internal-only — Loki is never exposed externally (FR-13). No `edge`.
+    dca_networks: []
+    dca_env:
+      # Non-secret config only (composition-wiring.md); Loki uses local disk at
+      # this scale, so there are no secrets to fetch. Retention is set in the
+      # rendered config (limits_config.retention_period), not via env.
+      LOKI_RETENTION: "{{ observability_logs_retention }}"
+    dca_state: "{{ observability_state }}"

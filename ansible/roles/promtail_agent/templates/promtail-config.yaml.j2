@@ -1,0 +1,82 @@
+---
+# promtail-config.yaml — rendered by the promtail_agent role (SVC-18, FR-5).
+# MANAGED BY ANSIBLE — do not edit on the host; change the role template instead.
+#
+# Promtail {{ promtail_image }} (schema-compatible with grafana/loki:3.3.x).
+# Tails BOTH the local Docker container logs (docker_sd_configs) AND the systemd
+# journal, attaches `project` / `service` / `host` labels, and pushes to Loki.
+
+server:
+  http_listen_port: {{ promtail_http_port }}
+  grpc_listen_port: {{ promtail_grpc_port }}
+
+# Read-offset bookmark on a persistent named volume so a restart resumes rather
+# than re-shipping already-shipped lines.
+positions:
+  filename: {{ promtail_positions_file }}
+
+# Loki push target (FR-5). Overridable via promtail_loki_push_url; the
+# orchestrator passes the Terraform output loki_push_url.
+clients:
+  - url: {{ promtail_loki_push_url }}
+
+scrape_configs:
+  # --- Docker container logs (docker service discovery) ---------------------
+  # Discovers every running container on this host via the read-only Docker
+  # socket and tails its JSON log file. relabel_configs attach the three FR-5
+  # labels: `project` and `service` are read from container labels (explicit
+  # platform labels first, then the com.docker.compose.* labels), and `host` is
+  # the inventory host. A container with no project/service label still gets the
+  # host's inventory project_slug / service_role defaults.
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix://{{ promtail_docker_socket }}
+        refresh_interval: {{ promtail_docker_sd_refresh_interval }}
+    relabel_configs:
+      # container name -> a readable `container` label
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/?(.*)'
+        target_label: 'container'
+      # project: explicit `project` label, else compose project, else default
+      - source_labels:
+          - '__meta_docker_container_label_{{ promtail_docker_project_label }}'
+          - '__meta_docker_container_label_{{ promtail_docker_compose_project_label | replace(".", "_") }}'
+        separator: ';'
+        regex: '([^;]+)?;?([^;]*)'
+        replacement: '${1}${2}'
+        target_label: 'project'
+      - source_labels: ['project']
+        regex: '^$'
+        replacement: '{{ promtail_default_project }}'
+        target_label: 'project'
+      # service: explicit `service` label, else compose service, else default
+      - source_labels:
+          - '__meta_docker_container_label_{{ promtail_docker_service_label }}'
+          - '__meta_docker_container_label_{{ promtail_docker_compose_service_label | replace(".", "_") }}'
+        separator: ';'
+        regex: '([^;]+)?;?([^;]*)'
+        replacement: '${1}${2}'
+        target_label: 'service'
+      - source_labels: ['service']
+        regex: '^$'
+        replacement: '{{ promtail_default_service }}'
+        target_label: 'service'
+      # host: the inventory host, attached to every docker stream
+      - replacement: '{{ promtail_host_label }}'
+        target_label: 'host'
+
+  # --- systemd journal ------------------------------------------------------
+  # Tails the host's persistent journal. `project` / `service` default to the
+  # host's inventory values (journal entries are host-scoped, not per-container);
+  # `host` is the inventory host. The journal unit becomes a `unit` label.
+  - job_name: journal
+    journal:
+      path: {{ promtail_journal_dir }}
+      max_age: 12h
+      labels:
+        project: '{{ promtail_default_project }}'
+        service: '{{ promtail_default_service }}'
+        host: '{{ promtail_host_label }}'
+    relabel_configs:
+      - source_labels: ['__journal__systemd_unit']
+        target_label: 'unit'

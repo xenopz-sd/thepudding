@@ -1,0 +1,30 @@
+---
+# handlers/main.yml — observability_stack (SVC-17/18)
+#
+# Restart handlers, one per component stack. When a component's rendered config
+# changes (prometheus.yml / alertmanager.yml / rules, Grafana provisioning,
+# loki-config.yaml — rendered in tasks 4.2/4.3/4.4), the matching handler
+# reconciles that stack with a forced recreate via
+# community.docker.docker_compose_v2 (PF §9 — declarative, not a shell
+# `docker compose up`). The task-4.2/4.3/4.4 template tasks `notify:` these.
+
+- name: Restart prometheus
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ observability_prometheus_stack_name }}"
+    project_name: "{{ observability_prometheus_stack_name }}"
+    state: present
+    recreate: always
+
+- name: Restart grafana
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ observability_grafana_stack_name }}"
+    project_name: "{{ observability_grafana_stack_name }}"
+    state: present
+    recreate: always
+
+- name: Restart loki
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ observability_loki_stack_name }}"
+    project_name: "{{ observability_loki_stack_name }}"
+    state: present
+    recreate: always

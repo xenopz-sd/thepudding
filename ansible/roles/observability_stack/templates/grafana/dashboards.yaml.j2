@@ -1,0 +1,27 @@
+#jinja2: trim_blocks: True, lstrip_blocks: True
+# {{ ansible_managed }}
+# Grafana dashboard-provider provisioning (apiVersion 1) — observability_stack
+# (SVC-17/18). Rendered by tasks/grafana.yml (task 4.3) to
+# {{ observability_grafana_dashboards_provider_dir }}/dashboards.yaml and
+# bind-mounted :ro into the Grafana container at
+# {{ observability_grafana_provisioning_container_dir }}/dashboards.
+#
+# The provider points Grafana at the in-container directory where the
+# version-controlled dashboard JSON (dashboards-as-code, files/dashboards/*.json)
+# is bind-mounted: {{ observability_grafana_dashboards_container_dir }}.
+# Grafana loads every *.json beneath that path. FR-6: host health
+# (node_exporter), container health (cAdvisor), and a per-service dashboard for
+# each Built_Service in the V1_Scrape_Set.
+---
+apiVersion: 1
+
+providers:
+  - name: "observability-dashboards"
+    orgId: 1
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: "{{ observability_grafana_dashboards_container_dir }}"
+      foldersFromFilesStructure: true

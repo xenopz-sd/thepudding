@@ -1,0 +1,76 @@
+---
+# tasks/main.yml — observability_stack (SVC-17/18) — per-guest dispatcher
+#
+# Three-guest observability stack on VLAN 20 (Prometheus + Alertmanager,
+# Grafana, Loki), each deployed as a Docker Compose stack via the generic
+# docker-compose-app role (consumed UNMODIFIED). This role is run against the
+# generated inventory, where each guest is grouped by its `service_role`
+# (prometheus / grafana / loki — see ansible/inventory/generate_inventory.py).
+#
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements.md, design.md §3.2).
+#
+# DISPATCH SCOPE: resolve the per-guest role and dispatch to one of
+# prometheus.yml / grafana.yml / loki.yml. tasks/prometheus.yml is IMPLEMENTED
+# (task 4.2: renders prometheus.yml file_sd-only + alertmanager.yml + the
+# baseline rules, then the Compose hand-off). grafana.yml / loki.yml remain
+# STUBS (tasks 4.3 / 4.4) — a placeholder marker + the docker-compose-app
+# invocation structure — with TODO markers for the Grafana provisioning and the
+# loki-config.yaml render respectively.
+
+# --- Resolve the guest's component role -------------------------------------
+# Prefer an explicitly-supplied observability_service_role (test harness / -e);
+# otherwise derive it from the inventory group membership (group_names), which
+# generate_inventory.py sets to the Terraform `service_role` (prometheus /
+# grafana / loki).
+- name: "Observability | Resolve this guest's component role"
+  ansible.builtin.set_fact:
+    observability_service_role: >-
+      {{
+        (observability_service_role | default('') | trim)
+        if (observability_service_role | default('') | trim | length > 0)
+        else (group_names | intersect(observability_known_roles) | first | default(''))
+      }}
+  changed_when: false
+
+# --- Fail closed on an unresolvable / unknown role --------------------------
+# A guest that is in none of the known component groups (prometheus/grafana/loki)
+# cannot be dispatched; fail with a clear remedy rather than silently no-op.
+- name: "Observability | Fail closed if the component role is unknown"
+  ansible.builtin.assert:
+    that:
+      - observability_service_role in observability_known_roles
+    fail_msg: >-
+      observability_stack could not resolve a component role for
+      {{ inventory_hostname }}. Expected it to belong to exactly one of
+      {{ observability_known_roles }} (set by the generated inventory's
+      service_role group), or to be passed explicitly via
+      -e observability_service_role=<prometheus|grafana|loki>. Got
+      group_names={{ group_names }}, observability_service_role=
+      {{ observability_service_role | default('') }}.
+    success_msg: "observability_stack dispatching {{ inventory_hostname }} as '{{ observability_service_role }}'."
+    quiet: true
+
+# --- Log the dispatch decision at INFO (composition-wiring.md) --------------
+- name: "Observability | Dispatch decision (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      observability_stack: {{ inventory_hostname }} -> component role
+      '{{ observability_service_role }}'
+      (mocks: grafana_oidc_enabled={{ grafana_oidc_enabled }},
+      obs_tls_self_signed={{ obs_tls_self_signed }},
+      dcgm_metrics_deferred={{ dcgm_metrics_deferred }}).
+
+# --- Per-guest dispatch ------------------------------------------------------
+# One include per component; the matching stub owns the config render (TODO
+# 4.2/4.3/4.4) + the docker-compose-app hand-off.
+- name: "Observability | Configure the Prometheus + Alertmanager guest"
+  ansible.builtin.include_tasks: prometheus.yml
+  when: observability_service_role == "prometheus"
+
+- name: "Observability | Configure the Grafana guest"
+  ansible.builtin.include_tasks: grafana.yml
+  when: observability_service_role == "grafana"
+
+- name: "Observability | Configure the Loki guest"
+  ansible.builtin.include_tasks: loki.yml
+  when: observability_service_role == "loki"

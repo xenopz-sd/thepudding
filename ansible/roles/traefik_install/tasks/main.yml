@@ -161,6 +161,16 @@
         ports:
           - "{{ traefik_entrypoint_web_port }}:{{ traefik_entrypoint_web_port }}"
           - "{{ traefik_entrypoint_websecure_port }}:{{ traefik_entrypoint_websecure_port }}"
+          # The internal `metrics` entrypoint (:8082) bound to the Traefik
+          # guest's OWN VLAN-20 IP so Prometheus (SVC-17, on another guest) can
+          # scrape 10.0.20.12:8082/metrics. This is NOT a LAN-exposed HTTP
+          # ingress host port — the :80/:443 entries above stay the documented
+          # FR-7 ingress exception. It is an internal VLAN-20 metrics bind for
+          # Prometheus only (SVC-09 §13 "internal-only metrics entrypoint" /
+          # integration-boundaries §1), bound to the guest's own VLAN-20 IP,
+          # never 0.0.0.0 — the same private-VLAN-bound-port form the fleet
+          # exporters (:9100/:8080) and Loki (:3100) use.
+          - "{{ traefik_metrics_bind_ip }}:{{ traefik_entrypoint_metrics_port }}:{{ traefik_entrypoint_metrics_port }}"
         volumes:
           # Read-only Docker socket — Traefik observes labels only (SVC-09 §12).
           - "{{ traefik_docker_socket }}:{{ traefik_docker_socket }}:ro"

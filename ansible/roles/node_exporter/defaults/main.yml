@@ -1,0 +1,127 @@
+---
+# defaults/main.yml — node_exporter (SVC-17, fleet-wide)
+#
+# Deploys Prometheus node_exporter on EVERY Proxmox VM/LXC in the fleet so the
+# observability_stack can scrape host-level metrics (CPU, memory, filesystem,
+# load, network) on port 9100 (FR-2). Default deployment is a Docker Compose
+# sidecar via the generic docker-compose-app role (consumed UNMODIFIED), with
+# the host root filesystem / /proc / /sys bind-mounted READ-ONLY and
+# `--path.rootfs=/host` so the containerised exporter reports the HOST's metrics
+# rather than the container's.
+#
+# LXC EXCEPTION (documented): on some unprivileged LXC guests the kernel blocks
+# a container from reading the host's /proc or /sys faithfully, so the
+# containerised sidecar cannot report accurate host metrics. For those guests the
+# role supports a host-level systemd unit instead (node_exporter_mode:
+# host_unit), installing the upstream static binary and a systemd service. The
+# DEFAULT is the Compose sidecar (node_exporter_mode: sidecar); the host-unit
+# path is opted into per host (e.g. a host var / group var) where needed.
+#
+# Internal only: node_exporter is scraped on VLAN 20, never fronted by Traefik.
+# The :9100 port is published to the guest's OWN VLAN IP only (never 0.0.0.0),
+# the documented docker-compose-app private-VLAN-bound-port exception — the same
+# pattern the SVC-01 postgres_exporter and the SVC-07 unsealer use.
+#
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements.md FR-2, design §3.3).
+# Mirrors the promtail_agent / observability_stack var contract and the
+# docker-compose-app hand-off (dca_app_name / dca_services / dca_volumes /
+# dca_networks / dca_env).
+
+# --- Image pin (tech.md: never track `latest`) -----------------------------
+# Pinned deliberately; a bump is a conscious follow-up flagged in the PR.
+node_exporter_image: "prom/node-exporter:v1.8.2"
+
+# --- Deployment mode --------------------------------------------------------
+# sidecar   -> Docker Compose sidecar with host /,/proc,/sys mounted :ro and
+#              --path.rootfs=/host (the DEFAULT; works on VMs and most LXC).
+# host_unit -> upstream static binary + a systemd unit on the host, for the
+#              unprivileged-LXC exception where the containerised sidecar cannot
+#              faithfully read the host's /proc,/sys. Opted into per host.
+node_exporter_mode: "sidecar"
+
+# --- Compose stack identity (consumed by docker-compose-app; sidecar mode) --
+node_exporter_stack_name: "node-exporter"
+node_exporter_container_name: "{{ node_exporter_stack_name }}-node-exporter-1"
+
+# --- Internal (VLAN-20) scrape port -----------------------------------------
+# node_exporter's /metrics endpoint. Internal only (no Traefik); published to
+# the guest's own VLAN IP so the observability_stack scrapes it fleet-wide.
+node_exporter_port: 9100
+
+# The guest's VLAN-20 IP the :9100 port is bound to (private VLAN-bound port,
+# NEVER 0.0.0.0). Defaults to the inventory ansible_host (the generated
+# inventory sets it to the guest's computed VLAN IP); overridable per host.
+node_exporter_bind_ip: "{{ ansible_host | default('127.0.0.1') }}"
+
+# --- Host rootfs mount (sidecar mode) ---------------------------------------
+# The containerised exporter reads the HOST filesystem via a read-only bind at
+# /host and is told to treat it as the root via --path.rootfs=/host, plus
+# dedicated /proc and /sys read-only mounts. This is the standard, upstream-
+# documented way to run node_exporter in a container and report host metrics.
+node_exporter_host_rootfs_mount: "/host"
+node_exporter_proc_path: "/host/proc"
+node_exporter_sys_path: "/host/sys"
+node_exporter_rootfs_path: "/host"
+
+# node_exporter collector flags. --path.{procfs,sysfs,rootfs} point the exporter
+# at the read-only host mounts; the filesystem collector ignore list excludes
+# container/pseudo mounts so the DiskSpaceLow alert (FR-7) reasons about real
+# host filesystems only.
+node_exporter_command_flags:
+  - "--path.procfs={{ node_exporter_proc_path }}"
+  - "--path.sysfs={{ node_exporter_sys_path }}"
+  - "--path.rootfs={{ node_exporter_rootfs_path }}"
+  - "--collector.filesystem.mount-points-exclude=^/(host/)?(dev|proc|sys|run|var/lib/docker/.+)($|/)"
+  # Pseudo/virtual filesystems excluded from the filesystem collector so the
+  # DiskSpaceLow alert (FR-7) reasons about real host filesystems only. Kept to
+  # one physical line (<120) with no newline-folding so the regex is injected
+  # verbatim (a folded-scalar wrap would insert a space and corrupt the pattern).
+  - "--collector.filesystem.fs-types-exclude=^({{ node_exporter_fs_types_exclude | join('|') }})$"
+
+# Pseudo/virtual filesystem types excluded from the filesystem collector (used
+# to build the --collector.filesystem.fs-types-exclude regex above). A LIST so
+# no single physical line exceeds the 120-char yamllint limit and the regex is
+# assembled verbatim via join('|') rather than a space-injecting folded scalar.
+node_exporter_fs_types_exclude:
+  - "autofs"
+  - "binfmt_misc"
+  - "bpf"
+  - "cgroup2?"
+  - "configfs"
+  - "debugfs"
+  - "devpts"
+  - "devtmpfs"
+  - "fusectl"
+  - "hugetlbfs"
+  - "iso9660"
+  - "mqueue"
+  - "nsfs"
+  - "overlay"
+  - "proc"
+  - "procfs"
+  - "pstore"
+  - "rpc_pipefs"
+  - "securityfs"
+  - "selinuxfs"
+  - "squashfs"
+  - "sysfs"
+  - "tracefs"
+
+# --- Host-unit mode (unprivileged-LXC exception) ----------------------------
+# Upstream static-binary release used when node_exporter_mode == host_unit.
+node_exporter_version: "1.8.2"
+# Assembled from short pieces (never a folded scalar — a fold would inject a
+# space and corrupt the URL) so each physical line stays under the 120-char
+# yamllint limit.
+node_exporter_release_base: "https://github.com/prometheus/node_exporter/releases/download"
+node_exporter_binary_url: >-
+  {{ node_exporter_release_base }}/v{{ node_exporter_version }}/node_exporter-{{
+  node_exporter_version }}.linux-amd64.tar.gz
+node_exporter_binary_checksum: >-
+  sha256:6809dd0b3ec45fd6e992c19071d6b5253aed3ead7bf0686885a51d85c6643c66
+node_exporter_binary_dest: "/usr/local/bin/node_exporter"
+node_exporter_system_user: "node_exporter"
+node_exporter_systemd_unit: "/etc/systemd/system/node_exporter.service"
+
+# --- Reconciliation behaviour (passed through to docker-compose-app) --------
+node_exporter_state: "present"

@@ -1,0 +1,82 @@
+---
+# defaults/main.yml — promtail_agent (SVC-18, fleet-wide)
+#
+# Deploys Promtail on EVERY host in the fleet as a Docker Compose stack via the
+# generic docker-compose-app role (consumed UNMODIFIED). Promtail tails both the
+# local Docker container logs (docker service discovery) and the systemd journal,
+# attaches `project` / `service` / `host` labels (FR-5), and pushes the resulting
+# log streams to Loki (SVC-18) on VLAN 20.
+#
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements.md FR-5, design §3.3).
+# Mirrors the observability_stack / traefik_install var contract and the
+# docker-compose-app hand-off (dca_app_name / dca_services / dca_volumes /
+# dca_networks / dca_env).
+
+# --- Image pin (tech.md: never track `latest`) -----------------------------
+# Pinned to the Loki MAJOR.MINOR line in observability_stack/defaults
+# (grafana/loki:3.3.2) so Promtail and Loki stay schema-compatible. A bump is a
+# conscious follow-up flagged in the PR.
+promtail_image: "grafana/promtail:3.3.2"
+
+# --- Compose stack identity (consumed by docker-compose-app) ----------------
+promtail_stack_name: "promtail"
+promtail_container_name: "{{ promtail_stack_name }}-promtail-1"
+
+# --- Config / data locations on the target host -----------------------------
+# The rendered promtail-config.yaml is bind-mounted :ro into the container; the
+# positions file (Promtail's read-offset bookmark) lives on a PERSISTENT named
+# volume so a restart/re-run resumes where it left off rather than re-shipping.
+promtail_config_dir: "/etc/promtail"
+promtail_config_file: "{{ promtail_config_dir }}/promtail-config.yaml"
+promtail_positions_volume: "promtail-positions"
+promtail_positions_mount: "/run/promtail"
+promtail_positions_file: "{{ promtail_positions_mount }}/positions.yaml"
+
+# --- Internal (VLAN-20) HTTP server port ------------------------------------
+# Promtail's own /metrics + readiness endpoint. Internal only (no host port);
+# the observability_stack scrapes it fleet-wide like any other target.
+promtail_http_port: 9080
+promtail_grpc_port: 0
+
+# --- Loki push target (FR-5) ------------------------------------------------
+# Defaults to the Loki guest's computed VLAN-20 IP (host_index 10 -> .20, design
+# §3.1 / glossary Loki_Server). The orchestrator overrides this with the
+# Terraform output `loki_push_url` (file-mediated handoff, integration-boundaries
+# §4) so the agents always point at the Loki guest Terraform actually created.
+promtail_loki_push_url: "http://10.0.20.20:3100/loki/api/v1/push"
+
+# --- Host-level log/journal sources (bind-mounted :ro) ----------------------
+# Docker writes per-container JSON logs under /var/lib/docker/containers; the
+# systemd persistent journal lives under /var/log/journal. Both are mounted
+# read-only. machine-id is needed for the journal source to resolve the host.
+promtail_docker_containers_dir: "/var/lib/docker/containers"
+promtail_journal_dir: "/var/log/journal"
+promtail_machine_id_file: "/etc/machine-id"
+
+# --- Docker service-discovery tuning ----------------------------------------
+# The Docker SD endpoint (the read-only host socket) and refresh cadence Promtail
+# uses to discover running containers for log tailing.
+promtail_docker_socket: "/var/run/docker.sock"
+promtail_docker_sd_refresh_interval: "15s"
+
+# --- Label wiring (FR-5) ----------------------------------------------------
+# `host` is taken from the inventory (ansible_hostname, falling back to
+# inventory_hostname) and attached to EVERY stream (docker + journal). `project`
+# and `service` are derived per-container from Docker labels where present
+# (relabel_configs in the template), falling back to the host's inventory
+# project_slug / service_role so a container that carries no label still ships
+# with a meaningful project/service rather than empty.
+promtail_host_label: "{{ ansible_hostname | default(inventory_hostname) }}"
+promtail_default_project: "{{ project_slug | default('shared') }}"
+promtail_default_service: "{{ service_role | default('unknown') }}"
+
+# Docker container-label keys relabel_configs read `project` / `service` from.
+# Compose stamps `com.docker.compose.*` labels automatically; a service MAY also
+# stamp explicit platform labels (project / service) for a precise value.
+promtail_docker_project_label: "project"
+promtail_docker_service_label: "service"
+promtail_docker_compose_project_label: "com.docker.compose.project"
+promtail_docker_compose_service_label: "com.docker.compose.service"
+
+# --- Reconciliation behaviour (passed through to docker-compose-app) --------
+promtail_state: "present"

@@ -1,0 +1,510 @@
+---
+# tasks/grafana.yml — observability_stack (SVC-17/18) — Grafana guest (task 4.3)
+#
+# Renders Grafana provisioning onto svc17-grafana-20-01 (10.0.20.19) and deploys
+# the Grafana Compose stack via the generic docker-compose-app role, attached to
+# SVC-09's external `edge` network with Traefik labels (NO host port, FR-13).
+#
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements FR-6/FR-9/FR-13,
+# design §3.2 Grafana guest + §4 Mock A).
+#
+# Order:
+#   0. Mock B TLS gate (FR-14): obs_tls_self_signed=true generates a self-signed
+#      cert via SVC-09's file provider; obs_tls_self_signed=false with no real CA
+#      (obs_tls_real_ca_available=false) FAILS CLOSED — never serve no-TLS.
+#   1. Fail-closed OIDC gate (Mock A): grafana_oidc_enabled=true requires the
+#      OIDC client vars set — never silently anonymous / mis-wired.
+#   2. Read Grafana secrets from OpenBao via the delegated bao-CLI docker-exec
+#      pattern (Break_Glass_Admin password; OIDC client secret when enabled),
+#      no_log:true (FR-15). Dev/offline falls back to explicit *_override vars.
+#   3. Ensure config/provisioning/dashboards dirs on the guest.
+#   4. Render provisioning: datasources (Prometheus + Loki), dashboard provider,
+#      grafana.ini auth block (OIDC only WHERE grafana_oidc_enabled); copy the
+#      version-controlled dashboard JSON (dashboards-as-code).
+#   5. Write the 0600 secret env (admin password; OIDC client secret when on).
+#   6. Deploy the Compose stack via docker-compose-app (edge network, Traefik
+#      labels, extra_env_files secret env, NO host port).
+
+# --- 0. Mock B: TLS for the Grafana websecure route (self-signed OR fail-closed)
+# PERMANENT, DEFAULT-OFF stand-in for SVC-08/EJBCA + Let's Encrypt (FR-14 /
+# design §4 Mock B). Two postures, selected by the default-off flag:
+#   * obs_tls_self_signed=true: generate an internal self-signed cert on the
+#     control node (community.crypto) and install it at SVC-09's own file-provider
+#     tls paths on the Traefik guest, so SVC-09's EXISTING file provider serves it
+#     for Grafana's websecure route (no second edge/file-provider owner, ADR-0013).
+#   * obs_tls_self_signed=false: Grafana's HTTPS route may only be rendered when a
+#     REAL CA is available (obs_tls_real_ca_available=true, i.e. SVC-08 deployed
+#     or Let's Encrypt reachable). With BOTH false, FAIL CLOSED at render with a
+#     remedy — never serve Grafana with no TLS.
+- name: "Observability (grafana) | Fail closed if Grafana would be served without TLS (Mock B off, no CA)"
+  ansible.builtin.assert:
+    that:
+      - (obs_tls_real_ca_available | bool)
+    fail_msg: >-
+      Grafana's HTTPS (websecure) route would be served with NO usable TLS
+      certificate: the self-signed TLS mock is off (obs_tls_self_signed=false)
+      AND no real CA is available (obs_tls_real_ca_available=false), so neither
+      SVC-08/Let's Encrypt nor the self-signed stand-in can supply the Grafana
+      cert. Deploy SVC-08 (or reach Let's Encrypt) and set
+      -e obs_tls_real_ca_available=true, OR explicitly opt into the development
+      stand-in with `-e obs_tls_self_signed=true` (self-signed cert via SVC-09's
+      file provider; clients use validate_certs:false — see
+      .kiro/steering/mock-stand-ins.md). Never served without TLS.
+    success_msg: "Grafana TLS will be issued by a real CA (SVC-08 / Let's Encrypt)."
+    quiet: true
+  when: not (obs_tls_self_signed | bool)
+
+- name: "Observability (grafana) | Generate mock self-signed TLS material (opt-in dev stand-in, Mock B)"
+  ansible.builtin.include_tasks: mock_tls_self_signed.yml
+  when: obs_tls_self_signed | bool
+
+# --- 1. Mock A fail-closed OIDC gate ----------------------------------------
+# When the OIDC flag is ON, the issuer URL + client id MUST be set (and, when
+# OpenBao is wired, the client secret must be retrievable — enforced at the read
+# below). Enabling the flag without them would render a broken/half OIDC block;
+# fail CLOSED here with a remedy rather than ship an unauthenticated or mis-wired
+# Grafana (requirements FR-9 / design §4 Mock A — never silently anonymous).
+- name: "Observability (grafana) | Fail closed if OIDC enabled without client vars (Mock A)"
+  ansible.builtin.assert:
+    that:
+      - (observability_grafana_oidc_issuer_url | default('') | trim | length > 0)
+      - (observability_grafana_oidc_client_id | default('') | trim | length > 0)
+    fail_msg: >-
+      grafana_oidc_enabled=true but the ZITADEL OIDC client is not configured:
+      observability_grafana_oidc_issuer_url and/or
+      observability_grafana_oidc_client_id are empty. Register a Grafana OIDC
+      client in ZITADEL (SVC-06), store its secret in OpenBao at
+      {{ observability_grafana_oidc_secret_path }} (field
+      {{ observability_grafana_oidc_secret_field }}), and set the issuer URL +
+      client id — OR leave grafana_oidc_enabled=false to use the
+      Break_Glass_Admin local account (Mock A default). Refusing to render a
+      broken OIDC block (never silently anonymous).
+    success_msg: "Grafana OIDC (Mock A) is wired against ZITADEL; rendering the generic_oauth block."
+    quiet: true
+  when: grafana_oidc_enabled | bool
+
+# --- 1b. INFO swap-gate decision log (Mock A) -------------------------------
+# composition-wiring.md §"Swap-Gate Pattern" step 4 / mock-stand-ins.md: emit an
+# INFO line stating WHICH auth implementation was selected and WHY, so the
+# mock-vs-real choice is visible in the play output without reading source. This
+# is the auth-selection decision specifically (the role-level dispatch INFO in
+# tasks/main.yml only echoes the raw flag values). Default posture (flag off) is
+# the honest stand-in (Break_Glass_Admin local account), NEVER anonymous.
+- name: "Observability (grafana) | Auth swap-gate decision (INFO, Mock A)"
+  ansible.builtin.debug:
+    msg: >-
+      Grafana auth (Mock A swap-gate): grafana_oidc_enabled={{ grafana_oidc_enabled }}
+      -> {{
+        ('REAL — OIDC via ZITADEL (SVC-06), issuer '
+          ~ observability_grafana_oidc_issuer_url ~ ', client_id '
+          ~ observability_grafana_oidc_client_id
+          ~ '; client secret from OpenBao ' ~ observability_grafana_oidc_secret_path
+          ~ '; local login form disabled, Break_Glass_Admin becomes break-glass-only')
+        if (grafana_oidc_enabled | bool)
+        else ('MOCK (default-off stand-in for the un-registered SVC-06 Grafana OIDC '
+          ~ 'client) — Break_Glass_Admin local account ONLY (password from OpenBao '
+          ~ observability_grafana_admin_secret_path ~ ', rotated after use); '
+          ~ 'generic_oauth block omitted; anonymous access disabled. Flip to real: '
+          ~ 'register the OIDC client in ZITADEL + store its secret in OpenBao, then '
+          ~ '-e grafana_oidc_enabled=true')
+      }}
+  changed_when: false
+
+# --- 2. Read Grafana secrets from OpenBao (delegated bao-CLI, no_log) --------
+# Break_Glass_Admin password (always) + OIDC client secret (only when enabled).
+# Mirrors zitadel-server's `docker exec <primary> bao kv get` delegated read.
+# Skipped when observability_openbao_addr is empty (dev/offline) — the *_override
+# vars are used instead.
+# --- 2a. SEED the Break_Glass_Admin password into OpenBao if absent (FR-15) ---
+# IDEMPOTENT self-seed so a from-scratch bring-up needs NO human-minted Grafana
+# secret (closes the same gap SVC-06's org-provision token auto-mint closed,
+# ADR-0016). Runs HERE — inside the Grafana configurator play (hosts: all, over
+# SSH) — because `delegate_to` to the OpenBao primary only SSHes from a remote
+# play; in the localhost orchestrator it would run docker on the control node.
+# Probe-then-put: if the KV path already has a non-empty password it is a NO-OP
+# (re-run keeps it; rotate-after-use is a separate operator action). get +
+# generate + put are all no_log — the value is never echoed. Skipped in
+# dev/offline (observability_openbao_addr empty -> the *_override path).
+- name: "Observability (grafana) | Probe whether the Break_Glass_Admin password is already seeded (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ observability_openbao_cli_bao_addr,
+          '-e', 'BAO_TOKEN=' ~ observability_bao_token,
+          observability_openbao_primary_container_name, observability_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (observability_openbao_tls_skip_verify | bool) else [])
+         + ['-field=' ~ observability_grafana_admin_secret_field,
+            observability_grafana_admin_secret_path] }}
+  delegate_to: "{{ observability_openbao_cli_host }}"
+  vars:
+    ansible_user: "{{ observability_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ observability_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: observability_grafana_admin_seed_probe
+  failed_when: false
+  changed_when: false
+  no_log: true
+  when: observability_openbao_addr | length > 0
+
+- name: "Observability (grafana) | Decide whether the admin password needs seeding (non-secret projection)"
+  ansible.builtin.set_fact:
+    observability_grafana_admin_needs_seed: >-
+      {{ (observability_openbao_addr | length > 0)
+         and ((observability_grafana_admin_seed_probe.rc | default(1)) != 0
+              or ((observability_grafana_admin_seed_probe.stdout | default('') | trim) | length == 0)) }}
+  changed_when: false
+
+- name: "Observability (grafana) | Generate a strong random Break_Glass_Admin password (no_log)"
+  ansible.builtin.set_fact:
+    observability_grafana_admin_seed_value: >-
+      {{ lookup('ansible.builtin.password', '/dev/null length=32 chars=ascii_letters,digits') }}
+  no_log: true
+  when: observability_grafana_admin_needs_seed | default(false) | bool
+
+- name: "Observability (grafana) | Seed the Break_Glass_Admin password into OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ observability_openbao_cli_bao_addr,
+          '-e', 'BAO_TOKEN=' ~ observability_bao_token,
+          observability_openbao_primary_container_name, observability_openbao_bao_bin, 'kv', 'put']
+         + (['-tls-skip-verify'] if (observability_openbao_tls_skip_verify | bool) else [])
+         + [observability_grafana_admin_secret_path,
+            observability_grafana_admin_secret_field ~ '=' ~ observability_grafana_admin_seed_value] }}
+  delegate_to: "{{ observability_openbao_cli_host }}"
+  vars:
+    ansible_user: "{{ observability_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ observability_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: observability_grafana_admin_seed_put
+  changed_when: true
+  no_log: true
+  when: observability_grafana_admin_needs_seed | default(false) | bool
+
+- name: "Observability (grafana) | Seed decision (INFO — by NAME only, never the value)"
+  ansible.builtin.debug:
+    msg: >-
+      Grafana Break_Glass_Admin seed (idempotent):
+      {{ ('SEEDED a new random password at ' ~ observability_grafana_admin_secret_path
+          ~ ' (value never echoed)')
+         if (observability_grafana_admin_needs_seed | default(false) | bool)
+         else ('already present at ' ~ observability_grafana_admin_secret_path
+          ~ ' — no-op (or dev/offline override path)') }}
+  changed_when: false
+
+- name: "Observability (grafana) | Read Break_Glass_Admin password from OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ observability_openbao_cli_bao_addr,
+          '-e', 'BAO_TOKEN=' ~ observability_bao_token,
+          observability_openbao_primary_container_name, observability_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (observability_openbao_tls_skip_verify | bool) else [])
+         + ['-field=' ~ observability_grafana_admin_secret_field,
+            observability_grafana_admin_secret_path] }}
+  delegate_to: "{{ observability_openbao_cli_host }}"
+  vars:
+    ansible_user: "{{ observability_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ observability_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: observability_grafana_admin_read
+  failed_when: false
+  changed_when: false
+  no_log: true
+  when: observability_openbao_addr | length > 0
+
+- name: "Observability (grafana) | Fail fast when the OpenBao admin-password read is empty while wired"
+  ansible.builtin.fail:
+    msg: >-
+      Grafana Break_Glass_Admin password retrieval FAILED: OpenBao is wired
+      (observability_openbao_addr={{ observability_openbao_addr }}) but the
+      '{{ observability_grafana_admin_secret_field }}' read from
+      {{ observability_grafana_admin_secret_path }} returned empty or errored
+      (rc={{ observability_grafana_admin_read.rc | default('n/a') }}). Store the
+      Break_Glass_Admin password at that KV path/field, or run dev/offline with
+      observability_openbao_addr empty and an explicit
+      observability_grafana_admin_password_override. Refusing to render an empty
+      admin password (the value is never echoed).
+  when:
+    - observability_openbao_addr | length > 0
+    - (observability_grafana_admin_read.rc | default(1)) != 0
+      or ((observability_grafana_admin_read.stdout | default('') | trim) | length == 0)
+
+- name: "Observability (grafana) | Bind the Break_Glass_Admin password fact (no_log)"
+  ansible.builtin.set_fact:
+    observability_grafana_admin_password: >-
+      {{ (observability_grafana_admin_read.stdout | default('') | trim)
+         if ((observability_openbao_addr | length > 0)
+              and (observability_grafana_admin_read.rc | default(1) == 0)
+              and ((observability_grafana_admin_read.stdout | default('') | trim) | length > 0))
+         else (observability_grafana_admin_password_override | default('')) }}
+  no_log: true
+
+- name: "Observability (grafana) | Read OIDC client secret from OpenBao (no_log, OIDC only)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ observability_openbao_cli_bao_addr,
+          '-e', 'BAO_TOKEN=' ~ observability_bao_token,
+          observability_openbao_primary_container_name, observability_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (observability_openbao_tls_skip_verify | bool) else [])
+         + ['-field=' ~ observability_grafana_oidc_secret_field,
+            observability_grafana_oidc_secret_path] }}
+  delegate_to: "{{ observability_openbao_cli_host }}"
+  vars:
+    ansible_user: "{{ observability_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ observability_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: observability_grafana_oidc_read
+  failed_when: false
+  changed_when: false
+  no_log: true
+  when:
+    - grafana_oidc_enabled | bool
+    - observability_openbao_addr | length > 0
+
+- name: "Observability (grafana) | Fail fast when OIDC enabled but the client-secret read is empty (wired)"
+  ansible.builtin.fail:
+    msg: >-
+      Grafana OIDC client-secret retrieval FAILED: grafana_oidc_enabled=true and
+      OpenBao is wired, but the '{{ observability_grafana_oidc_secret_field }}'
+      read from {{ observability_grafana_oidc_secret_path }} returned empty or
+      errored (rc={{ observability_grafana_oidc_read.rc | default('n/a') }}).
+      Store the ZITADEL Grafana OIDC client secret at that KV path/field.
+      Refusing to render OIDC without a client secret (never silently anonymous;
+      the value is never echoed).
+  when:
+    - grafana_oidc_enabled | bool
+    - observability_openbao_addr | length > 0
+    - (observability_grafana_oidc_read.rc | default(1)) != 0
+      or ((observability_grafana_oidc_read.stdout | default('') | trim) | length == 0)
+
+- name: "Observability (grafana) | Bind the OIDC client-secret fact (no_log, OIDC only)"
+  ansible.builtin.set_fact:
+    observability_grafana_oidc_client_secret: >-
+      {{ (observability_grafana_oidc_read.stdout | default('') | trim)
+         if ((observability_openbao_addr | length > 0)
+              and (observability_grafana_oidc_read.rc | default(1) == 0)
+              and ((observability_grafana_oidc_read.stdout | default('') | trim) | length > 0))
+         else (observability_grafana_oidc_client_secret_override | default('')) }}
+  no_log: true
+  when: grafana_oidc_enabled | bool
+
+# --- 3. Ensure config/provisioning/dashboards dirs on the guest -------------
+# 0755 (not 0750): these dirs are bind-mounted :ro into the non-root grafana
+# container (UID 472), which needs o+x traverse to read the 0644 config files
+# inside. Non-secret config dirs; the 0600 secret env is a separate file.
+- name: "Observability (grafana) | Ensure the Grafana config + provisioning + dashboards dirs exist"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ observability_grafana_config_dir }}"
+    - "{{ observability_grafana_provisioning_dir }}"
+    - "{{ observability_grafana_datasources_dir }}"
+    - "{{ observability_grafana_dashboards_provider_dir }}"
+    - "{{ observability_grafana_dashboards_json_dir }}"
+
+# --- 4. Render provisioning (datasources, dashboard provider, grafana.ini) --
+# Mode 0644 (world-readable), NOT 0640: all four files below are bind-mounted
+# :ro into the grafana/grafana container, which runs as a NON-ROOT UID (472). A
+# 0640 root:root file is unreadable by that container UID. These are non-secret
+# provisioning/config (datasources, dashboard provider, grafana.ini, dashboard
+# JSON). The admin password / OIDC client secret are NOT here — they live only
+# in the 0600 grafana.secret.env written below, which stays 0600.
+- name: "Observability (grafana) | Render the Prometheus + Loki datasource provisioning"
+  ansible.builtin.template:
+    src: grafana/datasources.yaml.j2
+    dest: "{{ observability_grafana_datasources_dir }}/datasources.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart grafana
+
+- name: "Observability (grafana) | Render the dashboard-provider provisioning"
+  ansible.builtin.template:
+    src: grafana/dashboards.yaml.j2
+    dest: "{{ observability_grafana_dashboards_provider_dir }}/dashboards.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart grafana
+
+- name: "Observability (grafana) | Render grafana.ini (auth block; OIDC only when enabled)"
+  ansible.builtin.template:
+    src: grafana/grafana.ini.j2
+    dest: "{{ observability_grafana_config_dir }}/grafana.ini"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart grafana
+
+- name: "Observability (grafana) | Install the version-controlled dashboard JSON (dashboards-as-code)"
+  ansible.builtin.copy:
+    src: dashboards/
+    dest: "{{ observability_grafana_dashboards_json_dir }}/"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart grafana
+
+# --- 5. Write the 0600 secret env (admin password; OIDC secret when on) -----
+- name: "Observability (grafana) | Write the 0600 runtime secret env on the guest (no_log)"
+  ansible.builtin.template:
+    src: grafana/grafana.secret.env.j2
+    dest: "{{ observability_grafana_secret_env_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart grafana
+
+# ============================================================================
+# 6. CROSS-GUEST INGRESS PATH SELECTION (tasks 3.1/3.2/3.3) — real route vs
+#    dev/offline mock-edge. Traefik (SVC-09, 10.0.20.12) runs on a SEPARATE
+#    guest from Grafana (10.0.20.19); a host-local `edge` network can never
+#    bridge two guests and Traefik never reads another guest's Docker labels, so
+#    the REAL cross-guest path (default, R3.1) is: publish the VLAN20_Port +
+#    delegate a Traefik file-provider Route_Fragment onto the Traefik_Guest. The
+#    mock-edge path (default-off, permanent per mock-stand-ins.md, R3.2) keeps
+#    the old local-`edge` + Docker-label discovery for a co-located dev box only.
+# ============================================================================
+
+# --- 6a. INFO swap-gate decision (R3.4) -------------------------------------
+# composition-wiring.md §"Swap-Gate Pattern" step 4 / mock-stand-ins.md: emit an
+# INFO line stating WHICH ingress path was selected and WHY, so the real-route vs
+# mock-edge choice is visible in the play output. (The traefik_route role emits
+# its own INFO too; this one names the Grafana-side VLAN20_Port decision.)
+- name: "Observability (grafana) | Cross-guest ingress swap-gate decision (INFO, R3.4)"
+  ansible.builtin.debug:
+    msg: >-
+      Grafana cross-guest ingress (swap-gate): obs_grafana_mock_edge={{ obs_grafana_mock_edge }}
+      -> {{
+        ('MOCK_EDGE (dev/offline, co-located Traefik ONLY — permanent default-off '
+          ~ 'placeholder per mock-stand-ins.md): attach the Grafana stack to the local '
+          ~ '`' ~ observability_edge_network ~ '` network + emit Traefik discovery labels; '
+          ~ 'NO VLAN20_Port, NO file-provider route. NEVER use on a host where SVC-09 '
+          ~ 'owns the real `edge` (ADR-0013).')
+        if (obs_grafana_mock_edge | bool)
+        else ('REAL cross-guest file-provider route (default production posture, R3.1): '
+          ~ 'publish the VLAN20_Port ' ~ ansible_host ~ ':' ~ (observability_grafana_port | string)
+          ~ ' (bound to Grafana''s own VLAN-20 IP, never 0.0.0.0/LAN — R2.1/R2.2) and '
+          ~ 'delegate a Traefik Route_Fragment onto the Traefik_Guest; NO cross-guest '
+          ~ '`edge` network, NO Docker labels (Traefik on another guest cannot read them).')
+      }}
+  changed_when: false
+
+# --- 6b. Compose the Grafana Traefik ingress labels (MOCK-EDGE PATH ONLY) ----
+# Only meaningful when Traefik's Docker provider is on the SAME daemon (the
+# co-located dev box). On the real cross-guest path these labels are inert
+# (Traefik is on another guest) and are NOT attached. Mirrors traefik_install's
+# set_fact so the long router/service label strings stay within 120 cols.
+- name: "Observability (grafana) | Compose the Grafana Traefik ingress labels (mock-edge path only)"
+  ansible.builtin.set_fact:
+    observability_grafana_labels: >-
+      {{
+        [
+          'traefik.enable=true',
+          'traefik.docker.network=' ~ observability_edge_network,
+          'traefik.http.routers.' ~ observability_grafana_traefik_router
+            ~ '.rule=Host(`' ~ observability_grafana_host ~ '`)',
+          'traefik.http.routers.' ~ observability_grafana_traefik_router
+            ~ '.entrypoints=websecure',
+          'traefik.http.routers.' ~ observability_grafana_traefik_router
+            ~ '.tls=true',
+          'traefik.http.services.' ~ observability_grafana_traefik_router
+            ~ '.loadbalancer.server.port=' ~ (observability_grafana_port | string),
+        ]
+      }}
+  changed_when: false
+  when: obs_grafana_mock_edge | bool
+
+# --- 6c. Render + delegate the Grafana Route_Fragment (REAL PATH, tasks 3.2/3.4)
+# Consume the reusable traefik_route role to drop grafana-route.yml onto the
+# Traefik_Guest's watched file-provider dir. route_tls=true + the fragment's
+# `tls: {}` (default store) means TLS TERMINATES AT TRAEFIK via SVC-09's
+# file-provider default cert (the self-signed Mock B when no real CA, task 3.4);
+# the backend hop is plain http over VLAN 20. The role fails closed (R3.5) if the
+# backend url / delegate target is unresolved. Skipped entirely on the mock-edge
+# path (the two ingress paths are mutually exclusive).
+- name: "Observability (grafana) | Render + delegate the Grafana cross-guest Route_Fragment (real path)"
+  ansible.builtin.include_role:
+    name: traefik_route
+  vars:
+    traefik_route_enabled: "{{ obs_grafana_traefik_route_enabled | bool }}"
+    route_name: "grafana"
+    route_host_rule: "{{ observability_grafana_host }}"
+    route_backend_url: "http://{{ ansible_host }}:{{ observability_grafana_port }}"
+    route_entrypoint: "websecure"
+    route_tls: true
+    # Delegate target = the Traefik_Guest, reusing the Mock-B delegate var
+    # (obs_traefik_guest_host, default 10.0.20.12 per ADR-0015) so both the route
+    # fragment and the Mock-B cert land on the same SVC-09 guest with no edit.
+    traefik_guest_host: "{{ obs_traefik_guest_host }}"
+    traefik_guest_user: "{{ obs_traefik_guest_user }}"
+    traefik_guest_python: "{{ obs_traefik_guest_python }}"
+    traefik_dynamic_config_dir: "{{ observability_traefik_dynamic_config_dir }}"
+  when: not (obs_grafana_mock_edge | bool)
+
+# --- 6d. Deploy the Compose stack via docker-compose-app --------------------
+# Grafana is a single Compose stack on its own guest (R2.3). On the REAL path
+# (default): the VLAN20_Port binds Grafana's :3000 to its OWN VLAN-20 IP
+# (`{{ ansible_host }}:3000:3000`, the same private-VLAN-bound-port pattern Loki
+# uses — never 0.0.0.0/LAN, R2.1/R2.2/R4.1/R4.5) and Traefik reaches it via the
+# delegated file-provider route; NO `edge` network, NO Docker labels. On the
+# MOCK-EDGE path: NO published port, attach to the local `edge` + emit labels.
+# TLS terminates at Traefik either way (SVC-09 file-provider default cert /
+# Mock B), so the backend hop stays plain http over VLAN 20.
+- name: "Observability (grafana) | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ observability_grafana_stack_name }}"
+    dca_services:
+      - name: grafana
+        image: "{{ observability_grafana_image }}"
+        restart: "unless-stopped"
+        # REAL path: publish the VLAN20_Port bound to the guest's own VLAN-20 IP
+        # ({{ ansible_host }}), consumed only by Traefik over VLAN 20 — never
+        # 0.0.0.0, never a host-wide/LAN port (R2.1/R2.2). MOCK-EDGE path:
+        # publish nothing ([]), discovery is via the `edge` labels instead.
+        ports: >-
+          {{ []
+             if (obs_grafana_mock_edge | bool)
+             else [ansible_host ~ ':' ~ (observability_grafana_port | string)
+                    ~ ':' ~ (observability_grafana_port | string)] }}
+        # Provisioning + config + dashboards bind-mounted READ-ONLY.
+        volumes:
+          - "{{ observability_grafana_config_dir }}/grafana.ini:/etc/grafana/grafana.ini:ro"
+          - "{{ observability_grafana_provisioning_dir }}:{{ observability_grafana_provisioning_container_dir }}:ro"
+          - "{{ observability_grafana_dashboards_json_dir }}:{{ observability_grafana_dashboards_container_dir }}:ro"
+          # Persistent config-DB volume (Grafana's own SQLite state).
+          - "{{ observability_grafana_data_volume }}:/var/lib/grafana"
+        # The 0600 secret env (admin password + OIDC client secret) layered on
+        # top of the non-secret .env.
+        extra_env_files:
+          - "{{ observability_grafana_secret_env_path }}"
+        # REAL path: NO cross-guest `edge` attachment (it cannot span guests).
+        # MOCK-EDGE path: attach to the local `edge` for co-located discovery.
+        networks: >-
+          {{ [observability_edge_network]
+             if (obs_grafana_mock_edge | bool)
+             else [] }}
+        # Traefik discovery labels apply ONLY on the mock-edge path (Traefik's
+        # Docker provider must be on the SAME daemon to read them). On the real
+        # cross-guest path the file-provider Route_Fragment supersedes them.
+        labels: >-
+          {{ observability_grafana_labels
+             if (obs_grafana_mock_edge | bool)
+             else [] }}
+    dca_volumes:
+      - "{{ observability_grafana_data_volume }}"
+    # REAL path: no external `edge` dependency (the file-provider route handles
+    # cross-guest ingress). MOCK-EDGE path: `edge` is created+owned by SVC-09
+    # (traefik_install) on a co-located dev box; attach to it (external: true).
+    dca_networks: >-
+      {{ [{'name': observability_edge_network, 'external': true}]
+         if (obs_grafana_mock_edge | bool)
+         else [] }}
+    dca_env:
+      # Non-secret Grafana config only (composition-wiring.md). The admin
+      # password + OIDC client secret are in the 0600 secret env (extra_env_files),
+      # NEVER here.
+      GF_SERVER_ROOT_URL: "https://{{ observability_grafana_host }}"
+      GF_SERVER_DOMAIN: "{{ observability_grafana_host }}"
+    dca_state: "{{ observability_state }}"

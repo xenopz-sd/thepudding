@@ -1,0 +1,322 @@
+---
+# tasks/main.yml — obs_provision (SVC-17/18 installer — Phase 2: Provision)
+#
+# Clone of svc09_provision adapted for the SVC-17/18 observability THREE-guest
+# root (Prometheus + Grafana + Loki on VLAN 20):
+#   - backend swap-gate (GitLab HTTP when all three CI keys present, else
+#     local_backend_override.tf) with its single INFO decision log,
+#   - terraform init / apply (Proxmox creds via TF_VAR_* env, no_log),
+#   - generate_inventory.py + THREE-guest existence assert (one group per
+#     service_role: prometheus / grafana / loki),
+#   - add_host of all THREE observability guests,
+#   - ssh-keygen -R + ssh-keyscan known_hosts reconciliation over the THREE
+#     guest IPs (10.0.20.18 / .19 / .20).
+#
+# NOTE (agent-live meta-guard): this role runs `terraform apply` (a destructive
+# marker) but is LEAF-EXEMPT like svc09_provision/svc07_provision — the
+# throwaway-guard consult is carried UPSTREAM by obs_preflight (Phase 1 runs
+# before Phase 2 in the same play).
+
+# --- Backend swap-gate selection --------------------------------------------
+- name: "Provisioning | Read the cluster env file to detect the state-backend signal"
+  ansible.builtin.slurp:
+    src: "{{ obs_repo_root }}/{{ cluster_env_file }}"
+  register: obs_env_slurp
+  no_log: true
+
+- name: "Provisioning | Reduce the env file to KEY=VALUE lines"
+  ansible.builtin.set_fact:
+    obs_env_pairs: >-
+      {{ (obs_env_slurp.content | b64decode).splitlines()
+         | map('trim')
+         | reject('match', '^\s*#')
+         | select('search', '=')
+         | list }}
+  no_log: true
+
+- name: "Provisioning | Extract the set of env keys (names only, no values)"
+  ansible.builtin.set_fact:
+    obs_env_keys: >-
+      {{ obs_env_pairs
+         | map('regex_replace', '^\s*([^=]+?)\s*=.*$', '\1')
+         | list }}
+
+- name: "Provisioning | Decide the Terraform backend (swap gate)"
+  ansible.builtin.set_fact:
+    obs_use_gitlab_backend: >-
+      {{ ('CI_API_V4_URL' in obs_env_keys)
+         and ('CI_PROJECT_ID' in obs_env_keys)
+         and ('CI_JOB_TOKEN' in obs_env_keys) }}
+
+- name: "Provisioning | Extract GitLab CI state-backend values (GitLab backend only)"
+  ansible.builtin.set_fact:
+    obs_env_ci_values: >-
+      {{ dict(obs_env_keys | zip(
+           obs_env_pairs
+           | map('regex_replace', '^[^=]+=\s*(.*?)\s*$', '\1')
+           | map('regex_replace', '^"(.*)"$', '\1')
+           | list
+         )) }}
+  when: obs_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Derive the GitLab state address + job token (GitLab backend only)"
+  ansible.builtin.set_fact:
+    obs_env_gitlab_state_address: >-
+      {{ obs_env_ci_values['CI_API_V4_URL'] }}/projects/{{
+         obs_env_ci_values['CI_PROJECT_ID'] }}/terraform/state/svc-17-18-observability
+    obs_env_ci_job_token: "{{ obs_env_ci_values['CI_JOB_TOKEN'] }}"
+  when: obs_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Log the Terraform backend selection (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Terraform backend:
+      {{ 'GitLab HTTP state (svc-17-18-observability) — the Cluster_Env_File '
+         ~ 'configures the GitLab CI state-backend variables'
+         if (obs_use_gitlab_backend | bool)
+         else 'LOCAL (local_backend_override.tf) — the Cluster_Env_File does not '
+              ~ 'configure the GitLab HTTP backend (solo/offline Developer-B default)' }}
+
+- name: "Provisioning | Ensure local_backend_override.tf is present (local backend)"
+  ansible.builtin.copy:
+    dest: "{{ obs_tf_root }}/local_backend_override.tf"
+    mode: "0644"
+    content: |
+      # Local, gitignored state backend for a solo/offline apply — overrides the
+      # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+      terraform {
+        backend "local" {}
+      }
+  when: not (obs_use_gitlab_backend | bool)
+
+- name: "Provisioning | Remove any local_backend_override.tf (GitLab HTTP backend)"
+  ansible.builtin.file:
+    path: "{{ obs_tf_root }}/local_backend_override.tf"
+    state: absent
+  when: obs_use_gitlab_backend | bool
+
+- name: "Provisioning | terraform init (local backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+  args:
+    chdir: "{{ obs_tf_root }}"
+  environment: "{{ obs_tf_env }}"
+  register: obs_tf_init_local
+  changed_when: true
+  when: not (obs_use_gitlab_backend | bool)
+  no_log: true
+
+- name: "Provisioning | terraform init (GitLab HTTP backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+      - "-backend-config=address={{ obs_env_gitlab_state_address }}"
+      - "-backend-config=lock_address={{ obs_env_gitlab_state_address }}/lock"
+      - "-backend-config=unlock_address={{ obs_env_gitlab_state_address }}/lock"
+      - -backend-config=username=gitlab-ci-token
+      - "-backend-config=password={{ obs_env_ci_job_token }}"
+      - -backend-config=lock_method=POST
+      - -backend-config=unlock_method=DELETE
+      - -backend-config=retry_wait_min=5
+  args:
+    chdir: "{{ obs_tf_root }}"
+  environment: "{{ obs_tf_env }}"
+  register: obs_tf_init_gitlab
+  changed_when: true
+  when: obs_use_gitlab_backend | bool
+  no_log: true
+
+# --- guest-variable assembly + non-interactive apply ------------------------
+# The SVC-17/18 root takes a per-guest template/datastore/vmid triple for EACH
+# of the three guests (prometheus / grafana / loki), plus the shared
+# operator_ssh_public_keys and platform_domain. Every value is resolved by
+# obs_preflight (Phase 1); refuse to apply if any is absent so no Proxmox
+# resource is created half-configured.
+- name: "Provisioning | Assert all required guest variables are present (before apply)"
+  ansible.builtin.assert:
+    that:
+      - "obs_proxmox_node_name is defined and (obs_proxmox_node_name | trim | length > 0)"
+      - "obs_platform_domain is defined and (obs_platform_domain | trim | length > 0)"
+      # Prometheus guest
+      - "obs_prometheus_template_file_id is defined and (obs_prometheus_template_file_id | trim | length > 0)"
+      - "obs_prometheus_datastore_id is defined and (obs_prometheus_datastore_id | trim | length > 0)"
+      - "obs_prometheus_datastore_id != obs_autodetect_sentinel"
+      - "obs_prometheus_vmid is defined"
+      # Grafana guest
+      - "obs_grafana_template_file_id is defined and (obs_grafana_template_file_id | trim | length > 0)"
+      - "obs_grafana_datastore_id is defined and (obs_grafana_datastore_id | trim | length > 0)"
+      - "obs_grafana_datastore_id != obs_autodetect_sentinel"
+      - "obs_grafana_vmid is defined"
+      # Loki guest
+      - "obs_loki_template_file_id is defined and (obs_loki_template_file_id | trim | length > 0)"
+      - "obs_loki_datastore_id is defined and (obs_loki_datastore_id | trim | length > 0)"
+      - "obs_loki_datastore_id != obs_autodetect_sentinel"
+      - "obs_loki_vmid is defined"
+    fail_msg: >-
+      A required guest variable is absent or empty; refusing to run
+      `terraform apply` so no Proxmox resource is created. Required for EACH of
+      the three guests (prometheus/grafana/loki): template_file_id, a resolved
+      datastore_id (not the auto-detect sentinel), vmid — plus proxmox_node_name
+      and platform_domain.
+    success_msg: "All required guest variables are present; proceeding to terraform apply."
+
+- name: "Provisioning | terraform apply (non-interactive, auto-approve)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - apply
+      - -input=false
+      - -auto-approve
+      - "-var=proxmox_node_name={{ obs_proxmox_node_name }}"
+      - "-var=platform_domain={{ obs_platform_domain }}"
+      # Prometheus guest
+      - "-var=prometheus_vmid={{ obs_prometheus_vmid }}"
+      - "-var=prometheus_template_file_id={{ obs_prometheus_template_file_id }}"
+      - "-var=prometheus_datastore_id={{ obs_prometheus_datastore_id }}"
+      # Grafana guest
+      - "-var=grafana_vmid={{ obs_grafana_vmid }}"
+      - "-var=grafana_template_file_id={{ obs_grafana_template_file_id }}"
+      - "-var=grafana_datastore_id={{ obs_grafana_datastore_id }}"
+      # Loki guest
+      - "-var=loki_vmid={{ obs_loki_vmid }}"
+      - "-var=loki_template_file_id={{ obs_loki_template_file_id }}"
+      - "-var=loki_datastore_id={{ obs_loki_datastore_id }}"
+  args:
+    chdir: "{{ obs_tf_root }}"
+  environment: "{{ obs_tf_env }}"
+  register: obs_tf_apply
+  changed_when: "'0 added, 0 changed, 0 destroyed' not in obs_tf_apply.stdout"
+  no_log: true
+
+# --- inventory generation + refresh handoff ---------------------------------
+- name: "Provisioning | Generate the Ansible inventory from Terraform outputs"
+  ansible.builtin.command:
+    argv:
+      - "{{ obs_venv_python }}"
+      - ansible/inventory/generate_inventory.py
+      - --root
+      - infra/projects/svc-17-18-observability
+      - --out
+      - "{{ obs_generated_inventory }}"
+  args:
+    chdir: "{{ obs_repo_root }}"
+  register: obs_gen_inventory
+  changed_when: true
+
+- name: "Provisioning | Confirm the generated inventory file was written"
+  ansible.builtin.stat:
+    path: "{{ obs_repo_root }}/{{ obs_generated_inventory }}"
+  register: obs_generated_inventory_stat
+
+- name: "Provisioning | Load the generated inventory to assert the three guests"
+  ansible.builtin.slurp:
+    src: "{{ obs_repo_root }}/{{ obs_generated_inventory }}"
+  register: obs_generated_inventory_slurp
+  when: obs_generated_inventory_stat.stat.exists
+
+- name: "Provisioning | Parse the generated inventory group map"
+  ansible.builtin.set_fact:
+    obs_generated_inventory_doc: >-
+      {{ (obs_generated_inventory_slurp.content | b64decode | from_yaml)
+         if (obs_generated_inventory_stat.stat.exists)
+         else {} }}
+
+- name: "Provisioning | Collect the service_role groups that carry at least one host"
+  ansible.builtin.set_fact:
+    obs_generated_inventory_roles: >-
+      {{ obs_guest_roles
+         | select('in', (obs_generated_inventory_doc.all.children
+                         | default({})).keys() | list)
+         | select('in', (obs_generated_inventory_doc.all.children
+                         | default({})) | dict2items
+                         | selectattr('value.hosts', 'defined')
+                         | selectattr('value.hosts', 'ne', None)
+                         | rejectattr('value.hosts', 'equalto', {})
+                         | map(attribute='key') | list)
+         | list }}
+
+- name: "Provisioning | Assert the generated inventory has ALL THREE guests (else halt before Bootstrap)"
+  ansible.builtin.assert:
+    that:
+      - "obs_generated_inventory_stat.stat.exists"
+      - "(obs_generated_inventory_roles | sort) == (obs_guest_roles | sort)"
+    fail_msg: >-
+      generate_inventory.py did not produce a {{ obs_generated_inventory }} with
+      all three observability guests. Expected one populated service_role group
+      per guest ({{ obs_guest_roles | join(', ') }}); found:
+      {{ obs_generated_inventory_roles | default([]) | join(', ') | default('none') }}.
+      Halting before the Bootstrap phase and leaving the provisioned guests in
+      place.
+    success_msg: >-
+      Generated inventory present with all three guests
+      ({{ obs_guest_roles | join(', ') }}): {{ obs_generated_inventory }}.
+
+- name: "Provisioning | add_host every observability guest into the in-memory inventory"
+  ansible.builtin.add_host:
+    name: "{{ item.hostname }}"
+    groups:
+      - "{{ item.role }}"
+    ansible_host: "{{ item.ip }}"
+    ansible_user: root
+    ansible_connection: ssh
+  loop:
+    - { role: "prometheus", hostname: "svc17-prometheus-20-01", ip: "10.0.20.18" }
+    - { role: "grafana", hostname: "svc17-grafana-20-01", ip: "10.0.20.19" }
+    - { role: "loki", hostname: "svc18-loki-20-01", ip: "10.0.20.20" }
+  loop_control:
+    label: "{{ item.hostname }} ({{ item.ip }})"
+  changed_when: false
+
+# --- SSH known_hosts reconciliation -----------------------------------------
+- name: "Provisioning | Ensure ~/.ssh exists (0700)"
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+
+- name: "Provisioning | Remove stale known_hosts fingerprints for the three guest IPs"
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -R
+      - "{{ item }}"
+      - -f
+      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
+  loop: "{{ obs_guest_ips }}"
+  register: obs_knownhosts_purge
+  changed_when: "'updated' in (obs_knownhosts_purge.stderr | default(''))"
+  failed_when: false
+
+- name: "Provisioning | ssh-keyscan each guest IP (per-address 30s timeout)"
+  ansible.builtin.command:
+    argv:
+      - ssh-keyscan
+      - -T
+      - "30"
+      - "{{ item }}"
+  loop: "{{ obs_guest_ips }}"
+  register: obs_keyscan
+  changed_when: false
+  failed_when: >-
+    obs_keyscan.rc != 0
+    or (obs_keyscan.stdout | default('') | trim | length == 0)
+
+- name: "Provisioning | Append current host keys to known_hosts"
+  ansible.builtin.blockinfile:
+    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+    create: true
+    mode: "0600"
+    marker: "# {mark} SVC-17/18 installer host keys for {{ item.item }}"
+    block: "{{ item.stdout }}"
+  loop: "{{ obs_keyscan.results }}"
+  loop_control:
+    label: "{{ item.item }}"

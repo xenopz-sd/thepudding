@@ -1,0 +1,53 @@
+---
+# defaults/main.yml — obs_clean_slate (SVC-17/18 installer — clean-slate branch)
+#
+# Clean-slate phase-specific defaults. Cross-phase constants (clean_slate,
+# clean_slate_confirm, cluster_env_file, obs_repo_root, obs_venv_python,
+# obs_tf_root, obs_cluster_env_helper, obs_prometheus_vmid, obs_grafana_vmid,
+# obs_loki_vmid, obs_throwaway_guard, obs_throwaway_allowlist) stay as play-level
+# vars / other-phase role defaults statically imported by the orchestrator. NO
+# secret value ever lives here. Clone of svc09_clean_slate/defaults adapted for
+# the three-guest observability root (Prometheus/Grafana/Loki in ONE state).
+
+# Proxmox host SSH address for the Clean_Slate_Reset path. The delegated
+# clean-slate.yml runs `pct` ON THE NODE, so it targets the Proxmox-host
+# inventory, whose ansible_host is a committed placeholder overridden at run
+# time. Supply the real LAN IP with `-e obs_proxmox_host=<real-proxmox-lan-ip>`.
+# Unset by default; the clean-slate branch fails fast (naming this var) if a
+# reset is requested without it. Not needed on the normal install path.
+obs_proxmox_host: ""
+# The Proxmox-host inventory clean-slate.yml expects (pct runs on the node).
+obs_proxmox_host_inventory: ansible/inventory/proxmox-hosts.yml
+
+# --- Grafana cross-guest Route_Fragment removal (traefik-cross-guest-ingress) ---
+# When Grafana is torn down, the delegated Traefik Route_Fragment it wrote onto
+# the Traefik_Guest's watched file-provider dir must ALSO be removed, so a
+# destroyed Grafana leaves no dangling route pointing at a freed VLAN-20 IP
+# (spec .kiro/specs/traefik-cross-guest-ingress/, R-NFR1 / R4.5; design
+# §"Data Models" Route_Fragment lifecycle + §"Error Handling" stale-route bullet).
+# obs_clean_slate is a SEPARATE role from observability_stack, so it does not see
+# that role's obs_traefik_* / observability_traefik_dynamic_config_dir defaults;
+# these mirror them with the SAME values so the removal targets exactly the file
+# the traefik_route role wrote. NOT a secret; NOT the SVC-09 default cert (Mock B
+# — shared, out of scope here; only the grafana-route.yml fragment this feature
+# added is removed).
+#   * obs_traefik_guest_host — the Traefik (SVC-09) guest the fragment lives on
+#     (the file-provider owner, delegate target). Default is the SVC-09 VLAN-20
+#     IP (10.0.20.12 per ADR-0015), matching observability_stack's default.
+obs_traefik_guest_host: "10.0.20.12"
+obs_traefik_guest_user: "root"
+obs_traefik_guest_python: "/usr/bin/python3"
+# SSH private key used to reach the Traefik_Guest when the removal delegates from
+# the localhost orchestrator play. Empty by default → `| default(omit)` so the
+# ambient SSH key is used, exactly as the obs_provision / svc09_provision roles
+# rely on the ambient key (they set no explicit ansible_ssh_private_key_file).
+# Overridable with -e obs_traefik_guest_ssh_key=<path> if the orchestrator runs
+# under an account whose default key does not reach the Traefik_Guest.
+obs_traefik_guest_ssh_key: ""
+# SVC-09's Traefik file-provider directory on the Traefik guest (watched, :ro
+# mount). Matches observability_stack's observability_traefik_dynamic_config_dir
+# and traefik_install's traefik_dynamic_config_dir with no SVC-09 edit.
+obs_traefik_dynamic_config_dir: "/etc/traefik/dynamic"
+# The delegated Grafana Route_Fragment the traefik_route role renders as
+# "{{ route_name }}-route.yml" with route_name=grafana. Removed on clean-slate.
+obs_grafana_route_fragment: "{{ obs_traefik_dynamic_config_dir }}/grafana-route.yml"

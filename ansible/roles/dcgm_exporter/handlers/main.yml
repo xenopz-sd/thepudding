@@ -1,0 +1,17 @@
+---
+# handlers/main.yml — dcgm_exporter (SVC-17/18, GPU-tagged hosts only)
+#
+# Restart handler. The stack carries no bind-mounted rendered config (DCGM
+# Exporter reads live GPU state, not a config file), so there is no template
+# `notify:` today; the handler is defined for parity with the sibling exporter
+# roles (promtail_agent) and so a future config-bearing change can `notify:` it.
+# When invoked, reconcile the stack with a forced recreate via
+# community.docker.docker_compose_v2 (PF §9 — declarative, not a shell
+# `docker compose up`).
+
+- name: Restart dcgm-exporter
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ dcgm_exporter_stack_name }}"
+    project_name: "{{ dcgm_exporter_stack_name }}"
+    state: present
+    recreate: always

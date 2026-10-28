@@ -18,3 +18,44 @@
 svc07_proxmox_host: ""
 # The Proxmox-host inventory clean-slate.yml expects (pct runs on the node).
 svc07_proxmox_host_inventory: ansible/inventory/proxmox-hosts.yml
+
+# --- OpenBao cross-guest Route_Fragment removal (svc-07-cross-guest-ingress) ---
+# When the OpenBao primary is torn down, the delegated Traefik Route_Fragment it
+# wrote onto the Traefik_Guest's watched file-provider dir must ALSO be removed,
+# so a destroyed OpenBao leaves no dangling route pointing at a freed VLAN-20 IP
+# (10.0.20.10). Spec .kiro/specs/svc-07-cross-guest-ingress/ (R4.1-R4.4); mirrors
+# the FIXED obs_clean_slate Route_Fragment-removal pattern.
+# svc07_clean_slate is a SEPARATE role from openbao_install, so it does not see
+# that role's traefik_* defaults; these mirror obs_clean_slate's obs_traefik_*
+# set (SAME values, OpenBao-named) so the removal targets exactly the file the
+# traefik_route role wrote. A Route_Fragment / CA cert is PUBLIC, non-secret; no
+# secret value ever lives here, and the private key is never involved.
+#   * svc07_traefik_guest_host — the Traefik (SVC-09) guest the fragment lives on
+#     (the file-provider owner, delegate target). Default is the SVC-09 VLAN-20
+#     IP (10.0.20.12 per ADR-0015), matching openbao_install's default.
+svc07_traefik_guest_host: "10.0.20.12"
+svc07_traefik_guest_user: "root"
+svc07_traefik_guest_python: "/usr/bin/python3"
+# SSH private key used to reach the Traefik_Guest when the removal delegates from
+# the localhost orchestrator play. Empty by default → `| default(omit)` so the
+# ambient SSH key is used, exactly as the svc07_provision role relies on the
+# ambient key. Overridable with -e svc07_traefik_guest_ssh_key=<path> if the
+# orchestrator runs under an account whose default key does not reach the guest.
+#
+# THE FIXED ORCHESTRATOR-CONTEXT CONNECTION PATTERN (why these vars exist). The
+# clean-slate branch runs in the `hosts: localhost` orchestrator play
+# (ansible_connection: local) — NOT the configurator play + generated inventory.
+# In that orchestrator context there is NO add_host for the Traefik_Guest and NO
+# known_hosts entry, so a bare `delegate_to: 10.0.20.12` has no working SSH
+# connection and a naive `failed_when: false` would swallow the connection
+# failure as a FALSE "already absent", silently leaving a dangling route. These
+# connection vars feed the add_host that reconciles known_hosts + supplies the
+# SSH connection before the delegated removal runs.
+svc07_traefik_guest_ssh_key: ""
+# SVC-09's Traefik file-provider directory on the Traefik guest (watched, :ro
+# mount). Matches openbao_install's traefik_dynamic_config_dir and
+# traefik_install's with no SVC-09 edit.
+svc07_traefik_dynamic_config_dir: "/etc/traefik/dynamic"
+# The delegated OpenBao Route_Fragment the traefik_route role renders as
+# "{{ route_name }}-route.yml" with route_name=openbao. Removed on clean-slate.
+svc07_openbao_route_fragment: "{{ svc07_traefik_dynamic_config_dir }}/openbao-route.yml"

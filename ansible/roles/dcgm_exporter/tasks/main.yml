@@ -1,0 +1,135 @@
+---
+# tasks/main.yml — dcgm_exporter (SVC-17/18, GPU-tagged hosts only, DEFERRED)
+#
+# Deploys NVIDIA DCGM Exporter on GPU-tagged hosts ONLY, as a Docker Compose
+# stack via the generic docker-compose-app role. Exposes NVIDIA GPU metrics on
+# :9400 for the observability_stack to scrape (FR-4). DEFERRED by default
+# (Mock C / GPU_Metrics_Deferred): while `dcgm_metrics_deferred` is true, or on a
+# host that is not in the `gpu` inventory group, the role is a logged NO-OP and
+# never a v1 acceptance gate (requirements AC-12).
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements.md FR-4/AC-12,
+# design §3.3 + §4 Mock C).
+#
+# Order (mirrors promtail_agent / traefik_install):
+#   1. Resolve the deploy gate (deferred flag AND gpu-group membership) and log
+#      the decision at INFO — honest inert fallback, never canned success
+#      (composition-wiring.md).
+#   2. When NOT deploying: stop (logged no-op, changed=0). Everything below is
+#      gated on dcgm_exporter_should_deploy.
+#   3. Idempotency version-check guard (skip templating/up on an already-pinned
+#      running container -> changed=0 on a converged GPU host).
+#   4. Deploy the Compose stack via docker-compose-app (with the GPU device
+#      reservation runtime flag).
+
+# --- 1. Resolve the deploy gate ---------------------------------------------
+# Deploy ONLY when BOTH hold:
+#   * the Mock C deferral flag is OFF (dcgm_metrics_deferred=false), AND
+#   * this host is tagged into the `gpu` inventory group.
+# There are zero `gpu`-group hosts today, so even with the flag flipped the role
+# touches no host until a GPU host (SVC-23) is tagged in.
+- name: "DCGM | Resolve the deploy gate (deferral flag AND gpu-group membership)"
+  ansible.builtin.set_fact:
+    dcgm_exporter_is_gpu_host: "{{ dcgm_exporter_gpu_group in group_names }}"
+    dcgm_exporter_should_deploy: >-
+      {{ (not (dcgm_metrics_deferred | bool))
+         and (dcgm_exporter_gpu_group in group_names) }}
+  changed_when: false
+
+# --- Log the deferred / no-op decision at INFO (composition-wiring.md) -------
+# Honest inert fallback — the role reports WHY it is a no-op rather than
+# pretending to have deployed. One of the two reasons is always named.
+- name: "DCGM | Deferred / no-op decision (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      dcgm_exporter on {{ inventory_hostname }}: NO-OP (changed=0) —
+      {{ 'dcgm_metrics_deferred=true (Mock C, GPU_Metrics_Deferred — deferred '
+         ~ 'until an SVC-23 GPU host exists; set -e dcgm_metrics_deferred=false '
+         ~ 'to un-defer)'
+         if (dcgm_metrics_deferred | bool)
+         else ('host is not in the ' ~ dcgm_exporter_gpu_group ~ ' inventory '
+               ~ 'group (no GPU host tagged yet); tag a GPU host into the '
+               ~ dcgm_exporter_gpu_group ~ ' group to deploy') }}.
+      GPU metrics are NOT a v1 acceptance gate (requirements AC-12).
+  when: not dcgm_exporter_should_deploy
+
+# --- Log the deploy decision at INFO (composition-wiring.md) ----------------
+- name: "DCGM | Deploy decision (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      dcgm_exporter on {{ inventory_hostname }}: DEPLOYING
+      {{ dcgm_exporter_image }} on :{{ dcgm_exporter_port }} with GPU
+      reservation '{{ dcgm_exporter_runtime_options | join(' ') }}'
+      (dcgm_metrics_deferred=false AND host in
+      '{{ dcgm_exporter_gpu_group }}' group). Requires the NVIDIA Container
+      Toolkit on this host (SVC-23 prerequisite — not installed by this role).
+  when: dcgm_exporter_should_deploy
+
+# --- 2. Everything below runs ONLY on a GPU host with the flag flipped -------
+
+# --- 3. IDEMPOTENCY: version-check guard ------------------------------------
+# Detect an already-running DCGM Exporter container at the pinned image BEFORE
+# bringing up the stack, so a second run against an already-installed GPU host
+# is a no-op that reports changed=0 (PF §9 idempotency rule).
+- name: "DCGM | Inspect any running container at the pinned image (idempotency guard)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "--format={{ '{{' }}index .Config.Image{{ '}}' }}"
+      - "{{ dcgm_exporter_container_name }}"
+  register: dcgm_exporter_running_image
+  failed_when: false
+  changed_when: false
+  when: dcgm_exporter_should_deploy
+
+- name: "DCGM | Set fact — already at the pinned image?"
+  ansible.builtin.set_fact:
+    dcgm_exporter_already_at_pinned_version: >-
+      {{ (dcgm_exporter_running_image.rc | default(1)) == 0
+         and (dcgm_exporter_running_image.stdout | default('') | trim) == dcgm_exporter_image }}
+  changed_when: false
+  when: dcgm_exporter_should_deploy
+
+- name: "DCGM | Report idempotent no-op when already at the pinned image"
+  ansible.builtin.debug:
+    msg: >-
+      DCGM Exporter container {{ dcgm_exporter_container_name }} is already
+      running at {{ dcgm_exporter_image }}; install is a no-op (changed=0).
+  when:
+    - dcgm_exporter_should_deploy
+    - dcgm_exporter_already_at_pinned_version | default(false)
+
+# --- 4. Deploy the Compose stack via docker-compose-app ----------------------
+# No host port (FR-13 / integration-boundaries §1) — :9400 is internal, scraped
+# on VLAN 20. The GPU device reservation is carried as a container-create runtime
+# flag (--gpus all) via `runtime_options`, the only mechanism the UNMODIFIED
+# docker-compose-app exposes for runtime flags Compose does not model as
+# first-class keys. Requires the NVIDIA Container Toolkit on the host.
+- name: "DCGM | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ dcgm_exporter_stack_name }}"
+    dca_services:
+      - name: dcgm-exporter
+        image: "{{ dcgm_exporter_image }}"
+        restart: "unless-stopped"
+        # GPU device reservation (--gpus all) — the NVIDIA-runtime reservation
+        # the design §3.3 requires. Needs the NVIDIA Container Toolkit (SVC-23
+        # prerequisite, not installed here).
+        runtime_options: "{{ dcgm_exporter_runtime_options }}"
+        networks: ["default"]
+    # No named volumes (DCGM Exporter is stateless — it reads live GPU state).
+    dca_volumes: []
+    # Pushes nothing out and takes no HTTP ingress; the default compose network
+    # suffices (no Traefik `edge` join — scraped internally on VLAN 20).
+    dca_networks: []
+    dca_env:
+      # Non-secret config only (composition-wiring.md). The listen port is baked
+      # into the image's default DCGM_EXPORTER_LISTEN; surfaced here by name for
+      # explicit, visible wiring.
+      DCGM_EXPORTER_LISTEN: ":{{ dcgm_exporter_port }}"
+    dca_state: "{{ dcgm_exporter_state }}"
+  when:
+    - dcgm_exporter_should_deploy
+    - not (dcgm_exporter_already_at_pinned_version | default(false))

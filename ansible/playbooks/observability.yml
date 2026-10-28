@@ -1,0 +1,101 @@
+---
+# Observability provisioning playbook (SVC-17/18 — feature:
+# svc-17-18-observability).
+#
+# CONFIGURATOR play (integration-boundaries.md §4): runs NATIVELY on the three
+# observability LXC guests, reached via the generated inventory the installer
+# wrote (ansible/inventory/svc-17-18-observability.generated.yml). Invoked by the
+# obs_bootstrap role as a child ansible-playbook run; also runnable standalone:
+#   ~/venv/devinfra/bin/ansible-playbook -i <generated-inventory> \
+#     ansible/playbooks/observability.yml
+#
+# Bind-only: NO role/task logic here (it lives in observability_stack and the
+# three fleet exporter roles). Two plays:
+#
+#   Play 1 (hosts: prometheus:grafana:loki) — fleet-wide exporters. node_exporter
+#     + cAdvisor (FR-2/FR-3), Promtail (FR-5), and the DEFERRED dcgm_exporter
+#     (Mock C: applies to the `gpu` group only — zero hosts today, logged no-op).
+#     SCOPED to the three observability service_role groups: this play is now
+#     driven by a MERGED multi-inventory (the obs_bootstrap Task-2 configurator
+#     run loads ALL ansible/inventory/*.generated.yml so the scrape-target index
+#     can see the V1_Scrape_Set groups), whose OTHER hosts (SVC-01/06/07/09) must
+#     NOT receive the exporter roles — hence prometheus:grafana:loki, not
+#     `hosts: all`. The three obs guests are the exporter fleet here.
+#
+#   Play 2 (hosts: prometheus:grafana:loki) — the observability_stack role, which
+#     self-dispatches
+#     per guest by the guest's `service_role` group (prometheus / grafana /
+#     loki) and is a no-op on any host that is in none of those groups. It
+#     renders prometheus.yml (file_sd only) + alertmanager + rules + the
+#     generated scrape-target files on the Prometheus guest, the Grafana
+#     provisioning (incl. the delegated OpenBao bao-CLI secret reads, no_log) on
+#     the Grafana guest, and loki-config on the Loki guest, then hands each stack
+#     to docker-compose-app (content-hash guarded `docker compose up -d`).
+#
+# A `meta: flush_handlers` sits between the two plays' role sections and the end
+# of each play so the Restart handlers (grafana / prometheus / loki / promtail)
+# fire deterministically once the rendered config is in place, mirroring
+# traefik.yml.
+#
+# OpenBao secret wiring (FR-15): the Grafana guest reads the Break_Glass_Admin
+# password (+ the OIDC client secret when enabled) from OpenBao via the delegated
+# bao-CLI docker-exec pattern inside observability_stack/tasks/grafana.yml. Those
+# reads need observability_openbao_addr set and the OPENBAO_ADMIN_TOKEN in the
+# environment (observability_bao_token looks it up). obs_bootstrap bridges both
+# across the child-process boundary (addr via -e, token via the child ENV,
+# no_log) when it invokes this play.
+
+# hosts scope: prometheus:grafana:loki — the three observability service_role
+# groups. Driven by a merged multi-inventory (obs_bootstrap Task 2 loads all
+# *.generated.yml so the scrape-target index sees the V1_Scrape_Set groups); the
+# other merged hosts (SVC-01/06/07/09) must NOT get the exporter roles.
+- name: Deploy the fleet-wide observability exporters (node_exporter, cAdvisor, Promtail, dcgm)
+  hosts: prometheus:grafana:loki
+  become: true
+  tasks:
+    - name: Install node_exporter (fleet-wide, FR-2)
+      ansible.builtin.import_role:
+        name: node_exporter
+      tags: ["exporters", "node_exporter"]
+
+    - name: Install cAdvisor (every Docker host, FR-3)
+      ansible.builtin.import_role:
+        name: cadvisor
+      tags: ["exporters", "cadvisor"]
+
+    - name: Install Promtail (fleet-wide log shipper, FR-5)
+      ansible.builtin.import_role:
+        name: promtail_agent
+      tags: ["exporters", "promtail"]
+
+    # DEFERRED (Mock C): applies to the `gpu` inventory group only — zero hosts
+    # today, logged no-op. SVC-23 is then a host-tag + `-e dcgm_metrics_deferred=false`.
+    - name: Install dcgm_exporter (GPU-tagged hosts only, deferred, FR-4)
+      ansible.builtin.import_role:
+        name: dcgm_exporter
+      tags: ["exporters", "dcgm_exporter"]
+
+    - name: Flush exporter handlers so each exporter runs with its final config
+      ansible.builtin.meta: flush_handlers
+
+# hosts scope: prometheus:grafana:loki — same merged-inventory rationale as Play
+# 1. The scrape-target index inside observability_stack reads controller-side
+# groups[...] inventory data (the V1_Scrape_Set postgres/zitadel/openbao/traefik
+# groups from the merged inventory), which is available regardless of this play's
+# host scope — so scoping to the three obs guests feeds the index correctly while
+# keeping the SVC-01/06/07/09 guests out of the stack role.
+- name: Configure the observability stack (Prometheus + Alertmanager, Grafana, Loki)
+  hosts: prometheus:grafana:loki
+  become: true
+  tasks:
+    # observability_stack self-dispatches per guest by the guest's service_role
+    # group (prometheus / grafana / loki); a host in none of those groups is a
+    # fail-closed assert, so this play is only meaningful on the three stack
+    # guests of the merged inventory. See observability_stack/tasks/main.yml.
+    - name: Render per-guest config + deploy the Compose stack (observability_stack)
+      ansible.builtin.import_role:
+        name: observability_stack
+      tags: ["stack"]
+
+    - name: Flush stack handlers so each component restarts with its final config
+      ansible.builtin.meta: flush_handlers

@@ -5,6 +5,111 @@ All notable changes to the Developer Services Platform are documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-10-28
+
+The fifth implemented service lands: **SVC-17/18 (Prometheus + Grafana + Loki
+observability)** on three VLAN-20 LXC guests, wiring a v1 scrape set across the four
+already-built services at `up==1`. Alongside it, **cross-guest Traefik ingress is
+generalized** — each HTTP backend on a separate guest from Traefik now renders and
+delegate-copies its own file-provider static route (ADR-0018), converting SVC-06
+(ZITADEL, h2c) and SVC-07 (OpenBao, https) onto the mechanism and completing the
+http/https/h2c three-scheme set without Docker Swarm. A single authoritative
+**dependency-ordered all-services from-scratch walkthrough + reverse-order teardown**
+is added to `docs/TESTING.md` and proven live on the throwaway cluster. Six
+correctness fixes surfaced by that from-scratch validation also land. Minor version
+bump: all additive (one new implemented service, one new cross-cutting ingress
+feature, new operator docs) plus fixes — no breaking changes. This release brings the
+implemented-services set to SVC-01/06/07/09 + SVC-17/18 + platform prerequisites.
+
+### Added
+- **SVC-17/18 — Observability stack (Prometheus + Grafana + Loki)** (spec
+  `svc-17-18-observability`, ADR-0017): the shared metrics/dashboards/logs stack on
+  THREE VLAN-20 LXC guests (Prometheus+Alertmanager, Grafana, Loki) at
+  Host_Index_Authority indices 8/9/10 (`10.0.20.18`/`.19`/`.20`). Prometheus with a
+  30-day local TSDB + `file_sd`-generated scrape targets; Grafana fronted by Traefik;
+  Loki + Promtail shipping fleet-wide logs; node_exporter/cAdvisor fleet exporters. The
+  v1 scrape set wires up the four already-built services (SVC-01/06/07/09) at `up==1`.
+  Ships three PERMANENT default-off mock stand-ins (Grafana OIDC until a client is
+  registered in SVC-06; self-signed TLS until the SVC-08 CA; GPU `dcgm-exporter` until
+  an SVC-23 GPU host) that fail closed when off. Own Terraform root +
+  `svc-17-18-bootstrap.yml` 4-phase orchestrator + `svc-17-18-health.yml` +
+  `INSTALL-RUNBOOK.md`. Live-validated on the throwaway cluster.
+- **ADR-0017**
+  (`.kiro/decisions/0017-svc-17-18-three-lxc-split-and-mock-flip-convention.md`): the
+  three-LXC split (not the catalog's one-VM) honoring the host-index ledger, the
+  per-slot svc_code split (svc17 prometheus/grafana, svc18 loki), and the three
+  default-off mock-to-real flip convention.
+- **Cross-guest Traefik ingress via file-provider static routes** (specs
+  `traefik-cross-guest-ingress`, `svc-07-cross-guest-ingress`,
+  `svc-06-cross-guest-ingress`, ADR-0018): each HTTP backend on a SEPARATE guest from
+  Traefik now renders its own Route_Fragment (one `http.routers` + one `http.services`
+  pointing at the backend's VLAN-20 `IP:port`) and delegate-copies it onto the Traefik
+  guest's file-provider dir — solving cross-guest discovery (a host-local `edge` Docker
+  network cannot span guests) WITHOUT Docker Swarm (rejected: violates the Compose-only
+  constitution). SVC-07 OpenBao (verified https backend) and SVC-06 ZITADEL (h2c
+  backend) converted to this mechanism, completing the http/https/h2c three-scheme set.
+  `integration-boundaries.md` §1 clarified: a VLAN-20-internal port bound to the
+  backend's own VLAN-20 IP and consumed only by Traefik is NOT a second ingress.
+  Live-validated.
+- **ADR-0018**
+  (`.kiro/decisions/0018-traefik-cross-guest-ingress-via-file-provider-static-routes.md`):
+  the file-provider static-route mechanism + the §1 clarification; Docker Swarm overlay
+  rejected.
+- **All-services provision walkthrough** (spec `all-services-provision-walkthrough`): a
+  single authoritative dependency-ordered from-scratch bring-up + reverse-order
+  teardown of every implemented service in `docs/TESTING.md` (platform-foundation →
+  SVC-07 → SVC-09 → SVC-06 incl. its backing SVC-01 → SVC-17/18), each step
+  tier-annotated and linking its INSTALL-RUNBOOK, proven live on the shrimp throwaway
+  cluster. Documents the two default-off dev mocks required pre-SVC-06/pre-SVC-08 and
+  the OpenBao-admin-token resolution. The README roadmap is reconciled with the box,
+  and the walkthrough is cross-linked from the SVC-01/06/09/17-18 runbooks.
+
+### Changed
+- **`integration-boundaries.md` §1** clarified (not rewritten) per ADR-0018: a
+  VLAN-20-internal backend port bound to the backend's own VLAN-20 IP and consumed only
+  by Traefik is the same private-VLAN-bound-port exception the fleet exporters and Loki
+  already use — Traefik stays the sole LAN-facing ingress.
+- **SVC-01 / SVC-17/18 OpenBao admin-token resolution** now resolves
+  `OPENBAO_ADMIN_TOKEN` process-env → cluster-env-file (so the one-command bring-up
+  works without a manual export); SVC-06 still reads it from the process env only.
+  `docs/TESTING.md`'s prerequisite + the SVC-01 install runbook are updated to the
+  accurate per-service picture.
+
+### Fixed
+- **SVC-01 cold-first-run DB-install diagnosability** (spec
+  `fix-svc01-db-install-first-run-transient`): the investigation DISPROVED a suspected
+  cold-start "transient" (a clean sanctioned-path run converges first-try); the real
+  defect was that a wired-but-empty `OPENBAO_ADMIN_TOKEN` failed inside a `no_log`
+  Phase-3 step with a generic censored error. Fixed with a fail-fast preflight gate
+  (names the var + remedy, secret-free) + a cluster-env-file token fallback, plus a
+  fail-fast on an empty `project_slug`. Live-validated; offline guard test added.
+- **SVC-17/18 scrape-target multi-inventory discovery + `__param_format` template bug**
+  (spec `fix-obs-scrape-targets-multi-inventory`): the configurator now merges every
+  generated inventory as SEPARATE `-i` flags so the V1 scrape-set service_role groups
+  are visible. Live-validated.
+- **SVC-17/18 AC-3 V1_Scrape_Set `up==1`** (spec `fix-obs-ac3-targets-up`): the four
+  built services scraped at `up==1` (traefik + zitadel + openbao TLS). Live-validated.
+- **SVC-17/18 one-command bring-up OpenBao admin-token bridging** (spec
+  `fix-obs-bootstrap-first-run-transient`): the one-command flow bridges
+  `OPENBAO_ADMIN_TOKEN` from the cluster env file (previously the child received an
+  empty token → delegated `bao kv put` 403). Live-validated.
+- **SVC-07 OpenBao `:8200` metrics port-publish** (spec
+  `fix-svc07-openbao-metrics-port-publish`): decoupled the metrics port-publish from
+  the edge path (AC-3 4/4). Live-validated.
+- **SVC-06 org-provision `delegate_to` crash + homelab guest-run path wiring** (spec
+  `fix-svc06-org-provision-delegate-to-crash`): fixed. Live-validated.
+
+### Known limitations
+- SVC-17/18's Grafana OIDC (SVC-06 client), real TLS (SVC-08 CA), and GPU metrics
+  (SVC-23) remain default-off mocks until those dependencies land — by design,
+  fail-closed when off.
+- SVC-06 still reads `OPENBAO_ADMIN_TOKEN` from the process env only (no
+  cluster-env-file fallback yet); its from-scratch bring-up requires the token
+  exported.
+- Onboarding a sample project (dronefleet/VLAN 100) with a standalone per-project
+  SVC-01 is deferred to a future spec (no existing root wires a per-project VNet);
+  SVC-01 is validated here via the ZITADEL backing DB.
+
 ## [0.9.0] - 2026-10-22
 
 The first substantive feature release since v0.7.x: it stands up **three new
@@ -691,6 +796,7 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
+[0.10.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.9.0...v0.10.0
 [0.9.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.8.0...v0.9.0
 [0.2.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.1.0...v0.2.0
 [0.1.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/releases/v0.1.0

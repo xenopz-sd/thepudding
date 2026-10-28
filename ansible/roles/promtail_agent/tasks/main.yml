@@ -1,0 +1,116 @@
+---
+# tasks/main.yml — promtail_agent (SVC-18, fleet-wide)
+#
+# Deploys Promtail on EVERY host as a Docker Compose stack via the generic
+# docker-compose-app role. Promtail tails the local Docker container logs
+# (docker SD) + the systemd journal, attaches `project`/`service`/`host` labels
+# (FR-5), and pushes to Loki (promtail_loki_push_url).
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements.md FR-5, design §3.3).
+#
+# Order (mirrors traefik_install):
+#   1. Idempotency version-check guard (skip templating/up on an already-pinned
+#      running container -> changed=0 on a converged host).
+#   2. Ensure the config dir on the host.
+#   3. Template promtail-config.yaml.
+#   4. Deploy the Compose stack via docker-compose-app.
+
+# --- 1. IDEMPOTENCY: version-check guard -------------------------------------
+# Detect an already-running Promtail container at the pinned image BEFORE
+# templating/bringing up the stack, so a second run against an already-installed
+# host is a no-op that reports changed=0 (PF §9 idempotency rule).
+- name: "Promtail | Inspect any running container at the pinned image (idempotency guard)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "--format={{ '{{' }}index .Config.Image{{ '}}' }}"
+      - "{{ promtail_container_name }}"
+  register: promtail_running_image
+  failed_when: false
+  changed_when: false
+
+- name: "Promtail | Set fact — already at the pinned image?"
+  ansible.builtin.set_fact:
+    promtail_already_at_pinned_version: >-
+      {{ (promtail_running_image.rc | default(1)) == 0
+         and (promtail_running_image.stdout | default('') | trim) == promtail_image }}
+  changed_when: false
+
+- name: "Promtail | Report idempotent no-op when already at the pinned image"
+  ansible.builtin.debug:
+    msg: >-
+      Promtail container {{ promtail_container_name }} is already running at
+      {{ promtail_image }}; install is a no-op (changed=0).
+  when: promtail_already_at_pinned_version
+
+# --- Log the push-target decision at INFO (composition-wiring.md) ------------
+- name: "Promtail | Loki push target (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      promtail_agent on {{ inventory_hostname }} -> pushing logs to
+      {{ promtail_loki_push_url }} with labels
+      host={{ promtail_host_label }},
+      project(default)={{ promtail_default_project }},
+      service(default)={{ promtail_default_service }}.
+
+# --- 2. Ensure config directory on the host ----------------------------------
+- name: "Promtail | Ensure the config directory exists"
+  ansible.builtin.file:
+    path: "{{ promtail_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  when: not promtail_already_at_pinned_version
+
+# --- 3. Template promtail-config.yaml ----------------------------------------
+- name: "Promtail | Template promtail-config.yaml"
+  ansible.builtin.template:
+    src: promtail-config.yaml.j2
+    dest: "{{ promtail_config_file }}"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Restart promtail
+
+# --- 4. Deploy the Compose stack via docker-compose-app ----------------------
+# Promtail reads host log sources, so it bind-mounts (READ-ONLY) the Docker
+# container-log dir, the systemd journal, the Docker socket, and machine-id.
+# The positions bookmark is a persistent NAMED VOLUME. No host port (FR-13 /
+# integration-boundaries §1) — the server port is internal, scraped on VLAN 20.
+- name: "Promtail | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ promtail_stack_name }}"
+    dca_services:
+      - name: promtail
+        image: "{{ promtail_image }}"
+        command: "-config.file={{ promtail_config_file }}"
+        restart: "unless-stopped"
+        volumes:
+          # Rendered config, read-only.
+          - "{{ promtail_config_file }}:{{ promtail_config_file }}:ro"
+          # Host log sources, read-only (FR-5): Docker per-container JSON logs,
+          # the systemd persistent journal, and machine-id for journal host
+          # resolution.
+          - "{{ promtail_docker_containers_dir }}:{{ promtail_docker_containers_dir }}:ro"
+          - "{{ promtail_journal_dir }}:{{ promtail_journal_dir }}:ro"
+          - "{{ promtail_machine_id_file }}:{{ promtail_machine_id_file }}:ro"
+          # Read-only Docker socket for docker service discovery.
+          - "{{ promtail_docker_socket }}:{{ promtail_docker_socket }}:ro"
+          # Persistent positions bookmark (named volume, never tmpfs).
+          - "{{ promtail_positions_volume }}:{{ promtail_positions_mount }}"
+        networks: ["default"]
+    dca_volumes:
+      - "{{ promtail_positions_volume }}"
+    # Promtail pushes OUT to Loki over VLAN 20; it does not join the Traefik
+    # `edge` network (no HTTP ingress). The default compose network suffices.
+    dca_networks: []
+    dca_env:
+      # Non-secret config only (composition-wiring.md). The Loki push URL is
+      # non-secret and is baked into the rendered config file; nothing secret is
+      # templated here.
+      PROMTAIL_LOKI_PUSH_URL: "{{ promtail_loki_push_url }}"
+    dca_state: "{{ promtail_state }}"
+  when: not promtail_already_at_pinned_version

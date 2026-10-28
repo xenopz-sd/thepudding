@@ -39,6 +39,14 @@ traefik_entrypoint_web_port: 80
 traefik_entrypoint_websecure_port: 443
 traefik_entrypoint_metrics_port: 8082
 
+# The Traefik guest's OWN VLAN-20 IP that the internal `metrics` entrypoint
+# (:8082) is host-published on, so Prometheus (SVC-17, on another guest) can
+# reach it. Traefik is host_index 2 on VLAN 20 -> 10.0.20.12 (ADR-0015). This is
+# the guest's own VLAN-20 IP and the publish is INTERNAL-ONLY — never 0.0.0.0,
+# never a LAN-facing host port. NOT reused from traefik_tls_self_signed_sans's
+# hard-coded IP:10.0.20.10 (that is a SAN literal, not a reusable bind var).
+traefik_metrics_bind_ip: "10.0.20.12"
+
 # --- Docker provider (SVC-09 FR-1) ---
 # exposedByDefault:false so a container must opt in with traefik.enable=true; the
 # Docker socket is mounted READ-ONLY (SVC-09 §12) — Traefik observes labels only.

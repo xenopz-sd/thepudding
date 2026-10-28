@@ -1,0 +1,35 @@
+#jinja2: trim_blocks: True, lstrip_blocks: True
+# {{ ansible_managed }}
+# Grafana datasource provisioning (apiVersion 1) — observability_stack (SVC-17/18)
+# Rendered by tasks/grafana.yml (task 4.3) to
+# {{ observability_grafana_datasources_dir }}/datasources.yaml and bind-mounted
+# :ro into the Grafana container at
+# {{ observability_grafana_provisioning_container_dir }}/datasources.
+#
+# Two datasources: the Prometheus metrics TSDB (default) and the Loki log store.
+# URLs point at the internal VLAN-20 endpoints of the Prometheus and Loki guests
+# (observability_prometheus_url / observability_loki_url) — never a host port.
+---
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    uid: observability-prometheus
+    url: "{{ observability_prometheus_url }}"
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: "15s"
+
+  - name: Loki
+    type: loki
+    access: proxy
+    uid: observability-loki
+    url: "{{ observability_loki_url }}"
+    isDefault: false
+    editable: false
+    jsonData:
+      maxLines: 1000

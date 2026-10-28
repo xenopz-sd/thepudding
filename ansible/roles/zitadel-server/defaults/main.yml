@@ -69,6 +69,17 @@ zitadel_db_admin_user: "{{ zitadel_db_user }}"
 zitadel_traefik_router: "zitadel"
 zitadel_traefik_network: "edge"
 
+# --- Cross-guest ingress (traefik_route Route_Mechanism; ADR-0018) ---
+# Fed to the traefik_route role's `traefik_route_enabled` — the real cross-guest
+# file-provider route is the DEFAULT production posture (mirrors
+# observability_stack's obs_grafana_traefik_route_enabled and
+# openbao_traefik_route_enabled). The mock-edge path is the default-off
+# dev/offline alternative.
+zitadel_traefik_route_enabled: true
+# The Traefik_Guest (SVC-09) delegate target per ADR-0015 (host_index 2 ->
+# 10.0.20.12). Fed to the traefik_route call's `traefik_guest_host`.
+zitadel_traefik_guest_host: "10.0.20.12"
+
 # --- OpenBao (SVC-07) secret storage ---
 # The masterkey + DB password are read from / written to OpenBao under this path
 # via the `bao` CLI docker-exec pattern. The admin token is supplied in the role
@@ -132,7 +143,24 @@ zitadel_openbao_cli_bao_addr: "https://127.0.0.1:8200"
 zitadel_secret_env_path: "/etc/zitadel/zitadel.secret.env"
 
 # --- Observability (requirements §13) ---
-zitadel_metrics_enabled: true
+# ZITADEL v4.18.0 has TWO metrics config blocks in defaults.yaml, and the NEW one
+# takes precedence over the deprecated one:
+#   * NEW   Instrumentation.Metric.Exporter.Type
+#           (env ZITADEL_INSTRUMENTATION_METRIC_EXPORTER_TYPE) — default `none`;
+#           option `prometheus` exposes metrics on an HTTP endpoint for Prometheus
+#           to scrape. This is the key that ACTUALLY enables /debug/metrics in
+#           v4.18.0 and MUST be `prometheus`.
+#   * LEGACY Metrics.Type (env ZITADEL_METRICS_TYPE) — marked Deprecated, default
+#           `otel`. Kept set ALSO (harmless) to document intent across the
+#           deprecation; on its own it does NOT serve metrics in v4.18.0 because
+#           the NEW block defaults to `none` and wins (observed HTTP 404).
+# LIVE-CONFIRMED on the throwaway cluster: with the instrumentation exporter type
+# set to `prometheus`, /debug/metrics flipped 404 -> 200 serving real Prometheus
+# data. This supersedes the earlier zitadel_metrics_type=otel-only attempt (which
+# 404'd) and the even earlier unrecognized boolean zitadel_metrics_enabled. Ref:
+# ZITADEL v4.18.0 defaults.yaml. Content rephrased for licensing compliance.
+zitadel_metrics_exporter_type: "prometheus"
+zitadel_metrics_type: "otel"
 
 # --- docker-compose-app reconciliation ---
 zitadel_state: "present"

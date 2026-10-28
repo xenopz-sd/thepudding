@@ -220,6 +220,134 @@
   register: svc07_clean_slate_runs
   changed_when: "'changed=0' not in (svc07_clean_slate_runs.stdout | default(''))"
 
+# ---- Remove the delegated OpenBao cross-guest Route_Fragment ----------------
+# The OpenBao primary guest is now destroyed (loop above). The Route_Fragment
+# OpenBao delegated onto the Traefik_Guest's watched file-provider dir
+# (openbao-route.yml) must ALSO be removed, or Traefik keeps a dangling route
+# pointing at the now-freed VLAN-20 IP (10.0.20.10). This is a
+# TRAEFIK-GUEST-SIDE cleanup, not a guest destroy — delegated to the
+# Traefik_Guest, and the watched file provider hot-reloads the route's removal
+# with no Traefik restart. Spec svc-07-cross-guest-ingress R4.1-R4.4; mirrors
+# the FIXED obs_clean_slate pattern EXACTLY.
+#
+# ORCHESTRATOR-CONTEXT CONNECTION SETUP (the bug fix). The clean-slate branch
+# runs in the `hosts: localhost` orchestrator play (localhost.yml,
+# ansible_connection: local) — NOT the configurator play (openbao.yml + the
+# generated inventory). In that orchestrator context there is NO add_host for
+# the Traefik_Guest and NO known_hosts entry for it, so a bare
+# `delegate_to: 10.0.20.12` has no working SSH connection. A naive
+# `failed_when: false` would swallow the connection failure as a FALSE
+# "already absent", silently leaving a dangling route. The fix mirrors
+# svc07_provision / obs_clean_slate EXACTLY: before delegating from the
+# orchestrator play, reconcile known_hosts (ssh-keygen -R + ssh-keyscan) and
+# add_host the guest with connection vars, so the removal actually connects —
+# and a de-masked failure condition makes a silent false-success impossible.
+- name: "Clean-Slate | Ensure ~/.ssh exists (0700) for the Traefik_Guest known_hosts reconcile"
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+
+- name: "Clean-Slate | Remove any stale known_hosts fingerprint for the Traefik_Guest"
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -R
+      - "{{ svc07_traefik_guest_host }}"
+      - -f
+      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
+  register: svc07_traefik_knownhosts_purge
+  changed_when: "'updated' in (svc07_traefik_knownhosts_purge.stderr | default(''))"
+  failed_when: false
+
+# failed_when:false on the KEYSCAN — during a FULL teardown the Traefik_Guest
+# itself may already be gone/unreachable (it is a separate guest, torn down by
+# its own SVC-09 clean-slate). A missing Traefik_Guest must NOT block the SVC-07
+# empty-baseline gate (the fragment dies with that guest anyway). So the keyscan
+# does not fail the play; instead we compute svc07_traefik_reachable from
+# (rc == 0 AND non-empty stdout) and GATE the append + the removal on it.
+- name: "Clean-Slate | ssh-keyscan the Traefik_Guest (30s; tolerant of a torn-down guest)"
+  ansible.builtin.command:
+    argv:
+      - ssh-keyscan
+      - -T
+      - "30"
+      - "{{ svc07_traefik_guest_host }}"
+  register: svc07_traefik_keyscan
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Resolve whether the Traefik_Guest is reachable (keyscan succeeded)"
+  ansible.builtin.set_fact:
+    svc07_traefik_reachable: >-
+      {{ (svc07_traefik_keyscan.rc | default(1)) == 0
+         and ((svc07_traefik_keyscan.stdout | default('') | trim | length) > 0) }}
+
+- name: "Clean-Slate | Append the Traefik_Guest host key to known_hosts (only when reachable)"
+  ansible.builtin.blockinfile:
+    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+    create: true
+    mode: "0600"
+    marker: "# {mark} SVC-07 clean-slate Traefik_Guest key for {{ svc07_traefik_guest_host }}"
+    block: "{{ svc07_traefik_keyscan.stdout }}"
+  when: svc07_traefik_reachable | bool
+
+# Scope: ONLY this feature's openbao-route.yml — NOT SVC-09's shared default
+# cert, which is out of scope for this teardown. `state: absent` is naturally
+# idempotent — a no-op when the fragment is already gone. The add_host supplies
+# the orchestrator-context SSH connection (the configurator play's add_host is
+# absent here); delegate_to that host so the file module runs ON the Traefik_Guest.
+- name: "Clean-Slate | Register the Traefik_Guest for the orchestrator-context delegation"
+  ansible.builtin.add_host:
+    name: svc07-traefik-cross-guest-cleanup
+    ansible_host: "{{ svc07_traefik_guest_host }}"
+    ansible_user: "{{ svc07_traefik_guest_user | default('root') }}"
+    ansible_python_interpreter: "{{ svc07_traefik_guest_python | default('/usr/bin/python3') }}"
+    ansible_ssh_private_key_file: >-
+      {{ (svc07_traefik_guest_ssh_key | default('') | trim | length > 0)
+         | ternary(svc07_traefik_guest_ssh_key, omit) }}
+    ansible_connection: ssh
+  changed_when: false
+  when: svc07_traefik_reachable | bool
+
+# De-masked removal. Gated on reachability: a full teardown (Traefik gone) SKIPS
+# this cleanly (the INFO task below reports "unreachable on full teardown"),
+# rather than the old silent false-success. When the guest IS reachable, the
+# removal runs with a REAL failure condition — it fails only if the `file` module
+# errored for a reason OTHER than the host being unreachable. A genuine "fragment
+# still there, removal errored" is no longer masked.
+- name: "Clean-Slate | Remove the delegated OpenBao Route_Fragment from the Traefik_Guest"
+  ansible.builtin.file:
+    path: "{{ svc07_openbao_route_fragment }}"
+    state: absent
+  delegate_to: svc07-traefik-cross-guest-cleanup
+  register: svc07_openbao_route_removed
+  when: svc07_traefik_reachable | default(true) | bool
+  failed_when:
+    - svc07_openbao_route_removed is failed
+    - "'unreachable' not in (svc07_openbao_route_removed.msg | default('') | lower)"
+
+- name: "Clean-Slate | INFO — OpenBao Route_Fragment removal outcome"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        ('OpenBao Route_Fragment removal SKIPPED: the Traefik_Guest '
+          ~ svc07_traefik_guest_host ~ ' was unreachable during a full teardown '
+          ~ '(ssh-keyscan found no host) — the fragment ' ~ svc07_openbao_route_fragment
+          ~ ' dies with the guest, no dangling route is possible. No action needed.')
+        if (not (svc07_traefik_reachable | default(true) | bool))
+        else (('Removed the dangling OpenBao Route_Fragment '
+          ~ svc07_openbao_route_fragment ~ ' from the reachable Traefik_Guest '
+          ~ svc07_traefik_guest_host ~ ' (no dangling route left pointing at the '
+          ~ 'freed OpenBao VLAN-20 IP).')
+        if (svc07_openbao_route_removed is changed)
+        else ('No OpenBao Route_Fragment to remove at ' ~ svc07_openbao_route_fragment
+          ~ ' on the reachable Traefik_Guest ' ~ svc07_traefik_guest_host
+          ~ ' (already absent — verified over a working SSH connection, NOT a '
+          ~ 'connection failure). No action needed.'))
+      }}
+  changed_when: false
+
 # ---- Verification gate (Req 7.7, 7.8) ---------------------------- #
 # After the reset, verify an EMPTY baseline two ways, and fail naming
 # every survivor if either check finds one.

@@ -1,0 +1,66 @@
+{#
+  templates/alertmanager.yml.j2 — observability_stack (SVC-17) — Alertmanager
+  configuration, co-located with Prometheus on svc17-prometheus-20-01
+  (10.0.20.18 :9093). Rendered onto the guest at
+  {{ observability_alertmanager_config_dir }}/alertmanager.yml and bind-mounted
+  :ro into the prom/alertmanager container.
+
+  Spec: .kiro/specs/svc-17-18-observability/ (requirements FR-7; design §3.2,
+  §Mock). Task 4.2.
+
+  ROUTING TREE (FR-7): a top-level route with sane group/wait/repeat defaults
+  sends to a DEFAULT receiver, with one child route per project rendered from
+  `observability_project_receivers` (each item matches on its project label and
+  routes to that project's receiver). The v1 DEFAULT receiver is a NO-OP / null
+  receiver — UI-only alerts with no external notifier, per the operator-approved
+  v1 scope (requirements §15 open questions; a real SMTP/webhook receiver is
+  confirmed per deployment before go-live and its credential comes from OpenBao,
+  never templated here).
+
+  No secret value is rendered here — receiver NAMES, matchers, and timings are
+  non-secret config; any receiver credential (SMTP password, pager key, webhook
+  URL carrying a token) is supplied to Alertmanager out-of-band via an
+  OpenBao-fetched env/file, never inlined (FR-15, integration-boundaries §2).
+#}
+# MANAGED BY ANSIBLE (observability_stack / task 4.2) — DO NOT EDIT BY HAND.
+# SVC-17 Alertmanager config. Spec: .kiro/specs/svc-17-18-observability.
+# v1 default receiver is a UI-only null receiver (no external notifier);
+# per-project receivers rendered from observability_project_receivers (FR-7).
+---
+route:
+  # Group alerts sharing these labels into a single notification so a storm
+  # (e.g. a host down taking several exporters with it) is one message.
+  group_by: ["alertname", "project", "service"]
+  group_wait: "{{ observability_alertmanager_group_wait }}"
+  group_interval: "{{ observability_alertmanager_group_interval }}"
+  repeat_interval: "{{ observability_alertmanager_repeat_interval }}"
+  # v1 default: the UI-only null receiver (no external notifier).
+  receiver: "{{ observability_alertmanager_default_receiver }}"
+  routes:
+{% for proj in observability_project_receivers %}
+    # --- Per-project route (FR-7): {{ proj.name }} ---------------------------
+    - matchers:
+        - 'project="{{ proj.project }}"'
+      receiver: "{{ proj.name }}"
+{% if proj.group_by is defined %}
+      group_by: {{ proj.group_by | to_json }}
+{% endif %}
+      continue: false
+{% endfor %}
+
+receivers:
+  # --- Default receiver: UI-only null receiver (v1 scope) --------------------
+  # No notifier configs -> Alertmanager holds/dedup/groups the alert and shows
+  # it in its own UI (and Grafana via the Alertmanager datasource), but sends
+  # nothing externally. A real receiver is added per deployment before go-live;
+  # its credentials come from OpenBao, never from this file.
+  - name: "{{ observability_alertmanager_default_receiver }}"
+{% for proj in observability_project_receivers %}
+  # --- Per-project receiver: {{ proj.name }} ---------------------------------
+  # Placeholder webhook endpoint; a real deployment overrides the URL and any
+  # credential is supplied out-of-band (never committed/templated).
+  - name: "{{ proj.name }}"
+    webhook_configs:
+      - url: "{{ proj.webhook_url | default('http://127.0.0.1:1/null') }}"
+        send_resolved: true
+{% endfor %}

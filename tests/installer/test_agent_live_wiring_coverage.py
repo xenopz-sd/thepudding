@@ -141,6 +141,14 @@ _LEAF_EXEMPT = {
     # (svc06_clean_slate is NOT exempt — it carries the gated consult directly and
     # is role-scanned like svc01_clean_slate / svc07_clean_slate.)
     "ansible/roles/svc06_provision/tasks/main.yml",
+    # obs_provision is the SVC-17/18 Phase-2 APPLY mechanism (`terraform apply`
+    # of the three observability guests), guarded UPSTREAM exactly like
+    # svc07_provision / svc09_provision: in ansible/playbooks/svc-17-18-bootstrap.yml
+    # the obs_preflight role (Phase 1) runs BEFORE obs_provision (Phase 2) in the
+    # SAME play and carries the gated throwaway-guard consult (--service obs) for
+    # the armed from-scratch path. Provision has no cluster-identity/guard context
+    # distinct from preflight, so it is exempt here (mirrors svc07/09_provision).
+    "ansible/roles/obs_provision/tasks/main.yml",
 }
 
 # --------------------------------------------------------------------------- #
@@ -191,6 +199,13 @@ _PLAYBOOK_LEAF_EXEMPT = {
     # svc06_clean_slate (both role-scanned). Exempt for the same reason as
     # svc-07-bootstrap.yml / svc-01-bootstrap.yml.
     "ansible/playbooks/svc-06-bootstrap.yml",
+    # svc-17-18-bootstrap.yml drives its mutations via import_role (obs_provision's
+    # `terraform apply` of the three observability guests, obs_clean_slate's child
+    # clean-slate.yml teardowns); its guard consult is NOT in the playbook — it is
+    # carried by obs_preflight (Phase 1, the from-scratch guard) and obs_clean_slate
+    # (the reset branch), BOTH of which the role scan already flags/checks. Exempt
+    # for the same reason as svc-07/09-bootstrap.yml.
+    "ansible/playbooks/svc-17-18-bootstrap.yml",
 }
 
 

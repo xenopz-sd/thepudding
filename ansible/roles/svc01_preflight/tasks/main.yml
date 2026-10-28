@@ -276,3 +276,109 @@
       - "ansible_version.full is version('2.15', '>=')"
     fail_msg: "Requires Ansible 2.15+; detected {{ ansible_version.full }}."
     success_msg: "Ansible {{ ansible_version.full }} satisfies >= 2.15."
+
+# =========================================================== #
+# Fail-fast diagnosability gates (fix-svc01-db-install-first-  #
+# run-transient). Placed at the END of preflight so they run   #
+# BEFORE Phase 3 (the postgres.yml child run) for BOTH engine  #
+# paths — a gate here covers postgres-server AND mariadb-server #
+# automatically. The Task-1 clean repro DISPROVED a race: the   #
+# real defect is that a wired-but-EMPTY OPENBAO_ADMIN_TOKEN     #
+# (or a wrong-var empty project_slug) fails deep inside the     #
+# Phase-3 no_log OpenBao read/write, surfacing only a generic   #
+# censored "non-zero return code". These gates fail CLOSED with #
+# an explicit, NON-SECRET diagnostic instead. Mirrors the       #
+# merged obs-precedent fix-obs-bootstrap-first-run-transient.   #
+# =========================================================== #
+
+# --- Gate A: empty project_slug (the wrong-var operator error) --------------
+# A standalone `postgres.yml -e project_slug=...` run (instead of the sanctioned
+# svc-01-bootstrap.yml, which maps project_slug -> postgres_project_slug) leaves
+# postgres_db_name empty -> a malformed pg_hba.conf crash-loop. Fail CLOSED here
+# naming the var + the sanctioned entry point. Non-secret; visible.
+- name: "Preflight | Fail closed if project_slug resolves empty (wrong-var operator error)"
+  ansible.builtin.assert:
+    that:
+      - "(project_slug | default('') | trim) | length > 0"
+    fail_msg: >-
+      SVC-01 bootstrap: project_slug resolved EMPTY. The DB name / app role are
+      derived from it, so an empty value produces a malformed pg_hba.conf that
+      crash-loops the database. Pass it via the SANCTIONED entry point
+      `ansible/playbooks/svc-01-bootstrap.yml -e project_slug=<slug>` (which maps
+      project_slug -> postgres_project_slug / mariadb_project_slug) — do NOT hand-run
+      the standalone postgres.yml with `-e project_slug=...`. Then re-run.
+    success_msg: "project_slug is present ('{{ project_slug }}')."
+    quiet: true
+
+# --- OpenBao admin-token resolution (process-env first, else cluster env file) #
+# The postgres-server OpenBao read/write authenticates the delegated bao-CLI with
+# OPENBAO_ADMIN_TOKEN, bridged into the Phase-3 child ENV (no_log). Historically
+# the orchestrator bridged it ONLY from the process environment (lookup('env',...)),
+# so the one-command bring-up — whose token lives in the cluster env file (loaded
+# into a fact by cluster_env.py, which does NOT pass the token through) — sent an
+# EMPTY token to the child and the delegated `bao kv put` failed (masked by no_log).
+# Resolve it ONCE here, precedence process-env -> cluster env file (the single
+# source of truth, service-installer.md I1), into a no_log fact consumed by
+# svc01_bootstrap's child-run ENV and the fail-closed gate below. The VALUE is
+# never echoed — only the resolution SOURCE is logged.
+- name: "Preflight | Slurp the cluster env file for the OpenBao admin token (no_log)"
+  ansible.builtin.slurp:
+    src: >-
+      {{ (svc01_repo_root ~ '/' ~ cluster_env_file)
+         if (cluster_env_file is not match('^/'))
+         else cluster_env_file }}
+  register: svc01_cluster_env_slurp
+  no_log: true
+
+- name: "Preflight | Resolve the OpenBao admin token (process-env first, else the cluster env file) (no_log)"
+  ansible.builtin.set_fact:
+    # Secret VALUE fact (no_log). Captures, in the SAME no_log task, the non-secret
+    # boolean the diagnostics below consume, so those diagnostics never name the
+    # token env var themselves (they reference only these derived facts).
+    svc01_openbao_admin_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         if ((lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim) | length > 0)
+         else ((svc01_cluster_env_slurp.content | b64decode
+                 | regex_findall('(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*["\']?([^"\'\r\n]*?)["\']?[ \t]*$')
+                 | first | default('') | trim)) }}
+    svc01_openbao_token_from_env: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim | length) > 0 }}
+  no_log: true
+
+- name: "Preflight | Project the admin-token presence + source (non-secret, no value)"
+  ansible.builtin.set_fact:
+    svc01_openbao_token_present: "{{ (svc01_openbao_admin_token | default('') | trim | length) > 0 }}"
+    svc01_openbao_token_source: >-
+      {{ 'none'
+         if ((svc01_openbao_admin_token | default('') | trim | length) == 0)
+         else ('process-env' if (svc01_openbao_token_from_env | bool) else 'cluster-env-file') }}
+  no_log: true
+  changed_when: false
+
+- name: "Preflight | INFO — OpenBao admin-token resolution source (never the value)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: OpenBao admin-token resolution source = {{ svc01_openbao_token_source }}
+      {{ '(' ~ cluster_env_file ~ ')' if svc01_openbao_token_source == 'cluster-env-file' else '' }}
+      — the token value is never echoed.
+
+# --- Gate B: OpenBao wired but no admin token resolvable (the real defect) ----
+# Runs ONLY when OpenBao is wired (openbao_addr non-empty). A dev/offline run with
+# openbao_addr empty skips this entirely (no behavior change). Non-secret; visible.
+- name: "Preflight | Fail closed if OpenBao is wired but no admin token is resolvable"
+  ansible.builtin.assert:
+    that:
+      - svc01_openbao_token_present | bool
+    fail_msg: >-
+      SVC-01 bootstrap: OpenBao is wired (openbao_addr='{{ openbao_addr }}') but
+      OPENBAO_ADMIN_TOKEN resolved EMPTY (from both the process env and the cluster
+      env file). The DB credential write to secret/proj-{{ project_slug }}/postgres
+      will fail inside the no_log Phase-3 OpenBao read/write, surfacing only a
+      generic censored error. Remedy: export OPENBAO_ADMIN_TOKEN into the process
+      environment (e.g. `set -a; . ./.env.throwaway; set +a`) or ensure it is
+      present in the cluster env file ({{ cluster_env_file }}) — the single source
+      of truth — then re-run. (Run dev/offline with openbao_addr empty to skip the
+      OpenBao credential write entirely.) The token value is never echoed.
+    success_msg: "OpenBao admin token resolved for the DB credential write."
+    quiet: true
+  when: (openbao_addr | default('') | trim) | length > 0

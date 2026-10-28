@@ -1,0 +1,66 @@
+{
+  "__comment": "STARTER dashboard (dashboards-as-code, SVC-17/18 FR-6). Container health via cAdvisor. Minimal valid v1 dashboard; expand panels as needed. Version-controlled JSON — edit here, not in the Grafana UI (allowUiUpdates=false).",
+  "annotations": {
+    "list": []
+  },
+  "editable": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Running containers",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "observability-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(container_last_seen{name!=\"\"})"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Container memory usage (bytes)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "observability-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 8,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (name) (container_memory_usage_bytes{name!=\"\"})"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": [
+    "observability",
+    "container",
+    "cadvisor",
+    "starter"
+  ],
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "",
+  "title": "Container health (cAdvisor) — starter",
+  "uid": "obs-cadvisor-container",
+  "version": 1
+}

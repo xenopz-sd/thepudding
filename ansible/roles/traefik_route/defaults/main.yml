@@ -1,0 +1,105 @@
+---
+# defaults/main.yml — traefik_route (Route_Mechanism)
+#
+# The reusable cross-guest Traefik route-registration mechanism. A backend
+# service role on one guest consumes this role to render ONE Traefik v3
+# file-provider Route_Fragment (one http.routers + one http.services entry) and
+# DELEGATE it onto the Traefik_Guest's already-watched file-provider directory,
+# so Traefik discovers a backend running on a SEPARATE guest without an
+# orchestrator or overlay network. Traefik hot-reloads the fragment (file
+# provider `watch: true`) with no container restart.
+#
+# Spec: .kiro/specs/traefik-cross-guest-ingress/ (requirements R1.2/R1.5/R1.6,
+# R3.1/R3.4/R3.5; design §"Component 1 — Route_Mechanism", §"Error Handling").
+#
+# This role does NOT edit or require any change to the SVC-09 traefik_install
+# role (R1.6): it only drops a *-route.yml file into the dynamic dir SVC-09
+# already enables + watches. It introduces no runtime beyond Docker Compose and
+# no orchestrator (NFR2); it templates NO secret into a Route_Fragment (NFR4).
+#
+# DEFAULTS ALIGNED to the sibling observability_stack obs_traefik_* conventions
+# (so a backend role reuses the same delegate target with no SVC-09 edit):
+#   obs_traefik_guest_host  default 10.0.20.12  -> traefik_guest_host
+#   obs_traefik_guest_user  default root        -> traefik_guest_user
+#   obs_traefik_guest_python /usr/bin/python3    -> traefik_guest_python
+
+# --- Delegate target: the Traefik_Guest (SVC-09 file-provider owner) --------
+# The LXC guest Traefik runs on. Per ADR-0015 SVC-09 Traefik moved to
+# host_index 2 -> 10.0.20.12 (NOT the stale pre-ADR-0015 10.0.20.10 some
+# defaults still carry). This is the `delegate_to` target for every task that
+# touches the file-provider directory, mirroring obs_traefik_guest_host.
+traefik_guest_host: "10.0.20.12"
+traefik_guest_user: "root"
+traefik_guest_python: "/usr/bin/python3"
+
+# The Traefik file-provider directory on the Traefik_Guest — enabled and
+# `watch: true` in SVC-09's traefik.yml.j2, bind-mounted :ro into the container.
+# A *-route.yml landing here is hot-reloaded with no restart (R1.5). Matches
+# SVC-09's traefik_dynamic_config_dir with no SVC-09 edit (R1.6).
+traefik_dynamic_config_dir: "/etc/traefik/dynamic"
+
+# =============================================================================
+# ROUTE_MECHANISM SELECTION FLAG (swap-gate) — DEFAULT TRUE (R3.1)
+# -----------------------------------------------------------------------------
+# The real file-provider cross-guest route is the DEFAULT PRODUCTION posture.
+# When true, this role renders + delegates the Route_Fragment. When false, the
+# role is a NO-OP (the consuming service uses the dev/offline mock-edge path
+# instead — the permanent, default-off Mock_Edge placeholders per
+# mock-stand-ins.md). The selection is logged at INFO at configure time (R3.4).
+# =============================================================================
+traefik_route_enabled: true
+
+# =============================================================================
+# ROUTE_FRAGMENT VARIABLE CONTRACT (design §"Component 1") — NO DEFAULT for the
+# per-call identity vars (route_name / route_host_rule / route_backend_url): the
+# consuming role MUST supply them, and the fail-closed assert (R3.5) rejects an
+# empty route_backend_url / traefik_guest_host BEFORE any fragment is rendered.
+# -----------------------------------------------------------------------------
+#   route_name        router+service id (fragment basename). e.g. "grafana"
+#   route_host_rule   Host() rule value. e.g. "grafana.{{ platform_domain }}"
+#   route_backend_url http.services loadBalancer url (VLAN-20 http). e.g.
+#                     "http://10.0.20.19:3000"
+# =============================================================================
+route_name: ""
+route_host_rule: ""
+route_backend_url: ""
+
+# Traefik entrypoint the router binds to (default websecure — the HTTPS edge).
+route_entrypoint: "websecure"
+
+# Enable TLS on the router (default true). TLS uses the DEFAULT certificate
+# store (`tls: {}` in the template), so it terminates at Traefik via the real
+# resolver when present, or the SVC-09 file-provider default cert from the
+# self-signed mock (Mock B) otherwise — no cert material is rendered here.
+route_tls: true
+
+# =============================================================================
+# OPTIONAL serversTransport CAPABILITY (VERIFIED https/h2c backend hop) —
+# ADDITIVE, DEFAULT-INERT (design §"Component 1"; spec
+# .kiro/specs/svc-07-cross-guest-ingress/)
+# -----------------------------------------------------------------------------
+# These two vars extend the Route_Fragment with an OPTIONAL verified backend-TLS
+# hop for a backend that speaks https/h2c (e.g. OpenBao on :8200). They are
+# ADDITIVE and DEFAULT-INERT: both default to "" so every existing caller's
+# render (today, only Grafana — a plain http backend) is BYTE-IDENTICAL to the
+# current output. The empty default is the preservation guard for this shared
+# role (also consumed by observability_stack/Grafana).
+#
+# When BOTH are non-empty, the template emits an
+# `http.serversTransports.<route_servers_transport_name>` with
+# `rootCAs: ["<route_backend_root_cas>"]`, and sets the service's
+# `loadBalancer.serversTransport: <route_servers_transport_name>` so Traefik
+# trusts the backend's certificate for the proxied hop. When EITHER is empty
+# (the default), neither the `loadBalancer.serversTransport` key nor the
+# `serversTransports` block is rendered — i.e. exactly today's output.
+#
+#   route_servers_transport_name  the serversTransport id (and the service's
+#                                 loadBalancer.serversTransport reference).
+#                                 e.g. "openbao"
+#   route_backend_root_cas        filesystem path to a CA bundle ON THE TRAEFIK
+#                                 GUEST that verifies the backend's cert. This is
+#                                 a PUBLIC cert (non-secret) delegated onto the
+#                                 Traefik_Guest — NOT a private key, NOT a secret.
+#                                 e.g. "/etc/traefik/dynamic/ca/openbao-mock-ca.crt"
+route_servers_transport_name: ""
+route_backend_root_cas: ""

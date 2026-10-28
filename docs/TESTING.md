@@ -345,6 +345,305 @@ simply never touches them rather than accidentally running them.
 
 ---
 
+## Deploy every implemented service from scratch (all-services walkthrough)
+
+The [Provision-then-test walkthrough](#provision-then-test-the-whole-path-in-order)
+above is the per-service deep-dive for **OpenBao (SVC-07)**. This section zooms out
+to the whole platform: the dependency-ordered, top-to-bottom from-scratch bring-up
+of **every** implemented service (per the root
+[README "Implemented services" index](../README.md)) on an empty throwaway Proxmox
+cluster, followed by teardown in reverse. It is the one document a new operator
+follows to take a bare cluster to a fully-deployed, health-gated platform without
+reconstructing the order from four separate runbooks. Each service step links to
+its own `INSTALL-RUNBOOK.md` for depth.
+
+Every command block below mirrors a command actually executed against the live
+`shrimp` throwaway cluster during this spec's validation — the walkthrough is
+proven, not asserted.
+
+> **PREREQUISITES — read before running any live step.**
+>
+> <!-- doctest: display-only -->
+> ```text
+> 1. Live-run interlock (every destructive command).
+>    - Arm AGENT_LIVE_AUTHORIZED=1 in the PROCESS ENVIRONMENT of each destructive
+>      command (as shown inline below) — never a committed file key.
+>    - Cluster identity is resolved from the gitignored .env.throwaway.
+>    - The fail-closed throwaway guard (scripts/installer/throwaway_guard.py) must
+>      AUTHORIZE: the resolved identity (192.168.0.69 / node shrimp) must be on
+>      scripts/installer/throwaway-clusters.yml. If it REFUSES, stop — never work
+>      around it.
+>    - Run ONLY against a throwaway / ephemeral cluster, never shared/acceptance/prod.
+>
+> 2. OPENBAO_ADMIN_TOKEN — resolved from the cluster env file, except SVC-06 needs it exported.
+>    - SVC-07's own bootstrap writes OPENBAO_ADMIN_TOKEN into .env.throwaway by name
+>      (the value is never echoed), so it is present in the cluster env file once
+>      SVC-07 has run.
+>    - SVC-01 and SVC-17/18 resolve the token from the cluster env file automatically
+>      (process environment first, then the cluster env file), so no manual export is
+>      needed for them. If neither source has it while OpenBao is wired, SVC-01 fails
+>      fast at preflight naming the var (OPENBAO_ADMIN_TOKEN).
+>    - SVC-06 reads the token from the PROCESS ENV only (no cluster-env-file fallback
+>      yet), so before the SVC-06 step you MUST export it from the gitignored
+>      throwaway env:
+>          set -a; . ./.env.throwaway; set +a
+>    - If you skip the export FOR SVC-06, the ZITADEL <-> backing-Postgres credential
+>      handoff silently breaks and ZITADEL crash-loops with SQLSTATE 28P01.
+>
+> 3. SDN reachability (ADR-0004) must already be satisfied.
+>    - A Proxmox SDN VLAN zone is Layer-2 only; an off-VLAN control node needs a
+>      static route to 10.0.20.0/24 via the Proxmox host before any live Ansible or
+>      health step will connect instead of timing out. See the
+>      "SDN VLAN reachability" section below for the full two-part prerequisite.
+> ```
+
+See [SDN VLAN reachability](#sdn-vlan-reachability-before-any-live-ansibletest-step-against-a-served-vlan)
+for the control-node static route and host-gateway detail that prerequisite 3 refers to.
+
+### Dependency order (the spine)
+
+Stand the services up in this order — it is dependency-driven, so each step's
+prerequisites are satisfied by the steps above it:
+
+1. **platform-foundation** — creates the shared VLAN-20 SDN VNet `p20` and the host
+   L3 gateway every service attaches to. Skip it and every service fails at
+   container start with `bridge 'p20' does not exist`.
+2. **SVC-07 (OpenBao)** — the secrets manager. Every later service stores its
+   generated credentials (DB passwords, ZITADEL masterkey, OIDC client secrets) in
+   OpenBao, so it comes up first.
+3. **SVC-09 (Traefik)** — owns the real external `edge` Docker network and TLS
+   termination. Standing it up before SVC-06 lets ZITADEL register against the real
+   ingress with its dev mocks OFF.
+4. **SVC-06 (ZITADEL)** — the identity provider. Its bootstrap internally stands up
+   its **own dedicated SVC-01 PostgreSQL backing DB** (`shared-zitadel`) as a child
+   `svc-01-bootstrap` run, and consumes OpenBao (secrets) + Traefik (ingress).
+5. **SVC-17/18 (observability)** — Prometheus / Grafana / Loki. It comes up **last**
+   because it scrapes and observes every other service (SVC-01/06/07/09) and depends
+   on SVC-07 (secrets) and SVC-09 (Traefik ingress for Grafana).
+
+**SVC-01 (PostgreSQL) has no standalone step here** — it is covered and validated by
+the dedicated backing DB that SVC-06 stands up as its child `svc-01-bootstrap` run
+(`shared-zitadel`), a real, healthy SVC-01 instance on VLAN 20. Onboarding a sample
+project (e.g. `dronefleet` on VLAN 100) with a standalone per-project SVC-01 is
+**out of scope** — deferred to its own future spec.
+
+### 1. platform-foundation — create `p20` + the host gateway
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/platform-bootstrap.yml \
+  -e cluster_env_file=.env.throwaway -e bootstrap_scope=all -e bootstrap_pve_identity=true
+```
+
+Gate — confirm the shared VNet `p20` now exists on the cluster SDN:
+
+<!-- doctest: display-only -->
+```bash
+pvesh get /cluster/sdn/vnets   # p20 is listed
+```
+
+Depth: [platform-foundation install runbook](../infra/platform-foundation/INSTALL-RUNBOOK.md).
+
+### 2. SVC-07 (OpenBao) — secrets manager
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-07-bootstrap.yml \
+  -e cluster_env_file=.env.throwaway
+```
+
+Gate — `bao status` on the primary reports an initialised, unsealed, active node:
+
+<!-- doctest: display-only -->
+```bash
+bao status   # Initialized=true, Sealed=false, HA Mode=active
+```
+
+SVC-07's bootstrap writes `OPENBAO_ADMIN_TOKEN` into `.env.throwaway` by name (value
+never echoed) — this is the token prerequisite 2 above relies on: SVC-01 and SVC-17/18
+resolve it from the cluster env file automatically, while SVC-06 requires it exported
+into the process env. For the per-step OpenBao deep-dive see the
+[Provision-then-test walkthrough](#provision-then-test-the-whole-path-in-order) above
+and the [SVC-07 install runbook](../infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md).
+
+### 3. SVC-09 (Traefik) — ingress; owns the real `edge` network
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-09-bootstrap.yml \
+  -e cluster_env_file=.env.throwaway \
+  -e traefik_dashboard_auth_disabled=true
+```
+
+`traefik_dashboard_auth_disabled=true` is the default-off dev stand-in
+(ADR-0014 / mock-stand-ins) required during the pre-ZITADEL window — the dashboard
+is internal-only on VLAN 20 regardless, and flips to **real** ZITADEL forward-auth
+once SVC-06 is up and its forward-auth address is set. Without this flag SVC-09 fails
+**CLOSED** (it refuses to serve an anonymous dashboard) — that is correct behaviour,
+not a bug.
+
+Gate — the HTTP listener redirects to HTTPS (301):
+
+<!-- doctest: display-only -->
+```bash
+curl -s -o /dev/null -w '%{http_code}' http://10.0.20.12/   # 301
+```
+
+Depth: [SVC-09 install runbook](../infra/projects/svc-09-reverse-proxy/INSTALL-RUNBOOK.md).
+
+### 4. SVC-06 (ZITADEL) — identity; stands up its own backing SVC-01
+
+`OPENBAO_ADMIN_TOKEN` must be in the process environment (prerequisite 2) — SVC-06
+still reads the token from the process env only — so export it from the throwaway env
+in the same shell, then run the orchestrator:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+set -a; . ./.env.throwaway; set +a
+AGENT_LIVE_AUTHORIZED=1 OPENBAO_ADMIN_TOKEN="${OPENBAO_ADMIN_TOKEN}" ~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-06-bootstrap.yml \
+  -e cluster_env_file=.env.throwaway \
+  -e svc06_zitadel_vmid=1103
+```
+
+The SVC-06 bootstrap stands up its own backing SVC-01 PostgreSQL child
+(`shared-zitadel`) as a `svc-01-bootstrap` run, with its mocks OFF against the real
+Traefik `edge` network. (If you skipped the export, the ZITADEL ↔ backing-Postgres
+credential handoff breaks and ZITADEL crash-loops with `SQLSTATE 28P01` — see
+prerequisite 2.)
+
+Gates — the backing DB accepts connections and ZITADEL's OIDC discovery answers 200
+through Traefik:
+
+<!-- doctest: display-only -->
+```bash
+pg_isready -h 10.0.20.14               # backing SVC-01 accepting
+curl -sk -H 'Host: auth.platform.example.test' \
+  https://10.0.20.12/.well-known/openid-configuration   # HTTP 200
+```
+
+Depth: [SVC-06 install runbook](../infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md).
+
+### 5. SVC-17/18 (observability) — last; scrapes everything above
+
+Observability comes up last, after everything it observes is running. The orchestrator
+resolves `OPENBAO_ADMIN_TOKEN` from the cluster env file automatically (prerequisite 2),
+so no manual export is required for this step:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+# optional: SVC-17/18 also resolves the token from the cluster env file
+set -a; . ./.env.throwaway; set +a
+AGENT_LIVE_AUTHORIZED=1 OPENBAO_ADMIN_TOKEN="${OPENBAO_ADMIN_TOKEN}" ~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-17-18-bootstrap.yml \
+  -e cluster_env_file=.env.throwaway \
+  -e obs_tls_self_signed=true
+```
+
+`obs_tls_self_signed=true` is the default-off dev stand-in (FR-14 / mock-stand-ins)
+required until an SVC-08 / Let's Encrypt CA exists — Grafana is served a self-signed
+cert via SVC-09's file provider. Without it SVC-17/18 fails **CLOSED** (it refuses to
+serve Grafana without TLS), which is correct.
+
+Gates — Grafana answers 200 through Traefik, Loki is ready, and the V1 Prometheus
+scrape set is up:
+
+<!-- doctest: display-only -->
+```bash
+curl -sk -H 'Host: grafana.platform.example.test' \
+  https://10.0.20.12/api/health     # HTTP 200
+curl -s http://10.0.20.20:3100/ready                     # Loki ready (200)
+# Prometheus V1 scrape set up==1 for zitadel / openbao / postgres / traefik + prometheus self
+```
+
+Depth: [SVC-17/18 install runbook](../infra/projects/svc-17-18-observability/INSTALL-RUNBOOK.md).
+
+### Mocks & degraded-mode
+
+Two default-off dev stand-ins appear above. Both exist only to let a service come up
+before its real dependency does; both **fail CLOSED when off and the real dependency
+is absent** — by design, so a misconfiguration surfaces loudly rather than silently
+degrading to no-auth or no-TLS:
+
+| Mock flag | Service | Stand-in behaviour (when `true`) | Flips to real when |
+|---|---|---|---|
+| `traefik_dashboard_auth_disabled=true` | SVC-09 | Dashboard served without forward-auth (internal-only on VLAN 20) | SVC-06 forward-auth is wired (flag back to its default `false`) |
+| `obs_tls_self_signed=true` | SVC-17/18 | Grafana served a self-signed cert via SVC-09's file provider | an SVC-08 / Let's Encrypt CA exists (flag back to its default `false`) |
+
+In production both flags stay at their default (`false`): Traefik owns real TLS + the
+real `edge` network, and the real dependencies are present.
+
+### Teardown (reverse order)
+
+Tear everything down in reverse dependency order, each service via its own
+clean-slate contract (`-e clean_slate=true -e clean_slate_confirm=force`). Services
+that must SSH to the Proxmox host for `pct` destruction take `-e svcNN_proxmox_host=…`;
+SVC-06 additionally needs its guest VMID:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+# 5 -> 1: SVC-17/18, then SVC-06 (+ its backing DB), SVC-09, SVC-07, platform.
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-17-18-bootstrap.yml \
+  -e cluster_env_file=.env.throwaway -e clean_slate=true -e clean_slate_confirm=force
+
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-06-bootstrap.yml \
+  -e cluster_env_file=.env.throwaway -e clean_slate=true -e clean_slate_confirm=force \
+  -e svc06_zitadel_vmid=1103 -e svc06_proxmox_host=<proxmox-lan-ip>
+
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-09-bootstrap.yml \
+  -e cluster_env_file=.env.throwaway -e clean_slate=true -e clean_slate_confirm=force
+
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-07-bootstrap.yml \
+  -e cluster_env_file=.env.throwaway -e clean_slate=true -e clean_slate_confirm=force
+
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/platform-bootstrap.yml \
+  -e cluster_env_file=.env.throwaway -e clean_slate=true -e clean_slate_confirm=force
+```
+
+End-state gate — no service guests survive and every root's Terraform state is empty:
+
+<!-- doctest: display-only -->
+```bash
+pct list                 # no svc guests remain
+terraform state list     # empty, per root
+```
+
+Two known teardown gotchas:
+
+- If a root was left after an offline `terraform init -backend=false`, a live state
+  op will refuse until you re-initialise the real backend with
+  `terraform init -reconfigure`.
+- The SDN zone/bridge can survive `terraform destroy` until the host re-reads
+  `interfaces.d` — an `ifreload -a` or a host reboot clears it (ADR-0011). The
+  gateway-side teardown and its reboot-persistence behaviour are covered in
+  [Gateway operator walkthrough → decommission-teardown](#gateway-operator-walkthrough--configure--reach--decommission-teardown--reboot-persistence).
+
+---
+
 ## What actually needs GitLab/CI (and what doesn't)
 
 Neither test tier *requires* CI **to run** — you can run both locally. The
@@ -989,6 +1288,7 @@ depends on the current registry contents.**
 | Document | What it covers |
 |---|---|
 | [root `README.md`](./README.md) | Quick start, prerequisites, the network topology, and the onboarding flow. |
+| [Deploy every implemented service from scratch](#deploy-every-implemented-service-from-scratch-all-services-walkthrough) | The dependency-ordered all-services bring-up (platform-foundation → SVC-07 → SVC-09 → SVC-06 → SVC-17/18) from an empty throwaway cluster, with per-service health gates and reverse-order teardown. |
 | [`infra/platform-foundation/README.md`](../infra/platform-foundation/README.md) | The shared foundation root: Terraform workflow, offline vs. requires-infra tiers, and the full onboarding sequence. |
 | [`infra/projects/_TEMPLATE/README.md`](../infra/projects/_TEMPLATE/README.md) | The per-project Terraform root template. |
 | [SVC-07 install runbook](../infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md) | The reference provision-then-test walkthrough (OpenBao primary + Transit unsealer), consumed by the SVC-07 live-test steps above. |

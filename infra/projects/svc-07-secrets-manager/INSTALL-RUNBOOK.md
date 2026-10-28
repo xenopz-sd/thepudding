@@ -392,6 +392,150 @@ A.2 from-scratch run.
 
 ---
 
+## A.5 — OpenBao reachable through Traefik (cross-guest file-provider route)
+
+This is the provision-then-test step for the **cross-guest ingress** behavior
+introduced by the
+[`traefik-cross-guest-ingress`](../../../.kiro/specs/traefik-cross-guest-ingress/)
+spec and its SVC-07 follow-up
+[`svc-07-cross-guest-ingress`](../../../.kiro/specs/svc-07-cross-guest-ingress/),
+recorded in
+[`ADR-0018`](../../../.kiro/decisions/0018-traefik-cross-guest-ingress-via-file-provider-static-routes.md)
+(plus its SVC-07 `https`/`serversTransport` addendum). It closes the SVC-07 case
+that carried the **same latent cross-guest discovery gap** as Grafana: the OpenBao
+primary runs on its own guest `svc07-20-01` · `10.0.20.10`, Traefik on a
+**separate** guest `svc09-20-01` · `10.0.20.12`, so a host-local `edge` Docker
+network can never bridge them and Traefik never discovers the primary's labels.
+
+**How the real (default) path works.** The `openbao_install` role, on the default
+production path (`openbao_mock_edge_network=false`):
+
+1. **Publishes the OpenBao VLAN20_Port** — binds the primary's API port `8200` to
+   the guest's **own VLAN-20 IP** (`10.0.20.10:8200`), never `0.0.0.0` and never a
+   LAN port. Reachable only on VLAN 20, consumed only by Traefik — the same
+   private-VLAN-bound-port exception the SVC-07 unsealer seal path, the fleet
+   exporters (`:9100`/`:8080`) and Loki (`:3100`) already use (ADR-0018).
+2. **Delegates a Traefik file-provider Route_Fragment** (`openbao-route.yml`, one
+   `http.routers` + one `http.services` entry pointing at `https://10.0.20.10:8200`)
+   onto the Traefik_Guest's watched dynamic-config dir via the shared
+   `traefik_route` role — the same `delegate_to` technique as the SVC-17/18 Mock-B
+   self-signed cert. **No SVC-09 `traefik_install` edit**, no cross-guest `edge`
+   network, no orchestrator/overlay.
+
+The one difference from Grafana (a plain `http` backend) is that OpenBao
+**terminates TLS itself**, so its backend hop is `https`. The `https://` scheme
+rides through the file-provider server `url` verbatim — no new Route_Mechanism
+field. The **Traefik→OpenBao hop is VERIFIED https** (not skipped): Traefik trusts
+OpenBao's cert via `serversTransport.rootCAs`. On the throwaway/dev cluster that
+anchor is the **delegated public mock CA** — the `openbao_install` role delegates
+OpenBao's **public** cert (never the private key) onto the Traefik_Guest at
+`/etc/traefik/dynamic/ca/openbao-mock-ca.crt`, gated on `openbao_tls_self_signed`.
+OpenBao's mock cert SAN already covers `IP:10.0.20.10` (matching the backend url
+host), so verification genuinely passes. In **production** OpenBao presents a real
+CA-issued cert, the route emits **no** `serversTransport`, and Traefik verifies
+against its **system trust store**. Traefik then hot-reloads the fragment (watched
+file provider, no restart) and proxies `https://openbao.<platform-domain>/` to the
+OpenBao VLAN20_Port over VLAN 20, terminating the LAN-facing TLS at Traefik.
+
+> **Mock-edge is a dev/offline affordance only.** `openbao_mock_edge_network=true`
+> flips the primary onto a **co-located-Traefik** path (attach the local `edge`
+> network + emit Traefik discovery labels — including the
+> `loadbalancer.server.scheme=https` label — **no** VLAN20_Port, **no**
+> file-provider route). It is a permanent, default-off placeholder per
+> [`mock-stand-ins.md`](../../../.kiro/steering/mock-stand-ins.md) and must
+> **never** be enabled on a host where SVC-09 owns the real `edge` (ADR-0013). The
+> real cross-guest route above is the default production posture.
+
+### A.5.0 — Offline preflight (render the route, no cluster needed)
+
+Render-check the OpenBao Route_Fragment + the `serversTransport` verified-hop
+wiring (default-inert vs. the mock-CA set path) and the SVC-07 clean-slate
+route-removal structure. These run offline against the role templates/tasks (no
+Traefik, no cluster). Run from the `tests/installer` pytest root as its own
+invocation (its `conftest.py` collides with the `infra/tests` root if collected
+together — `testing-strategy.md` → "Offline gate"):
+
+<!-- doctest: offline -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/pytest \
+  tests/installer/test_traefik_route_servers_transport.py \
+  tests/installer/test_svc07_clean_slate_route_removal.py -q
+```
+
+Format-check and validate the SVC-07 Terraform root (guest placement is unchanged
+by this feature, but the offline TF gate is part of the provision-then-test
+preflight — see the README
+[**Format and validate**](./README.md#format-and-validate-offline-tier-1) section
+for the `-backend=false` rationale):
+
+<!-- doctest: offline -->
+<!-- cwd: . -->
+```bash
+cd infra/projects/svc-07-secrets-manager
+terraform fmt -check -recursive
+terraform init -backend=false
+terraform validate
+```
+
+Compile-check the OpenBao configurator play that drives the delegating role and
+the VLAN20_Port publish (no connect):
+
+<!-- doctest: offline -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/ansible-playbook --syntax-check \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/openbao.yml
+```
+
+### A.5.1 — Live check: OpenBao through Traefik (requires-infra)
+
+After the A.2 bring-up has run (the primary publishing `10.0.20.10:8200`, its
+public mock CA delegated onto the Traefik_Guest, and `openbao-route.yml` delegated
+onto the Traefik_Guest's file-provider dir), confirm the cross-guest route
+end-to-end. First re-run the A.2 orchestrator against your throwaway cluster
+env-file so the real-path ingress wiring is in place (substitute
+`<cluster-env-file>`, e.g. `cluster.dev.env`):
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-07-bootstrap.yml \
+  -e cluster_env_file=<cluster-env-file>
+```
+
+Then verify a LAN request through Traefik reaches the OpenBao primary over the
+**VERIFIED** VLAN-20 `https` hop. The `sys/seal-status` endpoint is unauthenticated
+(no token needed) and returns OpenBao's seal-status JSON (e.g. `"sealed":false` on
+an unsealed primary) with HTTP 200, proxied to `https://10.0.20.10:8200` over
+VLAN 20. `--resolve` points the public `Host()` name at the Traefik_Guest
+(`<traefik-guest-ip>`, `10.0.20.12`); `-k` tolerates the LAN-facing self-signed
+Mock-B cert when no real CA is present (the inner Traefik→OpenBao hop is verified
+against the delegated mock CA regardless). Substitute `<platform-domain>` for your
+deployment's base domain:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+curl -sk --resolve openbao.<platform-domain>:443:<traefik-guest-ip> \
+  https://openbao.<platform-domain>/v1/sys/seal-status
+```
+
+A `200` with the seal-status JSON proves discovery is solved via the file provider
+(not a host-local `edge`): Traefik learned the
+`openbao.<platform-domain> → https://10.0.20.10:8200` mapping from the delegated
+Route_Fragment and reached the backend over VLAN 20 over a verified TLS hop (it
+fails fast if the delegated mock CA is missing/unreadable or the cert SAN does not
+match). A re-run of the A.2 bring-up is idempotent for the route (`changed=0` — the
+byte-identical fragment and CA are not re-written); the A.4 clean-slate removes the
+delegated `openbao-route.yml` from the Traefik_Guest so a torn-down primary leaves
+no dangling route.
+
+---
+
 ## The five-role layout — where each phase's tasks live
 
 > **Developer A reference.** As of the `svc07-installer-simplification` spec
@@ -2012,7 +2156,12 @@ every runnable block above carries an explicit tier:
   `init -backend=false` + `validate`, the orchestrator `ansible-playbook
   --syntax-check`, the `cluster_env.py --help`, and the offline `pytest
   tests/installer/` run) and the A.1 `cp cluster.env.example cluster.dev.env`
-  env-file prep; plus the section-0
+  env-file prep, and the A.5.0 cross-guest-route offline preflight (the
+  `pytest tests/installer/test_traefik_route_servers_transport.py
+  tests/installer/test_svc07_clean_slate_route_removal.py` render/clean-slate
+  checks, the `terraform fmt -check`/`init -backend=false`/`validate` on the
+  SVC-07 root, and the `openbao.yml` `ansible-playbook --syntax-check`); plus the
+  section-0
   preflight (`terraform fmt -check`, `terraform init -backend=false` +
   `validate`, the `bao` CLI install/check via `docker run --rm openbao/openbao:2.4
   bao -help` and `bao -help`), the section-1 `TF_VAR_*` export block, and the
@@ -2026,8 +2175,11 @@ every runnable block above carries an explicit tier:
   variables): in the **Developer B** section A, the A.2 single-command install
   (`svc-07-bootstrap.yml`), the A.3 live installer suite (`pytest -m
   requires_infra tests/installer/`, wired via `SVC07_TEST_CLUSTER_ENV_FILE` /
-  `SVC07_TEST_ALLOW_DESTROY` / `SVC07_TEST_PROXMOX_HOST`), and the A.4 clean-slate
-  reset (`clean_slate=true`); plus the section-0 Prerequisite_Gate `sudo pvesh get /cluster/sdn/vnets`
+  `SVC07_TEST_ALLOW_DESTROY` / `SVC07_TEST_PROXMOX_HOST`), the A.4 clean-slate
+  reset (`clean_slate=true`), and the A.5.1 cross-guest-route live check (the A.2
+  re-run via `svc-07-bootstrap.yml` and the
+  `curl --resolve openbao.<platform-domain> .../v1/sys/seal-status` OpenBao-through-
+  Traefik verified-hop probe); plus the section-0 Prerequisite_Gate `sudo pvesh get /cluster/sdn/vnets`
   fabric check, the section-1 `terraform apply` + `terraform output`, the
   section-1b ADR-0004 reachability steps (`ip route add` and the
   `ssh -o ConnectTimeout=5` reachability check), the section-1b

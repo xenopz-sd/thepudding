@@ -1,0 +1,167 @@
+---
+# tasks/mock_tls_self_signed.yml — observability_stack (SVC-17/18) — Mock B
+#
+# ============================================================================
+# MOCK self-signed TLS material for the Grafana route — OPT-IN, NOT FOR
+# PRODUCTION (Mock B, requirements FR-14 / design §4 Mock B).
+# ----------------------------------------------------------------------------
+# Stand-in for the SVC-08 (EJBCA) internal CA + Let's Encrypt, which issue
+# Traefik's real certificates. Neither exists yet, so this generates a
+# SELF-SIGNED cert + key (SANs covering grafana.<platform_domain>,
+# svc17-grafana-20-01, and 10.0.20.19) purely so Grafana's `websecure` Traefik
+# route can serve HTTPS and be validated now. Clients use validate_certs:false
+# (no trust chain). When a real resolver exists, leave obs_tls_self_signed=false
+# and SVC-09's letsencrypt/EJBCA resolver issues real certs — nothing else
+# changes.
+#
+# REUSES SVC-09's FILE-PROVIDER DEFAULT CERT (ADR-0013) — NO second owner:
+#   SVC-09 (traefik_install) OWNS the real `edge` network and the Traefik
+#   file-provider default certificate (dynamic.yml.j2
+#   `tls.stores.default.defaultCertificate`). This mock does NOT stand up a
+#   second edge/file-provider owner; it only PROVIDES the Grafana cert material
+#   and installs it at SVC-09's own tls paths on the TRAEFIK GUEST, so SVC-09's
+#   existing file provider serves it for Grafana's websecure route. The target
+#   paths (obs_traefik_tls_*) default to SVC-09's traefik_tls_* values so the two
+#   roles agree with no SVC-09 edit.
+#
+# This mirrors SVC-09's traefik_install/tasks/tls_self_signed.yml exactly:
+#   WHERE IT RUNS: the community.crypto modules run on the ANSIBLE CONTROL NODE
+#     (delegate_to: localhost) which has the Python `cryptography` lib; the
+#     minimal LXC guests do not. The cert + key are generated into a per-run
+#     control-node temp dir, copied to the TRAEFIK GUEST's tls dir, and the
+#     control-node temp copy is scrubbed.
+#   IDEMPOTENCY: the whole generate+copy block is skipped if the target cert
+#     already exists on the Traefik guest (stat first), so a present cert is left
+#     untouched — no copy, no `Restart traefik`, no churn.
+#   SECRETS DISCIPLINE: the private key is a secret — generated 0600 on the
+#     control node, copied 0640 owned by root on the guest (read via the :ro
+#     mount), never committed, never logged (key tasks set no_log).
+#
+# LIFECYCLE (.kiro/steering/mock-stand-ins.md): PERMANENT, opt-in dev stand-in,
+# NOT transitional debt. Never deleted "once SVC-08 lands"; simply not selected
+# in production (flag defaults false).
+# ============================================================================
+
+- name: "MOCK-TLS (obs): ensure the Traefik TLS host directory exists (0750)"
+  ansible.builtin.file:
+    path: "{{ obs_traefik_tls_host_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  delegate_to: "{{ obs_traefik_guest_host }}"
+  vars:
+    ansible_user: "{{ obs_traefik_guest_user | default('root') }}"
+    ansible_python_interpreter: "{{ obs_traefik_guest_python | default('/usr/bin/python3') }}"
+
+# --- IDEMPOTENCY: skip the whole generate+copy block when a cert already exists ---
+- name: "MOCK-TLS (obs): stat the target cert to decide whether generation is needed"
+  ansible.builtin.stat:
+    path: "{{ obs_traefik_tls_cert_file }}"
+  register: obs_mock_tls_cert_stat
+  delegate_to: "{{ obs_traefik_guest_host }}"
+  vars:
+    ansible_user: "{{ obs_traefik_guest_user | default('root') }}"
+    ansible_python_interpreter: "{{ obs_traefik_guest_python | default('/usr/bin/python3') }}"
+  changed_when: false
+
+- name: "MOCK-TLS (obs): set fact — (re)generate only when the target cert is absent"
+  ansible.builtin.set_fact:
+    obs_mock_tls_generate: "{{ not (obs_mock_tls_cert_stat.stat.exists | default(false)) }}"
+  changed_when: false
+
+- name: "MOCK-TLS (obs): report that a present cert is kept (idempotent, no restart)"
+  ansible.builtin.debug:
+    msg: >-
+      A mock TLS cert already exists at {{ obs_traefik_tls_cert_file }} on the
+      Traefik guest ({{ obs_traefik_guest_host }}); keeping it (no regenerate, no
+      `Restart traefik`). Delete it on the target to force regeneration.
+  when: not obs_mock_tls_generate
+
+# --- Generate on the CONTROL NODE (has `cryptography`); once for the whole run ---
+- name: "MOCK-TLS (obs): create a control-node temp dir for cert generation"
+  ansible.builtin.tempfile:
+    state: directory
+    prefix: "obs-mock-tls-"
+  register: obs_mock_tls_tmp
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  when: obs_mock_tls_generate
+
+- name: "MOCK-TLS (obs): generate the private key on the control node (stand-in for the CA)"
+  community.crypto.openssl_privatekey:
+    path: "{{ obs_mock_tls_tmp.path }}/key.pem"
+    type: RSA
+    size: 4096
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  no_log: true
+  when: obs_mock_tls_generate
+
+- name: "MOCK-TLS (obs): build a CSR carrying the Grafana SANs (control node)"
+  community.crypto.openssl_csr:
+    path: "{{ obs_mock_tls_tmp.path }}/grafana.csr"
+    privatekey_path: "{{ obs_mock_tls_tmp.path }}/key.pem"
+    common_name: "{{ obs_tls_self_signed_cn }}"
+    subject_alt_name: "{{ obs_tls_self_signed_sans }}"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: obs_mock_tls_generate
+
+- name: "MOCK-TLS (obs): self-sign the certificate from the CSR (control node)"
+  community.crypto.x509_certificate:
+    path: "{{ obs_mock_tls_tmp.path }}/cert.pem"
+    privatekey_path: "{{ obs_mock_tls_tmp.path }}/key.pem"
+    csr_path: "{{ obs_mock_tls_tmp.path }}/grafana.csr"
+    provider: selfsigned
+    selfsigned_not_after: "+{{ obs_tls_self_signed_valid_days }}d"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: obs_mock_tls_generate
+
+# --- Copy the generated material to the TRAEFIK GUEST (SVC-09 file provider) ---
+- name: "MOCK-TLS (obs): install the private key on the Traefik guest (root, 0640)"
+  ansible.builtin.copy:
+    src: "{{ obs_mock_tls_tmp.path }}/key.pem"
+    dest: "{{ obs_traefik_tls_key_file }}"
+    owner: root
+    group: root
+    mode: "0640"
+  delegate_to: "{{ obs_traefik_guest_host }}"
+  vars:
+    ansible_user: "{{ obs_traefik_guest_user | default('root') }}"
+    ansible_python_interpreter: "{{ obs_traefik_guest_python | default('/usr/bin/python3') }}"
+  no_log: true
+  when: obs_mock_tls_generate
+
+- name: "MOCK-TLS (obs): install the certificate on the Traefik guest (root, 0644)"
+  ansible.builtin.copy:
+    src: "{{ obs_mock_tls_tmp.path }}/cert.pem"
+    dest: "{{ obs_traefik_tls_cert_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  delegate_to: "{{ obs_traefik_guest_host }}"
+  vars:
+    ansible_user: "{{ obs_traefik_guest_user | default('root') }}"
+    ansible_python_interpreter: "{{ obs_traefik_guest_python | default('/usr/bin/python3') }}"
+  when: obs_mock_tls_generate
+
+# --- Scrub the control-node temp material (key must not linger off-target) ---
+- name: "MOCK-TLS (obs): remove the control-node temp dir (scrub key material)"
+  ansible.builtin.file:
+    path: "{{ obs_mock_tls_tmp.path }}"
+    state: absent
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  when: obs_mock_tls_generate

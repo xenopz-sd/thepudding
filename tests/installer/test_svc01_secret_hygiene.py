@@ -11,6 +11,7 @@ Run:  ~/venv/devinfra/bin/pytest tests/installer/test_svc01_secret_hygiene.py -v
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
@@ -91,6 +92,80 @@ def _set_fact_keys(t: dict) -> set[str]:
     return set()
 
 
+# Diagnostic-only modules (they cannot, by themselves, read/bind/template a value).
+_DIAGNOSTIC_MODULES = ("ansible.builtin.assert", "assert", "ansible.builtin.fail", "fail")
+
+# {{ ... }} expressions that interpolate a SECRET VALUE into a visible message.
+# A LITERAL plain-text mention of an env-var NAME (e.g. OPENBAO_ADMIN_TOKEN) is
+# NOT matched here — only an interpolation `{{ ... <secret-var> ... }}` is.
+_SECRET_VALUE_INTERP = (
+    re.compile(r"\{\{[^}]*\bopenbao_admin_token\b[^}]*\}\}", re.IGNORECASE),
+    re.compile(r"\{\{[^}]*\bproxmox_api_token\b[^}]*\}\}", re.IGNORECASE),
+    re.compile(r"\{\{[^}]*\bci_job_token\b[^}]*\}\}", re.IGNORECASE),
+    re.compile(r"\{\{[^}]*\bpassword\b[^}]*\}\}", re.IGNORECASE),
+    re.compile(r"\{\{[^}]*\bsecret\b[^}]*\}\}", re.IGNORECASE),
+)
+
+
+def _diagnostic_message(t: dict) -> str:
+    """The visible diagnostic text of a pure assert/fail task: assert.fail_msg +
+    assert.success_msg + fail.msg. (success_msg is visible on the pass path.)"""
+    parts: list[str] = []
+    for mod in ("ansible.builtin.assert", "assert"):
+        spec = t.get(mod)
+        if isinstance(spec, dict):
+            parts.append(str(spec.get("fail_msg", "")))
+            parts.append(str(spec.get("success_msg", "")))
+    for mod in ("ansible.builtin.fail", "fail"):
+        spec = t.get(mod)
+        if isinstance(spec, dict):
+            parts.append(str(spec.get("msg", "")))
+    return " ".join(parts)
+
+
+def _is_pure_diagnostic_no_secret_value(t: dict) -> bool:
+    """A VISIBLE fail-fast diagnostic that only NAMES a secret-related var but
+    carries no secret VALUE — exempt from the no_log requirement.
+
+    Rationale: the fix-svc01-db-install-first-run-transient bugfix added a
+    deliberately-VISIBLE fail-fast gate ("Preflight | Fail closed if OpenBao is
+    wired but no admin token is resolvable"). It is an `ansible.builtin.assert`
+    whose `that` reads ONLY the non-secret boolean fact `svc01_openbao_token_present`
+    and whose `fail_msg` names the env var `OPENBAO_ADMIN_TOKEN` as a LITERAL string
+    plus a remedy. Forcing `no_log: true` on it would suppress the very diagnostic
+    it exists to emit (a no_log fail task prints a censored message, defeating
+    fail-fast diagnosability). The hygiene heuristic over-matches it only because the
+    literal var-NAME text "openbao_admin_token" appears in the message (a _SECRET_MARKERS
+    hit) — it is a var-NAME mention, not a secret VALUE. This mirrors the SVC-06
+    precedent in infra/tests/test_svc06_zitadel_contract.py, whose no_log heuristic
+    was refined to exempt pure-diagnostic fail tasks that name only a non-secret
+    path/field.
+
+    EXEMPT iff ALL hold (keeps real leaks caught):
+      1. The task's only module is assert/fail (diagnostic-only — it does NOT also
+         run a command/set_fact/slurp/etc. that could carry a value).
+      2. It does NOT register a value and does NOT set_fact any _SECRET_REGISTERS key
+         (it only reads a non-secret boolean).
+      3. Its visible message does NOT INTERPOLATE a secret value — no `{{ ... }}`
+         expression referencing a secret var. A literal uppercase env-var NAME in
+         plain text (e.g. OPENBAO_ADMIN_TOKEN) is allowed.
+    """
+    modules = _module_names(t)
+    # (1) diagnostic-only: at least one diagnostic module, and NO non-diagnostic module.
+    if not modules or not modules.issubset(set(_DIAGNOSTIC_MODULES)):
+        return False
+    # (2) binds no secret-bearing value.
+    if str(t.get("register", "")) in _SECRET_REGISTERS:
+        return False
+    if _set_fact_keys(t) & set(_SECRET_REGISTERS):  # set_fact is non-diagnostic anyway
+        return False
+    # (3) the visible message interpolates no secret VALUE (literal NAME is fine).
+    msg = _diagnostic_message(t)
+    if any(pat.search(msg) for pat in _SECRET_VALUE_INTERP):
+        return False
+    return True
+
+
 def _is_token_handling(t: dict) -> bool:
     if any(m in _body_text(t) for m in _SECRET_MARKERS):
         return True
@@ -105,6 +180,12 @@ def test_token_handling_tasks_are_no_log_true():
     offenders = []
     for p, tasks in _load_task_files():
         for t in tasks:
+            # A pure-diagnostic fail/assert that only NAMES a token var (no secret
+            # VALUE interpolated) is a sanctioned VISIBLE fail-fast gate — exempt.
+            # See _is_pure_diagnostic_no_secret_value (fix-svc01-db-install-first-run
+            # -transient; SVC-06 precedent).
+            if _is_pure_diagnostic_no_secret_value(t):
+                continue
             if _is_token_handling(t) and _no_log(t) is not True:
                 offenders.append(f"  - {p.relative_to(_REPO_ROOT)} :: {t.get('name', '<unnamed>')!r}")
     assert not offenders, (
@@ -117,6 +198,10 @@ def test_no_no_log_false_token_task():
     offenders = []
     for p, tasks in _load_task_files():
         for t in tasks:
+            # Same exemption: a pure diagnostic may legitimately be no_log:false /
+            # omitted (it must stay VISIBLE), so it must not be flagged here either.
+            if _is_pure_diagnostic_no_secret_value(t):
+                continue
             if _no_log(t) is False and _is_token_handling(t):
                 offenders.append(f"  - {p.relative_to(_REPO_ROOT)} :: {t.get('name', '<unnamed>')!r}")
     assert not offenders, "SECRET-HYGIENE: no_log: false on a token-handling task:\n" + "\n".join(offenders)

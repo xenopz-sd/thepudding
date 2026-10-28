@@ -1,0 +1,75 @@
+---
+# defaults/main.yml — dcgm_exporter (SVC-17/18, GPU-tagged hosts only, DEFERRED)
+#
+# Deploys NVIDIA DCGM Exporter on GPU-tagged hosts ONLY, as a Docker Compose
+# stack via the generic docker-compose-app role (consumed UNMODIFIED). It
+# exposes NVIDIA GPU telemetry (utilisation, memory, temperature, ECC errors,
+# power) on port 9400 for the observability_stack Prometheus_Server to scrape
+# fleet-wide, exactly like node_exporter / cAdvisor / Promtail.
+#
+# DEFERRED BY DEFAULT (Mock C, GPU_Metrics_Deferred). No GPU host exists until
+# SVC-23 (model serving). While `dcgm_metrics_deferred` is true the role applies
+# to ZERO hosts and is a logged no-op — GPU metrics are explicitly NOT a v1
+# acceptance gate (requirements AC-12). When a GPU host lands with SVC-23 and the
+# operator (a) tags that host into the `gpu` inventory group AND (b) runs with
+# `-e dcgm_metrics_deferred=false`, the role deploys. SVC-23 is then a flag-flip
+# + a host tag, never a rebuild.
+#
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements.md FR-4 / AC-12,
+# design §3.3 dcgm_exporter + §4 Mock C). Mirrors the promtail_agent /
+# node_exporter var contract and the docker-compose-app hand-off (dca_app_name /
+# dca_services / dca_volumes / dca_networks / dca_env).
+#
+# GPU PASSTHROUGH PREREQUISITE (documented, NOT installed by this role):
+#   dcgm-exporter needs the NVIDIA runtime inside the container (`--gpus all`,
+#   carried below as a runtime_options container-create flag). That ONLY works on
+#   a host that already has the NVIDIA driver + the NVIDIA Container Toolkit
+#   installed and the Docker runtime wired to it. Provisioning the GPU host and
+#   its Container Toolkit is an SVC-23 prerequisite; this role assumes it is
+#   already present on any `gpu`-tagged host and does not install it.
+
+# --- Image pin (tech.md: never track `latest`) -----------------------------
+# Pinned deliberately. The DCGM Exporter image tag MUST be matched to the GPU
+# host's NVIDIA driver / DCGM line at SVC-23 build time (requirements §15 open
+# assumption) — revisit this pin when the first GPU host is provisioned. A bump
+# is a conscious follow-up flagged in the PR.
+dcgm_exporter_image: "nvidia/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04"
+
+# --- Deferral / GPU-group gate (Mock C — GPU_Metrics_Deferred) ---------------
+# `dcgm_metrics_deferred` is the Mock C flag already declared in
+# observability_stack/defaults/main.yml (default TRUE); this role CONSUMES it. It
+# is re-declared here (default true) so the role is self-contained and fails
+# safe/inert when run standalone without the observability_stack defaults loaded.
+# While true -> zero hosts, logged no-op.
+dcgm_metrics_deferred: true
+
+# The inventory group a host must belong to for this role to deploy. There are
+# ZERO hosts in this group today (no GPU host until SVC-23); when SVC-23 lands a
+# GPU host, tag it into this group (and flip dcgm_metrics_deferred=false).
+dcgm_exporter_gpu_group: "gpu"
+
+# --- Compose stack identity (consumed by docker-compose-app) ----------------
+dcgm_exporter_stack_name: "dcgm-exporter"
+dcgm_exporter_container_name: "{{ dcgm_exporter_stack_name }}-dcgm-exporter-1"
+
+# --- Internal (VLAN-20) scrape port -----------------------------------------
+# DCGM Exporter's /metrics endpoint. Internal only (no host port, FR-13 /
+# integration-boundaries §1); the observability_stack scrapes it fleet-wide like
+# any other exporter target.
+dcgm_exporter_port: 9400
+
+# --- GPU passthrough: container-create runtime flag -------------------------
+# docker-compose-app does NOT model `deploy.resources.reservations.devices` /
+# `gpus` as first-class compose keys; it carries container-create flags under a
+# service's `runtime_options` (rendered as the `x-runtime-options` extension and,
+# where supported, mapped onto runtime flags). `--gpus all` reserves every GPU on
+# the host to the container — the Compose equivalent of
+# `deploy.resources.reservations.devices: [{capabilities: [gpu]}]`. This is the
+# NVIDIA-runtime reservation the design §3.3 calls for; it REQUIRES the NVIDIA
+# Container Toolkit on the host (SVC-23 prerequisite, see the header note).
+dcgm_exporter_gpus: "all"
+dcgm_exporter_runtime_options:
+  - "--gpus {{ dcgm_exporter_gpus }}"
+
+# --- Reconciliation behaviour (passed through to docker-compose-app) --------
+dcgm_exporter_state: "present"

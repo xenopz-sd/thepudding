@@ -6,6 +6,10 @@ and then verifies the ingress against the instance you just built. It is the
 "build the live thing, then test what you built" half that the
 [`../../../docs/TESTING.md`](../../../docs/TESTING.md) tier table assumes exists.
 
+> To stand this service up as part of the whole platform (dependency-ordered, from
+> an empty cluster), see the [all-services walkthrough](../../../docs/TESTING.md#deploy-every-implemented-service-from-scratch-all-services-walkthrough)
+> in the testing guide.
+
 There are **two paths**. Section **A** is the **Developer B** fast path: one
 Ansible orchestrator command (`svc-09-bootstrap.yml`) that packages the whole
 Day-0 bring-up — Preflight → Provisioning → Bootstrap → Handoff — then health-gates

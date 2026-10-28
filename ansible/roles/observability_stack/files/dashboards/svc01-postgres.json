@@ -1,0 +1,67 @@
+{
+  "__comment": "STARTER per-service dashboard (dashboards-as-code, SVC-17/18 FR-6) for SVC-01 PostgreSQL via postgres_exporter (V1_Scrape_Set). Minimal valid v1 dashboard; one per-service starter is shipped (postgres) and the others in the V1_Scrape_Set (SVC-06/07/09) follow the same shape. Version-controlled JSON — edit here, not in the Grafana UI (allowUiUpdates=false).",
+  "annotations": {
+    "list": []
+  },
+  "editable": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "postgres_exporter up",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "observability-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{service=\"svc01-postgres\"}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Active connections",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "observability-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 8,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(pg_stat_activity_count{service=\"svc01-postgres\"})"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": [
+    "observability",
+    "svc01",
+    "postgres",
+    "per-service",
+    "starter"
+  ],
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "",
+  "title": "SVC-01 PostgreSQL — starter",
+  "uid": "obs-svc01-postgres",
+  "version": 1
+}

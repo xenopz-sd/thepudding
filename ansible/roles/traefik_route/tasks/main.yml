@@ -1,0 +1,123 @@
+---
+# tasks/main.yml — traefik_route (Route_Mechanism)
+#
+# Renders ONE Traefik v3 file-provider Route_Fragment and DELEGATES it onto the
+# Traefik_Guest's already-watched file-provider directory, so Traefik discovers
+# a backend running on a SEPARATE guest. No SVC-09 traefik_install edit (R1.6);
+# the file provider hot-reloads the fragment (R1.5). Non-secret config only
+# (NFR4); no runtime beyond Compose / no orchestrator (NFR2).
+#
+# Spec: .kiro/specs/traefik-cross-guest-ingress/ (R1.2/R1.5/R1.6, R3.1/R3.4/R3.5;
+# design §"Component 1 — Route_Mechanism", §"Error Handling").
+#
+# DELEGATE PATTERN mirrors observability_stack/tasks/mock_tls_self_signed.yml
+# EXACTLY: every task that touches the Traefik_Guest uses
+#   delegate_to: "{{ traefik_guest_host }}"
+#   vars:
+#     ansible_user: "{{ traefik_guest_user | default('root') }}"
+#     ansible_python_interpreter: "{{ traefik_guest_python | default('/usr/bin/python3') }}"
+# so the backend role (running against its OWN guest) installs the fragment onto
+# the Traefik_Guest with no SVC-09 edit.
+#
+# ORDER: swap-gate INFO + fail-closed assert (task 1.3) run BEFORE any render
+# (task 1.2), so a misconfigured real route never writes a partial/broken
+# fragment (R3.5).
+
+# ============================================================================
+# SWAP-GATE (task 1.3) — real file-provider route vs dev/offline mock-edge
+# ============================================================================
+
+# --- INFO swap-gate decision (R3.4) -----------------------------------------
+# composition-wiring.md §"Swap-Gate Pattern" step 4 / mock-stand-ins.md: emit an
+# INFO line stating WHICH path was selected and WHY, so the real-route vs
+# mock-edge choice is visible in the play output without reading source. Mirrors
+# the Grafana auth swap-gate INFO precedent in observability_stack/tasks/grafana.yml.
+- name: "Traefik_route | Route swap-gate decision (INFO, R3.4)"
+  ansible.builtin.debug:
+    msg: >-
+      traefik_route swap-gate: traefik_route_enabled={{ traefik_route_enabled }}
+      -> {{
+        ('REAL cross-guest file-provider route (default production posture, R3.1) '
+          ~ '— rendering Route_Fragment ' ~ (route_name | default('<unset>'))
+          ~ '-route.yml onto the Traefik_Guest ' ~ (traefik_guest_host | default('<unset>'))
+          ~ ':' ~ traefik_dynamic_config_dir ~ ', Host(' ~ (route_host_rule | default('<unset>'))
+          ~ ') -> ' ~ (route_backend_url | default('<unset>')) ~ ' over VLAN 20; '
+          ~ 'Traefik hot-reloads via the watched file provider (R1.5), no SVC-09 edit (R1.6)')
+        if (traefik_route_enabled | bool)
+        else ('NO-OP — the dev/offline mock-edge path is selected instead '
+          ~ '(permanent, default-off Mock_Edge placeholder per mock-stand-ins.md); '
+          ~ 'this role renders NOTHING. Flip to the real route with '
+          ~ '-e traefik_route_enabled=true')
+      }}
+  changed_when: false
+
+# --- Fail closed when the real route is selected but unresolved (R3.5) -------
+# When the real route IS selected (flag true) but route_backend_url OR
+# traefik_guest_host is empty/unresolved, fail at configure time with a clear
+# remedy — BEFORE rendering any fragment — rather than render a broken or
+# partial route that points nowhere (design §"Error Handling"). route_name is
+# included because it is the fragment basename; without it there is no fragment
+# to write.
+- name: "Traefik_route | Fail closed if the real route is selected but unresolved (R3.5)"
+  ansible.builtin.assert:
+    that:
+      - (route_name | default('') | trim | length > 0)
+      - (route_host_rule | default('') | trim | length > 0)
+      - (route_backend_url | default('') | trim | length > 0)
+      - (traefik_guest_host | default('') | trim | length > 0)
+    fail_msg: >-
+      traefik_route selected the REAL cross-guest route
+      (traefik_route_enabled=true) but a required value is empty/unresolved:
+      route_name='{{ route_name | default('') }}',
+      route_host_rule='{{ route_host_rule | default('') }}',
+      route_backend_url='{{ route_backend_url | default('') }}',
+      traefik_guest_host='{{ traefik_guest_host | default('') }}'. Refusing to
+      render a broken or partial Route_Fragment. Remedy: supply the backend's
+      VLAN-20 url (route_backend_url, e.g. http://10.0.20.19:3000), the Host()
+      rule (route_host_rule), the fragment id (route_name), and the Traefik_Guest
+      delegate target (traefik_guest_host, e.g. 10.0.20.12 per ADR-0015) — OR set
+      -e traefik_route_enabled=false to use the dev/offline mock-edge path.
+    success_msg: >-
+      traefik_route real route resolved: {{ route_name }} ->
+      {{ route_backend_url }} (delegate target {{ traefik_guest_host }}).
+    quiet: true
+  when: traefik_route_enabled | bool
+
+# ============================================================================
+# RENDER + DELEGATE (task 1.2) — only on the real-route path
+# ============================================================================
+
+# --- Ensure the file-provider dir exists on the Traefik_Guest (delegate) ----
+# 0755 so Traefik (file provider, :ro mount) can traverse + read the fragments;
+# this is SVC-09's already-watched dynamic dir — ensure-only, never re-own.
+- name: "Traefik_route | Ensure the Traefik file-provider dir exists on the Traefik_Guest"
+  ansible.builtin.file:
+    path: "{{ traefik_dynamic_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  delegate_to: "{{ traefik_guest_host }}"
+  vars:
+    ansible_user: "{{ traefik_guest_user | default('root') }}"
+    ansible_python_interpreter: "{{ traefik_guest_python | default('/usr/bin/python3') }}"
+  when: traefik_route_enabled | bool
+
+# --- Render the Route_Fragment onto the Traefik_Guest (delegate) ------------
+# 0640 root:root — non-secret config, read via the file provider's :ro mount.
+# IDEMPOTENT (NFR1 / R-NFR1): ansible.builtin.template reports changed=0 when the
+# rendered fragment is byte-identical, so a second converged run does not churn
+# or duplicate the fragment. Traefik's watched file provider hot-reloads a new/
+# changed fragment with no container restart (R1.5).
+- name: "Traefik_route | Render + delegate the Route_Fragment onto the Traefik_Guest (R1.2)"
+  ansible.builtin.template:
+    src: traefik-route-fragment.yml.j2
+    dest: "{{ traefik_dynamic_config_dir }}/{{ route_name }}-route.yml"
+    owner: root
+    group: root
+    mode: "0640"
+  delegate_to: "{{ traefik_guest_host }}"
+  vars:
+    ansible_user: "{{ traefik_guest_user | default('root') }}"
+    ansible_python_interpreter: "{{ traefik_guest_python | default('/usr/bin/python3') }}"
+  when: traefik_route_enabled | bool

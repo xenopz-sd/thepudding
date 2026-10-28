@@ -69,8 +69,17 @@
     # The OpenBao admin token for the bao-CLI credential write (postgres-server).
     # In the child ENV, never argv. Empty when OpenBao storage is not wired for a
     # given run (the role's write task is gated on an address being present).
+    #
+    # BRIDGE the PREFLIGHT-RESOLVED svc01_openbao_admin_token fact (resolved from
+    # the process env OR the cluster env file — the single source of truth), so the
+    # token in the cluster env file reaches the child without a manual export. Falls
+    # back to the direct process-env lookup so the historical exported-token
+    # convention still works, then to '' for a dev/offline (unwired) run. The
+    # fail-closed wired-but-empty gate lives in svc01_preflight (runs before Phase 3).
+    # See .kiro/specs/fix-svc01-db-install-first-run-transient/.
     OPENBAO_ADMIN_TOKEN: >-
-      {{ openbao_admin_token
+      {{ svc01_openbao_admin_token
+         | default(openbao_admin_token, true)
          | default(lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN'), true)
          | default('', true) }}
   register: svc01_db_run

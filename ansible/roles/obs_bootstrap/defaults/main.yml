@@ -1,0 +1,105 @@
+---
+# defaults/main.yml — obs_bootstrap (SVC-17/18 installer — Phase 3)
+#
+# Phase-3 role var contract. These are normally SUPPLIED by the thin orchestrator
+# svc-17-18-bootstrap.yml as play-level cross-role vars (task 9.5) and/or resolved
+# in obs_provision (task 9.2). They are declared here with safe defaults so the
+# role is self-contained, documents its inputs, and lint/`--syntax-check` resolve
+# cleanly when the role is exercised standalone. The orchestrator's play vars take
+# precedence over these defaults at runtime.
+#
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements FR-15/FR-17, §Phase 3,
+# design §3.5 obs_bootstrap).
+
+# --- Orchestration paths ----------------------------------------------------
+# Repository root: the orchestrator sets this to `{{ playbook_dir | dirname |
+# dirname }}` (two levels up from ansible/playbooks/); default to the ansible-
+# root's grandparent for a standalone run.
+obs_repo_root: "{{ playbook_dir | default(role_path ~ '/../../..') | dirname | dirname }}"
+# The generated dynamic inventory written by obs_provision (Phase 2), consumed by
+# this phase's child common.yml run as its `-i` (and FIRST in the Task-2
+# configurator run's merged inventory set).
+obs_generated_inventory: "ansible/inventory/svc-17-18-observability.generated.yml"
+# The de-duplicated, ordered list of generated inventory file paths passed as
+# multiple `-i` flags to the Task-2 observability.yml configurator child run. It
+# is normally SET as a run-time fact immediately before Task 2 (the obs inventory
+# FIRST, then every other ansible/inventory/*.generated.yml discovered by a
+# run-time fileglob rooted at obs_repo_root), so the V1_Scrape_Set service_role
+# groups (postgres/zitadel/openbao/traefik) — which live only in the OTHER
+# services' generated inventories — become visible to the controller-side
+# scrape-target index. Declared here (empty) so the role resolves standalone /
+# under --syntax-check. See .kiro/specs/fix-obs-scrape-targets-multi-inventory/.
+obs_configurator_inventories: []
+# The fanned-out inventory flag pairs for the Task-2 configurator child run —
+# `['-i', inv1, '-i', inv2, ...]`, one SEPARATE `-i` per entry of
+# obs_configurator_inventories. Ansible does NOT merge a single comma-joined `-i`
+# of inventory FILE PATHS (verified live: only all/ungrouped appear); only
+# MULTIPLE separate `-i` flags merge the groups. Built by a loop immediately
+# before Task 2; declared here (empty) so the role resolves standalone / under
+# --syntax-check. See .kiro/specs/fix-obs-scrape-targets-multi-inventory/.
+obs_inventory_flags: []
+# The COMPLETE, flat argv list for the Task-2 observability.yml configurator child
+# run (binary + fanned-out `-i` flags + play + the `-e` bridges), assembled as one
+# computed fact immediately before Task 2 because a Jinja list cannot be
+# inline-expanded into the middle of a literal YAML argv list (Ansible stringifies
+# a list-valued argv element into one arg). Declared here (empty) so the role
+# resolves standalone / under --syntax-check.
+obs_configurator_argv: []
+
+# --- Non-secret platform config bridged to the configurator -----------------
+# Builds the Grafana Traefik Host() rule + the Mock B self-signed cert SANs.
+obs_platform_domain: "platform.example.test"
+# Loki push URL for the fleet Promtail agents (FR-5). The orchestrator overrides
+# this from the Terraform output `loki_push_url`; the default is the computed
+# Loki VLAN-20 endpoint (host_index 10 -> 10.0.20.20).
+obs_loki_push_url: "http://10.0.20.20:3100/loki/api/v1/push"
+
+# --- Mock stand-in flags (mock-stand-ins.md) — DEFAULT OFF/deferred ---------
+# Bridged to the observability.yml child run so a CA-less / OIDC-less / GPU-less
+# Day-0 bring-up works when the operator opts in. Default posture == production.
+grafana_oidc_enabled: false
+obs_tls_self_signed: false
+obs_tls_real_ca_available: false
+dcgm_metrics_deferred: true
+
+# --- OpenBao wiring (FR-15) — delegated bao-CLI read in grafana.yml ---------
+# observability_openbao_addr (empty => dev/offline: the Grafana secret reads are
+# skipped and the role falls back to its *_override vars). The CLI delegate host
+# is the OpenBao PRIMARY guest the `bao` CLI runs against. The OPENBAO_ADMIN_TOKEN
+# itself is NOT a var here — it is read from the process ENV and bridged in the
+# child ENV (no_log), never a committed literal.
+obs_openbao_addr: ""
+obs_openbao_cli_host: "10.0.20.10"
+# The resolved OpenBao admin token, normally SUPPLIED by obs_preflight (resolved
+# from the process env OR the cluster env file — the single source of truth) and
+# bridged to the Phase-3 observability.yml child run's ENV (no_log). Default empty
+# so the role is self-contained standalone / under --syntax-check; the Task-2
+# bridge falls back to lookup('env', 'OPENBAO_ADMIN_TOKEN') when this is empty, so
+# the historical process-env convention (SVC-06/07) still works. See
+# .kiro/specs/fix-obs-bootstrap-first-run-transient/.
+obs_openbao_admin_token: ""
+
+# --- Grafana Break_Glass_Admin seed (FR-15) — delegated bao-CLI get/put -----
+# The seed step (tasks/seed_grafana_admin.yml) runs BEFORE the configurator
+# child run and idempotently mints secret/observability/grafana-admin (field
+# `password`) into OpenBao if absent, so a from-scratch bring-up needs no
+# human-minted Grafana secret (same gap SVC-06's org-provision auto-mint closed,
+# ADR-0016). It uses the SAME delegated `docker exec <primary> bao kv get|put`
+# pattern + var shapes as observability_stack/tasks/grafana.yml's read; declared
+# here with matching defaults so the seed resolves when obs_bootstrap runs. The
+# OPENBAO_ADMIN_TOKEN is read from the process ENV in the task (no_log), never a
+# committed literal. Runs ONLY when obs_openbao_addr is non-empty (wired);
+# dev/offline uses the password override and skips the seed.
+observability_openbao_cli_bao_addr: "https://127.0.0.1:8200"
+observability_openbao_cli_host: "{{ obs_openbao_cli_host }}"
+observability_openbao_cli_user: "root"
+observability_openbao_cli_python: "/usr/bin/python3"
+# docker-compose-app names the container <stack>-<svc>-1 ("openbao-openbao-1"),
+# matching zitadel-server / openbao_install — NOT "openbao-primary".
+observability_openbao_primary_container_name: "openbao-openbao-1"
+observability_openbao_bao_bin: "bao"
+observability_openbao_tls_skip_verify: true
+observability_bao_token: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+observability_openbao_kv_mount: "secret"
+observability_grafana_admin_secret_path: "{{ observability_openbao_kv_mount }}/observability/grafana-admin"
+observability_grafana_admin_secret_field: "password"

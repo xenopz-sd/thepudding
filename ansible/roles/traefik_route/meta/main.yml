@@ -1,0 +1,35 @@
+---
+# meta/main.yml — traefik_route (Route_Mechanism)
+galaxy_info:
+  role_name: traefik_route
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Reusable cross-guest Traefik route-registration mechanism. A backend service
+    role on one guest consumes this role to render ONE Traefik v3 file-provider
+    Route_Fragment (one http.routers + one http.services entry) and delegate it
+    onto the Traefik_Guest's already-watched file-provider directory, so Traefik
+    discovers a backend on a SEPARATE guest without an orchestrator or overlay
+    network. Real route is the default production posture (swap-gated against the
+    dev/offline mock-edge path, INFO-logged, fail-closed). Requires no edit to
+    the SVC-09 traefik_install role.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - traefik
+    - reverse-proxy
+    - ingress
+    - routing
+    - svc09
+
+# No cross-role dependencies. This role only renders + delegates a file-provider
+# Route_Fragment onto the Traefik_Guest; it neither depends on nor edits the
+# SVC-09 traefik_install role (R1.6).
+dependencies: []

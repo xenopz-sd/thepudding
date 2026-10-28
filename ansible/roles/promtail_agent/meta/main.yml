@@ -1,0 +1,33 @@
+---
+# meta/main.yml — promtail_agent (SVC-18, fleet-wide)
+galaxy_info:
+  role_name: promtail_agent
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Deploys Promtail (SVC-18) fleet-wide on every host as a Docker Compose stack
+    via the generic docker-compose-app role. Tails the local Docker container
+    logs (docker service discovery) and the systemd journal, attaches
+    project / service / host labels (FR-5), and pushes the log streams to Loki
+    on VLAN 20 (promtail_loki_push_url). Image pinned to the Loki major/minor
+    line; no host port (internal /metrics scraped on VLAN 20).
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - observability
+    - promtail
+    - loki
+    - logging
+    - svc18
+
+# No cross-role dependencies. The Compose stack is templated via the existing
+# docker-compose-app role, invoked by this role via include_role, not as a hard
+# meta dependency here — mirrors observability_stack / traefik_install.
+dependencies: []

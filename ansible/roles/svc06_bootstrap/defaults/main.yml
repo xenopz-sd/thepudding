@@ -28,12 +28,31 @@ svc06_bootstrap_org_slug: "svc06-smoke"
 # zitadel_db_password_override.
 svc06_openbao_addr: "10.0.20.10"
 
-# Dev/mock org-provision reachability (Traefik-less path). When the self-signed
-# TLS mock is on (zitadel_tls_self_signed=true — i.e. SVC-09/Traefik is NOT
-# deployed), org-provision cannot reach ZITADEL through Traefik, so it is pointed
-# at the ZITADEL GUEST and runs the helper there against the container IP:8080
-# with the external-domain Host header (see zitadel-org-provision dev path).
-# Defaults to the ZITADEL guest's computed VLAN-20 IP (host_index 5 ->
-# 10.0.20.15) when the mock is on; empty on the production Traefik path so
-# org-provision runs on the control node via https://auth.<domain>.
-svc06_zitadel_dev_guest_host: "{{ '10.0.20.15' if (zitadel_tls_self_signed | default(false) | bool) else '' }}"
+# Org-provision reachability path selector.
+#
+# The guest-run org-provision path is the homelab/Traefik-less DEFAULT (ADR-0018
+# cross-guest cleartext-h2c-behind-Traefik): it resolves the ZITADEL container IP
+# ON THE GUEST and runs the helper there against the container IP:8080 with the
+# external-domain Host header (see the zitadel-org-provision dev path), which
+# works regardless of whether ZITADEL serves its own TLS. The correct signal is
+# "homelab/Traefik-less bring-up where the public ZITADEL Traefik endpoint +
+# public DNS is NOT reachable from the control node" — NOT zitadel_tls_self_signed
+# (which only says "ZITADEL serves its own TLS", not "run org-provision on the
+# guest"; gating on it was the Layer-B defect — see
+# fix-svc06-org-provision-delegate-to-crash).
+#
+# The guest IP is DERIVED from the ZITADEL guest's host_index
+# (svc06_zitadel_host_index, defined in svc06_provision/defaults and in play
+# scope via import_role) so it stays single-sourced to the host-index ledger
+# (NET-00 10.0.<vlan>.(10+index)). The `| default(5)` fallback mirrors the
+# svc06_handoff role's pattern and resolves to the documented NET-00 literal
+# 10.0.20.15 (host_index 5) if the var is not in scope — NEVER re-introduce the
+# zitadel_tls_self_signed gate.
+#
+# Set svc06_org_provision_via_traefik=true for a real public-DNS deployment to
+# FORCE the control-node Traefik path (guest host empty -> the production
+# https://auth.<domain> path runs on the control node).
+svc06_org_provision_via_traefik: false
+svc06_zitadel_dev_guest_host: >-
+  {{ '' if (svc06_org_provision_via_traefik | default(false) | bool)
+     else ('10.0.20.' ~ (10 + (svc06_zitadel_host_index | default(5) | int))) }}

@@ -1,0 +1,19 @@
+---
+# meta/main.yml — obs_bootstrap (SVC-17/18 installer — Phase 3)
+galaxy_info:
+  role_name: obs_bootstrap
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-17/18 (observability stack) installer Phase 3 — host hardening & service
+    bootstrap: the common baseline child run (Docker + Compose) on all THREE
+    guests (Prometheus, Grafana, Loki), then the observability.yml configurator
+    child run that binds observability_stack (dispatched per guest by
+    service_role) + the three fleet exporter roles (promtail_agent,
+    node_exporter, cadvisor) and the deferred dcgm_exporter against the generated
+    inventory. Bridges the mock flags, the OpenBao wiring vars, and the Loki push
+    URL across the orchestrator/configurator seam; no_log on anything carrying a
+    token.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

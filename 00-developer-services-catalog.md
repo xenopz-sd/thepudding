@@ -142,6 +142,8 @@ Flagged explicitly, as requested, rather than silently defaulting: **Redis** (SV
 3. **Tier 2 recommended:** SVC-04, 05, 08, 10, 15, 20, 22, 24, 25, 29, 30 — add as soon as 2+ projects need them.
 4. **Tier 3 specialized:** SVC-12, 19, 26, 27, 31 — on demand.
 
+> **Day-one contracts for every new service (learned the hard way).** Independent of tier, every newly-built service MUST ship, from its first implementation: (1) a per-VLAN **host-index ledger** row in `infra/platform-foundation/host-indices.yaml` for each shared-VLAN guest it places (ADR-0015 — prevents the `10.0.<vlan>.x` collision class); (2) a **clean-slate** reset whose verification gate leaves `terraform state list` EMPTY, including non-guest `terraform_data` book-keeping resources (`service-installer.md` §4); and (3) a `requires-infra` acceptance run only via the `AGENT_LIVE_AUTHORIZED` + fail-closed throwaway-guard interlock (`testing-strategy.md` → "Agent Live-Test Authorization"), never against a shared/production cluster. These are not optional polish — each was a live-caught defect (ADR-0015, the clean-slate residue fix, the agent-live authorization control) now promoted to a standing contract so it is designed in rather than rediscovered.
+
 ## 5. Requirements documents produced
 
 Following the reusable 15-section template in `requirements-template.md`, full requirements documents now exist in this project under `requirements/` for the platform foundation and every Tier 1 service:

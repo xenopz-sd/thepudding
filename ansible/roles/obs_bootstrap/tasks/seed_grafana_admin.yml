@@ -1,0 +1,117 @@
+---
+# tasks/seed_grafana_admin.yml — obs_bootstrap (SVC-17/18) — Grafana admin seed
+#
+# IDEMPOTENT self-seeding of the Grafana Break_Glass_Admin password into OpenBao
+# at secret/observability/grafana-admin (field `password`), so a from-scratch
+# bring-up needs NO human-minted Grafana secret. This closes the same from-scratch
+# gap that SVC-06's org-provision token auto-mint closed for ZITADEL (ADR-0016):
+# the observability_stack grafana.yml only ever READS that KV path and FAILS
+# CLOSED if it is empty/absent; nothing previously MINTED it.
+#
+# Runs BEFORE the observability.yml configurator child run (Task 2 in main.yml),
+# delegated to the OpenBao PRIMARY guest via the SAME `docker exec <primary> bao
+# kv get|put` pattern observability_stack/tasks/grafana.yml uses for the read.
+#
+# Posture:
+#   * ONLY when OpenBao is wired (obs_openbao_addr non-empty). In dev/offline
+#     (addr empty) the role uses observability_grafana_admin_password_override,
+#     so there is nothing to seed — the whole file is skipped at the include site.
+#   * Check-then-seed: a `bao kv get -field=password` probe; if it returns a
+#     non-empty value the path is already seeded -> NO-OP (idempotent; a re-run
+#     keeps the existing password — "rotate after use" is a separate operator
+#     action, not a re-seed). If absent/empty -> generate a strong random
+#     password on the CONTROL NODE and `bao kv put` it.
+#   * no_log: true on the get, the generate, and the put — the value is NEVER
+#     echoed; only the decision (seeded-new / already-present) is INFO-logged,
+#     by NAME only (requirements §11 / security-standards.md).
+#
+# Secret bridging: the OPENBAO_ADMIN_TOKEN (what observability_bao_token looks up
+# from the env) travels in the task ENV (no_log), never the argv — mirroring how
+# grafana.yml's reads authenticate. The delegated-read var shapes
+# (observability_openbao_* ) are declared in defaults/main.yml so this role is
+# self-contained.
+
+# --- 1. Probe the existing admin secret (delegated bao-CLI get, no_log) ------
+# Mirrors grafana.yml's read EXACTLY: docker exec <primary> bao kv get
+# [-tls-skip-verify] -field=password secret/observability/grafana-admin.
+- name: "Seed (grafana-admin) | Probe the existing Break_Glass_Admin password in OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ observability_openbao_cli_bao_addr,
+          '-e', 'BAO_TOKEN=' ~ observability_bao_token,
+          observability_openbao_primary_container_name, observability_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (observability_openbao_tls_skip_verify | bool) else [])
+         + ['-field=' ~ observability_grafana_admin_secret_field,
+            observability_grafana_admin_secret_path] }}
+  delegate_to: "{{ observability_openbao_cli_host }}"
+  vars:
+    ansible_user: "{{ observability_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ observability_openbao_cli_python | default('/usr/bin/python3') }}"
+  environment:
+    # The platform-admin token for the delegated bao-CLI call — ENV, not argv.
+    OPENBAO_ADMIN_TOKEN: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+  register: obs_seed_admin_probe
+  failed_when: false
+  changed_when: false
+  no_log: true
+
+# Non-secret boolean projection of the probe: is the path already seeded?
+# (rc==0 AND a non-empty stdout). No secret value is referenced — only rc/length,
+# so this derivation is NOT no_log (mirrors the SVC-07/09 diagnostic convention).
+- name: "Seed (grafana-admin) | Decide whether a seed is needed (non-secret projection)"
+  ansible.builtin.set_fact:
+    obs_seed_admin_present: >-
+      {{ (obs_seed_admin_probe.rc | default(1) == 0)
+         and ((obs_seed_admin_probe.stdout | default('') | trim) | length > 0) }}
+
+# --- 2. Generate a strong random password on the CONTROL NODE (no_log) -------
+# The /dev/null form of the password lookup returns a random string WITHOUT
+# writing any file. Only generated when a seed is actually needed.
+- name: "Seed (grafana-admin) | Generate a strong random admin password on the control node (no_log)"
+  ansible.builtin.set_fact:
+    obs_seed_admin_password: >-
+      {{ lookup('ansible.builtin.password',
+                '/dev/null length=32 chars=ascii_letters,digits') }}
+  no_log: true
+  when: not (obs_seed_admin_present | bool)
+
+# --- 3. Write it to OpenBao (delegated bao-CLI put, no_log) ------------------
+# Mirrors grafana.yml's read shape: docker exec <primary> bao kv put
+# [-tls-skip-verify] secret/observability/grafana-admin password=<generated>.
+- name: "Seed (grafana-admin) | Write the generated password into OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ observability_openbao_cli_bao_addr,
+          '-e', 'BAO_TOKEN=' ~ observability_bao_token,
+          observability_openbao_primary_container_name, observability_openbao_bao_bin, 'kv', 'put']
+         + (['-tls-skip-verify'] if (observability_openbao_tls_skip_verify | bool) else [])
+         + [observability_grafana_admin_secret_path,
+            observability_grafana_admin_secret_field ~ '=' ~ obs_seed_admin_password] }}
+  delegate_to: "{{ observability_openbao_cli_host }}"
+  vars:
+    ansible_user: "{{ observability_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ observability_openbao_cli_python | default('/usr/bin/python3') }}"
+  environment:
+    OPENBAO_ADMIN_TOKEN: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+  register: obs_seed_admin_put
+  changed_when: true
+  no_log: true
+  when: not (obs_seed_admin_present | bool)
+
+# --- 4. INFO decision log (NAME only, never the value) -----------------------
+- name: "Seed (grafana-admin) | Seed decision (INFO — by NAME only, never the value)"
+  ansible.builtin.debug:
+    msg: >-
+      Grafana Break_Glass_Admin seed (idempotent):
+      {{
+        ('ALREADY PRESENT at ' ~ observability_grafana_admin_secret_path
+          ~ ' (field ' ~ observability_grafana_admin_secret_field
+          ~ ') — no-op; re-run keeps the existing password (rotate-after-use is a '
+          ~ 'separate operator action).')
+        if (obs_seed_admin_present | bool)
+        else ('SEEDED a new strong random password at '
+          ~ observability_grafana_admin_secret_path ~ ' (field '
+          ~ observability_grafana_admin_secret_field
+          ~ ') — the value is never echoed.')
+      }}
+  changed_when: false

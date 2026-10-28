@@ -298,6 +298,177 @@
       # openbao` — there is no running container yet, and this pre-up chown exists
       # precisely so the post-up chown never has to notify.
 
+# ============================================================================
+# CROSS-GUEST INGRESS PATH SELECTION (tasks 3.2/3.3) — real file-provider route
+#   vs dev/offline mock-edge. Mirrors observability_stack/tasks/grafana.yml §6
+#   (6a–6d) EXACTLY. Traefik (SVC-09, 10.0.20.12) runs on a SEPARATE guest from
+#   the OpenBao primary (10.0.20.10); a host-local `edge` network can never
+#   bridge two guests and Traefik never reads another guest's Docker labels, so
+#   the REAL cross-guest path (default, R3.1) is: publish the VLAN20_Port bound
+#   to the primary's own VLAN-20 IP + delegate a Traefik file-provider
+#   Route_Fragment onto the Traefik_Guest (plus, on the mock-cert path, delegate
+#   OpenBao's PUBLIC mock CA so the https backend hop verifies). The mock-edge
+#   path (default-off, permanent per mock-stand-ins.md, R3.2) keeps the old
+#   local-`edge` + Docker-label discovery for a co-located dev box only.
+#   ALL of this is gated on the primary role, matching the existing primary
+#   tasks (the unsealer carries no ingress).
+# ============================================================================
+
+# --- (a) INFO swap-gate decision (R3.3) -------------------------------------
+# composition-wiring.md §"Swap-Gate Pattern" step 4 / mock-stand-ins.md: emit an
+# INFO line stating WHICH ingress path was selected and WHY, so the real-route
+# vs mock-edge choice is visible in the play output. (traefik_route emits its
+# own INFO too; this one names the OpenBao-side VLAN20_Port + https backend
+# decision.) Mirrors grafana.yml 6a.
+- name: "OpenBao (primary) | Cross-guest ingress swap-gate decision (INFO, R3.3)"
+  ansible.builtin.debug:
+    msg: >-
+      OpenBao primary cross-guest ingress (swap-gate):
+      openbao_mock_edge_network={{ openbao_mock_edge_network }}
+      -> {{
+        ('MOCK_EDGE (dev/offline, co-located Traefik ONLY — permanent default-off '
+          ~ 'placeholder per mock-stand-ins.md): attach the primary stack to the local '
+          ~ '`' ~ openbao_traefik_network ~ '` network + emit Traefik discovery labels; '
+          ~ 'the VLAN20_Port ' ~ openbao_primary_ip ~ ':' ~ (openbao_api_port | string)
+          ~ ' is STILL published (it is decoupled from the edge path — the direct '
+          ~ 'VLAN-20 metrics/API reach, like the unsealer), but NO file-provider route. '
+          ~ 'NEVER use on a host where SVC-09 owns the real `edge` (ADR-0013).')
+        if (openbao_mock_edge_network | bool)
+        else ('REAL cross-guest file-provider route (default production posture, R3.1): '
+          ~ 'publish the VLAN20_Port ' ~ openbao_primary_ip ~ ':' ~ (openbao_api_port | string)
+          ~ ' (bound to OpenBao''s own VLAN-20 IP, never 0.0.0.0/LAN — R2.1/R2.2) and '
+          ~ 'delegate a Traefik Route_Fragment onto the Traefik_Guest, backend '
+          ~ 'https://' ~ openbao_primary_ip ~ ':' ~ (openbao_api_port | string)
+          ~ (' (Traefik VERIFIES the backend cert against the delegated mock CA '
+             ~ openbao_mock_ca_delegate_dest ~ ')'
+             if (openbao_tls_self_signed | bool)
+             else ' (Traefik verifies the backend cert against its system trust store)')
+          ~ '; NO cross-guest `edge` network, NO Docker labels (Traefik on another '
+          ~ 'guest cannot read them).')
+      }}
+  changed_when: false
+  when: openbao_role == "primary"
+
+# --- (b) Compose the primary Traefik ingress labels (MOCK-EDGE PATH ONLY) ----
+# Only meaningful when Traefik's Docker provider is on the SAME daemon (the
+# co-located dev box). On the real cross-guest path these labels are inert
+# (Traefik is on another guest) and are NOT attached. These are the five
+# existing traefik.* labels (incl. the https backend-scheme label) moved into a
+# set_fact so they are path-selectable. Mirrors grafana.yml 6b.
+- name: "OpenBao (primary) | Compose the primary Traefik ingress labels (mock-edge path only)"
+  ansible.builtin.set_fact:
+    openbao_primary_labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network={{ openbao_traefik_network }}"
+      - "traefik.http.routers.openbao.rule=Host(`openbao.{{ platform_domain }}`)"
+      - "traefik.http.routers.openbao.entrypoints=websecure"
+      - "traefik.http.routers.openbao.tls=true"
+      - "traefik.http.services.openbao.loadbalancer.server.port={{ openbao_api_port }}"
+      # OpenBao terminates TLS itself; tell Traefik the backend is https.
+      - "traefik.http.services.openbao.loadbalancer.server.scheme=https"
+  changed_when: false
+  when:
+    - openbao_role == "primary"
+    - openbao_mock_edge_network | bool
+
+# --- (3.3) Delegate the PUBLIC mock CA cert onto the Traefik_Guest -----------
+# REAL path + mock-cert path only. For the Traefik->OpenBao https backend hop to
+# be VERIFIED against OpenBao's self-signed/mock cert, Traefik must trust that
+# cert's issuer. We delegate OpenBao's PUBLIC cert (the same cert.pem behind
+# openbao_tls_cert_file, read from its host path) onto the Traefik_Guest at
+# openbao_mock_ca_delegate_dest (0644 root:root), then the traefik_route call
+# below points serversTransport.rootCAs at it. PUBLIC cert only — NEVER the
+# private key; a CA/leaf cert is public/non-secret, so no no_log is needed on
+# the copy. In production (openbao_tls_self_signed false) this is skipped
+# entirely: route_backend_root_cas stays empty, the route emits no
+# serversTransport, and Traefik uses its SYSTEM TRUST STORE. Mirrors the
+# delegate_to connection pattern in observability_stack mock_tls_self_signed.yml.
+- name: "OpenBao (primary) | Ensure the mock-CA dir exists on the Traefik_Guest (real+mock path)"
+  ansible.builtin.file:
+    path: "{{ openbao_mock_ca_delegate_dest | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  delegate_to: "{{ openbao_traefik_guest_host }}"
+  vars:
+    ansible_user: "{{ traefik_guest_user | default('root') }}"
+    ansible_python_interpreter: "{{ traefik_guest_python | default('/usr/bin/python3') }}"
+  when:
+    - openbao_role == "primary"
+    - not (openbao_mock_edge_network | bool)
+    - openbao_tls_self_signed | bool
+
+- name: "OpenBao (primary) | Read OpenBao's PUBLIC mock cert from the OpenBao guest (public, real+mock path)"
+  ansible.builtin.slurp:
+    src: "{{ openbao_tls_cert_file | regex_replace('^' + openbao_tls_dir, openbao_tls_host_dir) }}"
+  register: openbao_mock_ca_public_cert
+  when:
+    - openbao_role == "primary"
+    - not (openbao_mock_edge_network | bool)
+    - openbao_tls_self_signed | bool
+
+- name: "OpenBao (primary) | Delegate the PUBLIC mock CA cert onto the Traefik_Guest (0644, real+mock path)"
+  ansible.builtin.copy:
+    content: "{{ openbao_mock_ca_public_cert.content | b64decode }}"
+    dest: "{{ openbao_mock_ca_delegate_dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  delegate_to: "{{ openbao_traefik_guest_host }}"
+  vars:
+    ansible_user: "{{ traefik_guest_user | default('root') }}"
+    ansible_python_interpreter: "{{ traefik_guest_python | default('/usr/bin/python3') }}"
+  when:
+    - openbao_role == "primary"
+    - not (openbao_mock_edge_network | bool)
+    - openbao_tls_self_signed | bool
+
+# --- (c) Render + delegate the OpenBao Route_Fragment (REAL PATH, task 3.2) --
+# Consume the reusable traefik_route role to drop openbao-route.yml onto the
+# Traefik_Guest's watched file-provider dir. route_tls=true + the fragment's
+# `tls: {}` (default store) means the LAN->Traefik hop TERMINATES AT TRAEFIK;
+# the backend hop is https (OpenBao's own listener) and VERIFIED — on the mock
+# path via the delegated mock CA (route_servers_transport_name/
+# route_backend_root_cas non-empty), in production via the system trust store
+# (both empty -> byte-identical to today's plain fragment). The role fails
+# closed (R3.4) if the backend url / delegate target is unresolved. Skipped
+# entirely on the mock-edge path (the two ingress paths are mutually exclusive).
+- name: "OpenBao (primary) | Render + delegate the OpenBao cross-guest Route_Fragment (real path)"
+  ansible.builtin.include_role:
+    name: traefik_route
+  vars:
+    traefik_route_enabled: "{{ openbao_traefik_route_enabled | bool }}"
+    route_name: "openbao"
+    route_host_rule: "openbao.{{ platform_domain }}"
+    route_backend_url: "https://{{ openbao_primary_ip }}:{{ openbao_api_port }}"
+    route_entrypoint: "websecure"
+    route_tls: true
+    # VERIFIED https backend hop: on the mock-cert path name the serversTransport
+    # + point its rootCAs at the delegated mock CA (above); empty on the prod
+    # path so the fragment is byte-identical to today (system trust store).
+    route_servers_transport_name: "{{ 'openbao' if (openbao_tls_self_signed | bool) else '' }}"
+    route_backend_root_cas: "{{ openbao_route_backend_root_cas }}"
+    # Delegate target = the Traefik_Guest (ADR-0015, 10.0.20.12) so both the
+    # route fragment and the mock CA land on the same SVC-09 guest, no edit.
+    traefik_guest_host: "{{ openbao_traefik_guest_host }}"
+  when:
+    - openbao_role == "primary"
+    - not (openbao_mock_edge_network | bool)
+
+# --- (d) Build the PRIMARY OpenBao Compose stack (path-selected wiring) ------
+# The EDGE-DISCOVERY wiring (networks / labels / dca_networks) is PATH-SELECTED
+# on openbao_mock_edge_network, mirroring grafana.yml 6d; the VLAN20_Port
+# `ports` publish is NOW UNCONDITIONAL (decoupled — see the `ports` comment
+# below, fix-svc07-openbao-metrics-port-publish). The VLAN20_Port is bound to
+# the primary's OWN VLAN-20 IP ({{ openbao_primary_ip }}:{{ openbao_api_port }},
+# the same private-VLAN-bound-port form the SVC-07 unsealer uses — never
+# 0.0.0.0/LAN, R2.1/R2.2) and published on BOTH paths so the direct VLAN-20
+# metrics/API scrape always connects. REAL path (default): reach it via the
+# delegated file-provider route; NO `edge`, NO labels. MOCK-EDGE path: attach to
+# the local `edge` + emit labels (co-located dev only). Everything else — image,
+# `command: server`, restart, the four volumes, dca_volumes, dca_env — is
+# UNCHANGED (only the edge-discovery wiring is path-selected).
 - name: Build the PRIMARY OpenBao Compose stack
   ansible.builtin.include_role:
     name: docker-compose-app
@@ -318,6 +489,27 @@
         # -dev flag, which the entrypoint never adds).
         command: "server"
         restart: "unless-stopped"
+        # UNCONDITIONAL VLAN20_Port publish (DECOUPLED from the edge/Traefik
+        # ingress path — fix-svc07-openbao-metrics-port-publish). The :8200
+        # host-publish is the DIRECT VLAN-20 reach for the Prometheus metrics
+        # scrape (SVC-17, a direct VLAN-20 hit to 10.0.20.10:8200 — NOT through
+        # Traefik) AND the primary API; that reachability is ORTHOGONAL to
+        # whether the `edge`/Traefik ingress exists, so it is published
+        # UNCONDITIONALLY on BOTH the mock-edge and real paths, exactly mirroring
+        # the unsealer's unconditional static `:8200` below. It was previously
+        # keyed on `openbao_mock_edge_network` (`[] if (mock) else [...]`), which
+        # made the Day-0 mock-edge bring-up publish NOTHING ([]) — `:8200` was
+        # never host-published and the direct scrape got `connection refused`
+        # (OpenBao up == 0). It remains an INTERNAL VLAN-20 bind to the primary's
+        # OWN VLAN-20 IP ({{ openbao_primary_ip }}), NEVER 0.0.0.0/LAN — the same
+        # ADR-0018 private-VLAN-bound-port exception the unsealer seal-API `:8200`
+        # port, Loki :3100, and the fleet exporters already use; it is NOT a
+        # LAN/Traefik ingress host port (the PF FR-7 / integration-boundaries §1
+        # exception the unsealer port and the compose.yaml.j2 header note already
+        # describe). Only `ports` decouples — `networks`/`labels`/`dca_networks`
+        # below STAY path-selected on the edge flag.
+        ports:
+          - "{{ openbao_primary_ip }}:{{ openbao_api_port }}:{{ openbao_api_port }}"
         volumes:
           # Raft integrated storage (Req 11).
           - "{{ openbao_data_volume }}:{{ openbao_data_dir }}"
@@ -327,21 +519,24 @@
           - "{{ openbao_config_dir }}:{{ openbao_config_dir }}:ro"
           # TLS material issued by SVC-08 / Let's Encrypt (read-only, by path).
           - "{{ openbao_tls_host_dir }}:{{ openbao_tls_dir }}:ro"
-        # Traefik ingress via labels only — NO published host port (PF FR-7).
-        labels:
-          - "traefik.enable=true"
-          - "traefik.http.routers.openbao.rule=Host(`openbao.{{ platform_domain }}`)"
-          - "traefik.http.routers.openbao.entrypoints=websecure"
-          - "traefik.http.routers.openbao.tls=true"
-          - "traefik.http.services.openbao.loadbalancer.server.port=8200"
-          # OpenBao terminates TLS itself; tell Traefik the backend is https.
-          - "traefik.http.services.openbao.loadbalancer.server.scheme=https"
-        networks: ["{{ openbao_traefik_network }}"]
+        # REAL path: NO cross-guest `edge` attachment (it cannot span guests).
+        # MOCK-EDGE path: attach to the local `edge` for co-located discovery.
+        networks: >-
+          {{ [openbao_traefik_network] if (openbao_mock_edge_network | bool) else [] }}
+        # Traefik discovery labels apply ONLY on the mock-edge path (Traefik's
+        # Docker provider must be on the SAME daemon to read them). On the real
+        # cross-guest path the file-provider Route_Fragment supersedes them.
+        labels: >-
+          {{ openbao_primary_labels if (openbao_mock_edge_network | bool) else [] }}
     dca_volumes:
       - "{{ openbao_data_volume }}"
       - "{{ openbao_audit_volume }}"
-    dca_networks:
-      - { name: "{{ openbao_traefik_network }}", external: true }
+    # REAL path: no external `edge` dependency (the file-provider route handles
+    # cross-guest ingress). MOCK-EDGE path: `edge` is created+owned by SVC-09
+    # (traefik_install); attach to it (external: true).
+    dca_networks: >-
+      {{ [{'name': openbao_traefik_network, 'external': true}]
+         if (openbao_mock_edge_network | bool) else [] }}
     dca_env: "{{ openbao_env_primary }}"
   # Idempotent: docker_compose_v2 reconciles + reports changed=0 on a converged
   # stack, recreating only on real spec/.env drift (Req 13.2). NOT gated on the

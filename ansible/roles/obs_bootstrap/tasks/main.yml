@@ -1,0 +1,219 @@
+---
+# tasks/main.yml — obs_bootstrap (SVC-17/18 installer — Phase 3: Bootstrap)
+#
+# Phase-3 "Host hardening & service bootstrap" for the three-guest observability
+# stack. Clones the svc09_bootstrap / svc06_bootstrap anatomy and scales it to
+# THREE guests + the fleet exporter roles:
+#   1. common baseline child run (Docker CE + Compose + hardening) on ALL THREE
+#      guests (Prometheus, Grafana, Loki) via common.yml.
+#   2. observability.yml configurator child run against the generated inventory,
+#      which binds:
+#        * the fleet exporter roles — promtail_agent + node_exporter + cadvisor
+#          on every guest, and the DEFERRED dcgm_exporter (Mock C, gpu group
+#          only, zero hosts today);
+#        * observability_stack, which self-dispatches per guest by the guest's
+#          `service_role` group (prometheus / grafana / loki) — rendering
+#          prometheus.yml (file_sd only) + alertmanager + rules + the generated
+#          scrape-target files on the Prometheus guest, the Grafana provisioning
+#          on the Grafana guest, and loki-config on the Loki guest — then hands
+#          each stack to docker-compose-app (content-hash-guarded
+#          `docker compose up -d`).
+# Both as child ansible-playbook runs (orchestrator/configurator seam,
+# integration-boundaries.md §4). A non-zero child exit -> this phase's rescue
+# in svc-17-18-bootstrap.yml.
+#
+# Where svc09_bootstrap configures ONE guest with Traefik, obs_bootstrap
+# configures THREE guests (observability_stack dispatched by service_role) PLUS
+# the three fleet exporter roles across all guests — but the orchestration shape
+# (common.yml child run -> configurator child run, mock + secret var bridging) is
+# identical.
+#
+# --- Variable bridging across the child-process boundary --------------------
+# A child ansible-playbook run is a SEPARATE process: play vars from the
+# orchestrator do NOT propagate automatically. Non-secret config is bridged with
+# `-e`; secrets travel in the child ENV (never the argv) with no_log on the task.
+#
+#   * Mock flags (mock-stand-ins.md) — grafana_oidc_enabled, obs_tls_self_signed,
+#     obs_tls_real_ca_available, dcgm_metrics_deferred — DEFAULT OFF/deferred,
+#     bridged with -e so the operator can opt into a CA-less / OIDC-less / GPU-less
+#     Day-0 bring-up. Default posture == production (real).
+#   * OpenBao wiring (FR-15) — observability_openbao_addr (+ the CLI delegate
+#     coordinates) are bridged with -e so observability_stack/tasks/grafana.yml
+#     can reach OpenBao via the delegated bao-CLI docker-exec read. The
+#     OPENBAO_ADMIN_TOKEN (which observability_bao_token looks up from the env) is
+#     bridged in the child ENV, no_log — never on the command line.
+#   * Loki push URL (FR-5) — promtail_loki_push_url is bridged with -e from the
+#     Terraform output loki_push_url (file-mediated handoff, integration-
+#     boundaries §4), falling back to the computed Loki VLAN-20 IP (10.0.20.20)
+#     when the orchestrator did not resolve the output.
+#   * observability_platform_domain — the non-secret platform domain used for the
+#     Grafana Traefik Host() rule + the Mock B self-signed cert SANs.
+
+# ============================================================ #
+# Task 1 — Common baseline child run (Req FR-17, §Phase 3).     #
+# ------------------------------------------------------------ #
+# Child `ansible-playbook common.yml` against the generated     #
+# inventory so Docker CE + Compose (+ the hardened baseline) are #
+# installed on ALL THREE guests before any observability stack   #
+# starts. Run as a child process (orchestrator/configurator seam)#
+# so the configurator play targets the freshly-generated         #
+# inventory as its own `-i`. common.yml binds `hosts: all`, so   #
+# all three guests in the generated inventory are hardened in one #
+# run. A non-zero exit fails the task -> this phase's rescue.    #
+# ============================================================ #
+- name: "Bootstrap | common baseline (Docker + Compose) on all three observability guests"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ obs_generated_inventory }}"
+      - ansible/playbooks/common.yml
+  args:
+    chdir: "{{ obs_repo_root }}"
+  register: obs_common_run
+  changed_when: "'changed=0' not in (obs_common_run.stdout | default(''))"
+
+
+# ============================================================ #
+# Task 2a — Resolve the merged generated-inventory set          #
+# (fix-obs-scrape-targets-multi-inventory).                     #
+# ------------------------------------------------------------ #
+# The scrape-target index inside observability_stack discovers   #
+# the V1_Scrape_Set (SVC-01 postgres / SVC-06 zitadel / SVC-07   #
+# openbao / SVC-09 traefik) by reading controller-side           #
+# groups['postgres'|'zitadel'|'openbao'|'traefik']. Those        #
+# service_role groups live ONLY in the OTHER services' generated #
+# inventories, so the Task-2 configurator run must load ALL      #
+# ansible/inventory/*.generated.yml — not only the obs           #
+# inventory. Build a de-duplicated, ORDERED list: the obs        #
+# inventory FIRST (guaranteed present even if the glob misses    #
+# it), then every other *.generated.yml discovered by a run-time #
+# fileglob rooted at obs_repo_root, mapped to repo-root-relative #
+# paths to match the chdir + relative obs_generated_inventory    #
+# convention. Reads only file-mediated generated inventories     #
+# (integration-boundaries.md §4) — never tfstate, never Proxmox. #
+# A future service's generated inventory is auto-included        #
+# ("scrape what exists"), no code change needed.                 #
+# ============================================================ #
+- name: "Bootstrap | resolve the merged generated-inventory set for the configurator run"
+  ansible.builtin.set_fact:
+    obs_configurator_inventories: >-
+      {{ ([obs_generated_inventory]
+          + (query('ansible.builtin.fileglob',
+                   obs_repo_root ~ '/ansible/inventory/*.generated.yml')
+             | map('relpath', obs_repo_root) | list
+             | difference([obs_generated_inventory])))
+         | unique }}
+
+
+# ============================================================ #
+# Task 2b — Fan the merged inventory set out into SEPARATE `-i` #
+# flags (fix-obs-scrape-targets-multi-inventory).               #
+# ------------------------------------------------------------ #
+# Ansible does NOT merge a single comma-joined `-i` of inventory #
+# FILE PATHS into one inventory — verified LIVE:                 #
+#   ansible -i "a.yml,b.yml,c.yml" ...  -> only all/ungrouped    #
+#   ansible -i a.yml -i b.yml -i c.yml  -> all groups merge      #
+# So build `['-i', inv1, '-i', inv2, ...]` by appending a        #
+# ['-i', item] pair per entry of obs_configurator_inventories    #
+# (obs inventory first, then the other *.generated.yml). This is #
+# the ONLY form that actually merges the V1_Scrape_Set           #
+# service_role groups (postgres/zitadel/openbao/traefik) so the  #
+# controller-side scrape-target index can see them.              #
+# ============================================================ #
+- name: "Bootstrap | build the fanned-out -i inventory flags for the configurator run"
+  ansible.builtin.set_fact:
+    obs_inventory_flags: "{{ obs_inventory_flags | default([]) + ['-i', item] }}"
+  loop: "{{ obs_configurator_inventories }}"
+
+
+# ============================================================ #
+# Task 2c — Assemble the COMPLETE configurator argv as one      #
+# computed fact (fix-obs-scrape-targets-multi-inventory).       #
+# ------------------------------------------------------------ #
+# A Jinja list cannot be inline-expanded into the middle of a    #
+# literal YAML argv list — Ansible stringifies a list-valued     #
+# argv element into one arg rather than flattening it. So the    #
+# ENTIRE argv (binary + fanned-out `-i` flags + play + `-e`      #
+# bridges) is concatenated in Jinja here and Task 2 simply sets  #
+# `argv: "{{ obs_configurator_argv }}"`. The mock flags, the     #
+# OpenBao address + CLI delegate coordinates, the Loki push URL, #
+# and the platform domain are bridged with -e; the              #
+# OPENBAO_ADMIN_TOKEN travels in the child ENV (Task 2, no_log). #
+# ============================================================ #
+- name: "Bootstrap | assemble the configurator child-run argv (multi -i)"
+  ansible.builtin.set_fact:
+    obs_configurator_argv: >-
+      {{ [ansible_env.HOME ~ '/venv/devinfra/bin/ansible-playbook']
+         + obs_inventory_flags
+         + ['ansible/playbooks/observability.yml']
+         + ['-e', 'observability_platform_domain=' ~ (obs_platform_domain | default('platform.example.test'))]
+         + ['-e', 'promtail_loki_push_url=' ~ (obs_loki_push_url | default('http://10.0.20.20:3100/loki/api/v1/push'))]
+         + ['-e', 'grafana_oidc_enabled=' ~ (grafana_oidc_enabled | default(false) | string | lower)]
+         + ['-e', 'obs_tls_self_signed=' ~ (obs_tls_self_signed | default(false) | string | lower)]
+         + ['-e', 'obs_tls_real_ca_available=' ~ (obs_tls_real_ca_available | default(false) | string | lower)]
+         + ['-e', 'dcgm_metrics_deferred=' ~ (dcgm_metrics_deferred | default(true) | string | lower)]
+         + ['-e', 'observability_openbao_addr=' ~ (obs_openbao_addr | default(''))]
+         + ['-e', 'observability_openbao_cli_host=' ~ (obs_openbao_cli_host | default('10.0.20.10'))] }}
+
+
+# ============================================================ #
+# Task 2 — Observability configurator child run (FR-2/3/5/6/8/   #
+# 9/10/15, §Phase 3).                                           #
+# ------------------------------------------------------------ #
+# A single child `ansible-playbook observability.yml` run against #
+# the MERGED generated-inventory set (obs_configurator_inventories #
+# — obs inventory first, then every other *.generated.yml), passed #
+# as ONE comma-joined `-i` (ansible-playbook merges a comma list),  #
+# so the V1_Scrape_Set service_role groups become visible to the   #
+# controller-side scrape-target index. observability.yml           #
+# (bind-only) runs the fleet exporter roles and then               #
+# observability_stack, both now                                    #
+# scoped to hosts: prometheus:grafana:loki so the merged inventory #
+# does not over-apply those roles onto the SVC-01/06/07/09 guests. #
+# The mock flags, the OpenBao address + CLI delegate coordinates,  #
+# the Loki push URL, and the platform domain are bridged with -e;  #
+# the OPENBAO_ADMIN_TOKEN travels in the child ENV (no_log) so the  #
+# Grafana guest's delegated bao-CLI read can authenticate.         #
+#                                                                #
+# no_log:true because the child ENV carries the OpenBao admin      #
+# token AND the Grafana child run's captured stdout may carry a    #
+# revealed secret (Break_Glass_Admin password / OIDC client        #
+# secret) in the (unlikely) event of a verbose failure. The        #
+# functional secret reads inside grafana.yml are themselves        #
+# no_log; this outer no_log is defence-in-depth at the seam. A     #
+# child non-zero exit -> this phase's rescue (FR-17).             #
+# ============================================================ #
+- name: "Bootstrap | observability stack + fleet exporters (observability.yml child run, no_log)"
+  ansible.builtin.command:
+    # The COMPLETE argv is the computed fact obs_configurator_argv (Task 2c):
+    #   binary + the fanned-out SEPARATE `-i <path>` flags (Task 2b) + the play
+    #   + the `-e` non-secret bridges (mock flags, OpenBao addr/CLI host, Loki
+    #   push URL, platform domain). The inventory flags are MULTIPLE separate
+    #   `-i` pairs — NOT one comma-joined `-i` (which Ansible does NOT merge into
+    #   one inventory, verified live). This makes the V1_Scrape_Set service_role
+    #   groups (postgres/zitadel/openbao/traefik), which live only in the OTHER
+    #   services' generated inventories, visible to the controller-side
+    #   scrape-target index. Reads only file-mediated generated inventories
+    #   (integration-boundaries §4) — never tfstate, never Proxmox. A future
+    #   service's generated inventory is auto-included ("scrape what exists").
+    argv: "{{ obs_configurator_argv }}"
+  args:
+    chdir: "{{ obs_repo_root }}"
+  environment:
+    # The platform-admin token observability_bao_token looks up from the child ENV
+    # for the delegated OpenBao bao-CLI secret reads (FR-15). Never on the argv.
+    # BRIDGE the preflight-resolved obs_openbao_admin_token (resolved from the
+    # process env OR the cluster env file — the single source of truth), falling
+    # back to a direct process-env lookup so the historical SVC-06/07 exported-
+    # token convention keeps working. Resolving from the cluster env file is what
+    # makes the documented ONE-COMMAND bring-up authenticate on the first run
+    # (previously the child received an EMPTY token -> delegated `bao kv put` 403).
+    # See .kiro/specs/fix-obs-bootstrap-first-run-transient/.
+    OPENBAO_ADMIN_TOKEN: >-
+      {{ obs_openbao_admin_token
+         | default(lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN'), true)
+         | default('', true) }}
+  register: obs_observability_run
+  changed_when: "'changed=0' not in (obs_observability_run.stdout | default(''))"
+  no_log: true

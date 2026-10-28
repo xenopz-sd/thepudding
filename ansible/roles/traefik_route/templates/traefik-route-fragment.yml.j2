@@ -1,0 +1,83 @@
+{#
+  templates/traefik-route-fragment.yml.j2 — traefik_route (Route_Mechanism)
+
+  A reusable Traefik v3 DYNAMIC-config Route_Fragment. Renders EXACTLY ONE
+  `http.routers` entry + ONE `http.services` entry for ONE cross-guest backend,
+  delegated onto the Traefik_Guest's already-watched file-provider directory
+  ({{ '{{' }} traefik_dynamic_config_dir {{ '}}' }}, default /etc/traefik/dynamic).
+  Traefik hot-reloads it with no container restart (file provider `watch: true`).
+
+  Spec: .kiro/specs/traefik-cross-guest-ingress/ (R1.1, R1.3, R1.4; design
+  §"Interface — Route_Fragment schema"). Matches the v3 YAML style + the
+  MANAGED-BY-ANSIBLE header convention of traefik_install/templates/dynamic.yml.j2.
+
+  VARIABLE CONTRACT (design Component 1):
+    route_name        router+service id (fragment basename). e.g. "grafana"
+    route_host_rule   Host() rule value. e.g. "grafana.{{ '{{' }} platform_domain {{ '}}' }}"
+    route_backend_url http.services loadBalancer url (VLAN-20 scheme://IP:port).
+                      The scheme (http:// / https:// / h2c://) rides through
+                      VERBATIM — Traefik v3's file provider expresses the backend
+                      scheme purely via the server url scheme. e.g.
+                      "http://10.0.20.19:3000" or "https://10.0.20.10:8200"
+    route_entrypoint  Traefik entrypoint (default websecure).
+    route_tls         enable TLS on the router (default true).
+
+  OPTIONAL serversTransport CAPABILITY (ADDITIVE, DEFAULT-INERT) — spec
+  .kiro/specs/svc-07-cross-guest-ingress/, design §"Component 1":
+    route_servers_transport_name  (default "") id of the http.serversTransports
+                      entry and the service's loadBalancer.serversTransport ref.
+                      e.g. "openbao"
+    route_backend_root_cas        (default "") filesystem path, ON THE TRAEFIK
+                      GUEST, to a CA bundle (a PUBLIC cert — never a key, never a
+                      secret) Traefik trusts to VERIFY this backend's https/h2c
+                      cert. e.g. "/etc/traefik/dynamic/ca/openbao-mock-ca.crt"
+
+  TWO RENDERED FORMS:
+    * DEFAULT (both optional vars empty — e.g. a plain http backend, or an https
+      backend trusting the system trust store): the fragment carries NO
+      `loadBalancer.serversTransport` key and NO top-level `serversTransports`
+      block — i.e. BYTE-IDENTICAL to the pre-extension output (preservation guard
+      for the shared Grafana consumer).
+    * VERIFIED-BACKEND-HOP (BOTH optional vars non-empty): the service's
+      `loadBalancer` gains `serversTransport: <route_servers_transport_name>`, and
+      a top-level `http.serversTransports.<route_servers_transport_name>` with
+      `rootCAs: ["<route_backend_root_cas>"]` is emitted, so Traefik VERIFIES the
+      backend cert against that CA on the proxied hop (nothing skipped).
+
+  TLS uses the DEFAULT certificate store (`tls: {}`), so TLS terminates at
+  Traefik via the real resolver when present, or the SVC-09 file-provider default
+  cert from the self-signed mock (Mock B) otherwise — no cert material is
+  rendered here. The backend url scheme rides through verbatim (plaintext http is
+  permitted on the internal VLAN-20 hop; https/h2c backends are VERIFIED via the
+  optional serversTransport above; the LAN-facing hop is always HTTPS).
+
+  NON-SECRET ONLY — carries a Host() rule, a VLAN-20 scheme://IP:port, and (when
+  set) a PUBLIC CA path, never a credential or private key.
+#}
+{%- set _st = (route_servers_transport_name | default('') | trim | length > 0) and (route_backend_root_cas | default('') | trim | length > 0) %}
+# MANAGED BY ANSIBLE ({{ route_name }} cross-guest route) — DO NOT EDIT BY HAND.
+# Traefik v3 file-provider Route_Fragment. Spec: .kiro/specs/traefik-cross-guest-ingress.
+---
+http:
+  routers:
+    {{ route_name }}:
+      rule: "Host(`{{ route_host_rule }}`)"
+      entryPoints: ["{{ route_entrypoint | default('websecure') }}"]
+      service: "{{ route_name }}"
+{% if route_tls | default(true) | bool %}
+      tls: {}
+{% endif %}
+  services:
+    {{ route_name }}:
+      loadBalancer:
+{% if _st %}
+        serversTransport: "{{ route_servers_transport_name }}"
+{% endif %}
+        servers:
+          - url: "{{ route_backend_url }}"
+{% if _st %}
+  serversTransports:
+    {{ route_servers_transport_name }}:
+      rootCAs:
+        - "{{ route_backend_root_cas }}"
+{% endif %}

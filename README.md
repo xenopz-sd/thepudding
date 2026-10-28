@@ -72,16 +72,17 @@ The binding rules are in [`project-constitution.md`](./.kiro/steering/project-co
 
 ## What's in the box
 
-The first release ships the platform foundation and the first shared service.
+The platform foundation and five shared services are released: SVC-07 (secrets), SVC-09 (reverse proxy), SVC-01 (SQL database), SVC-06 (identity provider) and SVC-17/18 (observability).
 
 | Component | Status | What it does | Runbook | Spec |
 |---|---|---|---|---|
 | **Platform prerequisites** | ✅ Released | Bootstraps the `terraform@pve` identity and token, the base LXC/VM template, the Proxmox SDN VLAN zone and shared VLAN 20, and the host L3 gateway / firewall / routing. | [Install runbook](./infra/platform-foundation/INSTALL-RUNBOOK.md) | [`platform-prerequisites-bootstrap`](./.kiro/specs/platform-prerequisites-bootstrap/) |
 | **Network foundation** | ✅ Released | Per-project VLAN onboarding with computed VLAN IDs, subnets, host IPs and hostnames, backed by an append-only `projects.yaml` registry. | [Foundation README](./infra/platform-foundation/README.md) | [`platform-prerequisites-bootstrap`](./.kiro/specs/platform-prerequisites-bootstrap/) |
 | **SVC-07 — Secrets manager** ([OpenBao](https://openbao.org)) | ✅ Released | OpenBao primary plus a Transit auto-unsealer on two LXCs, with automated install, init/unseal, onboarding and live contract tests. | [Install runbook](./infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md) | [`svc-07-secrets-manager`](./.kiro/specs/svc-07-secrets-manager/) |
-| **SVC-09 — Reverse proxy** ([Traefik](https://traefik.io)) | ✅ Built | The shared HTTP/HTTPS ingress + TLS-termination edge on one LXC: Docker-label auto-discovery, HTTP→HTTPS redirect, an internal-only SSO-gated dashboard, and ownership of the shared `edge` network. Ships default-off mock stand-ins for the not-yet-built CA (SVC-08) and SSO (SVC-06). | [Install runbook](./infra/projects/svc-09-reverse-proxy/INSTALL-RUNBOOK.md) | [`svc-09-reverse-proxy`](./.kiro/specs/svc-09-reverse-proxy/) |
-| **SVC-01 — SQL database** ([PostgreSQL](https://www.postgresql.org)) | ✅ Built | The dedicated-per-project relational database, delivered as a reusable Terraform root + Ansible role: `postgres:17` + a `postgres_exporter` sidecar, a least-privilege per-project app role, per-flag pgvector/PostGIS/TimescaleDB, nightly `pg_dump`, and credentials stored in OpenBao. MariaDB is a selectable strict-EU alternative. | [Install runbook](./infra/projects/svc-01-sql-database/INSTALL-RUNBOOK.md) | [`svc-01-sql-database`](./.kiro/specs/svc-01-sql-database/) |
-| **SVC-06 — Identity provider** ([ZITADEL](https://zitadel.com)) | ✅ Built | The shared OIDC/SAML SSO backbone: one ZITADEL LXC on VLAN 20 fronted by Traefik, backed by its own dedicated SVC-01 PostgreSQL instance; masterkey + OIDC client secrets in OpenBao; idempotent per-project org/OIDC-app onboarding via a pure-Python management-API helper, with the provisioning token auto-minted at first-init and stored in OpenBao so a from-scratch bring-up onboards the first org with no human-minted token. | [Install runbook](./infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md) | [`svc-06-identity-provider`](./.kiro/specs/svc-06-identity-provider/) |
+| **SVC-09 — Reverse proxy** ([Traefik](https://traefik.io)) | ✅ Released | The shared HTTP/HTTPS ingress + TLS-termination edge on one LXC: Docker-label auto-discovery, HTTP→HTTPS redirect, an internal-only SSO-gated dashboard, and ownership of the shared `edge` network. Ships default-off mock stand-ins for the not-yet-built CA (SVC-08) and SSO (SVC-06). | [Install runbook](./infra/projects/svc-09-reverse-proxy/INSTALL-RUNBOOK.md) | [`svc-09-reverse-proxy`](./.kiro/specs/svc-09-reverse-proxy/) |
+| **SVC-01 — SQL database** ([PostgreSQL](https://www.postgresql.org)) | ✅ Released | The dedicated-per-project relational database, delivered as a reusable Terraform root + Ansible role: `postgres:17` + a `postgres_exporter` sidecar, a least-privilege per-project app role, per-flag pgvector/PostGIS/TimescaleDB, nightly `pg_dump`, and credentials stored in OpenBao. MariaDB is a selectable strict-EU alternative. | [Install runbook](./infra/projects/svc-01-sql-database/INSTALL-RUNBOOK.md) | [`svc-01-sql-database`](./.kiro/specs/svc-01-sql-database/) |
+| **SVC-06 — Identity provider** ([ZITADEL](https://zitadel.com)) | ✅ Released | The shared OIDC/SAML SSO backbone: one ZITADEL LXC on VLAN 20 fronted by Traefik, backed by its own dedicated SVC-01 PostgreSQL instance; masterkey + OIDC client secrets in OpenBao; idempotent per-project org/OIDC-app onboarding via a pure-Python management-API helper, with the provisioning token auto-minted at first-init and stored in OpenBao so a from-scratch bring-up onboards the first org with no human-minted token. | [Install runbook](./infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md) | [`svc-06-identity-provider`](./.kiro/specs/svc-06-identity-provider/) |
+| **SVC-17/18 — Observability** ([Prometheus](https://prometheus.io) + [Grafana](https://grafana.com) + [Loki](https://grafana.com/oss/loki/)) | ✅ Released | The shared metrics/dashboards/logs stack on three VLAN-20 LXCs: Prometheus (+ Alertmanager) with 30-day local TSDB and `file_sd`-generated scrape targets, Grafana fronted by Traefik, and Loki with Promtail shipping fleet-wide logs. Its v1 scrape set wires up the four already-built services (SVC-01/06/07/09). Ships default-off mock stand-ins for the not-yet-built CA (SVC-08), the un-registered Grafana OIDC client (SVC-06) and the GPU host (SVC-23). | [Install runbook](./infra/projects/svc-17-18-observability/INSTALL-RUNBOOK.md) | [`svc-17-18-observability`](./.kiro/specs/svc-17-18-observability/) |
 
 ## Quick start
 
@@ -240,7 +241,7 @@ Services are delivered in tiers from the [service catalog](./00-developer-servic
 | Identity & secrets | **SVC-06 IDP — ZITADEL ✅** · **SVC-07 Secrets — OpenBao ✅** |
 | Networking | **SVC-09 Reverse proxy — Traefik ✅** · SVC-11 Mesh VPN — NetBird |
 | CI/CD | SVC-13 CI runners — GitLab Runner 🚩 · SVC-14 Registry — Zot 🚩 |
-| Observability | SVC-17 Prometheus + Grafana · SVC-18 Loki |
+| Observability | **SVC-17 Prometheus + Grafana ✅** · **SVC-18 Loki ✅** |
 | Messaging | SVC-21 MQTT — Mosquitto |
 | ML / AI | SVC-23 Model serving — vLLM + Triton 🚩 |
 | Embedded | SVC-28 OTA updates — Mender |
@@ -255,8 +256,10 @@ Services are delivered in tiers from the [service catalog](./00-developer-servic
 | [Service catalog](./00-developer-services-catalog.md) | All 32 services, tenancy, technology origin, rollout order |
 | [Requirements](./requirements/) | Platform foundation, network plan and per-service requirements |
 | [Platform install runbook](./infra/platform-foundation/INSTALL-RUNBOOK.md) | Prerequisites bring-up, reset and troubleshooting |
+| [All-services walkthrough](./docs/TESTING.md#deploy-every-implemented-service-from-scratch-all-services-walkthrough) | Dependency-ordered from-scratch bring-up + teardown of every implemented service |
 | [SVC-07 install runbook](./infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md) | OpenBao provision-then-test |
 | [SVC-06 install runbook](./infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md) | ZITADEL (+ backing DB) provision-then-test |
+| [SVC-17/18 install runbook](./infra/projects/svc-17-18-observability/INSTALL-RUNBOOK.md) | Observability stack (Prometheus + Grafana + Loki) provision-then-test |
 | [Maintainer README](./docs/README.md) | The in-depth Developer-A guide: quick starts, principles, network foundation, onboarding, docs map |
 | [TESTING.md](./docs/TESTING.md) | Offline and live test tiers, and the CI offline merge gate (`.gitlab-ci.yml`) |
 | [Steering docs](./.kiro/steering/) | Constitution, tech choices, structure, security standards |

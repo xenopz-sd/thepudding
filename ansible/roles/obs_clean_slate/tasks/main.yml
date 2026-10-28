@@ -1,0 +1,441 @@
+---
+# tasks/main.yml — obs_clean_slate (SVC-17/18 installer — clean-slate branch)
+#
+# Clone of svc09_clean_slate adapted for the SVC-17/18 observability stack. The
+# enclosing `when: clean_slate` gate and the block/rescue phase-naming stay in
+# the thin orchestrator play; this role owns the branch BODY only:
+#   - agent-live throwaway-guard consult (FIRST, gated, fail-closed),
+#   - confirmation gating (pause 300s unless clean_slate_confirm=force),
+#   - independent cluster_env.py node-name resolution (no_log),
+#   - Proxmox-host-address assertion,
+#   - THREE-target assembly (prometheus/grafana/loki LXC vmids),
+#   - child clean-slate.yml run (invoking the generic terraform_clean_slate role
+#     — does NOT reimplement destroy logic),
+#   - two-way empty-baseline verification gate (pct list + terraform state list).
+#
+# THE KEY DIFFERENCE FROM svc09_clean_slate: svc09 has ONE guest in ONE state;
+# SVC-17/18 has THREE guests (Prometheus/Grafana/Loki) in ONE shared Terraform
+# state (infra/projects/svc-17-18-observability). So:
+#   (a) THREE clean_slate_targets are assembled, each with the SAME terraform_root
+#       and the per-guest resource_address
+#       (proxmox_virtual_environment_container.{prometheus,grafana,loki});
+#   (b) the child clean-slate.yml is run ONCE PER TARGET (its per-target contract
+#       takes clean_slate_confirm={{ item.vmid }} and a single-element
+#       clean_slate_targets list), pct-destroying each guest and state-rm'ing its
+#       container address;
+#   (c) the pct-list survivor check covers ALL THREE guest VMIDs; and
+#   (d) the residue sweep + empty-state gate run ONCE over the SINGLE shared
+#       state — they must catch the non-guest terraform_data residue the
+#       container-only state rm leaves behind:
+#         * terraform_data.ledger_index_assert               (root ledger-drift guard)
+#         * module.prometheus.terraform_data.input_guards    (per-module input guard)
+#         * module.grafana.terraform_data.input_guards
+#         * module.loki.terraform_data.input_guards
+
+# --- Agent-live throwaway-cluster authorization gate (FIRST, gated) ----------
+- name: "Clean-Slate | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ obs_venv_python }}"
+      - "{{ obs_throwaway_guard }}"
+      - --service
+      - obs
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ obs_throwaway_allowlist }}"
+  args:
+    chdir: "{{ obs_repo_root }}"
+  register: obs_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (obs_throwaway_decision.stdout | default('{}') | from_json).reason | default('no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | Refuse the reset unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "obs_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live clean-slate REFUSED by the throwaway-cluster guard:
+      {{ (obs_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      No container was destroyed and no Terraform state was modified. Arm the run
+      only against a throwaway cluster listed in throwaway-clusters.yml with
+      AGENT_LIVE_AUTHORIZED set.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live clean-slate."
+  when: agent_live_run | default(false) | bool
+
+# --- Confirmation gating -----------------------------------------------------
+- name: "Clean-Slate | Prompt for explicit confirmation (300s timeout; skipped on force)"
+  ansible.builtin.pause:
+    seconds: 300
+    prompt: >-
+      DESTRUCTIVE Clean-Slate reset of SVC-17/18 requested. This will pct-destroy
+      the THREE observability containers — Prometheus ({{ obs_prometheus_vmid }}),
+      Grafana ({{ obs_grafana_vmid }}), Loki ({{ obs_loki_vmid }}) — and remove
+      them (plus all non-guest terraform_data book-keeping) from the single
+      svc-17-18-observability Terraform state. Type 'yes' to proceed, anything
+      else to abort
+  register: obs_clean_slate_prompt
+  when: (clean_slate_confirm | default('')) != 'force'
+
+- name: "Clean-Slate | Resolve whether the reset is confirmed"
+  ansible.builtin.set_fact:
+    obs_clean_slate_confirmed: >-
+      {{ (clean_slate_confirm | default('')) == 'force'
+         or ((obs_clean_slate_prompt.user_input | default('') | trim | lower) in ['yes', 'y']) }}
+
+- name: "Clean-Slate | Abort with non-zero exit when not confirmed (destroys nothing)"
+  ansible.builtin.fail:
+    msg: >-
+      Clean-Slate reset ABORTED — confirmation was not given (received a
+      non-affirmative or empty/timed-out response). No container was destroyed
+      and no Terraform state was modified. Re-run with an affirmative 'yes' at the
+      prompt, or pass -e clean_slate_confirm=force to skip the prompt.
+  when: not (obs_clean_slate_confirmed | bool)
+
+# --- Delegated reset + verification gate -------------------------------------
+# Phase 1 does NOT run on a clean-slate invocation, so proxmox_node_name is not
+# resolved by preflight. Resolve it independently from the same cluster env.
+- name: "Clean-Slate | Resolve cluster env for the Proxmox node name ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ obs_venv_python }}"
+      - "{{ obs_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ obs_repo_root }}"
+  register: obs_cs_env_resolve
+  changed_when: false
+  no_log: true
+
+- name: "Clean-Slate | Bind the resolved Proxmox node name (no_log)"
+  ansible.builtin.set_fact:
+    proxmox_node_name: "{{ (obs_cs_env_resolve.stdout | from_json)['TF_VAR_proxmox_node_name'] }}"
+  no_log: true
+
+- name: "Clean-Slate | Assert the Proxmox host SSH address was supplied"
+  ansible.builtin.assert:
+    that:
+      - "obs_proxmox_host is defined"
+      - "(obs_proxmox_host | trim | length) > 0"
+    fail_msg: >-
+      The Clean-Slate reset delegates to clean-slate.yml against the Proxmox-host
+      inventory ({{ obs_proxmox_host_inventory }}), which runs `pct` on the node
+      over SSH. Supply the real Proxmox LAN IP with
+      -e obs_proxmox_host=<real-proxmox-lan-ip>. Nothing was destroyed.
+    success_msg: "Proxmox host SSH address supplied for the reset."
+
+# THREE targets, ONE shared state. Unlike svc09 (one guest, one target), the
+# SVC-17/18 root declares three containers in the SINGLE
+# infra/projects/svc-17-18-observability state. Each target carries the SAME
+# terraform_root and the per-guest resource_address; the child clean-slate.yml
+# runs once per target (below) to pct-destroy each guest and state-rm its
+# container address. The residue sweep that follows cleans the one shared state
+# ONCE.
+- name: "Clean-Slate | Assemble the THREE SVC-17/18 clean_slate_targets (one shared state)"
+  ansible.builtin.set_fact:
+    obs_clean_slate_targets:
+      - name: svc17-prometheus-20-01
+        terraform_root: infra/projects/svc-17-18-observability
+        resource_address: proxmox_virtual_environment_container.prometheus
+        node: "{{ proxmox_node_name }}"
+        vmid: "{{ obs_prometheus_vmid }}"
+      - name: svc17-grafana-20-01
+        terraform_root: infra/projects/svc-17-18-observability
+        resource_address: proxmox_virtual_environment_container.grafana
+        node: "{{ proxmox_node_name }}"
+        vmid: "{{ obs_grafana_vmid }}"
+      - name: svc18-loki-20-01
+        terraform_root: infra/projects/svc-17-18-observability
+        resource_address: proxmox_virtual_environment_container.loki
+        node: "{{ proxmox_node_name }}"
+        vmid: "{{ obs_loki_vmid }}"
+
+- name: "Clean-Slate | Delegate the reset to clean-slate.yml (one child run per guest)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ obs_proxmox_host_inventory }}"
+      - ansible/playbooks/clean-slate.yml
+      - --extra-vars
+      - "ansible_host={{ obs_proxmox_host }}"
+      - -e
+      - clean_slate_enabled=true
+      - -e
+      - "clean_slate_confirm={{ item.vmid }}"
+      - -e
+      - "{{ {'clean_slate_targets': [item]} | to_json }}"
+  args:
+    chdir: "{{ obs_repo_root }}"
+  loop: "{{ obs_clean_slate_targets }}"
+  loop_control:
+    label: "{{ item.name }} (vmid {{ item.vmid }})"
+  register: obs_clean_slate_runs
+  changed_when: "'changed=0' not in (obs_clean_slate_runs.stdout | default(''))"
+
+# ---- Remove the delegated Grafana cross-guest Route_Fragment ----------------
+# The Grafana guest is now destroyed (loop above). The Route_Fragment Grafana
+# delegated onto the Traefik_Guest's watched file-provider dir
+# (grafana-route.yml) must ALSO be removed, or Traefik keeps a dangling route
+# pointing at the now-freed VLAN-20 IP (10.0.20.19). This is a TRAEFIK-GUEST-SIDE
+# cleanup, not a guest destroy — delegated to the Traefik_Guest, and the watched
+# file provider hot-reloads the route's removal with no Traefik restart.
+#
+# ORCHESTRATOR-CONTEXT CONNECTION SETUP (the bug fix). The clean-slate branch
+# runs in the `hosts: localhost` orchestrator play (localhost.yml,
+# ansible_connection: local) — NOT the configurator play (observability.yml +
+# the generated inventory). In that orchestrator context there is NO add_host
+# for the Traefik_Guest and NO known_hosts entry for it, so a bare
+# `delegate_to: 10.0.20.12` has no working SSH connection. A prior LIVE teardown
+# showed this task report "already absent" (changed=false) while the fragment
+# was DEMONSTRABLY still on the Traefik_Guest: `failed_when: false` swallowed the
+# connection failure as a FALSE "already absent", silently leaving a dangling
+# route. The fix mirrors obs_provision / svc09_provision EXACTLY: before
+# delegating from the orchestrator play, reconcile known_hosts (ssh-keygen -R +
+# ssh-keyscan) and add_host the guest with connection vars, so the removal
+# actually connects — and a de-masked failure condition makes a silent
+# false-success impossible.
+- name: "Clean-Slate | Ensure ~/.ssh exists (0700) for the Traefik_Guest known_hosts reconcile"
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+
+- name: "Clean-Slate | Remove any stale known_hosts fingerprint for the Traefik_Guest"
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -R
+      - "{{ obs_traefik_guest_host }}"
+      - -f
+      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
+  register: obs_traefik_knownhosts_purge
+  changed_when: "'updated' in (obs_traefik_knownhosts_purge.stderr | default(''))"
+  failed_when: false
+
+# failed_when:false on the KEYSCAN — during a FULL teardown the Traefik_Guest
+# itself may already be gone/unreachable (it is a separate guest, torn down by
+# its own SVC-09 clean-slate). A missing Traefik_Guest must NOT block the
+# SVC-17/18 empty-baseline gate (the fragment dies with that guest anyway). So
+# the keyscan does not fail the play; instead we compute obs_traefik_reachable
+# from (rc == 0 AND non-empty stdout) and GATE the append + the removal on it.
+- name: "Clean-Slate | ssh-keyscan the Traefik_Guest (30s; tolerant of a torn-down guest)"
+  ansible.builtin.command:
+    argv:
+      - ssh-keyscan
+      - -T
+      - "30"
+      - "{{ obs_traefik_guest_host }}"
+  register: obs_traefik_keyscan
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Resolve whether the Traefik_Guest is reachable (keyscan succeeded)"
+  ansible.builtin.set_fact:
+    obs_traefik_reachable: >-
+      {{ (obs_traefik_keyscan.rc | default(1)) == 0
+         and ((obs_traefik_keyscan.stdout | default('') | trim | length) > 0) }}
+
+- name: "Clean-Slate | Append the Traefik_Guest host key to known_hosts (only when reachable)"
+  ansible.builtin.blockinfile:
+    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+    create: true
+    mode: "0600"
+    marker: "# {mark} SVC-17/18 clean-slate Traefik_Guest key for {{ obs_traefik_guest_host }}"
+    block: "{{ obs_traefik_keyscan.stdout }}"
+  when: obs_traefik_reachable | bool
+
+# Scope: ONLY this feature's grafana-route.yml — NOT SVC-09's shared default cert
+# (Mock B), which is out of scope for this teardown. `state: absent` is naturally
+# idempotent — a no-op when the fragment is already gone. The add_host supplies
+# the orchestrator-context SSH connection (the configurator play's add_host is
+# absent here); delegate_to that host so the file module runs ON the Traefik_Guest.
+- name: "Clean-Slate | Register the Traefik_Guest for the orchestrator-context delegation"
+  ansible.builtin.add_host:
+    name: traefik-cross-guest-cleanup
+    ansible_host: "{{ obs_traefik_guest_host }}"
+    ansible_user: "{{ obs_traefik_guest_user | default('root') }}"
+    ansible_python_interpreter: "{{ obs_traefik_guest_python | default('/usr/bin/python3') }}"
+    ansible_ssh_private_key_file: >-
+      {{ (obs_traefik_guest_ssh_key | default('') | trim | length > 0)
+         | ternary(obs_traefik_guest_ssh_key, omit) }}
+    ansible_connection: ssh
+  changed_when: false
+  when: obs_traefik_reachable | bool
+
+# De-masked removal. Gated on reachability: a full teardown (Traefik gone) SKIPS
+# this cleanly (the INFO task below reports "unreachable on full teardown"),
+# rather than the old silent false-success. When the guest IS reachable, the
+# removal runs with a REAL failure condition — it fails only if the `file` module
+# errored for a reason OTHER than the host being unreachable. A genuine "fragment
+# still there, removal errored" is no longer masked.
+- name: "Clean-Slate | Remove the delegated Grafana Route_Fragment from the Traefik_Guest"
+  ansible.builtin.file:
+    path: "{{ obs_grafana_route_fragment }}"
+    state: absent
+  delegate_to: traefik-cross-guest-cleanup
+  register: obs_grafana_route_removed
+  when: obs_traefik_reachable | default(true) | bool
+  failed_when:
+    - obs_grafana_route_removed is failed
+    - "'unreachable' not in (obs_grafana_route_removed.msg | default('') | lower)"
+
+- name: "Clean-Slate | INFO — Grafana Route_Fragment removal outcome"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        ('Grafana Route_Fragment removal SKIPPED: the Traefik_Guest '
+          ~ obs_traefik_guest_host ~ ' was unreachable during a full teardown '
+          ~ '(ssh-keyscan found no host) — the fragment ' ~ obs_grafana_route_fragment
+          ~ ' dies with the guest, no dangling route is possible. No action needed.')
+        if (not (obs_traefik_reachable | default(true) | bool))
+        else (('Removed the dangling Grafana Route_Fragment '
+          ~ obs_grafana_route_fragment ~ ' from the reachable Traefik_Guest '
+          ~ obs_traefik_guest_host ~ ' (no dangling route left pointing at the '
+          ~ 'freed Grafana VLAN-20 IP).')
+        if (obs_grafana_route_removed is changed)
+        else ('No Grafana Route_Fragment to remove at ' ~ obs_grafana_route_fragment
+          ~ ' on the reachable Traefik_Guest ' ~ obs_traefik_guest_host
+          ~ ' (already absent — verified over a working SSH connection, NOT a '
+          ~ 'connection failure). No action needed.'))
+      }}
+  changed_when: false
+
+# ---- Verification gate (empty baseline, two ways) ---------------------------
+- name: "Clean-Slate | VERIFY — list any surviving SVC-17/18 container on the host (pct list)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible"
+      - proxmox
+      - -i
+      - "{{ obs_proxmox_host_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ obs_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pct list"
+  args:
+    chdir: "{{ obs_repo_root }}"
+  register: obs_pct_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the set of surviving SVC-17/18 container VMIDs (all three)"
+  ansible.builtin.set_fact:
+    obs_surviving_vmids: >-
+      {{ [obs_prometheus_vmid | string,
+          obs_grafana_vmid | string,
+          obs_loki_vmid | string]
+         | select('in', (obs_pct_list.stdout | default('')))
+         | list }}
+
+# Zero RESOURCES of ANY kind in the SINGLE SVC-17/18 Terraform state. The child
+# clean-slate.yml runs above already `pct destroy`'d the three guests and
+# `terraform state rm`'d their container addresses. But the SVC-17/18 root also
+# carries NON-guest `terraform_data` book-keeping resources that manage no live
+# Proxmox object — the root-level ledger-drift guard
+# (`terraform_data.ledger_index_assert`) and ONE
+# `module.<name>.terraform_data.input_guards` per module
+# (module.prometheus / module.grafana / module.loki) — which the container-only
+# state rm leaves behind (the residue bug class, cf. spec
+# fix-svc07-clean-slate-terraform-data-residue). A correct clean-slate must leave
+# `terraform state list` EMPTY for the whole shared state. So, PROVIDER-FREE,
+# enumerate every remaining ADDRESS and `terraform state rm` it (NOT
+# `terraform destroy` — that would contact the provider and risk a hang / stale
+# lock). Because all three guests share ONE state, this sweep + the empty-state
+# gate run ONCE over that single root (not per-guest). All ops run on the CONTROL
+# NODE (state lives there).
+- name: "Clean-Slate | List ALL remaining addresses in the SVC-17/18 Terraform state (residue sweep)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+  args:
+    chdir: "{{ obs_tf_root }}"
+  register: obs_residual_state_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the residual (non-guest terraform_data) addresses to remove"
+  ansible.builtin.set_fact:
+    obs_residual_state_addrs: >-
+      {{ (obs_residual_state_list.stdout | default('')).splitlines()
+         | map('trim') | select('ne', '') | list }}
+
+- name: "Clean-Slate | Remove ALL remaining state addresses provider-free (terraform state rm)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - rm
+      - "{{ item }}"
+  args:
+    chdir: "{{ obs_tf_root }}"
+  loop: "{{ obs_residual_state_addrs }}"
+  loop_control:
+    label: "{{ item }}"
+  register: obs_residual_state_rm
+  changed_when: "'Removed' in (obs_residual_state_rm.stdout | default(''))"
+  failed_when:
+    - (obs_residual_state_rm.rc | default(1)) != 0
+    - "'No matching objects' not in (obs_residual_state_rm.stdout | default(''))"
+    - "'No matching objects' not in (obs_residual_state_rm.stderr | default(''))"
+
+- name: "Clean-Slate | VERIFY — list the FULL SVC-17/18 Terraform state after the residue sweep"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+  args:
+    chdir: "{{ obs_tf_root }}"
+  register: obs_state_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the set of surviving SVC-17/18 state addresses (FULL state)"
+  ansible.builtin.set_fact:
+    obs_surviving_state_addrs: >-
+      {{ (obs_state_list.stdout | default('')).splitlines()
+         | map('trim') | select('ne', '') | list }}
+
+- name: "Clean-Slate | GATE — assert an empty baseline (0 containers, 0 state), FR-18/AC-10"
+  ansible.builtin.assert:
+    that:
+      - "(obs_surviving_vmids | length) == 0"
+      - "(obs_surviving_state_addrs | length) == 0"
+    fail_msg: >-
+      Clean-Slate reset did NOT reach an empty baseline. Surviving SVC-17/18
+      container(s): {{ obs_surviving_vmids | default([]) | join(', ') | default('none', true) }};
+      surviving Terraform state address(es):
+      {{ obs_surviving_state_addrs | default([]) | join(', ') | default('none', true) }}.
+      Investigate on the Proxmox host / in the single svc-17-18-observability
+      Terraform state and re-run the reset until both are empty before
+      re-installing.
+    success_msg: >-
+      Clean-Slate reset complete — zero SVC-17/18 containers on the host and an
+      EMPTY svc-17-18-observability Terraform state (the three guests + the
+      non-guest terraform_data resources — ledger_index_assert and the three
+      module input_guards — all removed).
+
+- name: "Clean-Slate | Report the reset completed to an empty baseline"
+  ansible.builtin.debug:
+    msg: >-
+      SVC-17/18 Clean-Slate reset complete: the three observability containers —
+      Prometheus ({{ obs_prometheus_vmid }}), Grafana ({{ obs_grafana_vmid }}),
+      Loki ({{ obs_loki_vmid }}) — destroyed (or already absent) and removed,
+      along with all non-guest terraform_data book-keeping, from the single
+      svc-17-18-observability Terraform state. The baseline is empty; a fresh
+      install can now run.

@@ -1,0 +1,14 @@
+---
+# meta/main.yml — obs_preflight (SVC-17/18 installer — Phase 1)
+galaxy_info:
+  role_name: obs_preflight
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-17/18 (observability stack) installer Phase 1 — preflight & environment
+    validation: cluster.env resolve/validate, Proxmox reachability/auth, VLAN-20
+    p20 bridge, datastore autodetect, SSH-key injection, promtool availability,
+    agent-live throwaway-guard consult. Three-guest aware (Prometheus/Grafana/Loki).
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

@@ -1,0 +1,52 @@
+---
+# defaults/main.yml — obs_preflight (SVC-17/18 installer — Phase 1: Preflight)
+#
+# Phase-1 phase-specific defaults. Cross-phase constants (cluster_env_file,
+# obs_repo_root, obs_venv_python, the three VMIDs/guest IPs, etc.) are play-level
+# vars on svc-17-18-bootstrap.yml. NO secret value ever lives here. Clone of
+# svc09_preflight/defaults adapted for the three-guest observability root
+# (Prometheus/Grafana/Loki).
+
+# The pure-logic env helper (Phase 1 delegates parse/validate to it).
+obs_cluster_env_helper: scripts/installer/cluster_env.py
+
+# Sentinel emitted by cluster_env.py for an unset optional datastore var —
+# kept in sync with AUTODETECT in scripts/installer/cluster_env.py. A resolved
+# datastore equal to this triggers node-storage auto-detect.
+obs_autodetect_sentinel: "__AUTODETECT__"
+
+# Homelab Proxmox commonly presents a self-signed API cert; default to not
+# validating so preflight reachability does not fail on cert trust. Override:
+#   -e obs_proxmox_validate_certs=true
+# This single toggle governs BOTH the Phase-1 uri reachability tasks AND the
+# bpg/proxmox provider's TLS verification (obs_tf_env derives
+# TF_VAR_proxmox_insecure = NOT validate_certs), so they cannot drift.
+obs_proxmox_validate_certs: false
+
+# Ansible collections the installer's CONFIGURATOR child runs rely on. Preflight
+# asserts each is installed so a missing collection fails fast, not mid-bootstrap.
+obs_required_collections:
+  - community.docker
+  - community.general
+  - ansible.posix
+  - community.crypto
+
+# Project venv binaries the installer + its child runs invoke by absolute path.
+obs_required_venv_binaries:
+  - "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+  - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+  - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-galaxy"
+
+# promtool is required by SVC-17/18 to validate Prometheus scrape config + alert
+# rules (`promtool check config` / `promtool check rules`, requirements §10 lint
+# stage). Unlike terraform/ansible it is NOT a venv binary — it ships inside the
+# pinned prom/prometheus Docker image the stack uses (the offline render tests
+# invoke it via that image). Preflight asserts it is reachable by EITHER route:
+#   (a) a host-level `promtool` on PATH, OR
+#   (b) the pinned prom/prometheus image available to `docker run`.
+# If neither is present preflight fails fast with a remedy (install promtool, or
+# pull the pinned image) rather than discovering the gap mid-bootstrap.
+#
+# The pinned image tag used for the docker-fallback promtool check. Keep in sync
+# with the prom/prometheus tag the observability_stack role pins.
+obs_prometheus_image: prom/prometheus:v2.53.0

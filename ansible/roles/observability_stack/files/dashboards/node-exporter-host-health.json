@@ -1,0 +1,66 @@
+{
+  "__comment": "STARTER dashboard (dashboards-as-code, SVC-17/18 FR-6). Host health via node_exporter. Minimal valid v1 dashboard; expand panels as the fleet grows. Version-controlled JSON — edit here, not in the Grafana UI (allowUiUpdates=false).",
+  "annotations": {
+    "list": []
+  },
+  "editable": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Hosts up",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "observability-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(up{job=\"node\"} == 1)"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "CPU busy % (per host)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "observability-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 8,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": [
+    "observability",
+    "host",
+    "node-exporter",
+    "starter"
+  ],
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "",
+  "title": "Host health (node_exporter) — starter",
+  "uid": "obs-node-exporter-host",
+  "version": 1
+}

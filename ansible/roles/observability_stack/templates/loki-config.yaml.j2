@@ -1,0 +1,131 @@
+{#
+  templates/loki-config.yaml.j2 — observability_stack (SVC-17/18), Loki guest
+
+  Grafana Loki MONOLITHIC (single-binary, target=all) configuration for
+  svc18-loki-20-01 (10.0.20.20). Rendered onto the guest at
+  {{ observability_loki_config_dir }}/loki-config.yaml and bind-mounted :ro into
+  the `grafana/loki` container; `-config.file` points Loki at it. Loki reads this
+  only at start, so a change notifies `Restart loki`.
+
+  SCHEMA VERSION: this config targets the PINNED image
+  `{{ observability_loki_image }}` (Loki 3.x). The 3.x single-store-tsdb schema
+  is used — `schema: v13`, `store: tsdb`, `object_store: filesystem` — NOT the
+  2.x boltdb-shipper layout. The `common` block (path_prefix + filesystem
+  storage + inmemory ring + replication_factor 1) is the 3.x idiom for a
+  single-node filesystem deployment; per-component client stanzas are omitted
+  because `common` supplies them.
+
+  NO secret value is rendered here — Loki uses local disk only at this scale
+  (requirements §11: "No external DB credentials"). auth_enabled is false
+  (single-tenant homelab, documented below); the per-LABEL ingestion/query
+  limits in limits_config still apply regardless (FR-10).
+
+  Retention is driven by the role vars:
+    * observability_logs_retention       = {{ observability_logs_retention }}
+    * observability_loki_ingestion_rate_mb   = {{ observability_loki_ingestion_rate_mb }}
+    * observability_loki_ingestion_burst_mb  = {{ observability_loki_ingestion_burst_mb }}
+    * observability_loki_max_streams_per_user= {{ observability_loki_max_streams_per_user }}
+    * observability_loki_max_query_series    = {{ observability_loki_max_query_series }}
+#}
+{# ----------------------------------------------------------------------------
+   Loki durations do NOT accept a `d` (day) unit — only h/m/s. Normalise the
+   human-facing "<N>d" retention var to hours (<N>*24h) for retention_period.
+   A value already expressed in h/m/s is passed through unchanged.
+------------------------------------------------------------------------------- #}
+{% set _ret = observability_logs_retention | string | trim %}
+{% if _ret[-1] | lower == 'd' %}
+{%   set loki_retention_period = (_ret[:-1] | int * 24) | string ~ 'h' %}
+{% else %}
+{%   set loki_retention_period = _ret %}
+{% endif %}
+# MANAGED BY ANSIBLE (observability_stack) — DO NOT EDIT BY HAND.
+# SVC-18 Loki monolithic config. Spec: .kiro/specs/svc-17-18-observability.
+# Pinned image: {{ observability_loki_image }} (Loki 3.x, single-store-tsdb v13).
+---
+# Single-tenant homelab: auth_enabled=false means Loki does not require an
+# X-Scope-OrgID header and uses the synthetic tenant "fake" for every stream.
+# This is acceptable here (one operator, VLAN-20-internal push API, no
+# multi-customer separation) — the per-LABEL ingestion/query limits below still
+# apply and satisfy FR-10's "one noisy project cannot starve another" intent.
+auth_enabled: false
+
+server:
+  # Internal-only push/query API on VLAN 20 (requirements FR-13 / §3.2): no host
+  # port, no Traefik labels — the container binds :{{ observability_loki_port }}
+  # and the Compose stack maps it to the guest's internal VLAN-20 address only.
+  http_listen_port: {{ observability_loki_port }}
+  grpc_listen_port: 9096
+  log_level: info
+
+# Single-node filesystem deployment. `common` supplies the storage backend, the
+# instance ring (inmemory, replication_factor 1), and the on-disk layout that
+# the monolithic target=all binary shares across its internal components.
+common:
+  path_prefix: /loki
+  replication_factor: 1
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  ring:
+    kvstore:
+      store: inmemory
+
+# Single-store TSDB (Loki 3.x). object_store=filesystem keeps chunks on local
+# disk under the path_prefix above; schema v13 is the current 3.x schema.
+schema_config:
+  configs:
+    - from: "2024-01-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /loki/tsdb-index
+    cache_location: /loki/tsdb-cache
+  filesystem:
+    directory: /loki/chunks
+
+# Retention is applied by the compactor (the only 3.x mechanism that deletes on
+# a single-store/filesystem backend). retention_enabled must be true for
+# limits_config.retention_period to actually delete; delete_request_store is
+# required by the compactor when retention is enabled.
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+  delete_request_store: filesystem
+
+# Per-tenant / per-label ingestion + query limits (FR-10). ingestion_rate_mb /
+# ingestion_burst_size_mb throttle how fast a single tenant/label set may push;
+# max_streams_per_user and max_query_series bound stream cardinality and query
+# fan-out so one noisy project cannot starve another's log queries.
+limits_config:
+  retention_period: {{ loki_retention_period }}
+  ingestion_rate_mb: {{ observability_loki_ingestion_rate_mb }}
+  ingestion_burst_size_mb: {{ observability_loki_ingestion_burst_mb }}
+  max_streams_per_user: {{ observability_loki_max_streams_per_user }}
+  max_query_series: {{ observability_loki_max_query_series }}
+  # Reject out-of-order / far-future writes rather than silently accepting them.
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+
+# Ruler uses the same local filesystem store; alerting integration with
+# Alertmanager (on the Prometheus guest) is wired in a later task.
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /loki/rules-temp
+  enable_api: true
+
+# Quiet the "analytics" phone-home; this platform is self-hosted (product.md).
+analytics:
+  reporting_enabled: false

@@ -108,6 +108,16 @@
 # ZITADEL has no host port (boundaries §1); its mgmt API is reachable only at the
 # container's edge-network IP from the guest. Resolve that IP on the guest, stage
 # the stdlib helper there, and run it with --host-header + --insecure.
+#
+# delegate_to-before-when GOTCHA (why delegate_to is GUARDED, not bare):
+# Ansible evaluates `delegate_to` BEFORE `when`, so a bare
+# `delegate_to: "{{ zop_zitadel_guest_host }}"` crashes with
+# "Empty hostname produced from delegate_to" on the PRODUCTION path (where the
+# guest host is empty and `zop_dev_guest_run` is false) BEFORE `when: false` can
+# skip the task — leaving the production control-node path dead code. Guarding it
+# as `{{ zop_zitadel_guest_host if (zop_dev_guest_run | bool) else 'localhost' }}`
+# yields a harmless no-op delegate (localhost) for a task that `when` skips anyway,
+# so the skip is safe and the production path is reachable again.
 - name: "ZITADEL-org | DEV: resolve the ZITADEL container IP on the guest"
   ansible.builtin.command:
     argv:
@@ -115,7 +125,7 @@
       - inspect
       - "--format={{ zop_cip_go_format }}"
       - "{{ zop_zitadel_container_name }}"
-  delegate_to: "{{ zop_zitadel_guest_host }}"
+  delegate_to: "{{ zop_zitadel_guest_host if (zop_dev_guest_run | bool) else 'localhost' }}"
   vars:
     ansible_connection: ssh
     ansible_user: "{{ zop_zitadel_guest_ssh_user }}"
@@ -135,7 +145,7 @@
     src: "{{ zop_repo_root }}/{{ zop_provision_helper }}"
     dest: "{{ zop_guest_helper_path }}"
     mode: "0700"
-  delegate_to: "{{ zop_zitadel_guest_host }}"
+  delegate_to: "{{ zop_zitadel_guest_host if (zop_dev_guest_run | bool) else 'localhost' }}"
   vars:
     ansible_connection: ssh
     ansible_user: "{{ zop_zitadel_guest_ssh_user }}"
@@ -158,7 +168,7 @@
       - --app
       - "{{ zop_app_name }}"
       - "--redirect-uri={{ zop_redirect_uris | first }}"
-  delegate_to: "{{ zop_zitadel_guest_host }}"
+  delegate_to: "{{ zop_zitadel_guest_host if (zop_dev_guest_run | bool) else 'localhost' }}"
   vars:
     ansible_connection: ssh
     ansible_user: "{{ zop_zitadel_guest_ssh_user }}"
@@ -175,7 +185,7 @@
   ansible.builtin.file:
     path: "{{ zop_guest_helper_path }}"
     state: absent
-  delegate_to: "{{ zop_zitadel_guest_host }}"
+  delegate_to: "{{ zop_zitadel_guest_host if (zop_dev_guest_run | bool) else 'localhost' }}"
   vars:
     ansible_connection: ssh
     ansible_user: "{{ zop_zitadel_guest_ssh_user }}"

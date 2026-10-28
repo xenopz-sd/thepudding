@@ -1,0 +1,31 @@
+# node_exporter.service — rendered by the node_exporter role (SVC-17, FR-2).
+# MANAGED BY ANSIBLE — do not edit on the host; change the role template instead.
+#
+# Host-level systemd unit used ONLY in the unprivileged-LXC exception
+# (node_exporter_mode: host_unit), where a containerised sidecar cannot read the
+# host /proc,/sys faithfully. Runs the upstream static binary on the host itself,
+# listening on the guest's own VLAN-20 IP:{{ node_exporter_port }} (internal
+# only — scraped by the observability_stack, never fronted by Traefik).
+[Unit]
+Description=Prometheus node_exporter (SVC-17, host-unit mode)
+Documentation=https://github.com/prometheus/node_exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={{ node_exporter_system_user }}
+Group={{ node_exporter_system_user }}
+Type=simple
+# Listen on the guest's own VLAN-20 IP only (never 0.0.0.0) — the host-unit
+# analogue of the sidecar's private VLAN-bound port.
+ExecStart={{ node_exporter_binary_dest }} \
+  --web.listen-address={{ node_exporter_bind_ip }}:{{ node_exporter_port }}
+Restart=on-failure
+RestartSec=5s
+# Hardening: the exporter only reads host metrics; no write access needed.
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

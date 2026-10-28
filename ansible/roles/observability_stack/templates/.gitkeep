@@ -1,0 +1,3 @@
+# Keep the empty templates/ directory under version control.
+# The component config templates (prometheus.yml.j2, alertmanager.yml.j2,
+# Grafana provisioning, loki-config.yaml.j2) are added in tasks 4.2/4.3/4.4.

@@ -1,0 +1,47 @@
+---
+# tasks/scrape_targets_index_role.yml — observability_stack (SVC-17/18) — TASK 5.1
+#
+# Included in a loop by tasks/scrape_targets.yml, once per service_role group in
+# the built-service table. Reads the live inventory (groups[_obs_role] /
+# hostvars) and appends this service_role's { hostname -> {ip, project} } map to
+# the _obs_index_acc accumulator. Pure inventory read (integration-boundaries
+# §4) — no tfstate, no Proxmox. No secret value handled.
+#
+# `_obs_role` (loop var) : the service_role group being indexed.
+# project derivation      : for each present host, its project is the single
+#                           group it belongs to that is neither a known
+#                           service_role group nor an Ansible pseudo-group
+#                           (all/ungrouped). generate_inventory.py emits exactly
+#                           one such group per host (its project_slug). Falls
+#                           back to "shared" if none is resolvable.
+
+- name: "Observability (index) | Build this service_role's host map ({{ _obs_role }})"
+  ansible.builtin.set_fact:
+    _obs_role_hostmap: >-
+      {{
+        _obs_role_hostmap | default({}) | combine({
+          host_name: {
+            'ip': (hostvars[host_name].ansible_host | default('')),
+            'project': (
+              (
+                (groups | dict2items | selectattr('value', 'contains', host_name) | map(attribute='key') | list)
+                | difference(_obs_service_role_groups)
+                | difference(['all', 'ungrouped'])
+                | list
+              ) | first | default('shared')
+            )
+          }
+        })
+      }}
+  loop: "{{ groups[_obs_role] | default([]) }}"
+  loop_control:
+    loop_var: host_name
+    label: "{{ host_name }}"
+
+- name: "Observability (index) | Merge this service_role's host map into the accumulator"
+  ansible.builtin.set_fact:
+    _obs_index_acc: "{{ _obs_index_acc | default({}) | combine({_obs_role: (_obs_role_hostmap | default({}))}) }}"
+
+- name: "Observability (index) | Clear the per-role host map for the next iteration"
+  ansible.builtin.set_fact:
+    _obs_role_hostmap: {}

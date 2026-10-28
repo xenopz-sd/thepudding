@@ -1,0 +1,456 @@
+---
+# defaults/main.yml — observability_stack (SVC-17/18)
+#
+# Configures the three-guest observability stack (Prometheus + Alertmanager,
+# Grafana, Loki) on VLAN 20, each deployed as a Docker Compose stack via the
+# generic docker-compose-app role (consumed UNMODIFIED). tasks/main.yml
+# dispatches per guest by the `service_role` of the generated inventory
+# (prometheus / grafana / loki) — see tasks/main.yml.
+#
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements.md, design.md §9).
+# The actual prometheus.yml / alertmanager.yml / Grafana provisioning /
+# loki-config.yaml rendering is tasks 4.2/4.3/4.4 — this file declares the role
+# var contract + the three permanent default-off/deferred mock flags only.
+#
+# Mock stand-ins (per .kiro/steering/mock-stand-ins.md) are PERMANENT, default
+# OFF/deferred: they let the stack come up and be validated before SVC-08 (CA),
+# SVC-06 (Grafana OIDC client), and SVC-23 (GPU host) exist. Production leaves
+# them at their defaults and uses the real dependency.
+
+# --- Image pins (tech.md: never track `latest`) -----------------------------
+# Pinned deliberately; a bump is a conscious follow-up flagged in the PR. The
+# full config rendering (tasks 4.2–4.4) consumes these.
+observability_prometheus_image: "prom/prometheus:v2.55.1"
+observability_alertmanager_image: "prom/alertmanager:v0.28.0"
+observability_grafana_image: "grafana/grafana:11.4.0"
+observability_loki_image: "grafana/loki:3.3.2"
+
+# --- Per-guest dispatch -------------------------------------------------------
+# tasks/main.yml resolves the guest's role from the `service_role` group of the
+# generated inventory (prometheus / grafana / loki). This var is the resolved
+# value; by default it is derived from `group_names` at dispatch time, but it
+# MAY be overridden per play (e.g. in a unit/offline test harness).
+observability_service_role: ""
+
+# The set of inventory groups that map 1:1 to the three component roles. Used by
+# the dispatch guard in tasks/main.yml to resolve `observability_service_role`
+# from `group_names` when it is not set explicitly.
+observability_known_roles:
+  - prometheus
+  - grafana
+  - loki
+
+# --- Compose stack identities (consumed by docker-compose-app) --------------
+# One stack per guest; dca_app_name / stack dir derive from these.
+observability_prometheus_stack_name: "prometheus"
+observability_grafana_stack_name: "grafana"
+observability_loki_stack_name: "loki"
+
+# --- Config / data locations on the target guests ---------------------------
+# Rendered config roots per component (bind-mounted :ro into the containers).
+# The actual templating of the files beneath these dirs is tasks 4.2/4.3/4.4.
+observability_prometheus_config_dir: "/etc/prometheus"
+observability_prometheus_targets_dir: "{{ observability_prometheus_config_dir }}/targets"
+observability_prometheus_rules_dir: "{{ observability_prometheus_config_dir }}/rules"
+observability_alertmanager_config_dir: "/etc/alertmanager"
+observability_grafana_config_dir: "/etc/grafana"
+observability_grafana_provisioning_dir: "{{ observability_grafana_config_dir }}/provisioning"
+observability_loki_config_dir: "/etc/loki"
+
+# Persistent named volumes (never tmpfs) for stateful components — TSDB,
+# Alertmanager state, Grafana config-DB, Loki chunks/index.
+observability_prometheus_tsdb_volume: "prometheus-tsdb"
+observability_alertmanager_state_volume: "alertmanager-state"
+observability_grafana_data_volume: "grafana-data"
+observability_loki_data_volume: "loki-data"
+
+# --- Internal (VLAN-20) ports (no host ports; Grafana via Traefik labels) ---
+observability_prometheus_port: 9090
+observability_alertmanager_port: 9093
+observability_loki_port: 3100
+observability_grafana_port: 3000
+
+# --- Retention (FR-10 / §6) --------------------------------------------------
+# 30-day retention for both the metrics TSDB and the Loki log store.
+observability_metrics_retention: "30d"
+observability_logs_retention: "30d"
+
+# --- Loki per-tenant / per-label limits (FR-10; rendered in task 4.4) -------
+# Declared here so the role var contract is complete; the loki-config.yaml
+# render (task 4.4) consumes them. Conservative homelab-scale defaults.
+observability_loki_ingestion_rate_mb: 4
+observability_loki_ingestion_burst_mb: 6
+observability_loki_max_streams_per_user: 5000
+observability_loki_max_query_series: 500
+
+# --- Platform domain (non-secret) -------------------------------------------
+# Builds the Grafana Traefik Host() rule (grafana.<platform_domain>) and the
+# self-signed cert SANs (Mock B). Placeholder default; supplied per env.
+observability_platform_domain: "platform.example.test"
+
+# --- Grafana ingress (Traefik, SVC-09) --------------------------------------
+# Grafana registers with the shared Traefik `edge` network via Docker labels —
+# NO host port (FR-13 / integration-boundaries §1). The `edge` network is
+# created+owned by SVC-09's traefik_install; this role attaches to it.
+observability_grafana_host: "grafana.{{ observability_platform_domain }}"
+observability_edge_network: "edge"
+
+# --- Grafana ingress Traefik router/service identity (SVC-09 conventions) ---
+# Mirrors traefik_install / zitadel-server label conventions: a named router +
+# service bound to the websecure entrypoint with TLS on. NO host port (FR-13).
+observability_grafana_traefik_router: "grafana"
+
+# =============================================================================
+# CROSS-GUEST INGRESS: real file-provider route vs dev/offline mock-edge
+# (.kiro/specs/traefik-cross-guest-ingress/ — R3.1/R3.2/R3.3, R2.*/R4.*)
+# -----------------------------------------------------------------------------
+# Traefik (SVC-09) runs on a SEPARATE guest (10.0.20.12) from Grafana
+# (10.0.20.19). A host-local `edge` Docker network can NEVER bridge two guests,
+# and Traefik never sees Docker labels on another guest's daemon — so the
+# real cross-guest ingress path does NOT use `edge`/labels at all. Instead:
+#   * Grafana publishes its :3000 bound to its OWN VLAN-20 IP (the VLAN20_Port,
+#     same private-VLAN-bound-port pattern as Loki/exporters), and
+#   * the Grafana role renders a Traefik file-provider Route_Fragment and
+#     delegates it onto the Traefik_Guest (via the reusable traefik_route role),
+#     which Traefik hot-reloads — doing the routing it always could.
+#
+# obs_grafana_mock_edge is the DEFAULT-OFF (R3.1: real route is default) Mock_Edge
+# selector. It stays PERMANENT and default-off per mock-stand-ins.md:
+#   * false (default, production): NO cross-guest `edge` attachment, NO Docker
+#     labels; the VLAN20_Port + the file-provider Route_Fragment do the job.
+#   * true (dev/offline / co-located): the Grafana stack attaches to a local
+#     `edge` network and carries the Traefik discovery labels (the old path) —
+#     for a dev box where Traefik is co-located, NEVER on a host where SVC-09's
+#     Traefik owns the real `edge` (ADR-0013). On this path NO VLAN20_Port is
+#     published and NO file-provider route is rendered.
+obs_grafana_mock_edge: false
+
+# Delegate the Grafana Route_Fragment onto the Traefik_Guest via the traefik_route
+# role. Default true on the real path, and automatically suppressed on the
+# mock-edge path (the two are mutually exclusive — see tasks/grafana.yml). The
+# traefik_route role itself fails closed (R3.5) if the route is selected but the
+# backend url / delegate target is unresolved.
+obs_grafana_traefik_route_enabled: true
+
+# --- Grafana provisioning render (task 4.3) ---------------------------------
+# Grafana reads provisioning YAML from <provisioning_dir>/{datasources,dashboards}
+# at container start (standard Grafana provisioning layout). The dashboard
+# provider points at a path where the version-controlled dashboard JSON is
+# bind-mounted (dashboards-as-code). All three dirs are bind-mounted :ro into the
+# Grafana container.
+observability_grafana_datasources_dir: "{{ observability_grafana_provisioning_dir }}/datasources"
+observability_grafana_dashboards_provider_dir: "{{ observability_grafana_provisioning_dir }}/dashboards"
+# Where the version-controlled dashboard JSON lives on the guest (bind-mounted
+# :ro) and the matching in-container path the dashboard provider points at.
+observability_grafana_dashboards_json_dir: "{{ observability_grafana_config_dir }}/dashboards"
+observability_grafana_dashboards_container_dir: "/var/lib/grafana/dashboards"
+# In-container provisioning dir (Grafana's default provisioning root).
+observability_grafana_provisioning_container_dir: "/etc/grafana/provisioning"
+
+# --- Grafana datasources (Prometheus + Loki) --------------------------------
+# The datasource URLs point at the Prometheus and Loki guests' internal VLAN-20
+# endpoints. Defaults match the Host_Index_Authority allocation (prometheus
+# 10.0.20.18, loki 10.0.20.20); the installer MAY override from the generated
+# inventory / Terraform outputs (prometheus_internal_ip / loki_internal_ip).
+observability_prometheus_url: "http://10.0.20.18:{{ observability_prometheus_port }}"
+observability_loki_url: "http://10.0.20.20:{{ observability_loki_port }}"
+
+# =============================================================================
+# GRAFANA AUTH — Break_Glass_Admin + Mock A OIDC (task 4.3)
+# -----------------------------------------------------------------------------
+# Anonymous access is ALWAYS disabled (requirements §12). Two postures:
+#   * grafana_oidc_enabled=false (default, Mock A): the Break_Glass_Admin local
+#     account is the only login; the generic_oauth block is NOT rendered.
+#   * grafana_oidc_enabled=true: the generic_oauth (OIDC) block is rendered
+#     against ZITADEL (SVC-06); the client secret is read from OpenBao at
+#     configure time and layered via the 0600 secret env (never a literal here).
+#     Enabling the flag without the OIDC client vars set fails CLOSED at render.
+# =============================================================================
+
+# Break_Glass_Admin username (non-secret). The PASSWORD is read from OpenBao and
+# written to the 0600 secret env (GF_SECURITY_ADMIN_PASSWORD) — never a literal.
+observability_grafana_admin_user: "admin"
+
+# --- Mock A OIDC (generic_oauth -> ZITADEL) — rendered only when enabled -----
+# Non-secret OIDC config (issuer + client id). The client SECRET is read from
+# OpenBao (observability_grafana_oidc_secret_field) and layered via the secret
+# env as GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET — referenced by var, never literal.
+# All default EMPTY so that enabling the flag without wiring them fails closed.
+observability_grafana_oidc_name: "ZITADEL"
+observability_grafana_oidc_issuer_url: ""
+observability_grafana_oidc_client_id: ""
+observability_grafana_oidc_scopes: "openid email profile"
+
+# --- Grafana runtime secret env (0600; layered via docker-compose-app) ------
+# Carries GF_SECURITY_ADMIN_PASSWORD (Break_Glass_Admin) and, when OIDC is on,
+# GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET. NEVER the committed non-secret .env.
+# Written 0600 by a no_log task; the values come from OpenBao, never git.
+observability_grafana_secret_env_path: "{{ observability_grafana_config_dir }}/grafana.secret.env"
+
+# =============================================================================
+# OpenBao bao-CLI docker-exec secret reads (FR-15) — mirrors zitadel-server
+# -----------------------------------------------------------------------------
+# Grafana secrets (Break_Glass_Admin password, OIDC client secret) are read from
+# OpenBao via `docker exec <primary> bao kv get` delegated to the OpenBao guest,
+# with no_log:true — the established SVC-01/06/07 pattern (NOT community.hashi_vault).
+# When observability_openbao_addr is empty (dev/offline), the reads are skipped
+# and the role falls back to explicit *_override vars.
+# =============================================================================
+observability_openbao_addr: ""
+# The OpenBao PRIMARY container + guest the `bao` CLI runs against (delegate).
+observability_openbao_cli_host: "10.0.20.10"
+observability_openbao_cli_user: "root"
+observability_openbao_cli_python: "/usr/bin/python3"
+# docker-compose-app names the container <stack>-<svc>-1 ("openbao-openbao-1"),
+# matching zitadel-server / openbao_install — NOT "openbao-primary".
+observability_openbao_primary_container_name: "openbao-openbao-1"
+observability_openbao_bao_bin: "bao"
+# BAO_ADDR as seen from INSIDE the OpenBao container (container-local loopback).
+observability_openbao_cli_bao_addr: "https://127.0.0.1:8200"
+observability_openbao_tls_skip_verify: true
+# Whether the `platform-services` scrape job skips TLS verification. Prometheus
+# applies a job's `tls_config` ONLY to `https` targets, so this affects only the
+# one HTTPS target in the V1_Scrape_Set (SVC-07 OpenBao, __scheme__: https);
+# postgres/traefik/zitadel are plain HTTP and untouched. True is the homelab
+# mock-cert posture (no platform CA until SVC-08/EJBCA) — mirrors
+# observability_openbao_tls_skip_verify and the `bao` CLI -tls-skip-verify. The
+# production tightening is to flip this false AND supply a real CA bundle
+# (ca_file) in prometheus.yml.j2, mirroring the platform mock-cert philosophy.
+observability_platform_services_tls_skip_verify: true
+# The platform-admin token used for the reads (sourced from the environment /
+# installer, same as the sibling roles — never a committed literal).
+observability_bao_token: "{{ lookup('env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+# KV mount + secret paths (requirements §11).
+observability_openbao_kv_mount: "secret"
+observability_grafana_oidc_secret_path: "{{ observability_openbao_kv_mount }}/observability/grafana-oidc"
+observability_grafana_oidc_secret_field: "client_secret"
+observability_grafana_admin_secret_path: "{{ observability_openbao_kv_mount }}/observability/grafana-admin"
+observability_grafana_admin_secret_field: "password"
+# Dev/offline fallbacks (used ONLY when observability_openbao_addr is empty).
+observability_grafana_admin_password_override: ""
+observability_grafana_oidc_client_secret_override: ""
+
+# --- Prometheus static-config render knobs (task 4.2; prometheus.yml.j2) ----
+# FR-1: 15 s default scrape cadence; low-churn exporters use 30 s via a
+# per-target scrape_interval set in their generated target file. Prometheus's
+# own :9090 self-scrape is low-churn (30 s). file_sd target files are re-read on
+# the refresh interval below (FR-8). evaluation_interval also drives the rule
+# group cadence (baseline.rules.yml / alertmanager routing).
+observability_prometheus_global_scrape_interval: "15s"
+observability_prometheus_global_scrape_timeout: "10s"
+observability_prometheus_self_scrape_interval: "30s"
+observability_prometheus_evaluation_interval: "15s"
+observability_prometheus_file_sd_refresh_interval: "30s"
+
+# Alertmanager address Prometheus routes alerts to — co-located on this guest.
+# `localhost` because Alertmanager runs in the same Compose stack (:9093).
+observability_alertmanager_scrape_host: "localhost"
+
+# =============================================================================
+# SCRAPE-TARGET GENERATION (file_sd, from the generated inventory) — TASK 5.1
+# -----------------------------------------------------------------------------
+# FR-8 / FR-11 / FR-12 + design §3.4 ("scrape what exists"). The V1_Scrape_Set
+# is NEVER hand-listed in prometheus.yml; instead one `file_sd_configs` target
+# file is GENERATED per Built_Service present in the platform's generated
+# inventories, under {{ observability_prometheus_targets_dir }}. The already-
+# shipped prometheus.yml.j2 globs `service-*.yaml` (the `platform-services` job),
+# so each built-service file is named `service-<service>.yaml`.
+#
+# TWO INPUTS drive the render (tasks/scrape_targets.yml -> templates/targets/
+# service-target.yaml.j2):
+#
+#   1. observability_builtin_scrape_targets — the STATIC per-service knowledge
+#      (job/port/path/scheme/labels + which generated-inventory `service_role`
+#      group the guest lives in, and how its `project` label is derived). This
+#      table is the authoritative V1 target set (FR-11); adding a future service
+#      is a new row here, not a prometheus.yml edit.
+#
+#   2. observability_inventory_index — a resolved map
+#        { "<service_role>": { "<hostname>": { "ip": "<vlan20 ip>",
+#                                               "project": "<slug|null>" } } }
+#      assembled by tasks/scrape_targets.yml from the live Ansible inventory
+#      (groups[...] / hostvars[...]) that the installer loaded from every
+#      service's *.generated.yml (integration-boundaries §4: file-mediated
+#      Terraform->Ansible handoff — never a Proxmox/tfstate query). Defaults to
+#      {} so an offline/standalone render (and the task-5.2 test) can inject a
+#      FIXTURE index directly. A service whose `service_role` key is absent or
+#      whose host map is empty yields NO target file (degrade, not fail — §3.4).
+#
+# DEGRADE-ON-MISSING: the template emits a file ONLY for a built-service row
+# whose `service_role` group is present AND non-empty in the index. Nothing is
+# ever emitted for an absent service, and the generation never fails because a
+# service is not yet built.
+#
+# Per-target scrape path/scheme/param differences (OpenBao scrapes HTTPS at
+# /v1/sys/metrics?format=prometheus; ZITADEL at /debug/metrics; postgres_exporter
+# and Traefik at the default /metrics over http) are carried in the file_sd
+# target's own `labels` as Prometheus's reserved discovery labels
+# (`__scheme__`, `__metrics_path__`, `__param_<name>`). Prometheus consumes
+# those reserved labels directly during relabeling, so the single shipped
+# `platform-services` job scrapes each target on its correct path/scheme WITHOUT
+# any per-service job edit in prometheus.yml.j2. The non-reserved `project` /
+# `service` labels are kept as ordinary target labels (FR-11).
+
+# The V1 built-service scrape table (FR-11). Each row:
+#   service        : the `service` label value + the target-file suffix
+#                    (service-<service>.yaml).
+#   service_role   : the generated-inventory group the guest sits in
+#                    (generate_inventory.py groups by Terraform `service_role`).
+#   project        : the `project` label. Either a literal (e.g. "shared") or the
+#                    sentinel "__from_inventory__" to derive it per host from the
+#                    inventory index (used by the dedicated-per-project SVC-01).
+#   port           : the metrics port on the guest's VLAN-20 IP.
+#   metrics_path   : OPTIONAL. Omit/empty => Prometheus default /metrics.
+#   scheme         : OPTIONAL. Omit/empty => http. "https" for OpenBao.
+#   params         : OPTIONAL dict of query params (e.g. {format: prometheus}).
+#   scrape_interval: OPTIONAL per-target override (FR-1; low-churn => "30s").
+observability_builtin_scrape_targets:
+  # SVC-01 PostgreSQL — postgres_exporter sidecar on :9187, default /metrics.
+  # Dedicated-per-project, so the `project` label is derived per host from the
+  # inventory index (the non-service_role group the guest also belongs to).
+  - service: "postgres"
+    service_role: "postgres"
+    project: "__from_inventory__"
+    port: 9187
+    scrape_interval: "30s"
+  # SVC-06 ZITADEL — Prometheus metrics on the container HTTP port :8080 at the
+  # ZITADEL-specific path /debug/metrics (zitadel.com/docs — metrics overview).
+  - service: "zitadel"
+    service_role: "zitadel"
+    project: "shared"
+    port: 8080
+    metrics_path: "/debug/metrics"
+  # SVC-07 OpenBao primary — telemetry on the API port :8200, HTTPS, at
+  # /v1/sys/metrics with ?format=prometheus (unauthenticated_metrics_access).
+  # Only the PRIMARY `openbao` role is scraped as a built-service metrics target;
+  # the `openbao-unsealer` role is intentionally NOT in this table (its own
+  # SVC-07 scrape fragment owns the unsealer up{} target).
+  - service: "openbao"
+    service_role: "openbao"
+    project: "shared"
+    port: 8200
+    scheme: "https"
+    metrics_path: "/v1/sys/metrics"
+    params:
+      format: "prometheus"
+    scrape_interval: "30s"
+  # SVC-09 Traefik — native Prometheus metrics on the dedicated internal-only
+  # `metrics` entrypoint :8082, default /metrics.
+  - service: "traefik"
+    service_role: "traefik"
+    project: "shared"
+    port: 8082
+
+# The resolved inventory index (service_role -> hostname -> {ip, project}).
+# Populated by tasks/scrape_targets.yml from the loaded Ansible inventory;
+# default {} so an offline render / the task-5.2 test injects a fixture.
+observability_inventory_index: {}
+
+# Where the generated service target files land on the Prometheus guest. The
+# shipped prometheus.yml.j2 `platform-services` job globs service-*.yaml here.
+observability_scrape_targets_file_prefix: "service-"
+
+# --- Alertmanager routing (FR-7; rendered in task 4.2) ----------------------
+# v1 DEFAULT receiver is a UI-only null receiver (no external notifier) per the
+# operator-approved v1 scope; a real SMTP/webhook receiver is confirmed per
+# deployment before go-live (its credential from OpenBao, never templated).
+observability_alertmanager_default_receiver: "null-ui-only"
+# Sane grouping/notify defaults.
+observability_alertmanager_group_wait: "30s"
+observability_alertmanager_group_interval: "5m"
+observability_alertmanager_repeat_interval: "4h"
+# Per-project receivers feed the alertmanager.yml routing tree; default empty
+# (default receiver only) until projects declare receivers. Each item is a dict:
+#   - name: "<receiver-name>"        # stable receiver id the route references
+#     project: "<project-slug>"      # matched on the `project` alert label
+#     webhook_url: "<url>"           # optional; placeholder null if omitted
+#     group_by: ["alertname", ...]   # optional per-route grouping override
+observability_project_receivers: []
+
+# --- Deferred cert-expiry alert flag (FR-7 Reconciliation 3) ----------------
+# Off until SVC-08 issues real certs AND a cert-expiry exporter feeds
+# probe_ssl_earliest_cert_expiry. While false, the CertificateExpiringSoon rule
+# is NOT rendered into baseline.rules.yml (present-but-inert, never dirty).
+observability_cert_expiry_alert_enabled: false
+
+# =============================================================================
+# MOCK STAND-INS (per .kiro/steering/mock-stand-ins.md) — PERMANENT, DEFAULT OFF
+# -----------------------------------------------------------------------------
+# Opt-in development/validation affordances, NOT transitional debt. They stay in
+# the codebase indefinitely so the stack can come up before SVC-08 / SVC-06 /
+# SVC-23 exist, or to isolate a fault. Implemented in task 7 (mocks); the config
+# render tasks (4.2–4.4) consume the flags. Default posture == production (real).
+# =============================================================================
+
+# --- Mock A: Grafana OIDC disabled (stand-in for the SVC-06 OIDC client) ----
+# Default FALSE. When false, Grafana uses the Break_Glass_Admin local account
+# (credential from OpenBao, rotated after use); the OIDC provisioning block is
+# omitted. When true AND a ZITADEL Grafana OIDC client is registered with its
+# secret in OpenBao, the OIDC block is rendered. Enabling the flag without a
+# registered client fails CLOSED at render (never silently anonymous).
+grafana_oidc_enabled: false
+
+# --- Mock B: self-signed TLS (stand-in for SVC-08/EJBCA + Let's Encrypt) ----
+# Default FALSE. When true, generate an internal self-signed cert on the control
+# node (community.crypto, same pattern as SVC-07/09) and serve it via the
+# SVC-09-owned Traefik file-provider default cert so Grafana's websecure route
+# works before a real CA exists. When false AND no CA reachable, Grafana's HTTPS
+# route render fails CLOSED (never serve no-TLS). Does NOT provide a trust chain.
+obs_tls_self_signed: false
+obs_tls_self_signed_cn: "{{ observability_grafana_host }}"
+# SANs a faithful stand-in for what EJBCA / Let's Encrypt would issue for the
+# Grafana guest (design Mock B).
+obs_tls_self_signed_sans:
+  - "DNS:{{ observability_grafana_host }}"
+  - "DNS:svc17-grafana-20-01"
+  - "DNS:localhost"
+  - "IP:10.0.20.19"
+  - "IP:127.0.0.1"
+obs_tls_self_signed_valid_days: 825
+
+# Mock B reuses SVC-09's file-provider DEFAULT CERTIFICATE mechanism (ADR-0013:
+# SVC-09 owns the real `edge` network AND the file-provider default cert) rather
+# than standing up a second edge/file-provider owner. The cert + key are
+# generated on the control node and installed onto the TRAEFIK GUEST at SVC-09's
+# own tls paths (the same `traefik_tls_host_dir` / cert / key files SVC-09's
+# dynamic.yml.j2 `tls.stores.default.defaultCertificate` already references), so
+# Traefik's existing file provider serves them for Grafana's websecure route
+# before SVC-08 / Let's Encrypt exists. These default to SVC-09's own values so
+# the two roles agree on the path with no SVC-09 edit.
+#   * obs_traefik_guest_host — the Traefik (SVC-09) guest the cert is installed
+#     onto (the file-provider owner). Default is the SVC-09 VLAN-20 IP.
+obs_traefik_guest_host: "10.0.20.12"
+obs_traefik_guest_user: "root"
+obs_traefik_guest_python: "/usr/bin/python3"
+# SVC-09's tls dir + cert/key file paths on the Traefik guest (must match
+# traefik_install's traefik_tls_host_dir / traefik_tls_cert_file /
+# traefik_tls_key_file so the SVC-09 file provider picks them up unchanged).
+obs_traefik_tls_host_dir: "/etc/traefik/tls"
+obs_traefik_tls_cert_file: "{{ obs_traefik_tls_host_dir }}/traefik-cert.pem"
+obs_traefik_tls_key_file: "{{ obs_traefik_tls_host_dir }}/traefik-key.pem"
+
+# SVC-09's Traefik file-provider directory on the Traefik guest (enabled +
+# `watch: true` in traefik.yml.j2, bind-mounted :ro into the container). The
+# Grafana cross-guest Route_Fragment is delegated here via the traefik_route
+# role; matches traefik_install's traefik_dynamic_config_dir with no SVC-09 edit.
+observability_traefik_dynamic_config_dir: "/etc/traefik/dynamic"
+
+# --- Mock B fail-closed gate: "is a real CA reachable?" ---------------------
+# When obs_tls_self_signed is FALSE, Grafana's HTTPS route must only be rendered
+# if a REAL certificate path exists (SVC-08/EJBCA or Let's Encrypt). This flag is
+# the explicit "a real CA / ACME resolver will issue the Grafana cert" signal;
+# it stays FALSE until SVC-08 is deployed (or Let's Encrypt is reachable). With
+# BOTH obs_tls_self_signed=false AND obs_tls_real_ca_available=false, the Grafana
+# render FAILS CLOSED with a remedy — never serve no-TLS (requirements FR-14).
+obs_tls_real_ca_available: false
+
+# --- Mock C: GPU/dcgm metrics deferred (stand-in for the SVC-23 GPU host) ---
+# Default TRUE (deferred). While true, the dcgm_exporter role is applied to zero
+# hosts (no `gpu`-tagged host exists) and the GPU dashboards/alerts are present-
+# but-inert. When a GPU host lands with SVC-23, set
+# `-e dcgm_metrics_deferred=false` and tag the host. GPU metrics are NOT a v1
+# acceptance gate (AC-12).
+dcgm_metrics_deferred: true
+
+# --- Reconciliation behaviour (passed through to docker-compose-app) --------
+observability_state: "present"

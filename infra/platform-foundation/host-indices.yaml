@@ -113,18 +113,18 @@
     instance: 1
     host_index: 7             # -> 10.0.20.17
     status: reserved
-  - svc_code: svc17-18        # observability — Prometheus
+  - svc_code: svc17           # observability (SVC-17 metrics/dashboards) — Prometheus
     component: prometheus
     instance: 1
     host_index: 8             # -> 10.0.20.18
-    status: reserved
-  - svc_code: svc17-18        # observability — Grafana
+    status: allocated
+  - svc_code: svc17           # observability (SVC-17 metrics/dashboards) — Grafana
     component: grafana
     instance: 1
     host_index: 9             # -> 10.0.20.19
-    status: reserved
-  - svc_code: svc17-18        # observability — Loki
+    status: allocated
+  - svc_code: svc18           # observability (SVC-18 centralized logging) — Loki
     component: loki
     instance: 1
     host_index: 10            # -> 10.0.20.20
-    status: reserved
+    status: allocated

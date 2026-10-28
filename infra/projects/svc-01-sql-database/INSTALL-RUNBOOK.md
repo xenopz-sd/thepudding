@@ -6,6 +6,10 @@ PostgreSQL (or MariaDB) for a given project, then verifies it against the instan
 you just built. SVC-01 is a **reusable** root — the same one command stands a DB
 up for `dronefleet` on VLAN 100 or for ZITADEL's backing store on VLAN 20.
 
+> To stand this service up as part of the whole platform (dependency-ordered, from
+> an empty cluster), see the [all-services walkthrough](../../../docs/TESTING.md#deploy-every-implemented-service-from-scratch-all-services-walkthrough)
+> in the testing guide.
+
 Section **A** is the **Developer B** fast path (one Ansible command). Sections
 **0–3** are the **Developer A** manual spine.
 
@@ -91,6 +95,24 @@ with per-instance state `<slug>-svc01-postgres`, inventory, known_hosts),
 Bootstrap (the `common` role then `postgres.yml` — the DB + least-privilege
 `<slug>_app` role + requested extensions, passwords stored in OpenBao), and
 Handoff (`svc01-health.yml` + banner).
+
+> **First-run credential-storage behavior** (spec:
+> [`fix-svc01-db-install-first-run-transient`](../../../.kiro/specs/fix-svc01-db-install-first-run-transient/)).
+> When OpenBao credential storage is wired for the run — i.e. an `openbao_addr`
+> is set (e.g. `-e openbao_addr=10.0.20.10`, or via the SVC-06 backing-DB path) —
+> the installer resolves `OPENBAO_ADMIN_TOKEN` at Phase-1 preflight with
+> precedence: the process environment first, then the cluster env file
+> (`cluster_env_file`). So the one-command install works without a manual
+> `export` as long as the token is present in the cluster env file (SVC-07's
+> bootstrap writes it there by name). If OpenBao is wired but the token resolves
+> empty from BOTH sources, the installer fails fast at preflight with an explicit
+> message naming `OPENBAO_ADMIN_TOKEN` and the remedy — rather than failing later
+> behind a `no_log` mask. A dev/offline run with NO `openbao_addr` set skips the
+> OpenBao credential write entirely (the generated passwords stay only in the
+> on-guest `0600` env), and the token gate does not apply. The installer likewise
+> fails fast at preflight if `project_slug` resolves empty — use the sanctioned
+> `svc-01-bootstrap.yml -e project_slug=<slug>` entry point, not a hand-run of the
+> standalone `postgres.yml`.
 
 To stand the MariaDB alternative up instead, add `-e db_engine=mariadb`.
 

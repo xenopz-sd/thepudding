@@ -1,0 +1,40 @@
+---
+# meta/main.yml — dcgm_exporter (SVC-17/18, GPU-tagged hosts only, DEFERRED)
+galaxy_info:
+  role_name: dcgm_exporter
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Deploys NVIDIA DCGM Exporter (SVC-17/18) on GPU-tagged hosts ONLY as a Docker
+    Compose stack via the generic docker-compose-app role, exposing NVIDIA GPU
+    telemetry on port 9400 for the observability_stack to scrape (FR-4). DEFERRED
+    by default (Mock C / GPU_Metrics_Deferred): while dcgm_metrics_deferred is
+    true, or on a host not in the `gpu` inventory group, the role is a logged
+    no-op and never a v1 acceptance gate (AC-12). When an SVC-23 GPU host is
+    tagged into the `gpu` group and the operator sets dcgm_metrics_deferred=false,
+    the role deploys with a --gpus all device reservation. Requires the NVIDIA
+    Container Toolkit on the host (an SVC-23 prerequisite — not installed here).
+    Image pinned; no host port (internal /metrics scraped on VLAN 20).
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - observability
+    - dcgm
+    - nvidia
+    - gpu
+    - metrics
+    - svc17
+    - svc18
+
+# No cross-role dependencies. The Compose stack is templated via the existing
+# docker-compose-app role, invoked by this role via include_role, not as a hard
+# meta dependency here — mirrors promtail_agent / observability_stack /
+# traefik_install.
+dependencies: []

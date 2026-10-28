@@ -1,0 +1,15 @@
+---
+# meta/main.yml — obs_clean_slate (SVC-17/18 installer — clean-slate branch)
+galaxy_info:
+  role_name: obs_clean_slate
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-17/18 (observability) installer clean-slate reset: agent-live
+    throwaway-guard consult, confirmation gate, delegated terraform_clean_slate
+    destroy of the three observability LXCs (Prometheus/Grafana/Loki) sharing a
+    single Terraform state, and a two-way empty-baseline verification that also
+    sweeps the non-guest terraform_data residue.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

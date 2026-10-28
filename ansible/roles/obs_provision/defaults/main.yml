@@ -1,0 +1,35 @@
+---
+# defaults/main.yml — obs_provision (SVC-17/18 installer — Phase 2: Provision)
+#
+# Phase-2 phase-specific defaults. Clone of svc09_provision/defaults adapted for
+# the SVC-17/18 observability THREE-guest root. obs_tf_env is evaluated LAZILY
+# against the Phase-1 (obs_preflight) resolved facts; every consumer sets
+# no_log:true. NO secret value here.
+
+# The SVC-17/18 Terraform root (absolute, so the child `terraform` process runs
+# in it regardless of the play's cwd).
+obs_tf_root: "{{ obs_repo_root }}/infra/projects/svc-17-18-observability"
+
+# Environment passed to the child `terraform` init/apply processes. The Proxmox
+# endpoint/token travel here as TF_VAR_* (never on the command line); every task
+# using this env sets no_log:true. Evaluated lazily against the Phase-1 facts.
+#   * TF_VAR_proxmox_endpoint uses the canonical base set in Phase 1.
+#   * TF_VAR_proxmox_insecure is derived from the single
+#     obs_proxmox_validate_certs toggle (insecure == NOT validate_certs), so
+#     the provider's TLS verification cannot drift from preflight's.
+#   * TF_VAR_operator_ssh_public_keys is the JSON list the Phase-1 read task
+#     produced ("[]" when no key path was supplied -> strict no-op).
+obs_tf_env:
+  TF_VAR_proxmox_endpoint: >-
+    {{ obs_proxmox_endpoint_base | default(obs_proxmox_endpoint) | default('') }}
+  TF_VAR_proxmox_api_token: "{{ obs_proxmox_api_token | default('') }}"
+  TF_VAR_proxmox_insecure: "{{ (not (obs_proxmox_validate_certs | bool)) | lower }}"
+  TF_VAR_operator_ssh_public_keys: "{{ obs_operator_ssh_public_keys_json | default('[]') }}"
+
+# The three service_role group names the generated inventory must carry — one
+# per observability guest (service_role == proxmox-compute service_name). Used
+# by the three-guest existence assert and the add_host loop below.
+obs_guest_roles:
+  - prometheus
+  - grafana
+  - loki

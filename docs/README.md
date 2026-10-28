@@ -496,6 +496,11 @@ network foundation itself remains documented in [its own section above](#the-net
 Every implemented service follows the same entry pattern: a link to its install
 runbook (the provision-then-test walkthrough) and a link to its spec.
 
+To bring the whole platform up in one dependency-ordered pass from an empty
+cluster (and tear it back down), see the umbrella
+[all-services walkthrough](./TESTING.md#deploy-every-implemented-service-from-scratch-all-services-walkthrough)
+in the testing guide.
+
 | Service | Install runbook | Spec |
 |---|---|---|
 | **SVC-01 — SQL database (PostgreSQL)** | [`INSTALL-RUNBOOK.md`](../infra/projects/svc-01-sql-database/INSTALL-RUNBOOK.md) | [`svc-01-sql-database`](../.kiro/specs/svc-01-sql-database/) |

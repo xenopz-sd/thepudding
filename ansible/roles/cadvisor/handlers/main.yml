@@ -1,0 +1,14 @@
+---
+# handlers/main.yml — cadvisor (SVC-17, every Docker host)
+#
+# Restart handler. When the cAdvisor stack config changes, reconcile it with a
+# forced recreate via community.docker.docker_compose_v2 (PF §9 — declarative,
+# not a shell `docker compose up`). cAdvisor re-reads its collector flags only
+# at start, so a config change must recreate the container.
+
+- name: Restart cadvisor
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ cadvisor_stack_name }}"
+    project_name: "{{ cadvisor_stack_name }}"
+    state: present
+    recreate: always

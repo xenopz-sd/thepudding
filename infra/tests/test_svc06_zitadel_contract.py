@@ -7,8 +7,17 @@ secret-env template), parsed with PyYAML / inspected as text. No infra — alway
 runs.
 
 What is asserted (the SVC-06 ZITADEL contract):
-  * HTTP ingress via Traefik labels ONLY — no published host `ports:` for HTTP
-    (integration-boundaries §1 / FR-1); attaches the `edge` network.
+  * HTTP ingress is CROSS-GUEST (post svc-06-cross-guest-ingress conversion,
+    ADR-0018): Traefik (SVC-09) runs on a SEPARATE guest, so the REAL path
+    publishes the VLAN20_Port bound to ZITADEL's OWN VLAN-20 IP
+    (`{{ zitadel_bind_ip }}:8080:8080` — never 0.0.0.0/LAN, the ADR-0018
+    private-VLAN-bound-port exception, consumed only by Traefik) and delegates a
+    Traefik file-provider Route_Fragment onto the Traefik_Guest; the `edge`
+    network + Traefik Docker labels are gated behind the default-OFF
+    `zitadel_mock_edge_network` mock path (co-located-dev only). Traefik remains
+    the sole LAN-facing ingress (integration-boundaries §1 as clarified by
+    ADR-0018). ZITADEL no longer attaches `edge` unconditionally nor forbids all
+    host ports.
   * The ZITADEL_MASTERKEY + backing-DB password come from OpenBao (`bao` CLI) and
     live in a 0600 secret env layered via `extra_env_files` — NEVER the non-secret
     docker-compose-app `.env` (secret hygiene, §8). Secret-handling tasks no_log.
@@ -71,31 +80,124 @@ def test_image_pinned_not_latest():
 
 
 # --------------------------------------------------------------------------- #
-# Traefik-only HTTP ingress — no host port (FR-1 / integration-boundaries §1).
+# Cross-guest Traefik ingress — VLAN20_Port on the real path, edge/labels gated
+# behind the default-off mock (post svc-06-cross-guest-ingress conversion;
+# ADR-0018 clarifies integration-boundaries §1). SUPERSEDES the pre-conversion
+# "no host port at all + unconditional edge" invariant, reconciled against the
+# already-green tests/installer/test_svc06_cross_guest.py.
 # --------------------------------------------------------------------------- #
 def test_http_ingress_via_traefik_labels_no_host_port():
+    """Post-conversion (svc-06-cross-guest-ingress, ADR-0018) ZITADEL ingress.
+
+    ZITADEL's Traefik registration (traefik.enable=true + the Host router rule)
+    still lives in the role text — it now sits in the MOCK-EDGE
+    ``zitadel_traefik_labels`` set_fact — so the text asserts are kept.
+
+    The zitadel docker-compose-app service's ``ports``/``networks``/``labels``
+    and the stack ``dca_networks`` are now PATH-SELECTED Jinja CONDITIONAL
+    expressions keyed on ``zitadel_mock_edge_network``:
+      * REAL path (default-off mock): publish the VLAN20_Port bound to ZITADEL's
+        OWN VLAN-20 IP (``zitadel_bind_ip:zitadel_http_port`` — the ADR-0018
+        private-VLAN-bound-port exception, NEVER 0.0.0.0/LAN, consumed only by
+        Traefik), NO ``edge`` network, NO Docker labels (the file-provider route
+        supersedes them cross-guest).
+      * MOCK-EDGE path: ``ports: []``, attach to the local ``edge`` net + emit
+        the Traefik labels (co-located-dev discovery only).
+    Traefik stays the sole LAN-facing ingress (integration-boundaries §1 as
+    clarified by ADR-0018); the published port is VLAN-20-internal plumbing, NOT
+    a second ingress. Mirrors tests/installer/test_svc06_cross_guest.py.
+    """
     text = _TASKS.read_text(encoding="utf-8")
-    assert "traefik.enable=true" in text, "ZITADEL must register with Traefik via Docker labels (FR-1)"
+    # Traefik registration still present in the role text (now in the mock-edge
+    # zitadel_traefik_labels set_fact, but still text-present).
+    assert "traefik.enable=true" in text, "ZITADEL must register with Traefik via Docker labels (mock-edge path; FR-1/ADR-0018)"
     assert "traefik.http.routers.zitadel.rule=host(" in text.lower() or "routers.{{ zitadel_traefik_router }}.rule=host(" in text.lower(), (
-        "ZITADEL must declare a Traefik Host router rule"
+        "ZITADEL must declare a Traefik Host router rule (mock-edge labels; ADR-0018)"
     )
-    # The ZITADEL service dict must NOT publish an HTTP host port — Traefik is the
-    # only ingress path. (A `ports:` on the zitadel service would be the violation.)
+    # The zitadel docker-compose-app service's ingress wiring is now path-selected
+    # Jinja conditionals keyed on zitadel_mock_edge_network.
     tasks = _load_tasks(_TASKS)
     for t in tasks:
         if "ansible.builtin.include_role" in t:
             spec = t["ansible.builtin.include_role"]
             if isinstance(spec, dict) and spec.get("name") == "docker-compose-app":
-                services = t.get("vars", {}).get("dca_services", [])
+                tvars = t.get("vars", {})
+                services = tvars.get("dca_services", [])
                 for svc in services:
                     if isinstance(svc, dict) and svc.get("name") == "zitadel":
-                        assert "ports" not in svc, (
-                            "the ZITADEL compose service must NOT publish a host port — HTTP ingress is via "
-                            "Traefik labels only (integration-boundaries §1, FR-1)"
+                        # --- ports: VLAN20_Port on real, [] on mock, never 0.0.0.0 ---
+                        ports_expr = svc.get("ports")
+                        assert isinstance(ports_expr, str) and "{{" in ports_expr, (
+                            "the ZITADEL compose `ports` must now be a path-selected Jinja "
+                            f"conditional expression (ADR-0018); got {ports_expr!r}"
                         )
-                        nets = str(svc.get("networks", []))
-                        assert ("edge" in nets or "zitadel_traefik_network" in nets), (
-                            "ZITADEL must attach the edge network (literal or via zitadel_traefik_network)"
+                        ports_c = ports_expr.replace(" ", "")
+                        assert "zitadel_mock_edge_network" in ports_c, (
+                            "`ports` must be keyed on zitadel_mock_edge_network (ADR-0018 path select)"
+                        )
+                        assert "zitadel_bind_ip" in ports_c and "zitadel_http_port" in ports_c, (
+                            "the REAL-path port mapping must bind the guest's OWN VLAN-20 IP "
+                            "(zitadel_bind_ip) + zitadel_http_port — the ADR-0018 VLAN20_Port, "
+                            "consumed only by Traefik"
+                        )
+                        assert "0.0.0.0" not in ports_c, (
+                            "the ZITADEL VLAN20_Port must NEVER bind 0.0.0.0/LAN — it is bound to "
+                            "ZITADEL's own VLAN-20 IP, the ADR-0018 private-VLAN-bound-port exception, "
+                            "NOT a LAN host port (integration-boundaries §1 as clarified by ADR-0018)"
+                        )
+                        assert "[]" in ports_c and "else" in ports_c, (
+                            "`ports` must carry BOTH branches — [] on the mock-edge path and the "
+                            "IP:port mapping on the real path (ADR-0018)"
+                        )
+                        # --- networks: edge on mock, [] on real ---
+                        nets_expr = svc.get("networks")
+                        assert isinstance(nets_expr, str) and "{{" in nets_expr, (
+                            "the ZITADEL compose `networks` must now be a path-selected Jinja "
+                            f"conditional (edge gated behind the mock, ADR-0018); got {nets_expr!r}"
+                        )
+                        nets_c = nets_expr.replace(" ", "")
+                        assert "zitadel_mock_edge_network" in nets_c, (
+                            "`networks` must be keyed on zitadel_mock_edge_network"
+                        )
+                        assert "zitadel_traefik_network" in nets_c, (
+                            "`networks` must reference zitadel_traefik_network (the `edge` net) on the MOCK branch"
+                        )
+                        assert "[]" in nets_c, (
+                            "`networks` must resolve to [] on the REAL path — ZITADEL no longer attaches "
+                            "edge unconditionally; edge is gated behind the default-off mock (ADR-0018)"
+                        )
+                        # --- dca_networks: external edge on mock, [] on real ---
+                        dca_nets_expr = tvars.get("dca_networks")
+                        assert isinstance(dca_nets_expr, str) and "{{" in dca_nets_expr, (
+                            "the stack `dca_networks` must now be a path-selected Jinja conditional "
+                            f"(ADR-0018); got {dca_nets_expr!r}"
+                        )
+                        dca_c = dca_nets_expr.replace(" ", "")
+                        assert "zitadel_mock_edge_network" in dca_c, (
+                            "`dca_networks` must be keyed on zitadel_mock_edge_network"
+                        )
+                        assert "zitadel_traefik_network" in dca_c, (
+                            "`dca_networks` must declare the external `edge` dependency on the MOCK branch"
+                        )
+                        assert "[]" in dca_c, (
+                            "`dca_networks` must resolve to [] on the REAL path (no external edge dependency)"
+                        )
+                        # --- labels: mock-only set, [] on real ---
+                        labels_expr = svc.get("labels")
+                        assert isinstance(labels_expr, str) and "{{" in labels_expr, (
+                            "the ZITADEL compose `labels` must now be a path-selected Jinja conditional "
+                            f"(Traefik labels gated behind the mock, ADR-0018); got {labels_expr!r}"
+                        )
+                        labels_c = labels_expr.replace(" ", "")
+                        assert "zitadel_mock_edge_network" in labels_c, (
+                            "`labels` must be keyed on zitadel_mock_edge_network"
+                        )
+                        assert "zitadel_traefik_labels" in labels_c, (
+                            "`labels` must reference the mock-only zitadel_traefik_labels set on the MOCK branch"
+                        )
+                        assert "[]" in labels_c, (
+                            "`labels` must resolve to [] on the REAL path — Traefik on another guest cannot "
+                            "read Docker labels; the file-provider route supersedes them (ADR-0018)"
                         )
 
 
@@ -197,8 +299,31 @@ def test_external_endpoint_and_tls_settings_present():
 
 def test_metrics_enabled():
     text = _TASKS.read_text(encoding="utf-8")
-    assert "ZITADEL_METRICS_ENABLED" in text, "ZITADEL must expose Prometheus metrics (§13)"
-    assert _defaults().get("zitadel_metrics_enabled") is True, "zitadel_metrics_enabled must default true (§13)"
+    # ZITADEL v4.18.0 has TWO metrics blocks; the NEW
+    # Instrumentation.Metric.Exporter.Type (env
+    # ZITADEL_INSTRUMENTATION_METRIC_EXPORTER_TYPE) takes precedence and defaults
+    # to `none`, so it is the key that actually enables /debug/metrics — the
+    # deprecated Metrics.Type (env ZITADEL_METRICS_TYPE) on its own 404'd. See
+    # .kiro/specs/fix-obs-ac3-targets-up/ (Defect 3). The invalid
+    # Metrics.Enabled boolean must not be set.
+    assert "ZITADEL_INSTRUMENTATION_METRIC_EXPORTER_TYPE" in text, (
+        "ZITADEL v4.18.0 must expose Prometheus metrics via the NEW "
+        "Instrumentation.Metric.Exporter.Type key (§13); live-confirmed the one "
+        "that flips /debug/metrics to 200"
+    )
+    # The deprecated key is kept ALSO (harmless; documents intent).
+    assert "ZITADEL_METRICS_TYPE" in text, (
+        "the deprecated Metrics.Type (ZITADEL_METRICS_TYPE) is expected to remain "
+        "set alongside the instrumentation key (harmless; documents intent)"
+    )
+    assert "ZITADEL_METRICS_ENABLED" not in text, (
+        "ZITADEL v4 has no Metrics.Enabled key; ZITADEL_METRICS_ENABLED must not be set (left /debug/metrics 404)"
+    )
+    assert _defaults().get("zitadel_metrics_exporter_type") == "prometheus", (
+        "zitadel_metrics_exporter_type must default to 'prometheus' (ZITADEL "
+        "v4.18.0 Instrumentation.Metric.Exporter.Type — the key that serves "
+        "/debug/metrics for Prometheus to scrape, §13)"
+    )
 
 
 # --------------------------------------------------------------------------- #

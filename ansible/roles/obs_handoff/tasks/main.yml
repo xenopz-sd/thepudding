@@ -1,0 +1,101 @@
+---
+# tasks/main.yml — obs_handoff (SVC-17/18 installer — Phase 4: Handoff)
+#
+# Phase 4 = health sanity + Developer B completion handoff. Invoked from the thin
+# orchestrator play as `import_role: obs_handoff` inside the Phase-4
+# block/rescue. Clone of svc09_handoff adapted for the THREE observability guests
+# (Prometheus + Alertmanager, Grafana, Loki) and the four built-service scrape
+# targets.
+#
+# The health gate runs as the CHILD configurator play svc-17-18-health.yml
+# (hosts: obs_guests, NATIVELY on the three guests), invoked here with
+# `ansible-playbook -i {{ obs_generated_inventory }} svc-17-18-health.yml`
+# (integration-boundaries.md §4). The health knobs are THIS role's defaults,
+# bridged across the child-process boundary via -e (the child play does not load
+# this role's defaults). The completion banner has no guest dependency and runs
+# on the orchestrator (secrets referenced BY NAME only — never shown).
+
+- name: "Handoff | Run the three-guest health gate as a child configurator play (svc-17-18-health.yml)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ obs_generated_inventory }}"
+      - ansible/playbooks/svc-17-18-health.yml
+      - -e
+      - "obs_prometheus_container_name={{ obs_prometheus_container_name }}"
+      - -e
+      - "obs_alertmanager_container_name={{ obs_alertmanager_container_name }}"
+      - -e
+      - "obs_grafana_container_name={{ obs_grafana_container_name }}"
+      - -e
+      - "obs_loki_container_name={{ obs_loki_container_name }}"
+      - -e
+      - "obs_prometheus_port={{ obs_prometheus_port }}"
+      - -e
+      - "obs_alertmanager_port={{ obs_alertmanager_port }}"
+      - -e
+      - "obs_loki_port={{ obs_loki_port }}"
+      - -e
+      - "obs_grafana_port={{ obs_grafana_port }}"
+      - -e
+      - "obs_tls_skip_verify={{ obs_tls_skip_verify }}"
+      - -e
+      - "obs_health_retries={{ obs_health_retries }}"
+      - -e
+      - "obs_health_delay={{ obs_health_delay }}"
+      - -e
+      - "obs_scrape_services={{ obs_scrape_services | to_json }}"
+  args:
+    chdir: "{{ obs_repo_root }}"
+  register: obs_health_run
+  changed_when: false
+
+# --- Completion summary banner ----------------------------------------------
+- name: "Handoff | Resolve the absolute Cluster_Env_File path"
+  ansible.builtin.set_fact:
+    obs_cluster_env_abspath: >-
+      {{ (obs_repo_root ~ '/' ~ cluster_env_file) | ansible.builtin.realpath }}
+
+# Precompute banner fields so the debug lines stay within the 120-char limit.
+# The scrape-target up-count comes from the child health play's stdout (it prints
+# the asserted up==1 target set); the banner reports the configured built-service
+# set so the operator sees WHICH targets were gated without parsing child output.
+- name: "Handoff | Compose banner fields (domain, Grafana URL, scrape-target set)"
+  ansible.builtin.set_fact:
+    obs_banner_domain: >-
+      {{ observability_platform_domain | default(platform_domain)
+         | default('platform.example.test') }}
+    obs_banner_scrape_count: "{{ obs_scrape_services | length }}"
+    obs_banner_scrape_list: "{{ obs_scrape_services | join(', ') }}"
+    obs_banner_tls: >-
+      {{ 'self-signed MOCK cert (obs_tls_self_signed=true)'
+         if (obs_tls_self_signed | default(false) | bool)
+         else 'real resolver (SVC-08/EJBCA or Let''s Encrypt)' }}
+  changed_when: false
+
+- name: "Handoff | Print the Developer B completion summary banner"
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Service SVC-17/18 (Observability Stack) Deployed Successfully!"
+      - "============================================================"
+      - "Service:            SVC-17/18 (Prometheus + Alertmanager, Grafana, Loki)"
+      - "Status:             healthy"
+      - "Prometheus:         http://10.0.20.18:{{ obs_prometheus_port }} (VLAN-20, internal)"
+      - "Alertmanager:       http://10.0.20.18:{{ obs_alertmanager_port }} (VLAN-20, internal)"
+      - "Grafana:            http://10.0.20.19:{{ obs_grafana_port }} (VLAN-20, internal)"
+      - "Loki:               http://10.0.20.20:{{ obs_loki_port }} (VLAN-20, internal)"
+      - "Grafana (public):   https://grafana.{{ obs_banner_domain }} (via Traefik)"
+      - "TLS:                {{ obs_banner_tls }}"
+      - "Scrape targets up:  {{ obs_banner_scrape_count }} built services ({{ obs_banner_scrape_list }})"
+      - "Secrets:            Break_Glass_Admin password + Grafana OIDC client secret in OpenBao"
+      - "                    (secret/observability/grafana-admin + /grafana-oidc, by name only — never shown)"
+      - "Config:             {{ obs_cluster_env_abspath }}"
+      - ""
+      - "Next Steps for Project Developers:"
+      - "  A new scrape target is a GENERATED target file, never a prometheus.yml edit:"
+      - "  add a row to observability_builtin_scrape_targets (the built-service table)"
+      - "  and re-run the installer — Prometheus file_sd picks it up on the next refresh."
+      - "  Log shipping is automatic: Promtail runs fleet-wide and pushes to Loki."
+      - "============================================================"

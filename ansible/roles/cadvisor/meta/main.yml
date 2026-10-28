@@ -1,0 +1,34 @@
+---
+# meta/main.yml — cadvisor (SVC-17, every Docker host)
+galaxy_info:
+  role_name: cadvisor
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Deploys Google cAdvisor (SVC-17) on every Docker Compose host so the
+    observability_stack can scrape per-container metrics on :8080 (FR-3).
+    Deployed as a Docker Compose stack via docker-compose-app. Read-mounts
+    /var/lib/docker:ro and /sys/fs/cgroup:ro (documented unavoidable exception,
+    requirements §12) plus the host /:ro and /var/run:ro the upstream image
+    documents. Image pinned; internal only (no Traefik, scraped on VLAN 20, port
+    bound to the guest's own VLAN IP).
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - observability
+    - prometheus
+    - cadvisor
+    - containers
+    - svc17
+
+# No cross-role dependencies. The Compose stack is templated via the existing
+# docker-compose-app role, invoked by this role via include_role, not as a hard
+# meta dependency here — mirrors promtail_agent / traefik_install.
+dependencies: []

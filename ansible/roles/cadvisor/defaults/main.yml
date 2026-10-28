@@ -1,0 +1,67 @@
+---
+# defaults/main.yml — cadvisor (SVC-17, every Docker host)
+#
+# Deploys Google cAdvisor on EVERY Docker Compose host so the observability_stack
+# can scrape per-container metrics (CPU, memory, network, filesystem per
+# container) on port 8080 (FR-3). Deployed as a Docker Compose stack via the
+# generic docker-compose-app role (consumed UNMODIFIED).
+#
+# cAdvisor requires READ access to the host's container runtime state. Per
+# requirements §12 this is a documented, UNAVOIDABLE exception: it read-mounts
+# /var/lib/docker:ro and /sys/fs/cgroup:ro (plus the host /:ro and /var/run:ro
+# that the upstream image documents) to observe every container. The mounts are
+# read-only — cAdvisor never writes host state.
+#
+# Internal only: cAdvisor is scraped on VLAN 20, never fronted by Traefik. The
+# :8080 port is published to the guest's OWN VLAN IP only (never 0.0.0.0), the
+# documented docker-compose-app private-VLAN-bound-port exception — the same
+# pattern the SVC-01 postgres_exporter and node_exporter use.
+#
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements.md FR-3, design §3.3).
+# Mirrors the promtail_agent / observability_stack var contract and the
+# docker-compose-app hand-off (dca_app_name / dca_services / dca_volumes /
+# dca_networks / dca_env).
+
+# --- Image pin (tech.md: never track `latest`) -----------------------------
+# The maintained cAdvisor image. Pinned deliberately; a bump is a conscious
+# follow-up flagged in the PR.
+cadvisor_image: "gcr.io/cadvisor/cadvisor:v0.52.1"
+
+# --- Compose stack identity (consumed by docker-compose-app) ----------------
+cadvisor_stack_name: "cadvisor"
+cadvisor_container_name: "{{ cadvisor_stack_name }}-cadvisor-1"
+
+# --- Internal (VLAN-20) scrape port -----------------------------------------
+# cAdvisor's /metrics endpoint. Internal only (no Traefik); published to the
+# guest's own VLAN IP so the observability_stack scrapes it per Docker host.
+cadvisor_port: 8080
+
+# The guest's VLAN-20 IP the :8080 port is bound to (private VLAN-bound port,
+# NEVER 0.0.0.0). Defaults to the inventory ansible_host (the generated inventory
+# sets it to the guest's computed VLAN IP); overridable per host.
+cadvisor_bind_ip: "{{ ansible_host | default('127.0.0.1') }}"
+
+# --- Host read-only mounts (documented unavoidable exception, §12) ----------
+# cAdvisor needs read access to the host container runtime + cgroup state to
+# report per-container metrics. All mounts are READ-ONLY. /var/lib/docker:ro and
+# /sys/fs/cgroup:ro are the two called out in requirements §12; the host /:ro and
+# /var/run:ro are the additional read-only mounts the upstream cAdvisor image
+# documents for faithful per-container discovery.
+cadvisor_host_mounts:
+  - "/:/rootfs:ro"
+  - "/var/run:/var/run:ro"
+  - "/sys:/sys:ro"
+  - "/var/lib/docker/:/var/lib/docker:ro"
+  - "/sys/fs/cgroup:/sys/fs/cgroup:ro"
+  - "/dev/disk/:/dev/disk:ro"
+
+# cAdvisor collector flags. Disable the heavy per-process + referenced-memory
+# collectors that are unnecessary for fleet container health and expensive at
+# homelab scale; keep the default cgroup/container collectors.
+cadvisor_command_flags:
+  - "--docker_only=true"
+  - "--housekeeping_interval=15s"
+  - "--disable_metrics=percpu,referenced_memory,sched,process"
+
+# --- Reconciliation behaviour (passed through to docker-compose-app) --------
+cadvisor_state: "present"

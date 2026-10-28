@@ -1,0 +1,360 @@
+---
+# svc-17-18-health.yml — SVC-17/18 installer Phase-4 health gate (CHILD play)
+#
+# The child play the obs_handoff role invokes via
+# `ansible-playbook -i {{ obs_generated_inventory }} svc-17-18-health.yml`
+# (integration-boundaries.md §4). Runs `hosts: obs_guests` NATIVELY on the three
+# observability LXC guests — no delegate_to. The generated inventory's three
+# entries each carry `ansible_host: 10.0.20.18|19|20` / `ansible_user: root` over
+# SSH and a `service_role` of prometheus / grafana / loki, so every guest runs
+# only the stage(s) for the component it hosts (resolved from `group_names` /
+# `service_role`).
+#
+# Mirrors the SVC-07/09 two-stage recreate-robust shape, generalised to three
+# guests:
+#   Stage 1 — `docker inspect <container>`: wait for the component's stack
+#             container(s) to EXIST and be RUNNING (State.Running true). A
+#             crash-loop shows up here as never-running; a mid-recreate rc!=0 /
+#             "No such container" is a RETRY, not a failure.
+#   Stage 2 — reach the component's health endpoint on the guest's OWN loopback
+#             over plain http (the stack publishes the port on the guest):
+#               prometheus   -> GET :9090/-/healthy        (200)
+#               alertmanager -> GET :9093/-/healthy        (200, same guest)
+#               loki         -> GET :3100/ready            (200)
+#               grafana      -> GET :3000/api/health       (200)
+#             Grafana's PUBLIC route is Traefik-only (integration-boundaries §1),
+#             but the guest-local /api/health is plain http, so NO CA trust is
+#             assumed here (works under the self-signed TLS mock). The HTTPS
+#             Traefik route is validated end-to-end by the live acceptance (AC-5).
+#   Stage 3 — AC-3 scrape assert (Prometheus guest ONLY): query the local
+#             Prometheus /api/v1/targets and assert up==1 for each built-service
+#             (`service` label in obs_scrape_services) that is present as an
+#             active target. A service not yet scraped yields no target — the gate
+#             asserts only what is PRESENT (degrade, not fail; design §3.4), but
+#             fails if any present built-service target is up==0.
+#
+# Each `until` gate is EMPTY-SAFE: a length>0 + first-character guard is
+# evaluated BEFORE any from_json, short-circuited left-to-right, so a transient
+# absent-container / empty output is a falsy RETRY, never a parse throw and never
+# a false-healthy. All loops tolerate any rc/status (failed_when:false); the
+# explicit asserts after each loop produce accurate diagnostics on timeout.
+#
+# Knob vars (obs_*_container_name, obs_*_port, obs_tls_skip_verify,
+# obs_health_retries, obs_health_delay, obs_scrape_services) come from
+# obs_handoff/defaults and are passed via -e; referenced by name here, never
+# redefined.
+- name: SVC-17/18 observability health gate
+  hosts: obs_guests
+  gather_facts: false
+  any_errors_fatal: true
+
+  vars:
+    # The component this guest hosts, resolved from the generated inventory's
+    # service_role group (prometheus / grafana / loki). Each guest sits in
+    # exactly one of the three groups; group_names carries it.
+    obs_role: >-
+      {{ (group_names | intersect(['prometheus', 'grafana', 'loki']) | first)
+         | default('') }}
+
+  tasks:
+    # ---------------------------------------------------------------------
+    # Stage 1 — the component's stack container(s) exist and are RUNNING.
+    # Parse plain `docker inspect` JSON (array) rather than a Go-template
+    # format (which the command module would re-evaluate as Jinja). Empty-safe:
+    # length>0 + first-char '[' guard BEFORE from_json. One task per component,
+    # each gated on this guest's resolved role.
+    # ---------------------------------------------------------------------
+    - name: "Health | Stage 1 — wait for the Prometheus container to exist and be running"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ obs_prometheus_container_name }}"
+      register: obs_prometheus_container
+      failed_when: false
+      changed_when: false
+      when: obs_role == 'prometheus'
+      until: >-
+        (obs_prometheus_container.rc | default(1)) == 0
+        and (obs_prometheus_container.stdout | default('') | trim | length > 0)
+        and ((obs_prometheus_container.stdout | trim)[0] == '[')
+        and ((obs_prometheus_container.stdout | from_json)[0].State.Running | default(false) | bool)
+      retries: "{{ obs_health_retries | default(30) | int }}"
+      delay: "{{ obs_health_delay | default(5) | int }}"
+
+    - name: "Health | Stage 1 — wait for the Alertmanager container to exist and be running"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ obs_alertmanager_container_name }}"
+      register: obs_alertmanager_container
+      failed_when: false
+      changed_when: false
+      when: obs_role == 'prometheus'
+      until: >-
+        (obs_alertmanager_container.rc | default(1)) == 0
+        and (obs_alertmanager_container.stdout | default('') | trim | length > 0)
+        and ((obs_alertmanager_container.stdout | trim)[0] == '[')
+        and ((obs_alertmanager_container.stdout | from_json)[0].State.Running | default(false) | bool)
+      retries: "{{ obs_health_retries | default(30) | int }}"
+      delay: "{{ obs_health_delay | default(5) | int }}"
+
+    - name: "Health | Stage 1 — wait for the Grafana container to exist and be running"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ obs_grafana_container_name }}"
+      register: obs_grafana_container
+      failed_when: false
+      changed_when: false
+      when: obs_role == 'grafana'
+      until: >-
+        (obs_grafana_container.rc | default(1)) == 0
+        and (obs_grafana_container.stdout | default('') | trim | length > 0)
+        and ((obs_grafana_container.stdout | trim)[0] == '[')
+        and ((obs_grafana_container.stdout | from_json)[0].State.Running | default(false) | bool)
+      retries: "{{ obs_health_retries | default(30) | int }}"
+      delay: "{{ obs_health_delay | default(5) | int }}"
+
+    - name: "Health | Stage 1 — wait for the Loki container to exist and be running"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ obs_loki_container_name }}"
+      register: obs_loki_container
+      failed_when: false
+      changed_when: false
+      when: obs_role == 'loki'
+      until: >-
+        (obs_loki_container.rc | default(1)) == 0
+        and (obs_loki_container.stdout | default('') | trim | length > 0)
+        and ((obs_loki_container.stdout | trim)[0] == '[')
+        and ((obs_loki_container.stdout | from_json)[0].State.Running | default(false) | bool)
+      retries: "{{ obs_health_retries | default(30) | int }}"
+      delay: "{{ obs_health_delay | default(5) | int }}"
+
+    # Assert Stage 1 per component FIRST so a stuck-mid-recreate container is
+    # distinct from a running-but-not-answering endpoint.
+    - name: "Health | Assert Stage 1 — Prometheus + Alertmanager containers became running"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (obs_prometheus_container.rc | default(1)) == 0
+            and (obs_prometheus_container.stdout | default('') | trim | length > 0)
+            and ((obs_prometheus_container.stdout | trim)[0] == '[')
+            and ((obs_prometheus_container.stdout | from_json)[0].State.Running | default(false) | bool)
+          - >-
+            (obs_alertmanager_container.rc | default(1)) == 0
+            and (obs_alertmanager_container.stdout | default('') | trim | length > 0)
+            and ((obs_alertmanager_container.stdout | trim)[0] == '[')
+            and ((obs_alertmanager_container.stdout | from_json)[0].State.Running | default(false) | bool)
+        fail_msg: >-
+          The Prometheus and/or Alertmanager container
+          ({{ obs_prometheus_container_name }} / {{ obs_alertmanager_container_name }})
+          never became running within
+          {{ (obs_health_retries | default(30) | int) * (obs_health_delay | default(5) | int) }} seconds
+          on the guest. A crash-loop here usually means a bad prometheus.yml /
+          alertmanager.yml. Inspect `docker logs` on the Prometheus guest.
+        success_msg: "Prometheus + Alertmanager containers are running (Stage 1 gate passed)."
+      when: obs_role == 'prometheus'
+
+    - name: "Health | Assert Stage 1 — the Grafana container became running"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (obs_grafana_container.rc | default(1)) == 0
+            and (obs_grafana_container.stdout | default('') | trim | length > 0)
+            and ((obs_grafana_container.stdout | trim)[0] == '[')
+            and ((obs_grafana_container.stdout | from_json)[0].State.Running | default(false) | bool)
+        fail_msg: >-
+          The Grafana container ({{ obs_grafana_container_name }}) never became
+          running within
+          {{ (obs_health_retries | default(30) | int) * (obs_health_delay | default(5) | int) }} seconds
+          on the guest. Inspect `docker logs {{ obs_grafana_container_name }}`.
+        success_msg: "Grafana container is running (Stage 1 gate passed)."
+      when: obs_role == 'grafana'
+
+    - name: "Health | Assert Stage 1 — the Loki container became running"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (obs_loki_container.rc | default(1)) == 0
+            and (obs_loki_container.stdout | default('') | trim | length > 0)
+            and ((obs_loki_container.stdout | trim)[0] == '[')
+            and ((obs_loki_container.stdout | from_json)[0].State.Running | default(false) | bool)
+        fail_msg: >-
+          The Loki container ({{ obs_loki_container_name }}) never became running
+          within
+          {{ (obs_health_retries | default(30) | int) * (obs_health_delay | default(5) | int) }} seconds
+          on the guest. Inspect `docker logs {{ obs_loki_container_name }}`.
+        success_msg: "Loki container is running (Stage 1 gate passed)."
+      when: obs_role == 'loki'
+
+    # ---------------------------------------------------------------------
+    # Stage 2 — reach the component's health endpoint on the guest loopback.
+    # Plain http on the guest (no CA trust needed); validate_certs:false is a
+    # belt-and-braces no-op for http but keeps the gate honest if a port ever
+    # moves to https under the mock. A connection failure is a RETRY.
+    # ---------------------------------------------------------------------
+    - name: "Health | Stage 2 — poll Prometheus /-/healthy on the guest"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ obs_prometheus_port }}/-/healthy"
+        method: GET
+        follow_redirects: none
+        validate_certs: "{{ not (obs_tls_skip_verify | default(true) | bool) }}"
+        status_code: [200]
+      register: obs_prometheus_health
+      failed_when: false
+      changed_when: false
+      when: obs_role == 'prometheus'
+      until: "(obs_prometheus_health.status | default(0)) == 200"
+      retries: "{{ obs_health_retries | default(30) | int }}"
+      delay: "{{ obs_health_delay | default(5) | int }}"
+
+    - name: "Health | Stage 2 — poll Alertmanager /-/healthy on the guest"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ obs_alertmanager_port }}/-/healthy"
+        method: GET
+        follow_redirects: none
+        validate_certs: "{{ not (obs_tls_skip_verify | default(true) | bool) }}"
+        status_code: [200]
+      register: obs_alertmanager_health
+      failed_when: false
+      changed_when: false
+      when: obs_role == 'prometheus'
+      until: "(obs_alertmanager_health.status | default(0)) == 200"
+      retries: "{{ obs_health_retries | default(30) | int }}"
+      delay: "{{ obs_health_delay | default(5) | int }}"
+
+    - name: "Health | Stage 2 — poll Grafana /api/health on the guest"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ obs_grafana_port }}/api/health"
+        method: GET
+        follow_redirects: none
+        validate_certs: "{{ not (obs_tls_skip_verify | default(true) | bool) }}"
+        status_code: [200]
+      register: obs_grafana_health
+      failed_when: false
+      changed_when: false
+      when: obs_role == 'grafana'
+      until: "(obs_grafana_health.status | default(0)) == 200"
+      retries: "{{ obs_health_retries | default(30) | int }}"
+      delay: "{{ obs_health_delay | default(5) | int }}"
+
+    - name: "Health | Stage 2 — poll Loki /ready on the guest"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ obs_loki_port }}/ready"
+        method: GET
+        follow_redirects: none
+        validate_certs: "{{ not (obs_tls_skip_verify | default(true) | bool) }}"
+        status_code: [200]
+      register: obs_loki_health
+      failed_when: false
+      changed_when: false
+      when: obs_role == 'loki'
+      until: "(obs_loki_health.status | default(0)) == 200"
+      retries: "{{ obs_health_retries | default(30) | int }}"
+      delay: "{{ obs_health_delay | default(5) | int }}"
+
+    - name: "Health | Assert Stage 2 — Prometheus + Alertmanager answer /-/healthy"
+      ansible.builtin.assert:
+        that:
+          - "(obs_prometheus_health.status | default(0)) == 200"
+          - "(obs_alertmanager_health.status | default(0)) == 200"
+        fail_msg: >-
+          Prometheus (:{{ obs_prometheus_port }}/-/healthy) and/or Alertmanager
+          (:{{ obs_alertmanager_port }}/-/healthy) did not answer 200 within
+          {{ (obs_health_retries | default(30) | int) * (obs_health_delay | default(5) | int) }} seconds.
+          The container(s) are running (Stage 1 passed) but the endpoint is not
+          ready — check `docker logs` on the Prometheus guest.
+        success_msg: "Prometheus + Alertmanager serve /-/healthy (Stage 2 gate passed)."
+      when: obs_role == 'prometheus'
+
+    - name: "Health | Assert Stage 2 — Grafana answers /api/health"
+      ansible.builtin.assert:
+        that:
+          - "(obs_grafana_health.status | default(0)) == 200"
+        fail_msg: >-
+          Grafana (:{{ obs_grafana_port }}/api/health) did not answer 200 within
+          {{ (obs_health_retries | default(30) | int) * (obs_health_delay | default(5) | int) }} seconds.
+          The container is running (Stage 1 passed) but the app is not ready —
+          check `docker logs {{ obs_grafana_container_name }}`.
+        success_msg: "Grafana serves /api/health (Stage 2 gate passed)."
+      when: obs_role == 'grafana'
+
+    - name: "Health | Assert Stage 2 — Loki answers /ready"
+      ansible.builtin.assert:
+        that:
+          - "(obs_loki_health.status | default(0)) == 200"
+        fail_msg: >-
+          Loki (:{{ obs_loki_port }}/ready) did not answer 200 within
+          {{ (obs_health_retries | default(30) | int) * (obs_health_delay | default(5) | int) }} seconds.
+          The container is running (Stage 1 passed) but the app is not ready —
+          check `docker logs {{ obs_loki_container_name }}`.
+        success_msg: "Loki serves /ready (Stage 2 gate passed)."
+      when: obs_role == 'loki'
+
+    # ---------------------------------------------------------------------
+    # Stage 3 — AC-3 scrape assert, Prometheus guest ONLY. Query the local
+    # /api/v1/targets, build the up-by-service map from the active targets, and
+    # assert up==1 for every built-service (obs_scrape_services) that is PRESENT
+    # as an active target. A service not yet scraped yields no target — asserted
+    # only on what is present (degrade, not fail; design §3.4) — but any present
+    # built-service target reporting up==0 FAILS the gate. Empty-safe JSON guard
+    # as above.
+    # ---------------------------------------------------------------------
+    - name: "Health | Stage 3 — query Prometheus /api/v1/targets (AC-3)"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ obs_prometheus_port }}/api/v1/targets?state=active"
+        method: GET
+        follow_redirects: none
+        validate_certs: "{{ not (obs_tls_skip_verify | default(true) | bool) }}"
+        return_content: true
+        status_code: [200]
+      register: obs_targets
+      failed_when: false
+      changed_when: false
+      when: obs_role == 'prometheus'
+      until: >-
+        (obs_targets.status | default(0)) == 200
+        and ((obs_targets.json | default({})).get('status', '') == 'success')
+      retries: "{{ obs_health_retries | default(30) | int }}"
+      delay: "{{ obs_health_delay | default(5) | int }}"
+
+    # Build { "<service label>": "<up value>" } from the active target list.
+    # Each active target carries labels.service (our FR-11 target label) and a
+    # health of "up"/"down". A built service present in the set MUST be "up".
+    - name: "Health | Stage 3 — map active scrape targets by service label"
+      ansible.builtin.set_fact:
+        obs_present_services: >-
+          {{ (obs_targets.json.data.activeTargets | default([]))
+             | map(attribute='labels.service') | select('defined') | list }}
+        obs_down_built_services: >-
+          {{ (obs_targets.json.data.activeTargets | default([]))
+             | selectattr('labels.service', 'defined')
+             | selectattr('labels.service', 'in', obs_scrape_services)
+             | selectattr('health', 'ne', 'up')
+             | map(attribute='labels.service') | list }}
+      when: obs_role == 'prometheus'
+      changed_when: false
+
+    - name: "Health | Assert Stage 3 — every present built-service scrape target reports up==1 (AC-3)"
+      ansible.builtin.assert:
+        that:
+          - "(obs_targets.status | default(0)) == 200"
+          - "(obs_down_built_services | default(['unknown']) | length) == 0"
+        fail_msg: >-
+          One or more PRESENT built-service scrape targets are not up==1 on the
+          Prometheus guest: {{ obs_down_built_services | default([]) | join(', ') }}.
+          The V1 built-service set is {{ obs_scrape_services | join(', ') }} (a
+          service not yet scraped yields no target and is NOT asserted — degrade,
+          not fail; design §3.4). Inspect the Prometheus Targets page / the
+          generated target files and the target's own metrics endpoint.
+        success_msg: >-
+          Built-service scrape targets present report up==1 (AC-3 gate passed):
+          {{ (obs_present_services | default([]) | intersect(obs_scrape_services))
+             | join(', ') | default('none present yet', true) }}.
+      when: obs_role == 'prometheus'

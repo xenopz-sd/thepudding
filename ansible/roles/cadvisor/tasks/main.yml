@@ -1,0 +1,84 @@
+---
+# tasks/main.yml — cadvisor (SVC-17, every Docker host)
+#
+# Deploys cAdvisor on every Docker host so the observability_stack can scrape
+# per-container metrics on :8080 (FR-3). Deployed as a Docker Compose stack via
+# the generic docker-compose-app role.
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements.md FR-3, design §3.3).
+#
+# Order (mirrors promtail_agent / traefik_install):
+#   1. Idempotency version-check guard (skip bringing the stack up on an
+#      already-pinned running container -> changed=0 on a converged host).
+#   2. INFO decision-log debug (scrape endpoint + the §12 mount exception).
+#   3. Deploy the Compose stack via docker-compose-app.
+
+# --- 1. IDEMPOTENCY: version-check guard -------------------------------------
+# Detect an already-running cAdvisor container at the pinned image BEFORE
+# bringing up the stack, so a second run against an already-installed host is a
+# no-op that reports changed=0 (PF §9 idempotency rule).
+- name: "CAdvisor | Inspect any running container at the pinned image (idempotency guard)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "--format={{ '{{' }}index .Config.Image{{ '}}' }}"
+      - "{{ cadvisor_container_name }}"
+  register: cadvisor_running_image
+  failed_when: false
+  changed_when: false
+
+- name: "CAdvisor | Set fact — already at the pinned image?"
+  ansible.builtin.set_fact:
+    cadvisor_already_at_pinned_version: >-
+      {{ (cadvisor_running_image.rc | default(1)) == 0
+         and (cadvisor_running_image.stdout | default('') | trim) == cadvisor_image }}
+  changed_when: false
+
+- name: "CAdvisor | Report idempotent no-op when already at the pinned image"
+  ansible.builtin.debug:
+    msg: >-
+      cAdvisor container {{ cadvisor_container_name }} is already running at
+      {{ cadvisor_image }}; install is a no-op (changed=0).
+  when: cadvisor_already_at_pinned_version
+
+# --- 2. Log the deployment decision at INFO (composition-wiring.md) ----------
+- name: "CAdvisor | Deployment decision (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      cadvisor on {{ inventory_hostname }} -> pinned image {{ cadvisor_image }},
+      scraped at {{ cadvisor_bind_ip }}:{{ cadvisor_port }} on VLAN 20 (internal
+      only, no Traefik). Read-only host mounts (requirements §12 documented
+      unavoidable exception): /var/lib/docker:ro, /sys/fs/cgroup:ro (+ /:ro,
+      /var/run:ro).
+
+# --- 3. Deploy the Compose stack via docker-compose-app ----------------------
+# cAdvisor read-mounts the host container runtime + cgroup state (all :ro,
+# §12 documented unavoidable exception) and exposes :8080 on the guest's OWN
+# VLAN IP only (never 0.0.0.0, no Traefik labels) — the documented
+# docker-compose-app private-VLAN-bound-port exception (same pattern as the
+# SVC-01 postgres_exporter and node_exporter) — scraped per Docker host by the
+# observability_stack.
+- name: "CAdvisor | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ cadvisor_stack_name }}"
+    dca_services:
+      - name: cadvisor
+        image: "{{ cadvisor_image }}"
+        restart: "unless-stopped"
+        command: "{{ cadvisor_command_flags }}"
+        # PRIVATE VLAN-20-bound scrape port (NOT Traefik/LAN ingress). Bound to
+        # this guest's own VLAN IP only; never 0.0.0.0, never a host-wide port.
+        ports:
+          - "{{ cadvisor_bind_ip }}:{{ cadvisor_port }}:{{ cadvisor_port }}"
+        # Documented UNAVOIDABLE read-only host mounts (requirements §12):
+        # /var/lib/docker:ro + /sys/fs/cgroup:ro (+ /:ro, /var/run:ro, /dev/disk).
+        volumes: "{{ cadvisor_host_mounts }}"
+        networks: ["default"]
+    # cAdvisor neither fronts nor joins Traefik's `edge` network — it is a scrape
+    # target only. The default compose network suffices.
+    dca_networks: []
+    dca_env: {}
+    dca_state: "{{ cadvisor_state }}"
+  when: not cadvisor_already_at_pinned_version

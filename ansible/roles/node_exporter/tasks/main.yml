@@ -1,0 +1,172 @@
+---
+# tasks/main.yml — node_exporter (SVC-17, fleet-wide)
+#
+# Deploys node_exporter on EVERY host so the observability_stack can scrape host
+# metrics on :9100 (FR-2). Two modes (node_exporter_mode):
+#   * sidecar (DEFAULT) — Docker Compose sidecar via docker-compose-app, host
+#     /,/proc,/sys mounted :ro + --path.rootfs=/host.
+#   * host_unit — upstream static binary + systemd unit, for the unprivileged-LXC
+#     exception where the containerised sidecar cannot faithfully read host
+#     /proc,/sys.
+# Spec: .kiro/specs/svc-17-18-observability/ (requirements.md FR-2, design §3.3).
+#
+# Order (mirrors promtail_agent / traefik_install):
+#   1. Validate the mode + log the deployment decision at INFO.
+#   2. Idempotency version-check guard (skip when already at the pinned image /
+#      binary version -> changed=0 on a converged host).
+#   3. Mode-specific deploy (sidecar via docker-compose-app, or host_unit).
+
+# --- 1. Validate mode + INFO decision log (composition-wiring.md) ------------
+- name: "Node_exporter | Validate the deployment mode"
+  ansible.builtin.assert:
+    that:
+      - node_exporter_mode in ["sidecar", "host_unit"]
+    fail_msg: >-
+      node_exporter_mode must be 'sidecar' (default Compose sidecar) or
+      'host_unit' (unprivileged-LXC exception); got '{{ node_exporter_mode }}'.
+    quiet: true
+
+- name: "Node_exporter | Deployment decision (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      node_exporter on {{ inventory_hostname }} -> mode={{ node_exporter_mode }},
+      image/binary pinned to
+      {{ node_exporter_image if node_exporter_mode == 'sidecar'
+         else ('v' ~ node_exporter_version) }},
+      scraped at {{ node_exporter_bind_ip }}:{{ node_exporter_port }} on VLAN 20
+      (internal only, no Traefik).
+
+# --- 2. IDEMPOTENCY: version-check guard (sidecar) ---------------------------
+# Detect an already-running node_exporter container at the pinned image BEFORE
+# templating/bringing up the stack, so a second run against an already-installed
+# host is a no-op that reports changed=0 (PF §9 idempotency rule).
+- name: "Node_exporter | Inspect any running container at the pinned image (idempotency guard)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "--format={{ '{{' }}index .Config.Image{{ '}}' }}"
+      - "{{ node_exporter_container_name }}"
+  register: node_exporter_running_image
+  failed_when: false
+  changed_when: false
+  when: node_exporter_mode == "sidecar"
+
+- name: "Node_exporter | Set fact — already at the pinned image? (sidecar)"
+  ansible.builtin.set_fact:
+    node_exporter_already_at_pinned_version: >-
+      {{ (node_exporter_running_image.rc | default(1)) == 0
+         and (node_exporter_running_image.stdout | default('') | trim) == node_exporter_image }}
+  changed_when: false
+  when: node_exporter_mode == "sidecar"
+
+- name: "Node_exporter | Report idempotent no-op when already at the pinned image (sidecar)"
+  ansible.builtin.debug:
+    msg: >-
+      node_exporter container {{ node_exporter_container_name }} is already
+      running at {{ node_exporter_image }}; install is a no-op (changed=0).
+  when:
+    - node_exporter_mode == "sidecar"
+    - node_exporter_already_at_pinned_version | default(false)
+
+# --- 3a. SIDECAR MODE — deploy the Compose stack via docker-compose-app ------
+# node_exporter reads the HOST filesystem via read-only binds (/host, /host/proc,
+# /host/sys) and --path.rootfs=/host so it reports the host's metrics, not the
+# container's. The :9100 port is published to the guest's OWN VLAN IP only
+# (never 0.0.0.0, no Traefik labels) — the documented docker-compose-app
+# private-VLAN-bound-port exception (same pattern as the SVC-01 postgres_exporter
+# and the Loki push port) — scraped fleet-wide by the observability_stack.
+- name: "Node_exporter | Deploy the Compose sidecar (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ node_exporter_stack_name }}"
+    dca_services:
+      - name: node-exporter
+        image: "{{ node_exporter_image }}"
+        restart: "unless-stopped"
+        command: "{{ node_exporter_command_flags }}"
+        # PRIVATE VLAN-20-bound scrape port (NOT Traefik/LAN ingress). Bound to
+        # this guest's own VLAN IP only; never 0.0.0.0, never a host-wide port.
+        ports:
+          - "{{ node_exporter_bind_ip }}:{{ node_exporter_port }}:{{ node_exporter_port }}"
+        volumes:
+          # Host rootfs / procfs / sysfs, READ-ONLY, so the containerised
+          # exporter reports the HOST's metrics (--path.rootfs=/host).
+          - "/proc:{{ node_exporter_proc_path }}:ro"
+          - "/sys:{{ node_exporter_sys_path }}:ro"
+          - "/:{{ node_exporter_host_rootfs_mount }}:ro,rslave"
+        networks: ["default"]
+    # node_exporter neither fronts nor joins Traefik's `edge` network — it is a
+    # scrape target only. The default compose network suffices.
+    dca_networks: []
+    dca_env: {}
+    dca_state: "{{ node_exporter_state }}"
+  when:
+    - node_exporter_mode == "sidecar"
+    - not (node_exporter_already_at_pinned_version | default(false))
+
+# --- 3b. HOST-UNIT MODE — upstream static binary + systemd unit --------------
+# The unprivileged-LXC exception: install the upstream static binary and a
+# systemd service so node_exporter runs on the host itself and reads the real
+# host /proc,/sys directly. Bound to the guest VLAN IP:9100 via the unit's
+# --web.listen-address (templated).
+- name: "Node_exporter | Host-unit exception path"
+  when: node_exporter_mode == "host_unit"
+  block:
+    - name: "Node_exporter | Create the system user (host_unit)"
+      ansible.builtin.user:
+        name: "{{ node_exporter_system_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+
+    - name: "Node_exporter | Inspect the installed binary version (idempotency guard, host_unit)"
+      ansible.builtin.command:
+        argv:
+          - "{{ node_exporter_binary_dest }}"
+          - "--version"
+      register: node_exporter_installed_version
+      failed_when: false
+      changed_when: false
+
+    - name: "Node_exporter | Set fact — already at the pinned binary version? (host_unit)"
+      ansible.builtin.set_fact:
+        node_exporter_binary_at_pinned_version: >-
+          {{ (node_exporter_installed_version.rc | default(1)) == 0
+             and (node_exporter_version
+                  in (node_exporter_installed_version.stderr | default('')
+                      ~ node_exporter_installed_version.stdout | default(''))) }}
+      changed_when: false
+
+    - name: "Node_exporter | Download + unpack the pinned static binary (host_unit)"
+      ansible.builtin.unarchive:
+        src: "{{ node_exporter_binary_url }}"
+        dest: /usr/local/bin
+        remote_src: true
+        extra_opts:
+          - "--strip-components=1"
+          - "--wildcards"
+          - "*/node_exporter"
+        owner: root
+        group: root
+        mode: "0755"
+      notify: Restart node_exporter unit
+      when: not (node_exporter_binary_at_pinned_version | default(false))
+
+    - name: "Node_exporter | Template the systemd unit (host_unit)"
+      ansible.builtin.template:
+        src: node_exporter.service.j2
+        dest: "{{ node_exporter_systemd_unit }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd for node_exporter
+        - Restart node_exporter unit
+
+    - name: "Node_exporter | Enable + start the systemd unit (host_unit)"
+      ansible.builtin.systemd:
+        name: node_exporter.service
+        enabled: true
+        state: started

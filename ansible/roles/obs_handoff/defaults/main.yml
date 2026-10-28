@@ -1,0 +1,57 @@
+---
+# defaults/main.yml — obs_handoff (SVC-17/18 installer — Phase 4: Handoff)
+#
+# Phase-4 health-gate knobs, consumed by the child play svc-17-18-health.yml
+# (invoked by this role via `ansible-playbook -i {{ obs_generated_inventory }}
+# svc-17-18-health.yml`, integration-boundaries.md §4) and by the handoff banner.
+# Cross-phase constants (obs_generated_inventory, obs_repo_root, cluster_env_file,
+# observability_platform_domain, the three guest IPs) are play-level vars on
+# svc-17-18-bootstrap.yml. NO secret value ever lives here. Clone of
+# svc09_handoff/defaults adapted for the THREE observability guests (Prometheus +
+# Alertmanager, Grafana, Loki) and the four built-service scrape targets.
+
+# --- Per-guest stack container names on the guests ---------------------------
+# docker-compose-app names a container <stack>-<service>-1. Kept in sync with
+# observability_stack/defaults (stack names prometheus/grafana/loki). The
+# Prometheus stack co-locates Alertmanager as a second service.
+obs_prometheus_container_name: "prometheus-prometheus-1"
+obs_alertmanager_container_name: "prometheus-alertmanager-1"
+obs_grafana_container_name: "grafana-grafana-1"
+obs_loki_container_name: "loki-loki-1"
+
+# --- Internal (VLAN-20) health-endpoint ports (no host ports; guest-local) ---
+# Kept in sync with observability_stack/defaults. The health gate probes each
+# endpoint on the guest's own loopback over plain http (the containers publish
+# these ports on the guest; Grafana's PUBLIC route is Traefik-only, but the
+# guest-local /api/health is plain http — design §3.7).
+obs_prometheus_port: 9090
+obs_alertmanager_port: 9093
+obs_loki_port: 3100
+obs_grafana_port: 3000
+
+# --- The four built-service scrape targets the up==1 assert checks (AC-3) -----
+# The V1_Scrape_Set (FR-11): the already-built services SVC-01/06/07/09 that the
+# stack makes observable. The health gate queries Prometheus /api/v1/targets and
+# asserts up==1 for each of these `service` label values that is PRESENT as an
+# active target (a service not yet scraped yields no target — degrade, not fail;
+# design §3.4). Referenced by the health play, passed via -e.
+obs_scrape_services:
+  - postgres
+  - zitadel
+  - openbao
+  - traefik
+
+# --- TLS skip-verify for any HTTPS health probe under the self-signed mock ----
+# The health gate must NOT assume a real CA exists (Mock B self-signed TLS may be
+# in use), so any HTTPS probe uses validate_certs:false. The guest-local
+# /api/health endpoints are plain http, so this applies only to the optional
+# Grafana-via-Traefik check.
+obs_tls_skip_verify: true
+
+# --- Two-stage recreate-robust health gate retry budget ----------------------
+# retries × delay seconds per stage, per guest. Prometheus/Loki/Grafana start
+# reasonably fast, but keep headroom for the recreate window + SSH/docker latency
+# and for the Prometheus scrape loop to complete its first cycle before the
+# up==1 assert.
+obs_health_retries: 30
+obs_health_delay: 5

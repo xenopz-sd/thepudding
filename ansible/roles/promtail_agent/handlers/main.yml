@@ -1,0 +1,14 @@
+---
+# handlers/main.yml — promtail_agent (SVC-18, fleet-wide)
+#
+# Restart handler. When the rendered promtail-config.yaml changes, reconcile the
+# Promtail stack with a forced recreate via community.docker.docker_compose_v2
+# (PF §9 — declarative, not a shell `docker compose up`). Promtail re-reads its
+# config only at start, so a config change must recreate the container.
+
+- name: Restart promtail
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ promtail_stack_name }}"
+    project_name: "{{ promtail_stack_name }}"
+    state: present
+    recreate: always

@@ -1,0 +1,49 @@
+#jinja2: trim_blocks: True, lstrip_blocks: True
+; {{ ansible_managed }}
+; Grafana config (grafana.ini) — observability_stack (SVC-17/18), task 4.3.
+; Rendered to {{ observability_grafana_config_dir }}/grafana.ini and bind-mounted
+; :ro into the Grafana container at /etc/grafana/grafana.ini.
+;
+; AUTH POSTURE (requirements §12, FR-9 / design §4 Mock A):
+;   * Anonymous access is ALWAYS disabled (never silently anonymous).
+;   * grafana_oidc_enabled=false (default, Mock A): Break_Glass_Admin local
+;     account ONLY — the [auth.generic_oauth] block below is NOT rendered.
+;   * grafana_oidc_enabled=true: the generic_oauth (OIDC) block is rendered
+;     against ZITADEL (SVC-06). The client SECRET is NOT written here — it is
+;     supplied at container start from the 0600 secret env as
+;     GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET (read from OpenBao, FR-15). tasks/
+;     grafana.yml asserts the OIDC vars are set before this renders (fail closed).
+
+[server]
+root_url = https://{{ observability_grafana_host }}
+
+[users]
+; No self sign-up; operators are provisioned via OIDC (when on) or are the
+; single Break_Glass_Admin (when off).
+allow_sign_up = false
+
+[auth.anonymous]
+; Never anonymous (requirements §12). Explicit, not defaulted.
+enabled = false
+
+[auth]
+; Hide the local login form only when a real IdP is wired; keep it available
+; for Break_Glass_Admin when OIDC is off.
+disable_login_form = {{ 'true' if (grafana_oidc_enabled | bool) else 'false' }}
+{% if grafana_oidc_enabled | bool %}
+
+; --- Mock A FLIPPED TO REAL: OIDC via ZITADEL (SVC-06) ---------------------
+; Rendered ONLY when grafana_oidc_enabled=true. The client_secret is injected at
+; runtime from the 0600 secret env (GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET), never
+; written into this file.
+[auth.generic_oauth]
+enabled = true
+name = {{ observability_grafana_oidc_name }}
+allow_sign_up = true
+client_id = {{ observability_grafana_oidc_client_id }}
+scopes = {{ observability_grafana_oidc_scopes }}
+auth_url = {{ observability_grafana_oidc_issuer_url }}/oauth/v2/authorize
+token_url = {{ observability_grafana_oidc_issuer_url }}/oauth/v2/token
+api_url = {{ observability_grafana_oidc_issuer_url }}/oidc/v1/userinfo
+use_pkce = true
+{% endif %}
