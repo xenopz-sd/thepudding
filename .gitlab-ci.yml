@@ -177,29 +177,45 @@ syntax:ansible:
       done
       exit $rc
 
+# --- Root_Discovery (ci-offline-gate-hardening) ------------------------------
+# Enumerate every Terraform_Root under infra/ by the backend-block marker — NO
+# hardcoded list, so a newly-added root is validate-checked with no edit here.
+# Runs in the Python image (the terraform image has no python); hands the
+# stable-sorted root list to terraform:fmt-validate as an artifact. Fails loud
+# (non-zero) on zero roots. Spec: .kiro/specs/ci-offline-gate-hardening/.
+discover:tf-roots:
+  extends: .py-base
+  script:
+    - python scripts/ci/discover_tf_roots.py | tee tf_roots.txt
+    - test -s tf_roots.txt    # belt-and-braces: a non-empty root list is required
+  artifacts:
+    paths:
+      - tf_roots.txt
+    expire_in: 1 hour
+
 terraform:fmt-validate:
   image:
     name: "hashicorp/terraform:$TERRAFORM_VERSION"
     entrypoint: [""]
   stage: test
+  needs:
+    - discover:tf-roots          # consume the Root_Discovery root list (no hardcoded list)
   script:
     # fmt gate across all of infra/ (design §3.2).
     - terraform fmt -check -recursive infra/
-    # validate each root OFFLINE: `init -backend=false` (NEVER touches state —
-    # FR-3) then `validate`. Covers the 4 service roots + _TEMPLATE +
-    # platform-foundation.
+    # validate each DISCOVERED root OFFLINE: `init -backend=false` (NEVER touches
+    # state — FR-3) then `validate`. The root set comes from Root_Discovery
+    # (tf_roots.txt artifact), not a hardcoded list, so every root — including any
+    # newly-added one — is covered with no edit here (ci-offline-gate-hardening
+    # Req 1, 3.2). Accumulate failures: set rc=1 and CONTINUE so every failing root
+    # is reported, never stop at the first (Req 2.4).
     - |
       rc=0
-      for root in \
-        infra/platform-foundation \
-        infra/projects/_TEMPLATE \
-        infra/projects/svc-01-sql-database \
-        infra/projects/svc-06-identity-provider \
-        infra/projects/svc-07-secrets-manager \
-        infra/projects/svc-09-reverse-proxy; do
+      while IFS= read -r root; do
+        [ -n "$root" ] || continue
         echo "--- terraform validate $root ---"
         ( cd "$root" \
           && terraform init -backend=false -input=false -no-color \
           && terraform validate -no-color ) || rc=1
-      done
+      done < tf_roots.txt
       exit $rc

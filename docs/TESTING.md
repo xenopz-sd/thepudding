@@ -99,6 +99,64 @@ locally on a feature branch, add `-k "not scope_guard"` (and deselect the
 preservation-baseline test) to the `infra/tests` command. See
 `.kiro/steering/testing-strategy.md` → "Offline gate — how CI runs it".
 
+### Local slices for `infra/tests` (run the whole tree within budget)
+
+`infra/tests` is large enough (60+ files) that a whole-tree
+`pytest infra/tests` run exceeds a routine ~120s local command budget — so
+instead of hand-picking files, run it as a set of named **slices**. The slices
+**partition** the tree (their union is exactly the whole `infra/tests` tree,
+enforced offline by `infra/tests/test_slice_completeness.py`), and each runs
+within budget except the single-file `plan-preservation` slice (a full child
+pytest + terraform-plan baseline that legitimately takes a few minutes).
+
+The authoritative slice→files mapping lives in `infra/tests/slices.py`
+(the single source of truth). CI is unaffected — the `pytest:infra` job still
+runs the whole tree in one invocation; the slices are a **local convenience
+only** (spec `.kiro/specs/ci-offline-gate-hardening/`).
+
+| Slice | Covers | Command |
+|---|---|---|
+| `svc07a` | SVC-07 OpenBao (first half) | `~/venv/devinfra/bin/pytest $(python -c "import infra.tests.slices as s; print(' '.join('infra/tests/'+f for f in s.SLICES['svc07a']))") -q` |
+| `svc07b` | SVC-07 OpenBao (second half) | …`s.SLICES['svc07b']`… |
+| `svc06` | SVC-06 ZITADEL | …`s.SLICES['svc06']`… |
+| `obs` | SVC-17/18 observability | …`s.SLICES['obs']`… |
+| `svc01-09` | SVC-01 DB + SVC-09 Traefik | …`s.SLICES['svc01-09']`… |
+| `core` | fast cross-cutting (discovery, slice-completeness, readme-links) | …`s.SLICES['core']`… |
+| `tfplan-a` | heavy terraform apply/destroy/idempotency | …`s.SLICES['tfplan-a']`… |
+| `tfplan-b` | terraform plan/shape/degraded | …`s.SLICES['tfplan-b']`… |
+| `plan-preservation` | the offline-plan-preservation baseline (SLOW — minutes; use a longer timeout) | …`s.SLICES['plan-preservation']`… |
+
+<!-- doctest: offline -->
+<!-- cwd: . -->
+```bash
+# Run one slice (single-root invocation — preserves the four-root rule). The
+# helper expands the slice to its file list from the committed slices.py mapping:
+~/venv/devinfra/bin/python -m pytest -q \
+  $(~/venv/devinfra/bin/python -c "import sys; sys.path.insert(0,'infra/tests'); import slices; print(' '.join('infra/tests/'+f for f in slices.SLICES['svc07a']))")
+```
+
+**Feature-branch meta-test deselect.** The two branch-context meta-tests
+(`test_accessible_root_readme_links.py` → `core`,
+`test_offline_plan_preservation.py` → `plan-preservation`) fail *by construction*
+off `main`. On a feature branch, add the same `--deselect` the CI gate uses when
+running the `core` and `plan-preservation` slices:
+
+<!-- doctest: offline -->
+<!-- cwd: . -->
+```bash
+# core slice on a feature branch:
+~/venv/devinfra/bin/python -m pytest -q \
+  $(~/venv/devinfra/bin/python -c "import sys; sys.path.insert(0,'infra/tests'); import slices; print(' '.join('infra/tests/'+f for f in slices.SLICES['core']))") \
+  -k "not scope_guard"
+# plan-preservation slice on a feature branch (longer timeout — it is slow):
+~/venv/devinfra/bin/python -m pytest -q infra/tests/test_offline_plan_preservation.py \
+  --deselect "infra/tests/test_offline_plan_preservation.py::TestPreExistingSuiteBaseline::test_no_pre_existing_test_fails"
+```
+
+On `main` run every slice with **no** deselection (the meta-tests pass on an empty
+`main...HEAD` diff). See `.kiro/steering/testing-strategy.md` → "Offline gate —
+how CI runs it" and "When a CI pipeline becomes relevant (threshold)".
+
 ### Offline Terraform format / validate / plan loop
 
 `terraform fmt -recursive` is repo-wide, but `init` and `validate` act on a

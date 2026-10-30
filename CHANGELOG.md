@@ -5,6 +5,56 @@ All notable changes to the Developer Services Platform are documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] - 2026-10-30
+
+A CI offline-gate hardening patch (spec `ci-offline-gate-hardening`, an evolution
+of `ci-offline-test-pipeline`). **Fixes a real coverage gap**: the
+`terraform:fmt-validate` job validated a hand-maintained hardcoded roots list that
+had silently never `validate`-checked three roots —
+`infra/projects/svc-17-18-observability` (since v0.10.0),
+`infra/projects/dronefleet` and `infra/projects/dronefleet/db` (v0.11.0). Replaced
+the list with automatic **Root_Discovery** so every root (and any future root) is
+validated with no pipeline edit; the first green run surfaced latent
+`terraform validate` warnings in `dronefleet/db` that CI had never shown. Also adds
+a documented, drift-guarded set of local **Test_Slices** for `infra/tests` so the
+64-file tree can be run offline within the routine command budget. Patch bump:
+additive CI/verification hardening + docs, no runtime or service behavior change.
+
+### Fixed
+- **CI `terraform validate` coverage gap** (spec `ci-offline-gate-hardening`,
+  Problem 1): `.gitlab-ci.yml`'s `terraform:fmt-validate` validated a hardcoded
+  six-root list, silently skipping `svc-17-18-observability`, `dronefleet`, and
+  `dronefleet/db`. A new pure-stdlib `scripts/ci/discover_tf_roots.py` discovers
+  every Terraform root under `infra/` by the committed `backend`-block marker
+  (comment-robust, nested roots kept, fail-loud on zero roots); a new
+  `discover:tf-roots` CI job emits the stable-sorted list as an artifact and
+  `terraform:fmt-validate` (`needs:` it) validates each discovered root. A
+  newly-added root is now `validate`-checked with no `.gitlab-ci.yml` edit. The
+  per-root `init -backend=false -input=false`, `fmt -check -recursive`, and the
+  accumulate-don't-stop-at-first-failure loop are unchanged. CI-verified: the gate
+  now logs `--- terraform validate <root> ---` for all nine roots, surfacing
+  previously-hidden `dronefleet/db` validation warnings.
+
+### Added
+- **Local `infra/tests` Test_Slices** (spec `ci-offline-gate-hardening`,
+  Problem 2): `infra/tests/slices.py` defines a drift-guarded partition of the
+  `infra/tests` tree into named slices, each runnable offline within the ~120s
+  routine command budget (the single inherently-slow
+  `test_offline_plan_preservation.py` is isolated in its own `plan-preservation`
+  slice). `infra/tests/test_slice_completeness.py` enforces the invariant that the
+  slice union equals exactly the on-disk `test_*.py` set (no file unassigned, no
+  stale entry, no empty slice), so adding a test without slotting it fails offline.
+  CI is unchanged — the `pytest:infra` job still runs the whole tree in one
+  invocation; the slices are a local-only convenience. Documented in
+  `docs/TESTING.md` ("Local slices for `infra/tests`").
+
+### Changed
+- **`testing-strategy.md`** — "Offline gate — how CI runs it" now states CI
+  `terraform validate` coverage is **Root_Discovery**-driven (not a hardcoded
+  list); the runtime-signal note points at the documented Test_Slice mechanism as
+  the reproducible within-budget way to run `infra/tests` offline. Cross-references
+  `ci-offline-test-pipeline` and the new `ci-offline-gate-hardening` spec.
+
 ## [0.11.0] - 2026-10-30
 
 The **per-project consumer path** lands and is proven end-to-end on the throwaway
@@ -903,6 +953,7 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
+[0.11.1]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.0...v0.11.1
 [0.11.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.10.0...v0.11.0
 [0.10.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.9.0...v0.10.0
 [0.9.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.8.0...v0.9.0
