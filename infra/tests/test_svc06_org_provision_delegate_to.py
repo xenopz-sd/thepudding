@@ -272,16 +272,20 @@ def test_svc06_dev_guest_host_default_not_gated_on_tls_self_signed():
 # ===========================================================================
 
 # The production control-node task name (the single `when: not (...)` task).
+# Renamed by the two-client onboarding (spec: zitadel-spa-pkce-onboarding) from
+# "...Provision org/roles/OIDC-app..." to the per-app-loop "...Provision each app...".
 _PROD_TASK_NAME = (
-    "ZITADEL-org | Provision org/roles/OIDC-app via the helper (idempotent, no_log)"
+    "ZITADEL-org | Provision each app via the helper (idempotent, no_log)"
 )
 # The fail-fast token assert task name (names BOTH sources).
 _TOKEN_ASSERT_NAME = (
     "ZITADEL-org | Assert a provisioning token resolved (fail fast, names both sources)"
 )
-# The OpenBao OIDC-secret write task name.
+# The OpenBao OIDC-secret write task name. Renamed by the two-client onboarding
+# to the per-app unique-path write ("...Persist each new client_id/secret to its
+# unique OpenBao path...").
 _OIDC_WRITE_NAME = (
-    "ZITADEL-org | Persist the new OIDC client_id/secret to OpenBao (no_log)"
+    "ZITADEL-org | Persist each new client_id/secret to its unique OpenBao path (no_log)"
 )
 
 
@@ -513,7 +517,12 @@ def test_preservation_production_path_uses_base_url_zop_base_url():
         f"{argv_text}"
     )
     collapsed = argv_text.replace(" ", "")
-    assert "{{zop_base_url}}" in collapsed, (
-        "the production task's `--base-url` must be `{{ zop_base_url }}`; found "
+    # The two-client onboarding (spec: zitadel-spa-pkce-onboarding) folds the
+    # whole argv into one Jinja list expression, so `--base-url` is followed by
+    # the bare list element `zop_base_url` (the Traefik-fronted URL), not the
+    # per-arg `{{ zop_base_url }}` form. Accept either rendering — the invariant
+    # is that the production path's base URL is still `zop_base_url`.
+    assert ("{{zop_base_url}}" in collapsed) or ("'--base-url',zop_base_url" in collapsed), (
+        "the production task's `--base-url` must be `zop_base_url`; found "
         f"argv:\n{argv_text}"
     )

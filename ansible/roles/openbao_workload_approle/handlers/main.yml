@@ -1,0 +1,10 @@
+---
+# handlers/main.yml — openbao_workload_approle
+#
+# No handler is required by Task 3: the AppRole-method enable, the
+# Workload_AppRole create/reconcile, the role-id read, the secret-id mint, and
+# the credential handoff are all reconciled inline via check-then-write `bao`
+# calls and need no service restart. This file is present as part of the
+# standard role skeleton for consistency with the sibling openbao_* roles.
+#
+# (intentionally empty)

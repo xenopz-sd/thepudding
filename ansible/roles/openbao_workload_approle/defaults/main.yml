@@ -1,0 +1,194 @@
+---
+# defaults/main.yml — openbao_workload_approle  (openbao-workload-auth, Task 3)
+#
+# CONTROL-PLANE role for the openbao-workload-auth feature. For one project slug
+# (read READ-ONLY from projects.yaml) it writes to the PRIMARY OpenBao instance
+# via `docker exec` — byte-for-byte consistent with the sibling
+# openbao_project_onboard — to:
+#
+#   (1) enable the AppRole auth METHOD once at `approle/` (check-then-write)
+#   (2) create/reconcile the per-slug Workload_AppRole
+#       auth/approle/role/<slug>-workload bound to EXACTLY [policy-<slug>],
+#       renewable, with a workload-appropriate token TTL (NOT the <=3600/
+#       non-renewable CI ceiling of the sibling <slug>-ci JWT role)
+#   (3) read the (non-secret) role_id and mint a (secret) secret_id
+#   (4) hand role_id/secret_id off over the sanctioned first-secret channel
+#       (a 0600 host file for a homelab run, or a GitLab CI/CD protected+masked
+#       variable for a pipeline) — PF FR-8
+#
+# AUTH: a PLATFORM-ADMIN token (NOT the Root_Token — revoked after bootstrap).
+# Supplied at runtime from an operator-controlled, NEVER-COMMITTED env var (a
+# gitignored .env or a GitLab CI/CD protected+masked variable) via an `env`
+# lookup. Passed to every `bao` call as `-e BAO_TOKEN={{ openbao_admin_token }}`
+# on the docker exec, with `no_log: "{{ openbao_no_log }}"` — hidden by DEFAULT
+# (openbao_no_log resolves to true when the DEV-ONLY openbao_dev_expose_secrets
+# opt-in is off, the NON-NEGOTIABLE acceptance/production posture). Mirrors the
+# sibling openbao_project_onboard / openbao_init_unseal roles.
+#
+# TLS: every `bao` docker-exec call CONDITIONALLY splices `-tls-skip-verify`,
+# gated on openbao_primary_tls_skip_verify (derives from the install-time
+# openbao_tls_self_signed toggle), exactly like the sibling roles.
+#
+# NO secret value is templated, echoed, or defaulted anywhere in this role. The
+# Role_ID is non-secret config and MAY appear in output; the Secret_ID and the
+# Admin_Token are sensitive and carry `no_log` on every task that touches them,
+# and are scrubbed from facts at the end.
+
+# =============================================================================
+# The project this run mints a Workload_AppRole for (READ-ONLY from projects.yaml)
+# =============================================================================
+# project_slug is the authoritative identifier recorded in projects.yaml by the
+# network-foundation onboarding flow. This role READS it (as this variable,
+# passed by the caller) and NEVER writes, extends, or re-derives the registry.
+# Left intentionally UNDEFINED here so a run without an explicit slug fails
+# loudly rather than silently minting a credential for a wrong/empty project.
+# project_slug: "<slug>"        # REQUIRED — supplied by the caller, no default.
+
+# --- Optional: validate the slug exists in projects.yaml (READ-ONLY) ---------
+# When true, tasks/main.yml parses projects.yaml and asserts project_slug is a
+# recorded slug before writing anything. This is a READ; the registry is never
+# written. The default path points at the platform-foundation registry
+# (structure.md) and is anchored TWO levels up from the playbook dir, matching
+# the sibling openbao_project_onboard default.
+openbao_validate_slug_in_registry: true
+openbao_projects_yaml_path: >-
+  {{ playbook_dir }}/../../infra/platform-foundation/projects.yaml
+
+# =============================================================================
+# Primary instance addressing + `bao` invocation (mirrors the sibling roles)
+# =============================================================================
+# The control-plane writes run via `docker exec` against the PRIMARY OpenBao
+# container (consistent with openbao_project_onboard), using the server's own
+# `bao` binary/version — no host bao install needed.
+openbao_primary_ip: "10.0.20.10"
+openbao_api_port: 8200
+openbao_primary_addr: "https://{{ openbao_primary_ip }}:{{ openbao_api_port }}"
+
+# The primary Compose container name (matches openbao_install / init_unseal /
+# project_onboard).
+openbao_primary_container_name: "openbao-openbao-1"
+
+# Path to the `bao` CLI inside the running container.
+openbao_bao_bin: "bao"
+
+# =============================================================================
+# Conditional primary-delegation (composed-onboarder bugfix)
+# =============================================================================
+# Authored for the STANDALONE path (openbao.yml Play 2, hosts: openbao,
+# become: true) which already runs ON the primary guest, so every `docker exec`
+# below targets the LOCAL primary container. When consumer_bootstrap composes
+# this role on hosts: localhost, the composing caller supplies the PRIMARY guest
+# here so every docker exec runs ON the primary over SSH as root; otherwise a
+# "No such container" failure on the control node. Default = EMPTY -> the
+# `delegate_to` ternary resolves to inventory_hostname and the connection vars
+# resolve to omit, so the standalone path is byte-for-byte unchanged. (This role
+# has no `docker cp` and no primary-targeted render/slurp.)
+openbao_workload_delegate_host: ""
+openbao_workload_delegate_user: root
+openbao_workload_delegate_python: /usr/bin/python3
+
+# Splice `-tls-skip-verify` onto the PRIMARY `bao` docker-exec calls when the
+# primary's TLS listener uses the self-signed MOCK cert
+# (openbao_install's openbao_tls_self_signed). Spliced AFTER the `bao` subcommand
+# keyword and BEFORE positional args (bao rejects flags after positionals). With
+# a real SVC-08/EJBCA cert chaining to a trusted CA this is false and bao
+# verifies normally.
+#
+# SHARED-SYMBOL / SAME-VALUE-AS-SIBLING: byte-for-byte identical to the sibling
+# openbao_project_onboard / openbao_init_unseal default (all derive from
+# openbao_tls_self_signed). It lives in THIS role's own defaults because this
+# role runs as its own play and cannot rely on inheriting the sibling's default;
+# because all resolve the SAME expression, this is agreement, not a divergent
+# second definition.
+openbao_primary_tls_skip_verify: "{{ openbao_tls_self_signed | default(false) | bool }}"
+
+# =============================================================================
+# DEV-ONLY secret exposure opt-in (security-standards.md "Secrets handling")
+# =============================================================================
+# Default FALSE -> openbao_no_log is TRUE -> every token/secret-bearing task keeps
+# `no_log`, so secrets never leak to output. NON-NEGOTIABLE default for
+# acceptance/production. A developer debugging a THROWAWAY cluster MAY expose the
+# censored output for a SINGLE run with `-e openbao_dev_expose_secrets=true`
+# (ephemeral tokens only) — never committed, never in CI/acceptance/production.
+# tasks/main.yml fails closed if this is true while openbao_target_environment is
+# ci/acc/prod (Req 7.4).
+openbao_dev_expose_secrets: false
+# Resolved no_log value applied to every secret-bearing task via
+# `no_log: "{{ openbao_no_log }}"`. Hidden by default; exposed only on the
+# explicit dev opt-in above.
+openbao_no_log: "{{ not (openbao_dev_expose_secrets | bool) }}"
+# The target environment this run writes to; gates the dev-expose guard (Req 7.4).
+# One of: dev | ci | acc | prod. Only `dev` permits openbao_dev_expose_secrets.
+openbao_target_environment: "dev"
+
+# =============================================================================
+# Platform-admin authentication (day-2; NOT the Root_Token)
+# =============================================================================
+# The Root_Token is revoked after bootstrap, so this day-2 role authenticates
+# with a PLATFORM-ADMIN token supplied at runtime from an operator-controlled,
+# NEVER-COMMITTED environment variable via an `env` lookup. The var below carries
+# only the ENV VAR NAME; the token value is never defaulted, never written to a
+# vars file, and every task carrying it sets `no_log: "{{ openbao_no_log }}"`.
+openbao_admin_token_env_var: "OPENBAO_ADMIN_TOKEN"
+
+# =============================================================================
+# AppRole method + per-project Workload_AppRole (Req 1, 2)
+# =============================================================================
+# The AppRole auth method is enabled ONCE at mount path `approle/` (Req 1.1).
+openbao_approle_mount_path: "approle"
+
+# The Workload_AppRole name — `<slug>-workload` (Req 2.4). Distinct from the
+# sibling CI JWT role `<slug>-ci` created by openbao_project_onboard. This value
+# matches scripts/installer/workload_auth.py::workload_role_name(slug) — the
+# shared pure symbol both roles and their tests bind to.
+openbao_workload_role_name: "{{ project_slug }}-workload"
+
+# The existing per-project isolation policy the Workload_AppRole is scoped to
+# (Req 2.1, 7.6). Created by openbao_project_onboard; this role ASSERTS it is
+# present (fail-closed) and NEVER rewrites it.
+openbao_project_policy_name: "policy-{{ project_slug }}"
+
+# --- Workload token TTLs — renewable, NOT the CI <=3600 ceiling (Req 2.2) ----
+# A long-running workload token is RENEWABLE with a workload-appropriate TTL.
+# Both must be > 0 and token_ttl <= token_max_ttl; validated BEFORE any write by
+# the pure validator contract (scripts/installer/workload_auth.py::
+# validate_token_ttls) mirrored in tasks/main.yml STEP 2 (Req 2.3).
+openbao_workload_token_ttl: 3600
+openbao_workload_token_max_ttl: 86400
+
+# --- Secret_ID usage TTL + num-uses limit (Req 3.6, 3.7) ---------------------
+# secret_id_ttl must be > 0; secret_id_num_uses must be >= 0 (0 = unlimited),
+# validated BEFORE minting by validate_secret_id_inputs (Req 3.7).
+openbao_workload_secret_id_ttl: 86400
+openbao_workload_secret_id_num_uses: 0
+
+# =============================================================================
+# Role_ID / Secret_ID handoff (Req 3.3) — PF FR-8 first-secret channel
+# =============================================================================
+# Handoff channel: `file` (0600 service-owned host file, outside any git tree —
+# homelab path) or `gitlab` (GitLab CI/CD protected+masked variable — pipeline
+# path, PF FR-8).
+openbao_workload_handoff: "file"
+
+# Service-owned directory, OUTSIDE any git tree, for the 0600 credential files
+# (the `file` handoff path). The Secret_ID is sensitive; the Role_ID is non-secret
+# but written at the same perms. NEVER a path inside the repo checkout.
+openbao_workload_creds_dir: "/etc/openbao-workload/{{ project_slug }}"
+
+# Owner of the credential files (the workload's service account).
+openbao_workload_service_user: "root"
+
+# On-host credential file paths (derived; the templates render only to these
+# 0600 runtime paths — no secret is baked into a committed file).
+openbao_workload_role_id_file: >-
+  {{ openbao_workload_creds_dir }}/{{ openbao_workload_role_name }}-role-id
+openbao_workload_secret_id_file: >-
+  {{ openbao_workload_creds_dir }}/{{ openbao_workload_role_name }}-secret-id
+
+# --- GitLab handoff (the `gitlab` channel only) ------------------------------
+# Used only when openbao_workload_handoff == 'gitlab'. The GitLab API token is
+# read from a never-committed env var (CI_JOB_TOKEN by default) — only the NAME
+# lives here, never the value.
+openbao_gitlab_api_url: ""
+openbao_gitlab_project_id: ""
+openbao_gitlab_token_env_var: "CI_JOB_TOKEN"

@@ -1,0 +1,767 @@
+---
+# tasks/main.yml — openbao_workload_approle  (openbao-workload-auth, Task 3)
+#
+# CONTROL-PLANE day-2 role. Writes to the PRIMARY OpenBao instance via
+# `docker exec` (byte-for-byte consistent with the sibling
+# openbao_project_onboard) to enable the AppRole method once, create/reconcile a
+# per-slug Workload_AppRole bound to [policy-<slug>] (renewable), read the
+# non-secret role_id, mint a secret_id, and hand both off over the sanctioned
+# first-secret channel. IDEMPOTENT: a re-run leaves approle/ and the role
+# unchanged (changed=0) on its idempotent portions; the secret_id is re-minted
+# each run by design (an un-rereadable, TTL/num_uses-bounded credential —
+# design.md "Open risks and trade-offs").
+#
+# AUTH: a PLATFORM-ADMIN token (NOT the revoked Root_Token) from a
+# NEVER-COMMITTED env var via an `env` lookup, passed as `-e BAO_TOKEN=...` on
+# the docker exec with `no_log: "{{ openbao_no_log }}"` (hidden by default).
+#
+# TLS: every `bao` call conditionally splices `-tls-skip-verify` AFTER the `bao`
+# subcommand keyword and BEFORE positionals (bao rejects flags after positionals)
+# — same idiom as the sibling roles.
+#
+# NO secret value is templated, echoed, or defaulted. Role_ID is non-secret
+# config; Secret_ID + Admin_Token carry `no_log` on every carrying task and are
+# scrubbed at STEP 9.
+
+# ============================================================================
+# STEP 0 — Validate inputs (slug present; optionally recorded in projects.yaml)
+# ============================================================================
+
+- name: "3 — Assert project_slug is supplied"
+  ansible.builtin.assert:
+    that:
+      - project_slug is defined
+      - project_slug | string | length > 0
+    fail_msg: >-
+      project_slug is required. Supply the slug to mint a Workload_AppRole for
+      (read-only from projects.yaml) as an extra-var or play var — this role
+      never picks one.
+    success_msg: "Minting Workload_AppRole for OpenBao project slug '{{ project_slug }}'."
+    quiet: true
+
+# READ-ONLY validation that the slug is a recorded project. PARSES projects.yaml
+# and asserts the slug is present — it NEVER writes the registry (Req 2.8).
+# Skipped when openbao_validate_slug_in_registry is false (e.g. a test fixture
+# without the registry on disk). Delegated to the CONTROL NODE (projects.yaml is
+# a repo artifact that is NOT copied to the guest), become:false so the delegated
+# read runs as the invoking user — same fix as the sibling onboard role.
+- name: "3 — Read projects.yaml (READ-ONLY) to validate the slug is registered"
+  ansible.builtin.slurp:
+    src: "{{ openbao_projects_yaml_path }}"
+  register: openbao_projects_yaml_raw
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  changed_when: false
+  when: openbao_validate_slug_in_registry | bool
+
+- name: "3 — Parse the registered slugs from projects.yaml (READ-ONLY)"
+  ansible.builtin.set_fact:
+    openbao_registered_slugs: >-
+      {{ (openbao_projects_yaml_raw.content | b64decode | from_yaml).projects
+         | map(attribute='slug') | list }}
+  changed_when: false
+  when: openbao_validate_slug_in_registry | bool
+
+- name: "3 — Assert project_slug is a recorded project (never writes the registry)"
+  ansible.builtin.assert:
+    that:
+      - project_slug in openbao_registered_slugs
+    fail_msg: >-
+      project_slug '{{ project_slug }}' is not recorded in
+      {{ openbao_projects_yaml_path }}. Onboard the project into the VLAN-ID
+      registry first (NET-00 onboarding MR flow) — this role reads the registry
+      READ-ONLY and never adds a slug to it.
+    success_msg: "project_slug '{{ project_slug }}' is a recorded project (registry unchanged)."
+    quiet: true
+  when: openbao_validate_slug_in_registry | bool
+
+# ============================================================================
+# STEP 1 — Resolve + assert the platform-admin token (never committed)
+# ============================================================================
+# Read the platform-admin token from its never-committed env var. Fail closed if
+# absent — never proceed with an empty token, never fall back to the Root_Token
+# (revoked) or a committed value (Req 1.5, 1.6). This assert runs BEFORE any
+# read/enable/write against the Primary.
+- name: "3 — Resolve the platform-admin token from its env var (never committed)"
+  ansible.builtin.set_fact:
+    openbao_admin_token: >-
+      {{ lookup('ansible.builtin.env', openbao_admin_token_env_var, default='') }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+- name: "3 — Assert the platform-admin token was supplied (fail closed, Req 1.6)"
+  ansible.builtin.assert:
+    that:
+      - openbao_admin_token | length > 0
+    fail_msg: >-
+      No platform-admin token found. Supply it via the never-committed
+      environment variable '{{ openbao_admin_token_env_var }}' (a gitignored
+      .env or a GitLab CI/CD protected+masked variable). This day-2 role does
+      NOT use the Root_Token (revoked after bootstrap). It is never defaulted or
+      committed.
+    success_msg: "platform-admin token supplied via {{ openbao_admin_token_env_var }} (value not logged)."
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+
+# ============================================================================
+# STEP 2 — Validate TTL / num_uses inputs BEFORE any write (Req 2.3, 3.7)
+# ============================================================================
+# Mirrors the pure validator contract in
+# scripts/installer/workload_auth.py::validate_token_ttls /
+# validate_secret_id_inputs (the shared symbol both roles + tests bind to):
+#   token_ttl > 0 AND token_max_ttl > 0 AND token_ttl <= token_max_ttl
+#   secret_id_ttl > 0 AND secret_id_num_uses >= 0 (0 = unlimited)
+# Assert up front so a misconfiguration fails before touching OpenBao.
+- name: "3 — Assert the workload token TTL pair is valid (Req 2.2, 2.3)"
+  ansible.builtin.assert:
+    that:
+      - (openbao_workload_token_ttl | int) > 0
+      - (openbao_workload_token_max_ttl | int) > 0
+      - (openbao_workload_token_ttl | int) <= (openbao_workload_token_max_ttl | int)
+    fail_msg: >-
+      Workload_AppRole '{{ openbao_workload_role_name }}' requires
+      token_ttl > 0, token_max_ttl > 0, and token_ttl <= token_max_ttl
+      (Req 2.2, 2.3). Got token_ttl={{ openbao_workload_token_ttl }},
+      token_max_ttl={{ openbao_workload_token_max_ttl }}.
+    success_msg: >-
+      workload token TTL pair valid
+      (ttl={{ openbao_workload_token_ttl }}s <= max_ttl={{ openbao_workload_token_max_ttl }}s).
+    quiet: true
+
+- name: "3 — Assert the Secret_ID TTL / num_uses inputs are valid (Req 3.7)"
+  ansible.builtin.assert:
+    that:
+      - (openbao_workload_secret_id_ttl | int) > 0
+      - (openbao_workload_secret_id_num_uses | int) >= 0
+    fail_msg: >-
+      Workload_AppRole '{{ openbao_workload_role_name }}' requires
+      secret_id_ttl > 0 and secret_id_num_uses >= 0 (0 = unlimited) (Req 3.7).
+      Got secret_id_ttl={{ openbao_workload_secret_id_ttl }},
+      secret_id_num_uses={{ openbao_workload_secret_id_num_uses }}.
+    success_msg: >-
+      Secret_ID inputs valid
+      (ttl={{ openbao_workload_secret_id_ttl }}s, num_uses={{ openbao_workload_secret_id_num_uses }}).
+    quiet: true
+
+# --- DEV-ONLY expose-secrets guard (Req 7.4) ---------------------------------
+# openbao_dev_expose_secrets may be true ONLY in development. Fail closed if it
+# is true while the target environment is ci/acc/prod, before any secret-bearing
+# task runs, naming the dev-only opt-in.
+- name: "3 — Assert openbao_dev_expose_secrets is dev-only (fail closed in ci/acc/prod, Req 7.4)"
+  ansible.builtin.assert:
+    that:
+      - not (openbao_dev_expose_secrets | bool)
+        or (openbao_target_environment | lower == 'dev')
+    fail_msg: >-
+      openbao_dev_expose_secrets=true is permitted ONLY in development. The
+      target environment is '{{ openbao_target_environment }}'. Leave
+      openbao_dev_expose_secrets at its default (false) for ci/acc/prod — it must
+      never weaken the acceptance/production no_log posture (Req 7.3, 7.4).
+    success_msg: "secret-exposure posture valid for environment '{{ openbao_target_environment }}'."
+    quiet: true
+
+# ============================================================================
+# STEP 3 — Enable the AppRole method at approle/ (check-then-write, Req 1.1-1.4)
+# ============================================================================
+# One `bao auth list` read decides whether approle/ needs enabling. If absent,
+# enable it (changed=1) and re-read + assert a mount of type approle at approle/.
+# If present, skip (changed=0). The enable/skip decision is based SOLELY on this
+# single read (Req 1.4).
+- name: "3 — List enabled auth methods (check-then-write, Req 1.4)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `auth list` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'auth', 'list']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_auth_list
+  no_log: "{{ openbao_no_log }}"   # exec env carries the platform-admin token
+  check_mode: false
+  changed_when: false
+  delegate_to: >-
+    {{ openbao_workload_delegate_host
+       if (openbao_workload_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_workload_delegate_user
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_workload_delegate_python
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+
+- name: "3 — Decide whether the approle/ method must be enabled"
+  ansible.builtin.set_fact:
+    # `bao auth list -format=json` keys mounts by "<path>/". approle/ is enabled
+    # iff a key "<mount>/" exists whose type is "approle".
+    openbao_approle_present: >-
+      {{ (openbao_auth_list.stdout | default('{}') | from_json)
+         | dict2items
+         | selectattr('key', 'equalto', openbao_approle_mount_path ~ '/')
+         | selectattr('value.type', 'equalto', 'approle')
+         | list | length > 0 }}
+  no_log: "{{ openbao_no_log }}"   # openbao_auth_list derives from a token exec
+  changed_when: false
+
+- name: "3 — Enable the AppRole auth method at approle/ (only when absent, Req 1.1)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `auth enable` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'auth', 'enable']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-path=' ~ openbao_approle_mount_path, 'approle'] }}
+  register: openbao_approle_enable
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_approle_enable.rc == 0
+  delegate_to: >-
+    {{ openbao_workload_delegate_host
+       if (openbao_workload_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_workload_delegate_user
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_workload_delegate_python
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+  when: not (openbao_approle_present | bool)
+
+- name: "3 — Re-read enabled auth methods after enabling approle/ (verify, Req 1.2)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'auth', 'list']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  register: openbao_auth_list_verify
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+  delegate_to: >-
+    {{ openbao_workload_delegate_host
+       if (openbao_workload_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_workload_delegate_user
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_workload_delegate_python
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+  when: not (openbao_approle_present | bool)
+
+- name: "3 — Assert a mount of type approle is present at approle/ after enable (Req 1.2)"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (openbao_auth_list_verify.stdout | default('{}') | from_json)
+        | dict2items
+        | selectattr('key', 'equalto', openbao_approle_mount_path ~ '/')
+        | selectattr('value.type', 'equalto', 'approle')
+        | list | length > 0
+    fail_msg: >-
+      Enabled the AppRole method but a mount of type 'approle' is NOT present at
+      '{{ openbao_approle_mount_path }}/' on re-read (Req 1.2). The enable did
+      not take effect — aborting before creating the Workload_AppRole.
+    success_msg: "AppRole method verified present at '{{ openbao_approle_mount_path }}/' (Req 1.2)."
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+  when: not (openbao_approle_present | bool)
+
+- name: "3 — Report the approle/ enable decision"
+  ansible.builtin.debug:
+    msg: >-
+      auth method approle/:
+      {{ 'enabled (was absent) and verified present (changed=1)'
+         if not (openbao_approle_present | bool)
+         else 'already enabled — no change (changed=0, Req 1.3)' }}.
+
+# ============================================================================
+# STEP 4 — Assert policy-<slug> exists (fail closed, Req 2.5)
+# ============================================================================
+# The Workload_AppRole binds to the EXISTING policy-<slug> isolation policy
+# created by openbao_project_onboard. If it is absent, fail closed with a
+# "run openbao_project_onboard first" message BEFORE any role write — never
+# create the policy here (Req 2.5, Compatibility NFR).
+- name: "3 — Read policy-<slug> to assert it exists (fail closed if absent, Req 2.5)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the `policy read` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'policy', 'read']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json', openbao_project_policy_name] }}
+  register: openbao_policy_read
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+  failed_when: false           # a missing policy returns non-zero — that's "absent"
+  delegate_to: >-
+    {{ openbao_workload_delegate_host
+       if (openbao_workload_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_workload_delegate_user
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_workload_delegate_python
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+
+- name: "3 — Assert policy-<slug> is present before creating the Workload_AppRole (Req 2.5)"
+  ansible.builtin.assert:
+    that:
+      - openbao_policy_read.rc == 0
+    fail_msg: >-
+      Policy '{{ openbao_project_policy_name }}' does not exist on the Primary.
+      Run the openbao_project_onboard role for slug '{{ project_slug }}' FIRST to
+      create the isolation triple (policy-<slug>, the <slug>-ci jwt role, and the
+      secret/data/<slug>/ KV path) — this role binds the Workload_AppRole to that
+      existing policy and never creates it (Req 2.5).
+    success_msg: "policy '{{ openbao_project_policy_name }}' present — safe to bind the Workload_AppRole."
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+
+# ============================================================================
+# STEP 5 — Create/reconcile the Workload_AppRole (check-then-write, Req 2.1-2.7)
+# ============================================================================
+# Read the stored role; write ONLY when absent or when any of token_policies,
+# token_ttl, token_max_ttl, or renewable diverges from the desired contract. A
+# re-run against a matching role is a no-op (changed=0, Req 2.6).
+- name: "3 — Read the stored Workload_AppRole when it already exists (check-then-write)"
+  ansible.builtin.command:
+    # `-tls-skip-verify` after the bare `read` subcommand, before positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'read']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json',
+            'auth/' ~ openbao_approle_mount_path ~ '/role/' ~ openbao_workload_role_name] }}
+  register: openbao_workload_role_read
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+  failed_when: false           # a missing role returns non-zero — that's "absent"
+  delegate_to: >-
+    {{ openbao_workload_delegate_host
+       if (openbao_workload_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_workload_delegate_user
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_workload_delegate_python
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+
+- name: "3 — Parse the stored Workload_AppRole data (empty dict when absent)"
+  ansible.builtin.set_fact:
+    openbao_workload_role_stored: >-
+      {{ (openbao_workload_role_read.stdout | default('') | trim | from_json).data | default({})
+         if (openbao_workload_role_read.stdout | default('') | trim | length > 0
+             and openbao_workload_role_read.rc == 0)
+         else {} }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+- name: "3 — Compute the Workload_AppRole write decision (absent or diverged)"
+  ansible.builtin.set_fact:
+    # Write when absent, or when any contract field diverges. A renewable service
+    # token is represented by token_type 'service' with token_ttl < token_max_ttl
+    # (token_explicit_max_ttl is the hard cap); we compare the stored token_type,
+    # token_ttl, token_max_ttl, and token_policies against the desired contract.
+    openbao_workload_role_needs_write: >-
+      {{ (openbao_workload_role_stored | length == 0)
+         or ((openbao_workload_role_stored.token_policies | default([]) | sort)
+             != ([openbao_project_policy_name] | sort))
+         or ((openbao_workload_role_stored.token_ttl | default(-1) | int)
+             != (openbao_workload_token_ttl | int))
+         or ((openbao_workload_role_stored.token_max_ttl | default(-1) | int)
+             != (openbao_workload_token_max_ttl | int))
+         or ((openbao_workload_role_stored.token_type | default('')) != 'service') }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+- name: "3 — Write the Workload_AppRole (token_policies=[policy-<slug>], renewable, Req 2.1/2.2/2.7)"
+  ansible.builtin.command:
+    # `docker exec -i`: the request body is fed via stdin (`bao write <path> -`
+    # reads a JSON object). JSON-on-stdin (not key=value positionals) is used so
+    # token_policies lands as a proper list. `-tls-skip-verify` goes after
+    # `write`, before the `-` stdin positional (bao rejects flags after positionals).
+    # token_type 'service' makes the issued token RENEWABLE (distinct from the
+    # sibling <slug>-ci role which is non-renewable with a <=3600 ceiling, Req 2.4).
+    argv: >-
+      {{ ['docker', 'exec', '-i', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['auth/' ~ openbao_approle_mount_path ~ '/role/' ~ openbao_workload_role_name,
+            '-'] }}
+    stdin: >-
+      {{ {'token_policies': [openbao_project_policy_name],
+          'token_ttl': (openbao_workload_token_ttl | int),
+          'token_max_ttl': (openbao_workload_token_max_ttl | int),
+          'token_type': 'service',
+          'secret_id_ttl': (openbao_workload_secret_id_ttl | int),
+          'secret_id_num_uses': (openbao_workload_secret_id_num_uses | int)} | to_json }}
+  register: openbao_workload_role_write
+  no_log: "{{ openbao_no_log }}"
+  changed_when: openbao_workload_role_write.rc == 0
+  delegate_to: >-
+    {{ openbao_workload_delegate_host
+       if (openbao_workload_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_workload_delegate_user
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_workload_delegate_python
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+  when: openbao_workload_role_needs_write | bool
+
+- name: "3 — Re-read the Workload_AppRole after write (verify contract, Req 2.1/2.2)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'read']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json',
+            'auth/' ~ openbao_approle_mount_path ~ '/role/' ~ openbao_workload_role_name] }}
+  register: openbao_workload_role_verify
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+  delegate_to: >-
+    {{ openbao_workload_delegate_host
+       if (openbao_workload_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_workload_delegate_user
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_workload_delegate_python
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+  when: openbao_workload_role_needs_write | bool
+
+- name: "3 — Assert the stored Workload_AppRole honours the contract (Req 2.1, 2.2, 7.6)"
+  ansible.builtin.assert:
+    that:
+      - ((openbao_workload_role_verify.stdout | from_json).data.token_policies | default([]) | sort)
+        == ([openbao_project_policy_name] | sort)
+      - ((openbao_workload_role_verify.stdout | from_json).data.token_ttl | int)
+        == (openbao_workload_token_ttl | int)
+      - ((openbao_workload_role_verify.stdout | from_json).data.token_max_ttl | int)
+        == (openbao_workload_token_max_ttl | int)
+    fail_msg: >-
+      Stored Workload_AppRole '{{ openbao_workload_role_name }}' does not honour
+      the Req 2.1/2.2/7.6 contract (token_policies EXACTLY
+      [{{ openbao_project_policy_name }}], token_ttl={{ openbao_workload_token_ttl }},
+      token_max_ttl={{ openbao_workload_token_max_ttl }}, renewable service token).
+    success_msg: "Workload_AppRole '{{ openbao_workload_role_name }}' verified (Req 2.1, 2.2, 7.6)."
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+  when: openbao_workload_role_needs_write | bool
+
+- name: "3 — Report the Workload_AppRole decision"
+  ansible.builtin.debug:
+    msg: >-
+      auth/approle/role/{{ openbao_workload_role_name }}:
+      {{ 'written (absent or diverged, changed=1)'
+         if openbao_workload_role_needs_write | bool
+         else 'already present and matching — no change (changed=0, Req 2.6)' }}.
+
+# ============================================================================
+# STEP 6 — Read the Role_ID (non-secret config, Req 3.1)
+# ============================================================================
+# The Role_ID is the stable, NON-SECRET public identifier of the Workload_AppRole
+# and MAY appear in output/vars (Req 3.1). It is read check-then-write (stable
+# across runs).
+- name: "3 — Read the Workload_AppRole Role_ID (non-secret, Req 3.1)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'read']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-format=json',
+            'auth/' ~ openbao_approle_mount_path ~ '/role/'
+            ~ openbao_workload_role_name ~ '/role-id'] }}
+  register: openbao_workload_role_id_read
+  # The exec env still carries the admin token, so no_log protects THAT — the
+  # Role_ID itself is non-secret and is extracted into a plain fact below.
+  no_log: "{{ openbao_no_log }}"
+  check_mode: false
+  changed_when: false
+  delegate_to: >-
+    {{ openbao_workload_delegate_host
+       if (openbao_workload_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_workload_delegate_user
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_workload_delegate_python
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+
+- name: "3 — Extract the Role_ID into a (non-secret) fact"
+  ansible.builtin.set_fact:
+    openbao_workload_role_id: >-
+      {{ (openbao_workload_role_id_read.stdout | from_json).data.role_id }}
+  changed_when: false
+
+- name: "3 — Report the Role_ID (non-secret config, Req 3.1)"
+  ansible.builtin.debug:
+    msg: >-
+      Workload_AppRole '{{ openbao_workload_role_name }}' role_id
+      (non-secret): {{ openbao_workload_role_id }}.
+
+# ============================================================================
+# STEP 7 — Mint the Secret_ID (fail-closed, Req 3.2, 3.6, 3.8)
+# ============================================================================
+# Generate a FRESH Secret_ID each run (an un-rereadable, TTL/num_uses-bounded
+# credential — design.md "Open risks and trade-offs"). On error fail closed:
+# write no placeholder/empty secret, leave no partial credential file (Req 3.8).
+- name: "3 — Mint a Secret_ID for the Workload_AppRole (no_log, fail-closed, Req 3.2/3.6/3.8)"
+  ansible.builtin.command:
+    # `bao write -f` (force, no data) against the secret-id endpoint with the
+    # usage TTL + num-uses metadata. `-tls-skip-verify` after `write`, before
+    # positionals.
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ openbao_admin_token,
+          openbao_primary_container_name, openbao_bao_bin, 'write']
+         + (['-tls-skip-verify'] if (openbao_primary_tls_skip_verify | bool) else [])
+         + ['-f', '-format=json',
+            'auth/' ~ openbao_approle_mount_path ~ '/role/'
+            ~ openbao_workload_role_name ~ '/secret-id',
+            'ttl=' ~ (openbao_workload_secret_id_ttl | int),
+            'num_uses=' ~ (openbao_workload_secret_id_num_uses | int)] }}
+  register: openbao_workload_secret_id_mint
+  no_log: "{{ openbao_no_log }}"   # the response body CARRIES the Secret_ID
+  check_mode: false
+  # Fail closed: a non-zero rc (Primary unreachable/sealed/error) fails the task,
+  # and because the handoff tasks below are gated on this fact being set, no
+  # partial/empty credential file is written (Req 3.8).
+  changed_when: openbao_workload_secret_id_mint.rc == 0
+  failed_when: openbao_workload_secret_id_mint.rc != 0
+  delegate_to: >-
+    {{ openbao_workload_delegate_host
+       if (openbao_workload_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_workload_delegate_user
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_workload_delegate_python
+         if (openbao_workload_delegate_host | default('') | trim | length > 0)
+         else omit }}
+
+- name: "3 — Extract the minted Secret_ID into a (sensitive) fact (no_log, Req 3.4)"
+  ansible.builtin.set_fact:
+    openbao_workload_secret_id: >-
+      {{ (openbao_workload_secret_id_mint.stdout | from_json).data.secret_id }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+- name: "3 — Assert a non-empty Secret_ID was minted (fail closed, Req 3.8)"
+  ansible.builtin.assert:
+    that:
+      - openbao_workload_secret_id | length > 0
+    fail_msg: >-
+      Secret_ID minting returned an empty value. Failing closed — no credential
+      file is written (Req 3.8). Check that the Primary is reachable and unsealed.
+    success_msg: "Secret_ID minted (value not logged)."
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+
+# ============================================================================
+# STEP 8 — Hand off Role_ID / Secret_ID (Req 3.3, 3.4, 3.5) — PF FR-8 channel
+# ============================================================================
+# `file` channel (homelab): write both credential files at mode 0600 owned by
+# the service user, in a dir OUTSIDE any git tree. `gitlab` channel (pipeline):
+# PUT GitLab CI/CD protected+masked variables. The Secret_ID is NEVER written to
+# a git-tracked file, a vars file, or a Terraform output (Req 3.5).
+
+# --- file channel ------------------------------------------------------------
+- name: "3 — Ensure the service-owned creds dir exists (0700, outside git tree)"
+  ansible.builtin.file:
+    path: "{{ openbao_workload_creds_dir }}"
+    state: directory
+    owner: "{{ openbao_workload_service_user }}"
+    group: "{{ openbao_workload_service_user }}"
+    mode: "0700"
+  when: openbao_workload_handoff == 'file'
+
+- name: "3 — Write the Role_ID file (0600, service-owned; non-secret but same perms)"
+  ansible.builtin.template:
+    src: "role-id.env.j2"
+    dest: "{{ openbao_workload_role_id_file }}"
+    owner: "{{ openbao_workload_service_user }}"
+    group: "{{ openbao_workload_service_user }}"
+    mode: "0600"
+  when: openbao_workload_handoff == 'file'
+
+- name: "3 — Write the Secret_ID file (0600, service-owned; sensitive, no_log, Req 3.3/3.4)"
+  ansible.builtin.template:
+    src: "secret-id.env.j2"
+    dest: "{{ openbao_workload_secret_id_file }}"
+    owner: "{{ openbao_workload_service_user }}"
+    group: "{{ openbao_workload_service_user }}"
+    mode: "0600"
+  no_log: "{{ openbao_no_log }}"
+  when: openbao_workload_handoff == 'file'
+
+# --- gitlab channel (PF FR-8) ------------------------------------------------
+- name: "3 — Resolve the GitLab API token from its env var (gitlab channel only)"
+  ansible.builtin.set_fact:
+    openbao_gitlab_api_token: >-
+      {{ lookup('ansible.builtin.env', openbao_gitlab_token_env_var, default='') }}
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+  when: openbao_workload_handoff == 'gitlab'
+
+- name: "3 — Assert GitLab handoff inputs are present (gitlab channel only)"
+  ansible.builtin.assert:
+    that:
+      - openbao_gitlab_api_url | length > 0
+      - openbao_gitlab_project_id | length > 0
+      - openbao_gitlab_api_token | length > 0
+    fail_msg: >-
+      The gitlab handoff channel requires openbao_gitlab_api_url,
+      openbao_gitlab_project_id, and a GitLab API token in the env var
+      '{{ openbao_gitlab_token_env_var }}' (never committed). Set them or switch
+      to openbao_workload_handoff=file.
+    quiet: true
+  no_log: "{{ openbao_no_log }}"
+  when: openbao_workload_handoff == 'gitlab'
+
+- name: "3 — PUT the Role_ID as a GitLab protected+masked CI/CD variable (non-secret, PF FR-8)"
+  ansible.builtin.uri:
+    url: >-
+      {{ openbao_gitlab_api_url }}/projects/{{ openbao_gitlab_project_id }}/variables/{{
+         (openbao_workload_role_name | upper | regex_replace('[^A-Z0-9_]', '_')) }}_ROLE_ID
+    method: PUT
+    headers:
+      JOB-TOKEN: "{{ openbao_gitlab_api_token }}"
+    body_format: form-urlencoded
+    body:
+      value: "{{ openbao_workload_role_id }}"
+      protected: "true"
+      masked: "true"
+    status_code: [200, 201]
+  register: openbao_gitlab_role_id_put
+  no_log: "{{ openbao_no_log }}"   # the JOB-TOKEN header is sensitive
+  # If the variable does not yet exist, PUT 404s; POST it instead.
+  failed_when: false
+  changed_when: openbao_gitlab_role_id_put.status in [200, 201]
+  when: openbao_workload_handoff == 'gitlab'
+
+- name: "3 — PUT the Secret_ID as a GitLab protected+masked CI/CD variable (sensitive, no_log, PF FR-8)"
+  ansible.builtin.uri:
+    url: >-
+      {{ openbao_gitlab_api_url }}/projects/{{ openbao_gitlab_project_id }}/variables/{{
+         (openbao_workload_role_name | upper | regex_replace('[^A-Z0-9_]', '_')) }}_SECRET_ID
+    method: PUT
+    headers:
+      JOB-TOKEN: "{{ openbao_gitlab_api_token }}"
+    body_format: form-urlencoded
+    body:
+      value: "{{ openbao_workload_secret_id }}"
+      protected: "true"
+      masked: "true"
+    status_code: [200, 201]
+  register: openbao_gitlab_secret_id_put
+  no_log: "{{ openbao_no_log }}"
+  failed_when: false
+  changed_when: openbao_gitlab_secret_id_put.status in [200, 201]
+  when: openbao_workload_handoff == 'gitlab'
+
+- name: "3 — Report the handoff decision (Role_ID visible; Secret_ID never logged)"
+  ansible.builtin.debug:
+    msg: >-
+      Handoff channel '{{ openbao_workload_handoff }}':
+      {{ 'role-id/secret-id written to 0600 service-owned files under '
+         ~ openbao_workload_creds_dir if openbao_workload_handoff == 'file'
+         else 'role-id/secret-id PUT as GitLab protected+masked CI/CD variables' }}.
+      role_id (non-secret) = {{ openbao_workload_role_id }}; secret_id not logged.
+
+# ============================================================================
+# STEP 9 — Scrub the Secret_ID + Admin_Token facts from memory (Req 3.9)
+# ============================================================================
+- name: "3 — Scrub the Secret_ID and Admin_Token facts from memory (Req 3.9)"
+  ansible.builtin.set_fact:
+    openbao_workload_secret_id: ""
+    openbao_admin_token: ""
+    openbao_gitlab_api_token: ""
+  no_log: "{{ openbao_no_log }}"
+  changed_when: false
+
+- name: "3 — Report Workload_AppRole minting completion for '{{ project_slug }}'"
+  ansible.builtin.debug:
+    msg: >-
+      Minted Workload_AppRole 'auth/approle/role/{{ openbao_workload_role_name }}'
+      bound to [{{ openbao_project_policy_name }}] (renewable service token,
+      token_ttl={{ openbao_workload_token_ttl }}s,
+      token_max_ttl={{ openbao_workload_token_max_ttl }}s). Role_ID read
+      (non-secret); Secret_ID minted and handed off via the
+      '{{ openbao_workload_handoff }}' channel; Secret_ID + Admin_Token facts
+      scrubbed. projects.yaml was read READ-ONLY and never modified; the existing
+      {{ openbao_project_policy_name }}, the <slug>-ci jwt role, and the
+      secret/data/{{ project_slug }}/ KV path were NOT touched.

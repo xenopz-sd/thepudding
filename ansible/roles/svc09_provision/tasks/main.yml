@@ -201,7 +201,13 @@
     name: svc09-20-01
     groups:
       - traefik
-    ansible_host: "10.0.20.10"
+    # cidrhost("10.0.20.0/24", 10 + 2) = 10.0.20.12 — host_index 2 per the
+    # ADR-0015 host-index ledger (infra/platform-foundation/host-indices.yaml).
+    # MOVED off the colliding host_index 0 / 10.0.20.10, which the SVC-07 OpenBao
+    # primary owns. Carried as a literal here, matching the sibling svc07/svc06
+    # bootstraps (the Terraform root derives it; the Ansible layer carries the
+    # computed IP as a constant).
+    ansible_host: "10.0.20.12"
     ansible_user: root
     ansible_connection: ssh
   changed_when: false

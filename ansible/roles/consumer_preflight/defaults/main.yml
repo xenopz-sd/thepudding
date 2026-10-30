@@ -1,0 +1,49 @@
+---
+# defaults/main.yml — consumer_preflight (Consumer onboarding — Phase 1)
+#
+# Phase-1 phase-specific defaults. Cross-phase constants (cluster_env_file,
+# consumer_repo_root, consumer_venv_python, project_slug, consumer_manifest_path,
+# openbao_addr, dependency_probe_timeout, agent_live_run) are play-level vars on
+# project-consumer-bootstrap.yml. NO secret here.
+
+# The pure-Python helper surfaces the orchestrator composes for validation /
+# resolution (design "Components" — the Phase-1 gate invokes these, never
+# reimplements them). Invoked via the venv python by absolute path.
+consumer_manifest_helper: scripts/installer/consumer_manifest.py
+consumer_registry_helper: scripts/installer/consumer_registry.py
+
+# The cluster-env resolver helper (shared with the svcNN installers). Produces
+# the TF_VAR_* mapping + asserts the mandatory cluster vars are present.
+consumer_cluster_env_helper: scripts/installer/cluster_env.py
+
+# The FORBIDDEN build/automation tools (Req 4.2, 4.9). If any of these is named
+# as a configured orchestration tool the run halts naming it. The orchestrator
+# is Ansible-only (service-installer.md §2.1, ADR-0020 alt B rejected).
+consumer_forbidden_build_tools:
+  - make
+  - just
+  - task
+
+# An optional operator-supplied value that is IGNORED: the orchestrator resolves
+# vlan_id only from the Registry (Req 2.3). Declared here so the preflight can
+# detect and warn if an operator passed -e vlan_id=... and then ignore it.
+consumer_operator_supplied_vlan_id: ""
+
+# Homelab Proxmox self-signed cert tolerance (governs the ZITADEL health GET).
+consumer_validate_certs: false
+
+# --- Dependency-probe addressing (read-only diagnosis only, Req 9.1-9.4) -----
+# The OpenBao primary + its container, so the bounded `bao status` probe can run
+# via docker-exec on the primary guest (mirrors the sibling onboarders' pinning).
+consumer_openbao_primary_ip: "10.0.20.10"
+consumer_openbao_api_port: 8200
+consumer_openbao_primary_container_name: "openbao-openbao-1"
+consumer_openbao_bao_bin: "bao"
+consumer_openbao_tls_skip_verify: true
+consumer_openbao_cli_user: "root"
+consumer_openbao_cli_python: "/usr/bin/python3"
+
+# ZITADEL health endpoint (bounded reachability GET). Non-secret; the platform
+# domain is supplied per-env.
+consumer_platform_domain: "platform.example.test"
+consumer_zitadel_health_url: "https://auth.{{ consumer_platform_domain }}/debug/healthz"

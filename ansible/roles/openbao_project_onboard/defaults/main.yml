@@ -65,6 +65,27 @@ openbao_primary_container_name: "openbao-openbao-1"
 # Path to the `bao` CLI inside the running container.
 openbao_bao_bin: "bao"
 
+# =============================================================================
+# Conditional primary-delegation (composed-onboarder bugfix)
+# =============================================================================
+# These roles were authored for the STANDALONE path (ansible/playbooks/openbao.yml
+# Play 2, hosts: openbao, become: true) which already runs ON the primary guest,
+# so every `docker exec`/`docker cp` below targets the LOCAL primary container.
+# When consumer_bootstrap composes this role on hosts: localhost (the control
+# node), an undelegated exec would run where the container does not exist and
+# fail "No such container". The vars below let the composing caller supply the
+# PRIMARY guest as the delegation target; every docker task (and the policy
+# render + /tmp byte-compare slurp) then runs ON the primary over SSH as root.
+#
+# Default = EMPTY -> run-in-place: the `delegate_to` ternary in tasks/main.yml
+# resolves to `inventory_hostname` and the connection vars resolve to `omit`, so
+# the standalone path is byte-for-byte unchanged (no SSH hop, the play's own
+# become:true/connection intact). Mirrors the sibling zitadel-org-provision
+# (zop_openbao_cli_host) + consumer_bootstrap STEP 1 (delegate_to 10.0.20.10).
+openbao_onboard_delegate_host: ""
+openbao_onboard_delegate_user: root
+openbao_onboard_delegate_python: /usr/bin/python3
+
 # Pass `-tls-skip-verify` to the PRIMARY `bao` docker-exec calls in
 # tasks/main.yml when the primary's TLS listener uses the self-signed MOCK cert
 # (openbao_install's openbao_tls_self_signed). Without it, every `bao` call that

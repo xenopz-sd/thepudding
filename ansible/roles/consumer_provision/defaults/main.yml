@@ -1,0 +1,27 @@
+---
+# defaults/main.yml — consumer_provision (Consumer onboarding — Phase 2)
+#
+# Phase-2 phase-specific defaults. Cross-phase constants (cluster_env_file,
+# consumer_repo_root, consumer_venv_python, project_slug, openbao_addr,
+# agent_live_run) are play-level vars; consumer_vlan_id / consumer_manifest are
+# Phase-1 facts. NO secret here.
+
+# The SVC01_Consumer_Root per-project `db/` Terraform root (ADR-0019). The
+# apply is COMPOSED via a child svc-01-bootstrap.yml run (Req 4.4) — this role
+# never re-declares the DB container or re-derives addressing.
+consumer_db_tf_root: "infra/projects/{{ project_slug }}/db"
+
+# The sanctioned SVC-01 orchestrator the consumer provision COMPOSES (Req 4.4).
+# Running it stands up the per-project DB guest (Terraform apply) AND configures
+# it (common + postgres.yml) in one idempotent child run — never reimplemented.
+consumer_svc01_bootstrap_playbook: ansible/playbooks/svc-01-bootstrap.yml
+
+# The generated inventory the SVC-01 installer emits + the consumer-scoped copy
+# the orchestrator keys later phases on (design "Phase 2": generate_inventory.py
+# -> <slug>-consumer.generated.yml).
+consumer_svc01_generated_inventory: ansible/inventory/svc-01-sql-database.generated.yml
+consumer_generated_inventory: "ansible/inventory/{{ project_slug }}-consumer.generated.yml"
+
+# The per-project DB guest VMID. Supplied explicitly so instances get stable,
+# non-colliding IDs; a real per-project copy overrides via -e consumer_svc01_vmid=.
+consumer_svc01_vmid: 1101

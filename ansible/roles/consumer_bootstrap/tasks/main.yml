@@ -1,0 +1,255 @@
+---
+# tasks/main.yml — consumer_bootstrap (Consumer onboarding — Phase 3: Bootstrap)
+#
+# Phase-3 "Service bootstrap". Executes the declared onboarding in dependency
+# order by COMPOSING the existing per-service onboarders — never reimplementing
+# them (Req 4.4-4.6, ADR-0020). Each step is check-then-verify, so a re-run is a
+# no-op (Req 6.1-6.3): the composed onboarder roles are already idempotent
+# (openbao_project_onboard reports changed=0 on a re-run; the DB bootstrap is
+# check-then-write; zitadel-org-provision treats already-exists as success).
+#
+# Steps (design "Phase 3"):
+#   1. Database bootstrap — ALREADY performed by the Phase-2 composition of
+#      svc-01-bootstrap.yml (DB + least-priv app role + generated-password->
+#      OpenBao write at secret/proj-<slug>/<engine>, Req 8.1). Phase 3 VERIFIES
+#      it rather than re-mutating (resumable idempotence, Req 6.3). Gated on a
+#      declared database.
+#   2. OpenBao project onboarding — include_role openbao_project_onboard (the
+#      isolation triple policy-<slug> / <slug>-ci / secret/data/<slug>/, Req 4.6).
+#      Gated on a declared database OR secrets (the DB password write needs the
+#      KV path; an sso/secrets-only project still gets its isolation triple when
+#      it declares secrets).
+#   3. OpenBao workload AppRole — include_role openbao_workload_approle with the
+#      manifest `secrets` TTLs -> auth/approle/role/<slug>-workload bound to
+#      [policy-<slug>], role_id/secret_id handoff per PF FR-8 (Req 4.6, 8.7).
+#      FEATURE-GATED on a declared `secrets` block.
+#   4. SSO onboarding — compose zitadel-org-provision (two-client SPA+API) with
+#      the manifest `sso.app_registrations` list; OIDC client secret written to
+#      OpenBao (Req 4.5, 8.2). FEATURE-GATED on a declared `sso` block.
+#
+# SECRETS (Req 8.3, 8.4, 8.6): every composed onboarder suppresses secret values
+# by default (no_log in the onboarder roles); nothing is committed; a failed
+# OpenBao write halts fail-closed inside the onboarder (openbao_workload_approle
+# STEP 7 failed_when; zitadel-org-provision read-back verify), propagating a
+# non-zero exit to the Phase-3 rescue with no partial/committed secret.
+#
+# CREDENTIAL HANDOFF (Req 5.5, 5.6): inter-phase credentials cross in process
+# memory (include_role facts) or via the onboarders' own 0600 gitignored files —
+# never operator copy-paste.
+
+- name: "Bootstrap | INFO — Phase 3 start (compose onboarders)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Phase 3 (Bootstrap) — composing onboarders for '{{ project_slug }}':
+      db_verify={{ 'yes' if (consumer_manifest.database is defined) else 'skip' }},
+      openbao_onboard={{ 'yes' if ((consumer_manifest.database is defined)
+      or (consumer_manifest.secrets is defined)) else 'skip' }},
+      workload_approle={{ 'yes' if (consumer_manifest.secrets is defined) else 'skip' }},
+      sso={{ 'yes' if (consumer_manifest.sso is defined) else 'skip' }}.
+
+# === STEP 1 — Verify the DB bootstrap already completed (resumable, Req 6.3) ==
+# The DB + app role + generated-password->OpenBao write were performed by the
+# Phase-2 svc-01-bootstrap.yml composition. Here we VERIFY the DB password secret
+# exists at secret/proj-<slug>/<engine> rather than re-writing it — a check, not
+# a mutation (Req 6.3, 8.1). Skipped when OpenBao is unwired (dev/offline) or no
+# database is declared. no_log — the read touches a secret path.
+# NOTE (field name): SVC-01's postgres-server writes the least-privilege APP
+# credential to OpenBao under the field `app_password` (NOT a bare `password`) —
+# the same field zitadel-server reads back (`-field=app_password`). The consumer
+# DB-password-presence check MUST read that exact field, else it fails closed even
+# though the credential is present (live-caught: secret/proj-<slug>/postgres holds
+# app_password/superuser_password/exporter_password, no bare `password`).
+- name: "Bootstrap | STEP 1 — Verify the DB app_password secret is present in OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=https://127.0.0.1:' ~ 8200,
+          '-e', 'BAO_TOKEN=' ~ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true)),
+          'openbao-openbao-1', 'bao', 'kv', 'get']
+         + (['-tls-skip-verify'] if (consumer_openbao_tls_self_signed | bool) else [])
+         + ['-field=app_password', consumer_openbao_db_secret_path] }}
+  delegate_to: "10.0.20.10"
+  vars:
+    ansible_connection: ssh
+    ansible_user: root
+    ansible_python_interpreter: /usr/bin/python3
+  register: consumer_db_secret_verify
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Bootstrap | STEP 1 — Assert the DB password secret is present (fail-closed, Req 8.1/8.6)"
+  ansible.builtin.assert:
+    that:
+      - "consumer_db_secret_verify.rc == 0"
+    fail_msg: >-
+      The generated DB password is NOT present in OpenBao at
+      {{ consumer_openbao_db_secret_path }} after the Phase-2 DB bootstrap. The
+      onboarding fails closed — no partial wiring. Re-run after confirming the
+      Phase-2 svc-01-bootstrap.yml composition wrote the DB credential (its
+      svc01_bootstrap performs the write). (No secret value is shown.)
+    success_msg: "DB password secret present at {{ consumer_openbao_db_secret_path }} (value not shown)."
+    quiet: true
+  no_log: true
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
+# === STEP 2 — OpenBao project onboarding (isolation triple, Req 4.6) =========
+# Compose openbao_project_onboard as-is. It is idempotent (changed=0 on re-run,
+# Req 6.1/6.3). It authenticates with the platform-admin token from the
+# OPENBAO_ADMIN_TOKEN env var (never argv). Runs against the generated inventory
+# so the role's docker-exec delegation reaches the primary. Gated on a declared
+# database OR secrets (either needs the project KV path / policy). Skipped when
+# OpenBao is unwired.
+- name: "Bootstrap | STEP 2 — Compose openbao_project_onboard (isolation triple)"
+  ansible.builtin.include_role:
+    name: "{{ consumer_openbao_project_onboard_role }}"
+  vars:
+    openbao_tls_self_signed: "{{ consumer_openbao_tls_self_signed }}"
+    # Delegate the composed role's docker exec/cp + policy render/slurp to the
+    # primary (this role runs on hosts: localhost, where the container does not
+    # exist). The role sets ansible_connection: ssh / ansible_user: root itself
+    # when this host is non-empty — same root@10.0.20.10 channel as STEP 1.
+    openbao_onboard_delegate_host: "{{ consumer_openbao_primary_host }}"
+    openbao_onboard_delegate_user: root
+  when:
+    - (consumer_manifest.database is defined) or (consumer_manifest.secrets is defined)
+    - (openbao_addr | default('') | trim) | length > 0
+
+# === STEP 3 — OpenBao workload AppRole (FEATURE-GATED on `secrets`, Req 4.6/8.7) ==
+# Compose openbao_workload_approle as-is, threading the manifest `secrets` TTLs.
+# It mints auth/approle/role/<slug>-workload bound to [policy-<slug>] (renewable)
+# and hands role_id/secret_id off over the PF FR-8 first-secret channel. It is
+# idempotent on its role portions; the secret_id is re-minted each run by design
+# (an un-rereadable, TTL/num_uses-bounded credential). no_log is carried inside
+# the composed role on every secret-bearing task (Req 8.3); a failed OpenBao
+# write halts fail-closed there (Req 8.6).
+- name: "Bootstrap | STEP 3 — Compose openbao_workload_approle (<slug>-workload AppRole)"
+  ansible.builtin.include_role:
+    name: "{{ consumer_openbao_workload_approle_role }}"
+  vars:
+    openbao_tls_self_signed: "{{ consumer_openbao_tls_self_signed }}"
+    openbao_workload_handoff: "{{ consumer_workload_handoff }}"
+    openbao_workload_token_ttl: "{{ consumer_manifest.secrets.workload_token_ttl }}"
+    openbao_workload_token_max_ttl: "{{ consumer_manifest.secrets.workload_token_max_ttl }}"
+    openbao_workload_secret_id_ttl: "{{ consumer_manifest.secrets.secret_id_ttl }}"
+    openbao_workload_secret_id_num_uses: "{{ consumer_manifest.secrets.secret_id_num_uses }}"
+    # Delegate the composed role's docker exec to the primary (same rationale as
+    # STEP 2). The STEP 8 file/uri handoff tasks remain undelegated inside the
+    # role (they target the control node / GitLab, not the primary container).
+    openbao_workload_delegate_host: "{{ consumer_openbao_primary_host }}"
+    openbao_workload_delegate_user: root
+    # Composed-run handoff path (fix-composed-workload-creds-dir-writable-path):
+    # the STEP 8 file-channel handoff runs on THIS control node (undelegated — the
+    # credential is for Developer B), so override the role's /etc + root defaults
+    # (correct only for the standalone root-on-guest run) with a $HOME path owned
+    # by the invoking non-root user. STEP 8 sets owner/group = this user at
+    # 0700/0600, so these two overrides are sufficient (no role-task change).
+    # ansible_user_id is the gather_facts fact for the current user (reliable;
+    # env USER may be empty in non-login contexts).
+    openbao_workload_creds_dir: "{{ consumer_workload_creds_dir }}"
+    openbao_workload_service_user: "{{ ansible_user_id }}"
+  when:
+    - consumer_manifest.secrets is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Bootstrap | STEP 3 — INFO — workload AppRole step skipped (no secrets declared)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: workload AppRole step skipped for '{{ project_slug }}' —
+      the Consumer_Manifest declares no secrets block.
+  when: consumer_manifest.secrets is not defined
+
+# === STEP 4 — SSO onboarding (FEATURE-GATED on `sso`, Req 4.5/8.2) ===========
+# Compose zitadel-org-provision via its own playbook child run with the manifest
+# `sso.app_registrations` list (two-client SPA + API) and zop_project_slug=<slug>.
+# The role captures each new OIDC client secret and writes it to OpenBao at the
+# per-app path secret/proj-<slug>/zitadel/oidc/<app> (Req 8.2), with no_log and a
+# read-back verify inside the role. The app_registrations list is bridged across
+# the child-process boundary as a JSON -e so the list structure survives. The
+# ZITADEL provisioning token + OpenBao admin token travel in the child ENV
+# (never argv). A non-zero child exit propagates to the Phase-3 rescue.
+#
+# Inter-phase credential handoff is in process/child ENV + the role's own OpenBao
+# writes — never operator copy-paste (Req 5.5, 5.6).
+#
+# VOCABULARY BRIDGE (fix-consumer-manifest-app-type-mapping): the Consumer_Manifest
+# uses DESCRIPTIVE app_type/auth_method forms (public-spa/confidential-web/api,
+# none/basic/jwt-profile); the zitadel-org-provision role accepts only the SHORT
+# forms (spa/web/api, none/basic/jwt). STEP 4 therefore translates each entry
+# through consumer_app_type_map / consumer_auth_method_map (defaults, single
+# source of truth) BEFORE composing the child run — preserving name + redirect_uris
+# — and fails closed (naming the entry) on any value outside the map keys. A
+# well-formed manifest always passes the assert because the manifest validator
+# already restricts these fields to exactly the map keys.
+- name: "Bootstrap | STEP 4 — Assert every app_registration app_type/auth_method is mappable (fail names the entry)"
+  ansible.builtin.assert:
+    that:
+      - item.app_type is defined
+      - item.app_type in consumer_app_type_map
+      - item.auth_method is defined
+      - item.auth_method in consumer_auth_method_map
+    fail_msg: >-
+      App_Registration entry '{{ item.name | default('<unnamed>') }}' carries an
+      app_type '{{ item.app_type | default('<missing>') }}' and/or auth_method
+      '{{ item.auth_method | default('<missing>') }}' that cannot be mapped to the
+      zitadel-org-provision vocabulary. Mappable app_types are
+      {{ consumer_app_type_map.keys() | list }}; mappable auth_methods are
+      {{ consumer_auth_method_map.keys() | list }}. Onboarding fails closed — no
+      partial wiring.
+    success_msg: "App_Registration '{{ item.name }}' app_type/auth_method are mappable."
+    quiet: true
+  loop: "{{ consumer_manifest.sso.app_registrations }}"
+  loop_control:
+    label: "{{ item.name | default('<unnamed>') }}"
+  changed_when: false
+  when: consumer_manifest.sso is defined
+
+- name: "Bootstrap | STEP 4 — Map app_registrations to role vocabulary (preserve name/redirect_uris)"
+  ansible.builtin.set_fact:
+    consumer_mapped_app_registrations: >-
+      {{ consumer_mapped_app_registrations | default([]) + [{
+           'name': item.name,
+           'app_type': consumer_app_type_map[item.app_type],
+           'auth_method': consumer_auth_method_map[item.auth_method],
+           'redirect_uris': (item.redirect_uris | default([])),
+         }] }}
+  loop: "{{ consumer_manifest.sso.app_registrations }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+  when: consumer_manifest.sso is defined
+
+- name: "Bootstrap | STEP 4 — Compose zitadel-org-provision (two-client SPA+API)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - ansible/inventory/localhost.yml
+      - "{{ consumer_zitadel_org_provision_playbook }}"
+      - -e
+      - "zop_project_slug={{ project_slug }}"
+      - -e
+      - "{{ {'zop_app_registrations': consumer_mapped_app_registrations} | to_json }}"
+      - -e
+      - "zop_openbao_addr={{ openbao_addr | default('') }}"
+      - -e
+      - "{{ {'zop_org_name': consumer_manifest.sso.org_name} | to_json }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_sso_run
+  changed_when: "'changed=0' not in (consumer_sso_run.stdout | default(''))"
+  no_log: true
+  when: consumer_manifest.sso is defined
+
+- name: "Bootstrap | STEP 4 — INFO — SSO step skipped (no sso declared)"
+  ansible.builtin.debug:
+    msg: "INFO: SSO onboarding step skipped for '{{ project_slug }}' — the Consumer_Manifest declares no sso block."
+  when: consumer_manifest.sso is not defined
+
+- name: "Bootstrap | INFO — Phase 3 complete"
+  ansible.builtin.debug:
+    msg: "INFO: Phase 3 (Bootstrap) complete for '{{ project_slug }}'. Proceeding to Phase 4 (Health/Handoff)."

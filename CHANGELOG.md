@@ -5,6 +5,113 @@ All notable changes to the Developer Services Platform are documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-10-30
+
+The **per-project consumer path** lands and is proven end-to-end on the throwaway
+cluster: a project declares the catalog services it consumes in a
+`consumer-manifest.yml`, and the manifest-driven `project-consumer-bootstrap.yml`
+orchestrator wires them by COMPOSING the existing per-service onboarders — never
+reimplementing them. Three feature specs make this real: **OpenBao workload
+AppRole auth** (`openbao-workload-auth`), **ZITADEL SPA/PKCE + two-client
+onboarding** (`zitadel-spa-pkce-onboarding`), and the **consumer onboarding
+orchestrator + per-project SVC-01 consumer root** (`project-consumer-onboarding`).
+A full live acceptance for the `dronefleet` project — a dedicated SVC-01 DB on its
+own VLAN 100 coexisting with the shared services on VLAN 20, the OpenBao isolation
+triple, a workload AppRole, and a two-client SSO org (public SPA + API) in one
+ZITADEL org/project — completed `failed=0`. Seven correctness fixes surfaced by
+that live acceptance also land, each fixed in its own spec (never hand-patched).
+Minor version bump: all additive (the per-project consumer vertical slice + its
+onboarders) plus fixes — no breaking changes. The implemented-services set is
+unchanged (SVC-01/06/07/09 + SVC-17/18 + platform prerequisites); this release
+adds the per-project CONSUMER path on top of them.
+
+### Added
+- **Consumer onboarding orchestrator + per-project SVC-01 consumer root** (spec
+  `project-consumer-onboarding`): a per-project PostgreSQL guest on the project's
+  OWN VLAN (100+) via the `db/` SVC01_Consumer_Root, plus the manifest-driven
+  `ansible/playbooks/project-consumer-bootstrap.yml` 4-phase orchestrator that
+  reads a project's `consumer-manifest.yml` and wires its declared DB + SSO +
+  secrets by COMPOSING the per-service onboarders (feature-gated per manifest
+  block, idempotent/resumable). Ships `scripts/installer/consumer_manifest.py`
+  (pure-Python schema validator) and the `dronefleet` scaffold project
+  (VLAN 100) with its `INSTALL-RUNBOOK.md`. The first per-project-VLAN SVC-01
+  consumer; live-validated end-to-end on the throwaway cluster.
+- **OpenBao workload AppRole auth path** (spec `openbao-workload-auth`): the
+  `openbao_workload_approle` onboarder mints `auth/approle/role/<slug>-workload`
+  bound to `[policy-<slug>]` with manifest-driven TTLs, plus the agent-side
+  AppRole login/credential-fetch role, handing the `role_id`/`secret_id` off over
+  the PF FR-8 first-secret channel (0600 host file or GitLab CI/CD variable). The
+  workload fetches its DB credential + OIDC client secret from OpenBao via its own
+  Agent/AppRole at container start — never a plaintext secret in a repo.
+  Live-validated.
+- **ZITADEL SPA/PKCE + two-client onboarding** (spec
+  `zitadel-spa-pkce-onboarding`): the `zitadel-org-provision` role +
+  `zitadel_provision.py` helper now onboard MULTIPLE app registrations of multiple
+  types (public SPA with PKCE + `NONE` auth, and an API resource server) in ONE
+  org/project in a single run, via the `zop_app_registrations` list — a superset
+  of the legacy single confidential-web `<slug>-webapp` default (preserved for an
+  empty list). Live-validated.
+
+### Fixed
+- **Consumer manifest → role app_type/auth_method vocabulary gap** (spec
+  `fix-consumer-manifest-app-type-mapping`): `consumer_bootstrap` STEP 4 now maps
+  the manifest's descriptive vocabulary (`public-spa`/`confidential-web`/`api`,
+  `none`/`basic`/`jwt-profile`) to the `zitadel-org-provision` role's short forms
+  (`spa`/`web`/`api`, `none`/`basic`/`jwt`) at the composition boundary — a
+  single-source-of-truth mapping with a fail-closed per-entry assert — instead of
+  passing the descriptive values through untranslated (which the role rejected
+  `unrecognized app_type 'public-spa'`). Manifest schema and role accepted-set
+  unchanged; `name`/`redirect_uris` preserved. Live-caught, live-validated.
+- **ZITADEL org-provision production-path TLS verification** (spec
+  `fix-zitadel-org-provision-production-path-insecure-tls`): the production
+  (control-node → Traefik HTTPS) helper invocation now appends a gated
+  `--insecure` (new `zop_base_url_tls_skip_verify`, default true for the
+  self-signed `traefik_tls_self_signed` mock reality, flip to false once SVC-08 /
+  Let's-Encrypt real certs land) so SSO onboarding no longer fails
+  `CERTIFICATE_VERIFY_FAILED` against Traefik's self-signed mock cert. The
+  dev-guest HTTP path and the helper are unchanged. Live-caught, live-validated.
+- **SVC-06 clean-slate OpenBao provision_token residue** (spec
+  `fix-svc06-clean-slate-provision-token-residue`): a SVC-06 clean-slate now
+  clears the stale ZITADEL `provision_token` FIELD from OpenBao (a field-scoped
+  `bao kv patch` — the co-resident `masterkey` and the sibling backing-DB
+  `app_password` are left intact, NEVER a whole-entry delete), gated on OpenBao
+  reachability with a de-masked failure. Without this, a clean-slate left the
+  prior instance's token in OpenBao (a different, untouched guest) and
+  zitadel-server's absolute persist idempotency refused to replace it on the next
+  re-bootstrap, so a consumer reading it got HTTP 401 `Errors.Token.Invalid`. Now
+  the re-bootstrap persists a fresh, coherent PAT. Live-caught, live-validated
+  (masterkey confirmed 32 bytes intact after the clear).
+- **SVC-06 clean-slate backing-DB residue** (spec
+  `fix-svc06-clean-slate-backing-db-residue`): the backing-DB identity
+  (`svc06_db_vmid`/`svc06_db_project_slug`/`svc06_db_vlan_id`) is hoisted to
+  play-level `vars` so it is visible on the `clean_slate=true` branch (it was only
+  in `svc06_provision/defaults`, unloaded on that branch, so VMID 1102 was never
+  destroyed), plus a hardened empty-baseline gate (pre-survivor assert + whole-
+  token `select('in', stdout.split())`). Live-caught, live-validated.
+- **Composed OpenBao onboarder primary delegation** (spec
+  `fix-composed-openbao-onboarder-primary-delegation`): `openbao_project_onboard`
+  and `openbao_workload_approle` now carry a `delegate_to` ternary on every
+  `docker exec`/`cp` task so that when composed on `hosts: localhost` they reach
+  the OpenBao primary over SSH (instead of running on the control node →
+  `No such container`); the empty default preserves the standalone run-in-place
+  behavior byte-for-byte. Live-caught, live-validated.
+- **Composed workload-cred handoff writable path** (spec
+  `fix-composed-workload-creds-dir-writable-path`): the composed
+  `openbao_workload_approle` file-channel handoff writes the workload credentials
+  under `$HOME/.openbao-workload/<slug>` owned by the invoking user (not the
+  standalone role's `/etc/openbao-workload/<slug>` + root), so the unprivileged
+  control-node consumer run can write them. Live-caught, live-validated.
+- **SVC-01 per-instance local Terraform state** (spec
+  `fix-svc01-local-backend-per-instance-state`): the SVC-01 local backend path is
+  now per-instance (`<svc01_state_name>.tfstate`) so two SVC-01 instances (the
+  shared-zitadel backing DB and a per-project consumer DB) do not share one state
+  file — honoring one-state-per-service.
+
+### Changed
+- **README** — the per-project consumer-onboarding row in the implemented-paths
+  index is updated to reflect the end-to-end live validation (two-client SSO +
+  workload AppRole + per-project-VLAN DB coexistence proven, not merely built).
+
 ## [0.10.0] - 2026-10-28
 
 The fifth implemented service lands: **SVC-17/18 (Prometheus + Grafana + Loki
@@ -796,6 +903,7 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
+[0.11.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.10.0...v0.11.0
 [0.10.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.9.0...v0.10.0
 [0.9.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.8.0...v0.9.0
 [0.2.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.1.0...v0.2.0

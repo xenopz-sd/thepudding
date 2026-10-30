@@ -24,12 +24,16 @@
 # its SVC-01 state name `shared-zitadel-svc01-postgres` is unique and isolated
 # (Terraform state isolation, cross-cutting §3). Lowercase/hyphenated, <=20 chars
 # (PF §4 slug rule; "shared-zitadel" is 14 chars).
-svc06_db_project_slug: "shared-zitadel"
+# MOVED to play-level vars in ansible/playbooks/svc-06-bootstrap.yml (single
+# source of truth): the clean_slate branch skips this role, so its child
+# svc-01-bootstrap clean-slate must still see svc06_db_project_slug — spec
+# fix-svc06-clean-slate-backing-db-residue, Req 3.2. Do NOT redefine it here.
 
 # The backing DB lives on the shared-services VLAN 20 alongside ZITADEL itself
 # (both are shared platform services — domain-rules §1). Its VNet `p20` is the
 # platform-foundation-owned precondition.
-svc06_db_vlan_id: 20
+# MOVED to play-level vars (single source of truth, Req 3.2) — see the
+# svc06_db_project_slug note above. Do NOT redefine svc06_db_vlan_id here.
 
 # Engine + extensions: ZITADEL requires PostgreSQL 14-18 (requirements §12);
 # `postgres:17` (the SVC-01 default) satisfies this. ZITADEL does NOT need
@@ -50,7 +54,10 @@ svc06_db_tier: "small"
 # the host-index ledger infra/platform-foundation/host-indices.yaml. The ZITADEL
 # guest itself takes a different host_index (svc06_zitadel_host_index, Task 15/17).
 svc06_db_host_index: 4
-svc06_db_vmid: 1102
+# svc06_db_vmid MOVED to play-level vars (single source of truth, Req 3.2) — the
+# clean_slate branch needs it to target VMID 1102 for destruction. Do NOT
+# redefine it here. (svc06_db_host_index stays — consumed only on this provision
+# branch's child argv, never by svc06_clean_slate.)
 
 # The app-subnet CIDR the SVC-01 firewall rule (opt-in, default off) would scope
 # the DB's 5432 to — the ZITADEL guest's own subnet. On the shared VLAN the whole

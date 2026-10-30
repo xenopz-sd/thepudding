@@ -1,0 +1,289 @@
+---
+# tasks/main.yml — consumer_preflight (Consumer onboarding — Phase 1: Preflight)
+#
+# Phase-1 "Preflight & validation" FAIL-CLOSED GATE (Req 2, 4.8, 4.9, 5.3, 9.1).
+# A failure here leaves ZERO provisioning side effect — nothing in this role
+# touches Proxmox, Terraform state, OpenBao, or ZITADEL state; every dependency
+# probe is READ-ONLY diagnosis used only to decide whether to proceed (Req 9.1).
+#
+# Order (design "Phase 1 — consumer_preflight"):
+#   1. assert project_slug supplied (the per-instance identity).
+#   2. resolve + assert the Cluster_Env_File vars (halt naming a missing var).
+#   3. forbidden-build-tool gate (Ansible-only, Req 4.9).
+#   4. manifest schema validation via consumer_manifest.py (Req 1.6/1.7).
+#   5. Registry resolution via consumer_registry.py (Req 2.1-2.5); vlan_id is an
+#      OUTPUT, never an operator input (Req 2.3).
+#   6. bounded dependency probes for the DECLARED services (Req 9.1-9.4).
+#
+# NO interactive prompt in any mutating path (Req 4.7) — this role performs no
+# mutation at all and never prompts.
+
+# === 1. project_slug is the per-instance identity ===========================
+- name: "Preflight | Assert project_slug is supplied"
+  ansible.builtin.assert:
+    that:
+      - "(project_slug | default('') | trim) | length > 0"
+    fail_msg: >-
+      project_slug is required — the Consumer_Project to onboard. Pass it via
+      the sanctioned entry point
+      `ansible/playbooks/project-consumer-bootstrap.yml -e project_slug=<slug>`.
+      Nothing was provisioned.
+    success_msg: "Onboarding Consumer_Project '{{ project_slug }}'."
+    quiet: true
+
+# === 2. Cluster_Env_File resolve + mandatory-var assertion (Req 4.8) ========
+# The shared cluster_env.py resolver reads the Cluster_Env_File and emits the
+# TF_VAR_* mapping; it fails (non-zero) if a mandatory cluster var is absent, so
+# a missing var halts here at preflight NAMING the variable (Req 4.8), before any
+# mutation. no_log — the resolved mapping carries the Proxmox API token.
+- name: "Preflight | Resolve + validate the cluster env file ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ consumer_venv_python }}"
+      - "{{ consumer_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_env_resolve
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | Capture the resolved TF_VAR_* mapping (no_log)"
+  ansible.builtin.set_fact:
+    consumer_tfvars: "{{ consumer_env_resolve.stdout | from_json }}"
+  no_log: true
+
+- name: "Preflight | Bind non-secret cluster facts for later phases"
+  ansible.builtin.set_fact:
+    consumer_proxmox_node_name: "{{ consumer_tfvars['TF_VAR_proxmox_node_name'] }}"
+  no_log: true
+
+# === 3. Forbidden-build-tool gate (Ansible-only, Req 4.2, 4.9) ==============
+# The orchestrator must introduce NO build/automation tool beyond Ansible. An
+# operator may signal a configured orchestration tool via
+# `consumer_orchestration_tool` (default 'ansible'); any other value — or a
+# forbidden tool name — halts naming the offending tool (Req 4.9). This is a
+# config-level fail-closed assertion; the structural guarantee (no make/just/
+# task/bash invoked) is additionally enforced by ansible-lint over this play.
+- name: "Preflight | Assert no forbidden build/automation tool is configured (Ansible-only, Req 4.9)"
+  ansible.builtin.assert:
+    that:
+      - "(consumer_orchestration_tool | default('ansible')) == 'ansible'"
+      - "(consumer_orchestration_tool | default('ansible')) not in consumer_forbidden_build_tools"
+    fail_msg: >-
+      The Consumer_Onboarding_Orchestrator is Ansible-only (service-installer.md
+      §2.1, ADR-0020). A forbidden build/automation tool
+      '{{ consumer_orchestration_tool | default('ansible') }}' was configured —
+      remove it. Permitted: ansible only; forbidden:
+      {{ consumer_forbidden_build_tools }} (and any bash wrapper). Nothing was
+      provisioned.
+    success_msg: "Orchestration tool is Ansible-only — no forbidden build tool configured."
+    quiet: true
+
+# === 4. Manifest schema validation (Req 1.6, 1.7) ==========================
+- name: "Preflight | Stat the Consumer_Manifest ({{ consumer_manifest_path }})"
+  ansible.builtin.stat:
+    path: "{{ consumer_repo_root }}/{{ consumer_manifest_path }}"
+  register: consumer_manifest_stat
+
+- name: "Preflight | Assert the Consumer_Manifest exists (fail-closed)"
+  ansible.builtin.assert:
+    that:
+      - "consumer_manifest_stat.stat.exists"
+    fail_msg: >-
+      The Consumer_Manifest '{{ consumer_manifest_path }}' does not exist.
+      Declare the services the project consumes in that file (see the
+      manifest-format reference) before onboarding. Nothing was provisioned.
+    success_msg: "Consumer_Manifest present at '{{ consumer_manifest_path }}'."
+    quiet: true
+
+# Compose the pure validator (consumer_manifest.py --check). A non-zero exit is a
+# schema rejection naming the FIRST offending field / service entry on stderr
+# (Req 1.6, 1.7); failed_when:false lets us surface that message explicitly in
+# the assert below rather than a bare "non-zero return code". This is offline,
+# side-effect-free (reads the file only), so it leaves zero provisioning effect.
+- name: "Preflight | Validate the Consumer_Manifest schema (compose consumer_manifest.py)"
+  ansible.builtin.command:
+    argv:
+      - "{{ consumer_venv_python }}"
+      - "{{ consumer_manifest_helper }}"
+      - --check
+      - "{{ consumer_manifest_path }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_manifest_check
+  changed_when: false
+  failed_when: false
+
+- name: "Preflight | Reject an invalid Consumer_Manifest naming the offender (Req 1.6/1.7)"
+  ansible.builtin.assert:
+    that:
+      - "consumer_manifest_check.rc == 0"
+    fail_msg: >-
+      The Consumer_Manifest '{{ consumer_manifest_path }}' failed schema
+      validation: {{ consumer_manifest_check.stderr | default('see the validator
+      output above') | trim }}. Nothing was provisioned.
+    success_msg: "Consumer_Manifest satisfies the schema."
+    quiet: true
+
+# Parse the (now validated) manifest into a fact so later phases can feature-gate
+# on the declared blocks and thread the declared parameters. Pure read.
+- name: "Preflight | Load the validated Consumer_Manifest into a fact"
+  ansible.builtin.set_fact:
+    consumer_manifest: >-
+      {{ lookup('ansible.builtin.file',
+                consumer_repo_root ~ '/' ~ consumer_manifest_path) | from_yaml }}
+  changed_when: false
+
+- name: "Preflight | INFO — declared consumable services"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Consumer_Manifest for '{{ project_slug }}' declares:
+      database={{ 'yes' if (consumer_manifest.database is defined) else 'no' }},
+      sso={{ 'yes' if (consumer_manifest.sso is defined) else 'no' }},
+      secrets={{ 'yes' if (consumer_manifest.secrets is defined) else 'no' }}.
+
+# === 5. Registry slug -> vlan_id resolution (Req 2.1-2.5; vlan_id NEVER input) ==
+# Warn if an operator passed -e vlan_id=...: it is IGNORED. The orchestrator
+# resolves vlan_id only from the Registry (Req 2.3).
+- name: "Preflight | WARN if an operator supplied a vlan_id (it is IGNORED, Req 2.3)"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: an operator-supplied vlan_id
+      ('{{ consumer_operator_supplied_vlan_id | default('') }}'/
+      '{{ vlan_id | default('') }}') is IGNORED. The Consumer_Onboarding_
+      Orchestrator resolves vlan_id ONLY from the Registry
+      (infra/platform-foundation/projects.yaml), never from operator input
+      (Req 2.3).
+  when: >-
+    ((consumer_operator_supplied_vlan_id | default('') | trim) | length > 0)
+    or ((vlan_id | default('') | string | trim) | length > 0)
+
+# Compose the pure resolver (consumer_registry.py --resolve). A non-zero exit is
+# a distinct no-resolution halt classification (absent / decommissioned /
+# unreadable) on stderr (Req 2.2/2.4/2.5); the stdout of a success is
+# "<slug> -> VLAN <n>". failed_when:false so the assert below surfaces the exact
+# classification. Reads projects.yaml only — zero provisioning side effect.
+- name: "Preflight | Resolve the project's vlan_id from the Registry (compose consumer_registry.py)"
+  ansible.builtin.command:
+    argv:
+      - "{{ consumer_venv_python }}"
+      - "{{ consumer_registry_helper }}"
+      - --resolve
+      - "{{ project_slug }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_registry_resolve
+  changed_when: false
+  failed_when: false
+
+- name: "Preflight | Halt fail-closed on any Registry no-resolution (Req 2.2/2.4/2.5)"
+  ansible.builtin.assert:
+    that:
+      - "consumer_registry_resolve.rc == 0"
+    fail_msg: >-
+      Registry resolution for slug '{{ project_slug }}' halted:
+      {{ consumer_registry_resolve.stderr | default('see the resolver output
+      above') | trim }}. Nothing was provisioned.
+    success_msg: "Registry resolved '{{ project_slug }}' successfully."
+    quiet: true
+
+# Bind the resolved vlan_id as the AUTHORITATIVE fact for Phases 2-4. The helper
+# prints "<slug> -> VLAN <n>"; extract the integer. This is the ONLY source of
+# vlan_id in the whole run (Req 2.1, 2.3).
+- name: "Preflight | Bind the Registry-resolved vlan_id (authoritative, never operator input)"
+  ansible.builtin.set_fact:
+    consumer_vlan_id: >-
+      {{ (consumer_registry_resolve.stdout | regex_search('VLAN\s+(\d+)', '\1') | first) | int }}
+  changed_when: false
+
+- name: "Preflight | INFO — resolved VLAN (Registry-authoritative)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: '{{ project_slug }}' resolved to VLAN {{ consumer_vlan_id }}
+      (Registry-authoritative; not operator input).
+
+# === 6. Bounded dependency probes for DECLARED services (Req 9.1-9.4) =======
+# Each probe is READ-ONLY diagnosis within a bounded timeout — never an
+# indefinite wait, never a mutation (Req 9.1). An unavailable dependency halts
+# fail-closed naming the dependency (Req 9.2-9.4), leaving zero side effect.
+
+# --- OpenBao probe: needed when the manifest declares secrets OR a database
+#     (the DB password is written to OpenBao). Skipped when OpenBao is unwired
+#     (openbao_addr empty — a dev/offline run). Read-only `bao status`. ---
+- name: "Preflight | Probe OpenBao (bounded, read-only bao status) — when needed + wired"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', consumer_openbao_primary_container_name,
+          consumer_openbao_bao_bin, 'status']
+         + (['-tls-skip-verify'] if (consumer_openbao_tls_skip_verify | bool) else [])
+         + ['-format=json'] }}
+  delegate_to: "{{ consumer_openbao_primary_ip }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ consumer_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ consumer_openbao_cli_python }}"
+  register: consumer_openbao_probe
+  changed_when: false
+  failed_when: false
+  timeout: "{{ dependency_probe_timeout | int }}"
+  when:
+    - (consumer_manifest.secrets is defined) or (consumer_manifest.database is defined)
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Preflight | Halt fail-closed if OpenBao is sealed/unreachable (Req 9.2)"
+  ansible.builtin.assert:
+    that:
+      # rc 0 (unsealed) or rc 2 (sealed-but-reachable) both indicate a REACHABLE
+      # OpenBao; only an unreachable/timeout (rc not in {0,2}) or an explicitly
+      # sealed status halts. A sealed OpenBao cannot serve the secret writes, so
+      # treat sealed as unavailable for onboarding (Req 9.2).
+      - "consumer_openbao_probe.rc == 0"
+      - "not ((consumer_openbao_probe.stdout | default('{}') | from_json).sealed | default(true) | bool)"
+    fail_msg: >-
+      OpenBao is unavailable (sealed or unreachable) within the bounded probe
+      timeout ({{ dependency_probe_timeout }}s). The per-project DB password and
+      OIDC client secret writes depend on it. Bring OpenBao up/unseal it ONLY via
+      its own `ansible/playbooks/svc-07-bootstrap.yml` automated path (never raw
+      ssh/docker/pct), then re-run. Nothing was provisioned (Req 9.2, 9.5, 9.6).
+    success_msg: "OpenBao is reachable and unsealed."
+    quiet: true
+  when:
+    - (consumer_manifest.secrets is defined) or (consumer_manifest.database is defined)
+    - (openbao_addr | default('') | trim) | length > 0
+
+# --- ZITADEL probe: needed only when the manifest declares sso. Bounded
+#     read-only health GET. ---
+- name: "Preflight | Probe ZITADEL (bounded, read-only health GET) — when sso declared"
+  ansible.builtin.uri:
+    url: "{{ consumer_zitadel_health_url }}"
+    method: GET
+    validate_certs: "{{ consumer_validate_certs }}"
+    timeout: "{{ dependency_probe_timeout | int }}"
+    status_code: [200]
+  register: consumer_zitadel_probe
+  changed_when: false
+  failed_when: false
+  when: consumer_manifest.sso is defined
+
+- name: "Preflight | Halt fail-closed if ZITADEL is unreachable (Req 9.3)"
+  ansible.builtin.assert:
+    that:
+      - "(consumer_zitadel_probe.status | default(0)) == 200"
+    fail_msg: >-
+      The SSO provider (ZITADEL) is unreachable within the bounded probe timeout
+      ({{ dependency_probe_timeout }}s) at {{ consumer_zitadel_health_url }}. The
+      SSO org/app onboarding depends on it. Bring ZITADEL up ONLY via its own
+      `ansible/playbooks/svc-06-bootstrap.yml` automated path (never raw
+      ssh/docker/pct), then re-run. Nothing was provisioned (Req 9.3, 9.5, 9.6).
+    success_msg: "ZITADEL is reachable."
+    quiet: true
+  when: consumer_manifest.sso is defined
+
+- name: "Preflight | INFO — Phase 1 complete, fail-closed gate passed"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Phase 1 (Preflight) complete for '{{ project_slug }}' — manifest
+      valid, VLAN {{ consumer_vlan_id }} resolved, declared dependencies
+      reachable. Proceeding to Phase 2.

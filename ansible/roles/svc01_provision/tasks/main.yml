@@ -82,8 +82,19 @@
     content: |
       # Local, gitignored state backend for a solo/offline apply — overrides the
       # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+      #
+      # PER-INSTANCE state (fix-svc01-local-backend-per-instance-state): the path is
+      # keyed on the project slug (<slug>-svc01-postgres.tfstate) so each SVC-01
+      # instance applied against the one reusable svc-01-sql-database root gets its
+      # OWN isolated local state — matching the GitLab backend's per-slug isolation
+      # (ADR-0019; integration-boundaries §5). Without a path, every slug shared the
+      # default terraform.tfstate and a second instance collided with the first
+      # (prevent_destroy abort). A bare filename is relative to the root dir, so the
+      # state lands inside svc01_tf_root.
       terraform {
-        backend "local" {}
+        backend "local" {
+          path = "{{ svc01_state_name }}.tfstate"
+        }
       }
   when: not (svc01_use_gitlab_backend | bool)
 

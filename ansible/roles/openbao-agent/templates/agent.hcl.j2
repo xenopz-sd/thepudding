@@ -1,0 +1,67 @@
+{#-
+  templates/agent.hcl.j2 — openbao-agent  (openbao-workload-auth, Task 4.2)
+
+  The `bao agent` config rendered onto the workload host by tasks/main.yml. It is
+  kept STRUCTURALLY EQUIVALENT — byte-for-byte after whitespace normalisation —
+  to the shared pure renderer
+  scripts/installer/workload_auth.py::render_agent_hcl, so the golden-file unit
+  test (tests/installer/test_workload_auth_unit.py) and the live render
+  cross-check one another (design.md "Open risks and trade-offs"). If you change
+  one you MUST change the other and regenerate
+  tests/installer/fixtures/openbao_workload_auth/agent.hcl.golden.
+
+  Structure (mirrors render_agent_hcl exactly):
+    * a `vault` block — address, a `tls_skip_verify = true` line emitted IFF
+      openbao_primary_tls_skip_verify is true (Req 4.5, Property 6), and a
+      `retry { num_retries = N }` stanza (Req 6.3);
+    * one `auto_auth` block — a `method "approle"` reading the on-host
+      role_id/secret_id file paths (Req 4.1, Property 4) + a token `sink "file"`;
+    * one `template` stanza per openbao_agent_secret_mappings entry (Req 4.2,
+      Property 5), each reading secret/data/<slug>/<kv_subpath> and emitting
+      <env_key>=<.Data.data.<kv_field>> into the single Rendered_Secret_File at
+      0600 (Req 4.9);
+    * `exit_after_auth = false`.
+
+  NO secret VALUE is ever rendered — only file paths and the literal OpenBao
+  consul-template directives the Agent expands at RUNTIME (Req 4.8). The inner
+  double quotes around the KV path are escaped (\") because the directive is the
+  value of a double-quoted HCL `contents` string — matching the pure renderer.
+
+  Determinism (Req 4.6, Property 7): the mappings loop iterates the given
+  (ordered) list and interpolates no non-deterministic value, so a re-render on
+  unchanged config is byte-identical and reports changed=0.
+-#}
+# MANAGED BY ANSIBLE (openbao-agent) — DO NOT EDIT BY HAND.
+pid_file = "{{ openbao_agent_pid_file }}"
+
+vault {
+  address = "{{ openbao_primary_addr }}"
+{% if openbao_primary_tls_skip_verify | bool %}
+  tls_skip_verify = true
+{% endif %}
+  retry { num_retries = {{ openbao_agent_num_retries | int }} }
+}
+
+auto_auth {
+  method "approle" {
+    mount_path = "{{ openbao_agent_approle_mount }}"
+    config = {
+      role_id_file_path   = "{{ openbao_agent_role_id_path }}"
+      secret_id_file_path = "{{ openbao_agent_secret_id_path }}"
+      remove_secret_id_file_after_reading = {{ 'true' if (openbao_agent_remove_secret_id_after_read | bool) else 'false' }}
+    }
+  }
+  sink "file" {
+    config = { path = "{{ openbao_agent_token_sink_path }}" }
+  }
+}
+
+{% for m in openbao_agent_secret_mappings %}
+template {
+  contents    = "{{ '{{' }} with secret \"secret/data/{{ project_slug }}/{{ m.kv_subpath }}\" {{ '}}' }}{{ m.env_key }}={{ '{{' }} .Data.data.{{ m.kv_field }} {{ '}}' }}{{ '{{' }} end {{ '}}' }}"
+  destination = "{{ openbao_agent_rendered_secret_file }}"
+  perms       = "0600"
+}
+
+{% endfor %}
+exit_after_auth = false

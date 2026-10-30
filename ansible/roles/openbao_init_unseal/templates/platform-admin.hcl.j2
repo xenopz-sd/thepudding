@@ -43,6 +43,14 @@ path "auth/jwt/*" {
 path "auth/oidc/*" {
   capabilities = ["create", "read", "update", "delete", "list"]
 }
+# Manage the approle auth method and its roles (openbao-workload-auth:
+# Workload_AppRole creation — auth/approle/role/<slug>-workload). The admin
+# token could already ENABLE the method (via sys/auth/*) and manage jwt/oidc
+# roles above, but had no grant to create/update an approle ROLE — a 403 on the
+# Workload_AppRole write. Mirrors the jwt/oidc stanzas exactly; approle only.
+path "auth/approle/*" {
+  capabilities = ["create", "read", "update", "delete", "list"]
+}
 
 # Full management of the project KV tree (onboarding creates per-project paths).
 path "{{ openbao_kv_mount }}/*" {

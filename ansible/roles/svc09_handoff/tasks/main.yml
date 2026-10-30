@@ -59,7 +59,7 @@
       - "============================================================"
       - "Service:            SVC-09 (Traefik reverse proxy / TLS termination)"
       - "Status:             healthy"
-      - "Internal endpoint:  https://10.0.20.10 (VLAN-20); web:80 / websecure:443"
+      - "Internal endpoint:  https://10.0.20.12 (VLAN-20); web:80 / websecure:443"
       - "Edge network:       `edge` external Docker network (owned by Traefik)"
       - "Dashboard:          https://traefik.{{ svc09_banner_domain }}/dashboard/"
       - "                    (internal-only route; ZITADEL auth once SVC-06 live)"

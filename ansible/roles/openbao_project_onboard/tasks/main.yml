@@ -174,13 +174,39 @@
   ansible.builtin.template:
     src: "policy-slug.hcl.j2"
     dest: "/tmp/{{ openbao_project_policy_name }}.hcl"
-    owner: root
-    group: root
+    # NO owner/group (fix-svc06... consumer composition): this is a TRANSIENT,
+    # non-secret scratch render — the policy ACL document is slurped only for a
+    # byte-compare, then `docker cp`'d into the primary container and `bao policy
+    # write`-n. Its LOCAL ownership is irrelevant to correctness. Setting
+    # owner/group root broke the consumer orchestrator's composition, which runs
+    # this role on the control node as an UNPRIVILEGED user (no become) — chown
+    # to root fails "Operation not permitted". The standalone SVC-07 path (Play 2
+    # hosts: openbao, become: true) still renders it fine (root owns it by
+    # default); mode 0640 is retained.
     mode: "0640"
   register: openbao_policy_render
   # Rendering to a tmp file is not the source-of-truth change; the `bao policy
   # write` below is. Templating is idempotent (same vars -> same bytes), so this
   # only reports changed when the rendered content actually differs.
+  # Option (a) coherence: delegate the render to the primary so /tmp/<policy>.hcl
+  # is created on the host the `docker cp` + byte-compare slurp run on.
+  delegate_to: >-
+    {{ openbao_onboard_delegate_host
+       if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_onboard_delegate_user
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_onboard_delegate_python
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
 
 - name: "9.1 — List existing policies (check-then-write, no change)"
   ansible.builtin.command:
@@ -194,6 +220,23 @@
   no_log: "{{ openbao_no_log }}"   # exec env carries the platform-admin token
   check_mode: false
   changed_when: false
+  delegate_to: >-
+    {{ openbao_onboard_delegate_host
+       if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_onboard_delegate_user
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_onboard_delegate_python
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
 
 - name: "9.1 — Read the live policy-<slug> body when it already exists"
   ansible.builtin.command:
@@ -207,6 +250,23 @@
   no_log: "{{ openbao_no_log }}"
   check_mode: false
   changed_when: false
+  delegate_to: >-
+    {{ openbao_onboard_delegate_host
+       if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_onboard_delegate_user
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_onboard_delegate_python
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
   when: >-
     openbao_project_policy_name in (openbao_policy_list.stdout | default('[]') | from_json)
 
@@ -216,6 +276,26 @@
   register: openbao_policy_rendered_raw
   check_mode: false
   changed_when: false
+  # Option (a) coherence: slurp the primary-local rendered file (the render above
+  # is delegated to the same host), so the byte-compare reads what `docker cp`
+  # will copy into the container.
+  delegate_to: >-
+    {{ openbao_onboard_delegate_host
+       if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_onboard_delegate_user
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_onboard_delegate_python
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
 
 - name: "9.1 — Decide whether policy-<slug> must be (re)written"
   ansible.builtin.set_fact:
@@ -241,6 +321,23 @@
       - "/tmp/{{ openbao_project_policy_name }}.hcl"
       - "{{ openbao_primary_container_name }}:/tmp/{{ openbao_project_policy_name }}.hcl"
   changed_when: true
+  delegate_to: >-
+    {{ openbao_onboard_delegate_host
+       if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_onboard_delegate_user
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_onboard_delegate_python
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
   when: openbao_policy_needs_write | bool
 
 - name: "9.1 — Write policy-<slug> (CRUD+list on the five KV sub-paths only, Req 1.2/1.3)"
@@ -255,6 +352,23 @@
   register: openbao_policy_write
   no_log: "{{ openbao_no_log }}"
   changed_when: openbao_policy_write.rc == 0
+  delegate_to: >-
+    {{ openbao_onboard_delegate_host
+       if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_onboard_delegate_user
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_onboard_delegate_python
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
   when: openbao_policy_needs_write | bool
 
 - name: "9.1 — Report the policy-<slug> decision"
@@ -295,6 +409,23 @@
   check_mode: false
   changed_when: false
   failed_when: false           # a missing role returns non-zero — that's "absent"
+  delegate_to: >-
+    {{ openbao_onboard_delegate_host
+       if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_onboard_delegate_user
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_onboard_delegate_python
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
 
 - name: "9.1 — Decide whether the jwt role must be (re)written"
   ansible.builtin.set_fact:
@@ -360,6 +491,23 @@
   register: openbao_jwt_role_write
   no_log: "{{ openbao_no_log }}"
   changed_when: openbao_jwt_role_write.rc == 0
+  delegate_to: >-
+    {{ openbao_onboard_delegate_host
+       if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_onboard_delegate_user
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_onboard_delegate_python
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
   when: openbao_jwt_role_needs_write | bool
 
 # Re-read the stored role AFTER a write and verify ref_type/ref (when supplied)
@@ -378,6 +526,23 @@
   no_log: "{{ openbao_no_log }}"
   check_mode: false
   changed_when: false
+  delegate_to: >-
+    {{ openbao_onboard_delegate_host
+       if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_onboard_delegate_user
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_onboard_delegate_python
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
   when: openbao_jwt_role_needs_write | bool
 
 - name: "9.1 — Assert the stored jwt role honours the bound_claims + TTL contract (Req 4.2, 4.7)"
@@ -437,6 +602,23 @@
   check_mode: false
   changed_when: false
   failed_when: false           # a missing path returns non-zero — that's "absent"
+  delegate_to: >-
+    {{ openbao_onboard_delegate_host
+       if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_onboard_delegate_user
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_onboard_delegate_python
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
 
 - name: "9.1 — Ensure the KV path secret/data/<slug>/ exists (metadata-only, no secret version, Req 1.6)"
   ansible.builtin.command:
@@ -450,6 +632,23 @@
   register: openbao_kv_metadata_put
   no_log: "{{ openbao_no_log }}"
   changed_when: openbao_kv_metadata_put.rc == 0
+  delegate_to: >-
+    {{ openbao_onboard_delegate_host
+       if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+       else inventory_hostname }}
+  vars:
+    ansible_connection: >-
+      {{ 'ssh'
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_user: >-
+      {{ openbao_onboard_delegate_user
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
+    ansible_python_interpreter: >-
+      {{ openbao_onboard_delegate_python
+         if (openbao_onboard_delegate_host | default('') | trim | length > 0)
+         else omit }}
   # Only create when absent, so a re-run is a no-op that reports changed=0 and,
   # by using metadata (not data), never touches a secret version even on create.
   when: openbao_kv_metadata_get.rc != 0

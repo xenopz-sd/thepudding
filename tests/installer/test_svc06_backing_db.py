@@ -36,6 +36,14 @@ import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DB_DEFAULTS = _REPO_ROOT / "ansible" / "roles" / "svc06_provision" / "defaults" / "main.yml"
+# Fix (spec fix-svc06-clean-slate-backing-db-residue, Req 3.2): the three
+# backing-DB IDENTITY values (svc06_db_project_slug/svc06_db_vlan_id/svc06_db_vmid)
+# were HOISTED to the play-level vars of svc-06-bootstrap.yml (single source of
+# truth) so the clean_slate branch — which skips svc06_provision — can still see
+# them. svc06_db_host_index and the provision-only knobs (engine, extensions,
+# tier) STAY in svc06_provision/defaults. This test therefore reads the identity
+# from the play and the provision-only knobs from the role defaults.
+_SVC06_BOOTSTRAP = _REPO_ROOT / "ansible" / "playbooks" / "svc-06-bootstrap.yml"
 _SVC01_PROVISION = _REPO_ROOT / "ansible" / "roles" / "svc01_provision" / "tasks" / "main.yml"
 _SVC01_ROOT = _REPO_ROOT / "infra" / "projects" / "svc-01-sql-database"
 _SVC06_ROOT = _REPO_ROOT / "infra" / "projects" / "svc-06-identity-provider"
@@ -44,18 +52,56 @@ _SVC06_ROOT = _REPO_ROOT / "infra" / "projects" / "svc-06-identity-provider"
 _EXPECTED_DB_STATE_NAME = "shared-zitadel-svc01-postgres"
 
 
+def _load_play_vars() -> dict:
+    """The play-level ``vars:`` of svc-06-bootstrap.yml — the authoritative home
+    of the three backing-DB IDENTITY values after the single-source-of-truth
+    hoist (Req 3.2)."""
+    assert _SVC06_BOOTSTRAP.is_file(), (
+        "svc-06-bootstrap.yml must exist and carry the play-level backing-DB identity vars"
+    )
+    doc = yaml.safe_load(_SVC06_BOOTSTRAP.read_text(encoding="utf-8")) or []
+    assert isinstance(doc, list) and doc and isinstance(doc[0], dict), (
+        "svc-06-bootstrap.yml must be a play list whose first play is a mapping"
+    )
+    return doc[0].get("vars", {}) or {}
+
+
 def _load_db_defaults() -> dict:
+    """Merged backing-DB view: the three IDENTITY values from the play-level vars
+    (authoritative single source of truth, Req 3.2) OVERLAID on the provision
+    role defaults (which still own svc06_db_host_index + the engine/extension/
+    tier knobs). This mirrors Ansible precedence (play vars outrank role defaults)
+    and lets this shape guard assert the full backing-DB parameter set from its
+    post-hoist locations."""
     assert _DB_DEFAULTS.is_file(), (
         "svc06_provision/defaults/main.yml must define the ZITADEL backing-DB "
-        "SVC-01 instance parameters (Task 14, design.md §3.3)"
+        "provision-only parameters (engine/extensions/tier/host_index)"
     )
-    return yaml.safe_load(_DB_DEFAULTS.read_text(encoding="utf-8")) or {}
+    merged = yaml.safe_load(_DB_DEFAULTS.read_text(encoding="utf-8")) or {}
+    play_vars = _load_play_vars()
+    for identity_key in ("svc06_db_project_slug", "svc06_db_vlan_id", "svc06_db_vmid"):
+        if identity_key in play_vars:
+            merged[identity_key] = play_vars[identity_key]
+    return merged
 
 
 # --------------------------------------------------------------------------- #
 # 1. The backing-DB parameter set names a correct SVC-01 instance.
 # --------------------------------------------------------------------------- #
 def test_backing_db_params_present_and_correct():
+    # Single source of truth (Req 3.2): the three identity values live in the
+    # play-level vars, NOT (also) in svc06_provision/defaults — else they drift.
+    role_defaults = yaml.safe_load(_DB_DEFAULTS.read_text(encoding="utf-8")) or {}
+    play_vars = _load_play_vars()
+    for identity_key in ("svc06_db_project_slug", "svc06_db_vlan_id", "svc06_db_vmid"):
+        assert identity_key in play_vars, (
+            f"{identity_key} must be a PLAY-LEVEL var in svc-06-bootstrap.yml "
+            "(authoritative single source of truth for the clean_slate branch, Req 3.2)"
+        )
+        assert identity_key not in role_defaults, (
+            f"{identity_key} must NOT also be defined in svc06_provision/defaults "
+            "(two editable copies drift — Req 3.2); it was hoisted to the play"
+        )
     d = _load_db_defaults()
     assert d.get("svc06_db_project_slug") == "shared-zitadel", (
         "the ZITADEL backing DB must use the distinct slug 'shared-zitadel' so its SVC-01 "

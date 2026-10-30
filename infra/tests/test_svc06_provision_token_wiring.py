@@ -234,7 +234,9 @@ class TestOrgProvisionResolutionOrder:
         )
 
     def test_helper_token_still_child_env_not_argv(self):
-        t = _find(self.tasks, "provision org/roles/oidc-app via the helper")
+        # Renamed by the two-client onboarding (spec: zitadel-spa-pkce-onboarding)
+        # to the per-app-loop "Provision each app via the helper".
+        t = _find(self.tasks, "provision each app via the helper")
         assert t is not None
         env = t.get("environment") or {}
         assert "ZITADEL_PROVISION_TOKEN" in env, "token must travel to the helper in the child ENV"

@@ -98,6 +98,61 @@
     quiet: true
   no_log: true
 
+# --- Build the effective App_Registration list (two-client onboarding) -------
+# (spec: zitadel-spa-pkce-onboarding, design Component 5.)
+# EMPTY list -> synthesize exactly the pre-existing single confidential-web
+# `<slug>-webapp` entry (legacy default, byte-for-byte; R4.3/R6.1). Otherwise
+# use the supplied list verbatim. This happens BEFORE any helper call.
+- name: "ZITADEL-org | Synthesize the legacy single-webapp default when no list supplied"
+  ansible.builtin.set_fact:
+    zop_effective_registrations: >-
+      {{ zop_app_registrations
+         if (zop_app_registrations | length > 0)
+         else [{
+           'name': zop_default_app_name,
+           'app_type': zop_default_app_type,
+           'auth_method': zop_default_auth_method,
+           'redirect_uris': zop_redirect_uris,
+         }] }}
+  changed_when: false
+
+# Validate every entry's app_type BEFORE any registration (R4.5): fail naming the
+# offending entry. Run as an item-by-item assert so the fail_msg names the entry.
+- name: "ZITADEL-org | Assert each App_Registration app_type is recognized (fail names the entry)"
+  ansible.builtin.assert:
+    that:
+      - item.app_type is defined
+      - item.app_type in zop_valid_app_types
+    fail_msg: >-
+      App_Registration entry '{{ item.name | default('<unnamed>') }}' has an
+      unrecognized app_type '{{ item.app_type | default('<missing>') }}'.
+      Valid app types are {{ zop_valid_app_types }}.
+    success_msg: "App_Registration '{{ item.name }}' app_type '{{ item.app_type }}' recognized."
+    quiet: true
+  loop: "{{ zop_effective_registrations }}"
+  loop_control:
+    label: "{{ item.name | default('<unnamed>') }}"
+  changed_when: false
+
+# Normalize each entry: derive auth_method from zop_app_type_default_auth_method
+# when omitted, and default redirect_uris to [] (so an api entry needs none).
+# The derivation is a pure map lookup keyed on the (already-validated) app_type.
+- name: "ZITADEL-org | Normalize registrations (derive auth_method + redirect_uris defaults)"
+  ansible.builtin.set_fact:
+    zop_normalized_registrations: >-
+      {{ zop_normalized_registrations | default([]) + [{
+           'name': item.name,
+           'app_type': item.app_type,
+           'auth_method': (item.auth_method
+             if (item.auth_method is defined and (item.auth_method | string | trim | length) > 0)
+             else zop_app_type_default_auth_method[item.app_type]),
+           'redirect_uris': (item.redirect_uris | default([])),
+         }] }}
+  loop: "{{ zop_effective_registrations }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+
 # --- Resolve the run mode: production (Traefik, control node) vs dev (guest) --
 - name: "ZITADEL-org | Set fact — dev/mock guest-run path active?"
   ansible.builtin.set_fact:
@@ -152,29 +207,40 @@
     ansible_python_interpreter: "{{ zop_guest_python }}"
   when: zop_dev_guest_run | bool
 
-- name: "ZITADEL-org | DEV: provision via the helper on the guest (container IP + Host header, no_log)"
+# Per-app loop over the normalized registrations. org/project/roles are created
+# ONCE on the first iteration (the helper is idempotent — already-exists is a
+# no-op SUCCESS), so every app lands in the SAME org + project derived from the
+# slug (R4.2); subsequent iterations re-ensure the org/project as no-ops. Each
+# iteration passes --app-type/--auth-method/--redirect-uri for THAT entry, and
+# changed_when is computed per iteration from that iteration's parsed stdout
+# (R6.4). loop_control.label is the entry NAME only — never a secret.
+- name: "ZITADEL-org | DEV: provision each app via the helper on the guest (container IP + Host header, no_log)"
   ansible.builtin.command:
-    argv:
-      - "{{ zop_guest_python }}"
-      - "{{ zop_guest_helper_path }}"
-      - --base-url
-      - "http://{{ (zop_zitadel_cip.stdout | default('') | trim).split() | first }}:{{ zop_zitadel_http_port }}"
-      - --host-header
-      - "{{ zop_zitadel_host_header }}"
-      - --org
-      - "{{ zop_org_name }}"
-      - --project
-      - "{{ zop_project_name }}"
-      - --app
-      - "{{ zop_app_name }}"
-      - "--redirect-uri={{ zop_redirect_uris | first }}"
+    argv: >-
+      {{ [zop_guest_python, zop_guest_helper_path,
+          '--base-url', zop_dev_base_url,
+          '--host-header', zop_zitadel_host_header,
+          '--org', zop_org_name,
+          '--project', zop_project_name,
+          '--app', item.name,
+          '--app-type', item.app_type,
+          '--auth-method', item.auth_method]
+         + zop_redirect_arg }}
   delegate_to: "{{ zop_zitadel_guest_host if (zop_dev_guest_run | bool) else 'localhost' }}"
   vars:
     ansible_connection: ssh
     ansible_user: "{{ zop_zitadel_guest_ssh_user }}"
     ansible_python_interpreter: "{{ zop_guest_python }}"
+    zop_dev_container_ip: "{{ (zop_zitadel_cip.stdout | default('') | trim).split() | first }}"
+    zop_dev_base_url: "http://{{ zop_dev_container_ip }}:{{ zop_zitadel_http_port }}"
+    zop_redirect_arg: >-
+      {{ ['--redirect-uri=' ~ (item.redirect_uris | first)]
+         if ((item.redirect_uris | default([])) | length > 0) else [] }}
   environment:
     ZITADEL_PROVISION_TOKEN: "{{ zop_provision_token }}"
+  loop: "{{ zop_normalized_registrations }}"
+  loop_control:
+    label: "{{ item.name }}"
   register: zop_provision_run_guest
   changed_when: >-
     (zop_provision_run_guest.stdout | default('{}') | from_json).oidc_app.already_existed | default(true) == false
@@ -194,86 +260,174 @@
   when: zop_dev_guest_run | bool
 
 # ===== PRODUCTION PATH: run the helper on the control node via Traefik =====
-- name: "ZITADEL-org | Provision org/roles/OIDC-app via the helper (idempotent, no_log)"
+# Same per-app loop semantics as the dev path: org/project/roles ensured once
+# (idempotent), every app in the SAME org+project (R4.2), per-entry
+# --app-type/--auth-method/--redirect-uri, per-iteration changed_when (R6.4),
+# loop label = entry name only (never a secret).
+- name: "ZITADEL-org | Provision each app via the helper (idempotent, no_log)"
   ansible.builtin.command:
-    argv:
-      - "{{ zop_venv_python }}"
-      - "{{ zop_provision_helper }}"
-      - --base-url
-      - "{{ zop_base_url }}"
-      - --org
-      - "{{ zop_org_name }}"
-      - --project
-      - "{{ zop_project_name }}"
-      - --app
-      - "{{ zop_app_name }}"
-      - "--redirect-uri={{ zop_redirect_uris | first }}"
+    argv: >-
+      {{ [zop_venv_python, zop_provision_helper,
+          '--base-url', zop_base_url,
+          '--org', zop_org_name,
+          '--project', zop_project_name,
+          '--app', item.name,
+          '--app-type', item.app_type,
+          '--auth-method', item.auth_method]
+         + zop_redirect_arg + zop_insecure_arg }}
   args:
     chdir: "{{ zop_repo_root }}"
+  vars:
+    zop_redirect_arg: >-
+      {{ ['--redirect-uri=' ~ (item.redirect_uris | first)]
+         if ((item.redirect_uris | default([])) | length > 0) else [] }}
+    # Production path only: tolerate Traefik's self-signed mock cert (ADR-0013)
+    # when zop_base_url_tls_skip_verify is true; enforce verification when false.
+    # Non-secret transport flag — safe on the argv (the TOKEN stays in ENV).
+    zop_insecure_arg: >-
+      {{ ['--insecure'] if (zop_base_url_tls_skip_verify | bool) else [] }}
   environment:
     # The access token travels in the child ENV, never the argv (the helper
     # reads ZITADEL_PROVISION_TOKEN). no_log on this task keeps it out of logs.
     ZITADEL_PROVISION_TOKEN: "{{ zop_provision_token }}"
+  loop: "{{ zop_normalized_registrations }}"
+  loop_control:
+    label: "{{ item.name }}"
   register: zop_provision_run_prod
   changed_when: >-
     (zop_provision_run_prod.stdout | default('{}') | from_json).oidc_app.already_existed | default(true) == false
   no_log: true
   when: not (zop_dev_guest_run | bool)
 
-# Unify the result from whichever path ran, for downstream parse/write.
-- name: "ZITADEL-org | Bind the provisioning run result (no_log)"
+# Unify the per-iteration results from whichever path ran into a single list of
+# {name, result-dict} items for the per-app OpenBao capture loop below. Each
+# element of `.results` carries its own `item` (the registration entry) and its
+# own `stdout` (that app's JSON result). no_log — stdout may carry a secret.
+- name: "ZITADEL-org | Bind the per-app provisioning results (no_log)"
   ansible.builtin.set_fact:
-    zop_provision_run: "{{ zop_provision_run_guest if (zop_dev_guest_run | bool) else zop_provision_run_prod }}"
+    zop_app_results: >-
+      {{ (zop_provision_run_guest if (zop_dev_guest_run | bool) else zop_provision_run_prod).results
+         | default([]) }}
   no_log: true
   changed_when: false
 
-# --- Parse the result (non-secret fields only exposed in a debug) ------------
-- name: "ZITADEL-org | Parse the provisioning result (no_log)"
-  ansible.builtin.set_fact:
-    zop_result: "{{ zop_provision_run.stdout | default('{}') | from_json }}"
-  no_log: true
-  changed_when: false
-
-- name: "ZITADEL-org | INFO — provisioning outcome (non-secret)"
+# --- INFO — per-app provisioning outcome (non-secret fields only) ------------
+- name: "ZITADEL-org | INFO — per-app provisioning outcome (non-secret)"
   ansible.builtin.debug:
     msg: >-
-      INFO: ZITADEL onboarding for {{ zop_project_slug }}:
-      org {{ zop_result.org.id | default('?') }}
-      (created={{ zop_result.org.created | default('?') }}),
-      project {{ zop_result.project.id | default('?') }}
-      (created={{ zop_result.project.created | default('?') }}),
-      roles_created={{ zop_result.roles_created | default([]) }},
-      oidc_app already_existed={{ zop_result.oidc_app.already_existed | default('?') }}.
+      INFO: ZITADEL onboarding for {{ zop_project_slug }}: app '{{ item.item.name }}'
+      (type={{ item.item.app_type }}) ->
+      org {{ (item.stdout | default('{}') | from_json).org.id | default('?') }},
+      project {{ (item.stdout | default('{}') | from_json).project.id | default('?') }},
+      oidc_app already_existed={{ (item.stdout | default('{}') | from_json).oidc_app.already_existed | default('?') }}.
+  loop: "{{ zop_app_results }}"
+  loop_control:
+    label: "{{ item.item.name | default('<unnamed>') }}"
 
-# --- Capture the OIDC client secret into OpenBao (only when newly created) ---
-# ZITADEL returns a client secret ONLY at creation time; on a re-run the app
-# already exists and no secret is emitted (so there is nothing new to store —
-# the first run already persisted it). Gated on OpenBao being wired AND a secret
-# actually being present. no_log — the exec carries the client secret + token.
+# --- Per-app OpenBao capture (unique path, read-back verify, no-secret skip) --
+# (spec: zitadel-spa-pkce-onboarding, design Component 6; R5.1-R5.4.)
+# Each newly-created confidential-web client secret is written to the UNIQUE path
+# secret/proj-<slug>/zitadel/oidc/<app_name> (from zop_openbao_app_secret_path_tmpl),
+# then read back and compared; a mismatch fails naming the path (value never
+# echoed — no_log). Apps with NO OIDC client_secret are skipped by `when`: a SPA
+# resolves an empty string, and an API (resource-server) app resolves JSON null
+# (its created-once credential is a JWT key, not a client_secret — out of scope
+# for this client_secret-persist path). The `default('', true)` two-arg form makes
+# that null evaluate as empty (a bare `default('')` substitutes only for an
+# UNDEFINED value, not for None, so `None | length` would crash). When OpenBao is
+# unwired (zop_openbao_addr empty) the whole write+verify is skipped with a
+# per-app warning and the run is NOT failed.
 - name: "ZITADEL-org | Bind the OpenBao admin token from the environment (no_log)"
   ansible.builtin.set_fact:
     zop_bao_token: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
   no_log: true
   changed_when: false
 
-- name: "ZITADEL-org | Persist the new OIDC client_id/secret to OpenBao (no_log)"
+# OpenBao unwired -> per-app warning + continue (NOT a failure) (R5.4).
+- name: "ZITADEL-org | WARN — OpenBao unwired, per-app secret write skipped"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: OpenBao is not wired (zop_openbao_addr is empty) — the client
+      secret for app '{{ item.item.name }}' (type={{ item.item.app_type }}) was
+      NOT written to OpenBao. ZITADEL emits a client secret only at creation
+      time, so if this app was newly created you must rotate its client secret
+      once OpenBao is wired. The run is NOT failed.
+  loop: "{{ zop_app_results }}"
+  loop_control:
+    label: "{{ item.item.name | default('<unnamed>') }}"
+  when: zop_openbao_addr | length == 0
+
+- name: "ZITADEL-org | Persist each new client_id/secret to its unique OpenBao path (no_log)"
   ansible.builtin.command:
     argv: >-
       {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zop_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zop_bao_token,
           zop_openbao_primary_container_name, zop_openbao_bao_bin, 'kv', 'put']
          + (['-tls-skip-verify'] if (zop_openbao_tls_skip_verify | bool) else [])
-         + [zop_openbao_oidc_secret_path,
-            'client_id=' ~ (zop_result.oidc_app.client_id | default('')),
-            'client_secret=' ~ (zop_result.oidc_app.client_secret | default(''))] }}
+         + [zop_openbao_app_secret_path_tmpl | regex_replace('\\{app_name\\}', item.item.name),
+            'client_id=' ~ ((item.stdout | default('{}') | from_json).oidc_app.client_id | default('')),
+            'client_secret='
+              ~ ((item.stdout | default('{}') | from_json).oidc_app.client_secret | default('', true))] }}
   delegate_to: "{{ zop_openbao_cli_host }}"
   vars:
     ansible_connection: ssh
     ansible_user: "{{ zop_openbao_cli_user | default('root') }}"
     ansible_python_interpreter: "{{ zop_openbao_cli_python | default('/usr/bin/python3') }}"
+  loop: "{{ zop_app_results }}"
+  loop_control:
+    label: "{{ item.item.name | default('<unnamed>') }}"
   register: zop_oidc_secret_write
   changed_when: true
   no_log: true
   when:
     - zop_openbao_addr | length > 0
-    - not (zop_result.oidc_app.already_existed | default(true) | bool)
-    - (zop_result.oidc_app.client_secret | default('')) | length > 0
+    - not ((item.stdout | default('{}') | from_json).oidc_app.already_existed | default(true) | bool)
+    - ((item.stdout | default('{}') | from_json).oidc_app.client_secret | default('', true)) | length > 0
+
+# Read back each written secret and fail naming the path + mismatch on inequality
+# (value never echoed — no_log) (R5.2). Same `when` as the write so SPA / unwired
+# / already-existed apps are skipped.
+- name: "ZITADEL-org | Read back each written client_secret from its OpenBao path (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zop_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zop_bao_token,
+          zop_openbao_primary_container_name, zop_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (zop_openbao_tls_skip_verify | bool) else [])
+         + ['-field=client_secret',
+            zop_openbao_app_secret_path_tmpl | regex_replace('\\{app_name\\}', item.item.name)] }}
+  delegate_to: "{{ zop_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zop_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zop_openbao_cli_python | default('/usr/bin/python3') }}"
+  loop: "{{ zop_app_results }}"
+  loop_control:
+    label: "{{ item.item.name | default('<unnamed>') }}"
+  register: zop_oidc_secret_readback
+  changed_when: false
+  no_log: true
+  when:
+    - zop_openbao_addr | length > 0
+    - not ((item.stdout | default('{}') | from_json).oidc_app.already_existed | default(true) | bool)
+    - ((item.stdout | default('{}') | from_json).oidc_app.client_secret | default('', true)) | length > 0
+
+- name: "ZITADEL-org | Verify each read-back equals the written client_secret (fail names the path, no value echoed)"
+  vars:
+    zop_rb_read: "{{ item.stdout | default('') }}"
+    zop_rb_written: "{{ (item.item.stdout | default('{}') | from_json).oidc_app.client_secret | default('', true) }}"
+  ansible.builtin.assert:
+    that:
+      - zop_rb_read == zop_rb_written
+    fail_msg: >-
+      OpenBao read-back MISMATCH for app
+      '{{ item.item.item.name }}' at path
+      {{ zop_openbao_app_secret_path_tmpl | regex_replace('\\{app_name\\}', item.item.item.name) }} —
+      the value read back does not equal the value written. (No secret value is shown.)
+    success_msg: "OpenBao read-back verified for app '{{ item.item.item.name }}' (value not logged)."
+    quiet: true
+  loop: "{{ zop_oidc_secret_readback.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.name | default('<unnamed>') }}"
+  no_log: true
+  when:
+    - zop_openbao_addr | length > 0
+    - not (item.skipped | default(false))

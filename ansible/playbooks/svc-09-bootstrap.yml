@@ -53,10 +53,13 @@
     svc09_generated_inventory: ansible/inventory/svc-09-reverse-proxy.generated.yml
     # Fixed SVC-09 guest VMID (the installer assigns it, not operator-supplied).
     svc09_traefik_vmid: 1090
-    # The single SVC-09 guest IP (computed by NET-00 cidrhost 10.0.20.0/24 +10).
-    # Non-secret; read by provision (known_hosts) and handoff.
+    # The single SVC-09 guest IP: cidrhost("10.0.20.0/24", 10 + 2) = 10.0.20.12
+    # — host_index 2 per the ADR-0015 host-index ledger
+    # (infra/platform-foundation/host-indices.yaml), MOVED off the colliding
+    # host_index 0 / 10.0.20.10 owned by the SVC-07 OpenBao primary. Non-secret;
+    # read by provision (known_hosts purge/keyscan) and handoff.
     svc09_guest_ips:
-      - "10.0.20.10"
+      - "10.0.20.12"
     # Clean-slate reset controls (off by default).
     clean_slate: false
     clean_slate_confirm: ""

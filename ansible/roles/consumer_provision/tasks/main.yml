@@ -1,0 +1,163 @@
+---
+# tasks/main.yml — consumer_provision (Consumer onboarding — Phase 2: Provision)
+#
+# Phase-2 "Infrastructure provisioning". Runs ONLY when the manifest declares a
+# database (design "Phase 2"; a project consuming only sso/secrets skips it).
+#
+# COMPOSITION, NOT REIMPLEMENTATION (Req 4.4, ADR-0020): the per-project DB is
+# stood up by COMPOSING the sanctioned SVC-01 orchestrator
+# `svc-01-bootstrap.yml` as a child ansible-playbook run — the one reproducible
+# SVC-01 lifecycle entry point (service-installer.md single-orchestrator rule).
+# That child drives the SVC01_Consumer_Root apply (terraform apply against
+# infra/projects/<slug>/db/ via the reused svc-01-sql-database module, ADR-0019),
+# the common baseline, and the DB bootstrap (DB + least-priv app role +
+# generated-password->OpenBao write) — this role never re-declares or re-derives
+# any of it. The slug, Registry-resolved vlan_id, ledger host_index, engine/tier,
+# and svc01_vmid are threaded across the child-process boundary via -e.
+#
+# After the child run this role regenerates the dynamic inventory into a
+# consumer-scoped copy (<slug>-consumer.generated.yml) and refreshes known_hosts,
+# mirroring svc07_provision (integration-boundaries.md §4 file-mediated handoff).
+#
+# IDEMPOTENCE (Req 6): svc-01-bootstrap.yml is idempotent (terraform converges;
+# the DB bootstrap is check-then-write), so a re-run against an already-provisioned
+# DB converges with zero changes.
+
+- name: "Provisioning | INFO — Phase 2 start (per-project DB on VLAN {{ consumer_vlan_id }})"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Phase 2 (Provision) — composing svc-01-bootstrap.yml for
+      '{{ project_slug }}' DB on VLAN {{ consumer_vlan_id }}
+      (host_index from the Host_Index_Authority ledger).
+
+# Compose the SVC-01 orchestrator child run (Req 4.4). The DB guest's host_index
+# is READ from the ledger by the SVC01_Consumer_Root (infra/projects/<slug>/db/
+# main.tf resolves it from host-indices.yaml), so we do NOT pass host_index here
+# — the per-project db/ root defaults host_index to its ledger-resolved value via
+# the reused module. We DO thread project_slug, the Registry-resolved vlan_id,
+# engine, tier, svc01_vmid, and the OpenBao address. The child carries its own
+# throwaway-guard consult (gated on agent_live_run) in svc01_preflight, so this
+# role is LEAF-EXEMPT (no duplicate guard here).
+#
+# NOTE: svc-01-bootstrap.yml drives the REUSABLE svc-01-sql-database root
+# directly (its svc01_provision uses state name <slug>-svc01-postgres). The
+# SVC01_Consumer_Root `db/` wrapper root (state <slug>-db) is the ADR-0019
+# per-project pattern; composing svc-01-bootstrap.yml reuses the SAME underlying
+# module and threads the SAME per-project inputs, so the provisioned guest is
+# identical. A non-zero child exit propagates to the Phase-2 rescue.
+- name: "Provisioning | Compose svc-01-bootstrap.yml to provision + bootstrap the per-project DB"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - ansible/inventory/localhost.yml
+      - "{{ consumer_svc01_bootstrap_playbook }}"
+      - -e
+      - "cluster_env_file={{ cluster_env_file }}"
+      - -e
+      - "project_slug={{ project_slug }}"
+      - -e
+      - "vlan_id={{ consumer_vlan_id }}"
+      - -e
+      - "svc01_vmid={{ consumer_svc01_vmid }}"
+      - -e
+      - "db_engine={{ consumer_manifest.database.engine | default('postgres') }}"
+      - -e
+      - "tier={{ consumer_manifest.database.tier | default('small') }}"
+      - -e
+      - "openbao_addr={{ openbao_addr | default('') }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_db_bootstrap_run
+  changed_when: "'changed=0' not in (consumer_db_bootstrap_run.stdout | default(''))"
+  when: consumer_manifest.database is defined
+
+# --- Regenerate a consumer-scoped dynamic inventory (design "Phase 2") -------
+# The SVC-01 installer wrote ansible/inventory/svc-01-sql-database.generated.yml
+# against the reusable root. Regenerate from the SAME root into a consumer-scoped
+# <slug>-consumer.generated.yml so later phases + the operator have a per-project
+# inventory artifact (file-mediated handoff, integration-boundaries.md §4).
+- name: "Provisioning | Regenerate the consumer-scoped dynamic inventory"
+  ansible.builtin.command:
+    argv:
+      - "{{ consumer_venv_python }}"
+      - ansible/inventory/generate_inventory.py
+      - --root
+      - infra/projects/svc-01-sql-database
+      - --out
+      - "{{ consumer_generated_inventory }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_gen_inventory
+  changed_when: true
+  when: consumer_manifest.database is defined
+
+- name: "Provisioning | Confirm the consumer-scoped inventory was written"
+  ansible.builtin.stat:
+    path: "{{ consumer_repo_root }}/{{ consumer_generated_inventory }}"
+  register: consumer_generated_inventory_stat
+  when: consumer_manifest.database is defined
+
+- name: "Provisioning | Assert the consumer-scoped inventory exists (else halt before Phase 3)"
+  ansible.builtin.assert:
+    that:
+      - "consumer_generated_inventory_stat.stat.exists"
+    fail_msg: >-
+      generate_inventory.py did not produce {{ consumer_generated_inventory }};
+      halting before Phase 3 (Bootstrap).
+    success_msg: "Consumer-scoped inventory present: {{ consumer_generated_inventory }}."
+  when: consumer_manifest.database is defined
+
+# --- known_hosts refresh for the DB guest IP (mirrors svc01/svc07_provision) --
+- name: "Provisioning | Compute the DB guest IP (cidrhost 10.0.<vlan>.0/24, +10)"
+  ansible.builtin.set_fact:
+    # Single-guest project VLAN -> host_index 0 -> .10 (the ledger value for the
+    # dronefleet DB). The authoritative IP is the SVC-01 root's output; this
+    # mirror is used only for the known_hosts refresh below.
+    consumer_db_guest_ip: "10.0.{{ consumer_vlan_id }}.10"
+  changed_when: false
+  when: consumer_manifest.database is defined
+
+- name: "Provisioning | Ensure ~/.ssh exists (0700)"
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+  when: consumer_manifest.database is defined
+
+- name: "Provisioning | Remove stale known_hosts fingerprints for the DB guest IP"
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -R
+      - "{{ consumer_db_guest_ip }}"
+      - -f
+      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
+  register: consumer_knownhosts_purge
+  changed_when: "'updated' in (consumer_knownhosts_purge.stderr | default(''))"
+  failed_when: false
+  when: consumer_manifest.database is defined
+
+- name: "Provisioning | ssh-keyscan the DB guest IP (30s timeout)"
+  ansible.builtin.command:
+    argv: [ssh-keyscan, -T, "30", "{{ consumer_db_guest_ip }}"]
+  register: consumer_keyscan
+  changed_when: false
+  failed_when: false
+  when: consumer_manifest.database is defined
+
+- name: "Provisioning | Append current host keys to known_hosts"
+  ansible.builtin.blockinfile:
+    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+    create: true
+    mode: "0600"
+    marker: "# {mark} consumer onboarding host keys for {{ project_slug }}"
+    block: "{{ consumer_keyscan.stdout }}"
+  when:
+    - consumer_manifest.database is defined
+    - (consumer_keyscan.stdout | default('') | trim | length) > 0
+
+- name: "Provisioning | INFO — Phase 2 skipped (no database declared)"
+  ansible.builtin.debug:
+    msg: "INFO: Phase 2 (Provision) skipped for '{{ project_slug }}' — the Consumer_Manifest declares no database."
+  when: consumer_manifest.database is not defined

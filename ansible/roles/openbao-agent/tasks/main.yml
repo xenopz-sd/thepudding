@@ -1,0 +1,241 @@
+---
+# tasks/main.yml — openbao-agent  (openbao-workload-auth, Task 4.3-4.6)
+#
+# DATA-PLANE role. Runs on the WORKLOAD host; holds NO admin token. It:
+#   STEP 1 (4.3) — validates inputs + ensures service-owned dirs.
+#   STEP 2 (4.4) — renders agent.hcl idempotently (byte-identical on re-run).
+#   STEP 3 (4.5) — builds the docker-compose-app var set with the SWAP-GATE
+#                  (Agent sidecar + workload, depends_on service_healthy) and
+#                  includes docker-compose-app.
+#   STEP 4 (4.6) — emits the composition-wiring INFO line naming the Primary.
+#
+# FAIL-CLOSED: the workload's `depends_on … condition: service_healthy` gate on
+# the Agent's RSF-presence healthcheck means a sealed/unreachable Primary ⇒ no
+# Rendered_Secret_File ⇒ Agent never healthy ⇒ workload never starts. No
+# canned/empty secret is ever substituted.
+#
+# NO secret value is templated, echoed, or defaulted. The role_id/secret_id
+# arrive at runtime (0600 host files from openbao_workload_approle); the rendered
+# secrets arrive at container start (OpenBao → the Agent).
+
+# ============================================================================
+# STEP 1 (Task 4.3) — Validate inputs + ensure service-owned dirs (Req 4.9)
+# ============================================================================
+
+- name: "4 — Assert project_slug is supplied"
+  ansible.builtin.assert:
+    that:
+      - project_slug is defined
+      - project_slug | string | length > 0
+    fail_msg: >-
+      project_slug is required. Supply the slug whose KV subtree
+      (secret/data/<slug>/...) the Agent renders, as an extra-var or play var —
+      this role never picks one.
+    success_msg: "Rendering the OpenBao Agent sidecar for project slug '{{ project_slug }}'."
+    quiet: true
+
+- name: "4 — Assert the workload image is supplied"
+  ansible.builtin.assert:
+    that:
+      - workload_image is defined
+      - workload_image | string | length > 0
+    fail_msg: >-
+      workload_image is required. Supply the workload container image the Agent
+      sidecar renders secrets for — this role has no default.
+    success_msg: "Workload image '{{ workload_image }}' supplied."
+    quiet: true
+
+- name: "4 — Assert at least one secret mapping is configured (Req 4.2)"
+  ansible.builtin.assert:
+    that:
+      - openbao_agent_secret_mappings is defined
+      - openbao_agent_secret_mappings | length > 0
+      - openbao_agent_secret_mappings
+        | selectattr('kv_subpath', 'defined') | list | length
+        == openbao_agent_secret_mappings | length
+      - openbao_agent_secret_mappings
+        | selectattr('kv_field', 'defined') | list | length
+        == openbao_agent_secret_mappings | length
+      - openbao_agent_secret_mappings
+        | selectattr('env_key', 'defined') | list | length
+        == openbao_agent_secret_mappings | length
+    fail_msg: >-
+      openbao_agent_secret_mappings must be a non-empty list of
+      {kv_subpath, kv_field, env_key} dicts — one `template` stanza is rendered
+      per entry (Req 4.2). A workload with no secrets does not need the Agent.
+    success_msg: >-
+      {{ openbao_agent_secret_mappings | length }} secret mapping(s) configured
+      — one template stanza each.
+    quiet: true
+
+- name: "4 — Assert the credential file paths are set (Req 4.1)"
+  ansible.builtin.assert:
+    that:
+      - openbao_agent_role_id_host_path | string | length > 0
+      - openbao_agent_secret_id_host_path | string | length > 0
+      - openbao_agent_role_id_path | string | length > 0
+      - openbao_agent_secret_id_path | string | length > 0
+    fail_msg: >-
+      The role_id/secret_id host and in-container file paths must all be set.
+      These are the on-host files openbao_workload_approle wrote at 0600 and the
+      in-container paths the Agent's auto_auth reads them from (Req 4.1).
+    success_msg: "AppRole credential file paths set (host + in-container)."
+    quiet: true
+
+# The Compose stack dir this role and docker-compose-app share
+# (openbao_agent_stack_dir, reproducing docker-compose-app's default expression
+# EXACTLY — see defaults/main.yml); created here so the rendered agent.hcl and
+# the rendered-secrets dir are service-owned before docker-compose-app runs.
+# docker-compose-app's own `dca_stack_dir` is not yet in scope at this point
+# (it is defined inside that role), which is why this anchor exists.
+- name: "4 — Ensure the Compose stack dir exists (service-owned)"
+  ansible.builtin.file:
+    path: "{{ openbao_agent_stack_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: "4 — Ensure the Rendered_Secret_File host dir exists (service-owned, Req 4.9)"
+  ansible.builtin.file:
+    path: "{{ openbao_agent_host_rendered_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# ============================================================================
+# STEP 2 (Task 4.4) — Render agent.hcl idempotently (Req 4.1, 4.2, 4.6, 4.8)
+# ============================================================================
+# Rendered from templates/agent.hcl.j2 (kept structurally equivalent to the
+# shared pure renderer). A re-run against unchanged config produces a
+# byte-identical file and reports changed=0 (Req 4.6). No secret value is
+# templated (Req 4.8).
+- name: "4 — Render agent.hcl onto the workload host (idempotent, Req 4.1/4.2/4.6)"
+  ansible.builtin.template:
+    src: "agent.hcl.j2"
+    dest: "{{ openbao_agent_config_host_path }}"
+    owner: root
+    group: root
+    mode: "0640"
+  register: openbao_agent_config_render
+
+# ============================================================================
+# STEP 3 (Task 4.5) — Build the docker-compose-app var set with the SWAP-GATE
+# ============================================================================
+# Two services with a start-gate between them (Req 4.3, 5.2, 5.4, 5.5, 6.1, 6.2,
+# 6.5, 7.5):
+#   openbao-agent sidecar — mounts agent.hcl + role-id/secret-id (read-only) +
+#     the rendered dir; healthcheck `test -s <RSF>` with retries derived from
+#     openbao_agent_render_timeout; NO published host port.
+#   workload — extra_env_files for the Rendered_Secret_File; depends_on the Agent
+#     `condition: service_healthy`; Traefik labels; networks edge; NO ports:.
+# The depends_on gate on the RSF-presence healthcheck is the swap-gate: real
+# secrets rendered ⇒ workload starts; no RSF ⇒ Agent unhealthy ⇒ workload never
+# starts (fail-closed, composition-wiring.md).
+- name: "4 — Deploy the Agent sidecar + workload Compose stack (swap-gate, Req 4.3/7.5)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    # Passed EXPLICITLY (never a self-reference, never relying on this role's
+    # own default flowing through): docker-compose-app has its own
+    # defaults/main.yml `dca_app_name: ""`, and an included role's own default
+    # wins over the caller's default — so the concrete value MUST be set here.
+    # Same expression as this role's default (defaults/main.yml); project_slug
+    # is asserted in scope at the top of this tasks file.
+    dca_app_name: "{{ project_slug }}-workload"
+    dca_services:
+      # --- the openbao-agent sidecar (NO host port; RSF-presence healthcheck) --
+      - name: openbao-agent
+        image: "{{ openbao_agent_image }}"
+        command: ["agent", "-config={{ openbao_agent_config_path }}"]
+        restart: "unless-stopped"
+        # Keep the sidecar running as root (defect G). The openbao image
+        # entrypoint normalizes `agent -config=...` to a `bao` subcommand and
+        # su-exec's it to the non-root `openbao` user unless BAO_SKIP_DROP_ROOT
+        # is set. A dropped-root sidecar cannot read its OWN root-owned mounts:
+        # agent.hcl (0640 root:root — carries no secret) AND, critically, the
+        # role-id/secret-id (0600 root:root). Those cred files are DELIBERATELY
+        # 0600 on the host (never world-readable — integration-boundaries §2 /
+        # security-standards); loosening them to be readable by a non-root uid
+        # would widen secret exposure and is the WRONG fix. Matching the
+        # PRIMARY's root posture (it runs uid=0 too) lets the sidecar read the
+        # 0600 files WITHOUT touching their host perms. This is the image's own
+        # documented knob — the least-surprising mechanism.
+        environment:
+          BAO_SKIP_DROP_ROOT: "1"
+        # agent.hcl + role-id/secret-id mounted READ-ONLY; the rendered dir is
+        # read-write so the Agent can write the Rendered_Secret_File into it.
+        volumes:
+          - "{{ openbao_agent_config_host_path }}:{{ openbao_agent_config_path }}:ro"
+          - "{{ openbao_agent_role_id_host_path }}:{{ openbao_agent_role_id_path }}:ro"
+          - "{{ openbao_agent_secret_id_host_path }}:{{ openbao_agent_secret_id_path }}:ro"
+          - "{{ openbao_agent_host_rendered_dir }}:{{ openbao_agent_rendered_dir }}"
+        # Healthy ONLY once the non-empty Rendered_Secret_File exists (Req 6.5).
+        # retries = render_timeout / interval so the healthcheck keeps failing
+        # until at most render_timeout has elapsed, then the dependent workload
+        # is never released (fail-closed).
+        healthcheck:
+          test: ["CMD", "test", "-s", "{{ openbao_agent_rendered_secret_file }}"]
+          interval: "{{ openbao_agent_healthcheck_interval }}s"
+          retries: >-
+            {{ ((openbao_agent_render_timeout | int)
+                // (openbao_agent_healthcheck_interval | int)) | int }}
+        # NO published host port — the Agent speaks only to the Primary over
+        # VLAN 20 and writes a local file (Req 4.3).
+      # --- the workload (Traefik-only ingress; gated on the Agent) ------------
+      - name: "{{ openbao_agent_workload_service_name }}"
+        image: "{{ workload_image }}"
+        restart: "unless-stopped"
+        # The Rendered_Secret_File (0600) layered over the non-secret .env — a
+        # later env_file wins on key conflicts (Req 5.1). Only the PATH is
+        # emitted; the secret VALUE lives in the 0600 file, never the repo.
+        # LONG-FORM with `required: false` (Compose v2.24+): the Agent renders
+        # this file only AFTER it auto-auths, so it does NOT exist at `up`-time.
+        # A hard/required env_file reference makes Compose abort at its eager
+        # up-front existence check BEFORE honoring `depends_on: service_healthy`,
+        # defeating the swap-gate. `required: false` suppresses only that
+        # up-front check; the START-GATE below (depends_on service_healthy on the
+        # Agent's `test -s <RSF>` healthcheck) still blocks the workload until the
+        # non-empty file exists — fail-closed is preserved (composition-wiring.md).
+        extra_env_files:
+          - path: "{{ openbao_agent_rendered_secret_file }}"
+            required: false
+        # START-GATE: the workload starts only after the Agent is healthy, i.e.
+        # only after the Rendered_Secret_File exists (Req 5.2, 6.2).
+        depends_on:
+          openbao-agent:
+            condition: "service_healthy"
+        # Traefik-only ingress via Docker labels — NO host `ports:` (Req 5.4, 5.5).
+        labels:
+          - "traefik.enable=true"
+          - "traefik.http.routers.{{ dca_app_name }}.rule=Host(`{{ openbao_agent_workload_host_rule }}`)"
+        networks:
+          - "{{ openbao_agent_edge_network }}"
+        # NO ports: entry (Req 5.5).
+    # The workload needs the shared Traefik `edge` network; the Agent does not.
+    dca_networks:
+      - name: "{{ openbao_agent_edge_network }}"
+        external: true
+    # Non-secret workload config only. Real secrets arrive via the
+    # Rendered_Secret_File (extra_env_files), never here (integration-boundaries §2).
+    dca_env: "{{ openbao_agent_workload_env }}"
+
+# ============================================================================
+# STEP 4 (Task 4.6) — Composition-wiring dependency-type INFO line (Req 7.7)
+# ============================================================================
+# Make the real-vs-unavailable decision visible without reading source
+# (composition-wiring.md dependency-type logging): the Agent auto-auths via
+# AppRole to the named Primary; the workload is gated on the Agent rendering the
+# secret file (fail-closed if the Primary is sealed/unreachable).
+- name: "4 — INFO: dependency wiring (AppRole auto_auth → Primary, Req 7.7)"
+  ansible.builtin.debug:
+    msg: >-
+      openbao-agent[{{ project_slug }}]: secrets source =
+      OpenBao Agent (AppRole auto_auth), endpoint={{ openbao_primary_addr }}
+      (tls_skip_verify={{ openbao_primary_tls_skip_verify | bool }}).
+      Workload '{{ openbao_agent_workload_service_name }}' is gated on the Agent
+      rendering {{ openbao_agent_rendered_secret_file }} (service_healthy) —
+      fail-closed: a sealed/unreachable Primary leaves the Agent unhealthy and
+      the workload never starts. agent.hcl render:
+      {{ 'changed' if openbao_agent_config_render.changed else 'unchanged (changed=0)' }}.

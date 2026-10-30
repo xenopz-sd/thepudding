@@ -1,0 +1,72 @@
+---
+# defaults/main.yml — consumer_bootstrap (Consumer onboarding — Phase 3)
+#
+# Phase-3 phase-specific defaults. Cross-phase constants (cluster_env_file,
+# consumer_repo_root, consumer_venv_python, project_slug, openbao_addr) are
+# play-level vars; consumer_vlan_id / consumer_manifest are Phase-1 facts;
+# consumer_generated_inventory is set by consumer_provision. NO secret here.
+
+# The composed onboarder playbooks / roles (Req 4.5, 4.6; design "Phase 3").
+# These are IMPORTED/CHILD-RUN as-is and NEVER modified (ADR-0020). The OpenBao
+# onboarders run as include_role; the ZITADEL onboarder is composed via its own
+# playbook child run (it is a localhost/network role, not a guest configurator).
+consumer_openbao_project_onboard_role: openbao_project_onboard
+consumer_openbao_workload_approle_role: openbao_workload_approle
+consumer_zitadel_org_provision_playbook: ansible/playbooks/zitadel-org-provision.yml
+
+# TLS-skip for the primary `bao` docker-exec calls in the composed OpenBao
+# onboarders when the primary serves the self-signed mock cert (dev). Threaded
+# into the include_role vars so the composed role behaves as in its own play.
+consumer_openbao_tls_self_signed: true
+
+# The PRIMARY OpenBao guest the composed onboarder roles delegate their
+# docker-exec/cp tasks to (composed-onboarder primary-delegation bugfix). STEP 2
+# passes this as openbao_onboard_delegate_host and STEP 3 as
+# openbao_workload_delegate_host, so the composed roles reach the primary over
+# SSH as root instead of running on the control node (where the container does
+# not exist -> "No such container"). Identical to STEP 1's existing
+# `delegate_to: "10.0.20.10"` literal — STEP 1/2/3 all name the same host; no new
+# credential is introduced (the composed roles set ansible_connection: ssh /
+# ansible_user: root themselves when this is non-empty).
+consumer_openbao_primary_host: "10.0.20.10"
+
+# The OpenBao KV path prefix the generated DB password is written under
+# (secret/proj-<slug>/<engine>). The svc01_bootstrap step (composed in Phase 2)
+# already performed this write; this value documents the path for the handoff
+# summary (Req 8.1).
+consumer_openbao_db_secret_path: >-
+  secret/proj-{{ project_slug }}/{{ consumer_manifest.database.engine | default('postgres') }}
+
+# Workload AppRole handoff channel (Req 8.7): `file` (0600 host file, homelab) or
+# `gitlab` (CI/CD protected+masked variable, PF FR-8).
+consumer_workload_handoff: "file"
+
+# Developer-B-writable handoff dir for the COMPOSED openbao_workload_approle
+# file-channel STEP 8 (fix-composed-workload-creds-dir-writable-path). Absolute,
+# under the invoking user's $HOME, inherently OUTSIDE any git tree (under $HOME,
+# not the repo checkout — no .gitignore entry needed). Overrides the role default
+# /etc/openbao-workload/<slug> (correct only for the standalone root-on-guest
+# run) for the composed unprivileged control-node run, where the Developer-B user
+# can neither write under /etc nor set owner root.
+consumer_workload_creds_dir: >-
+  {{ lookup('ansible.builtin.env', 'HOME') }}/.openbao-workload/{{ project_slug }}
+
+# --- Consumer-boundary app_type/auth_method translation (fix-consumer-manifest-
+# app-type-mapping) ----------------------------------------------------------
+# The Consumer_Manifest schema (scripts/installer/consumer_manifest.py) and the
+# zitadel-org-provision role use two DIFFERENT vocabularies for an
+# App_Registration's app_type/auth_method (manifest = descriptive long forms;
+# role = short forms). STEP 4 maps each manifest entry through these dicts BEFORE
+# composing the child run. Single source of truth — do not duplicate the mapping
+# elsewhere. Keys are the manifest's APP_TYPES/AUTH_METHODS; values are the
+# role's zop_valid_app_types / {none,basic,jwt}. The mapping is total over the
+# manifest vocabulary and identity-preserving on already-role-vocabulary values
+# (api->api, none->none, basic->basic), so a role-vocabulary entry is a no-op.
+consumer_app_type_map:
+  public-spa: spa
+  confidential-web: web
+  api: api
+consumer_auth_method_map:
+  none: none
+  basic: basic
+  jwt-profile: jwt

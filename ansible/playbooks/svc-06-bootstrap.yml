@@ -36,6 +36,21 @@
     svc06_zitadel_vmid: 0
     svc06_platform_domain: platform.example.test
 
+    # --- ZITADEL backing-DB (SVC-01) identity — PLAY-LEVEL (single source of
+    #     truth) so BOTH the provision branch (svc06_provision) AND the
+    #     clean_slate branch (svc06_clean_slate) see it. On a clean_slate=true
+    #     run svc06_provision is SKIPPED, so its role defaults never load — these
+    #     three values MUST live here, not in svc06_provision/defaults, or the
+    #     child svc-01-bootstrap clean-slate receives empty svc01_vmid/slug/vlan
+    #     and VMID 1102 is never destroyed (spec
+    #     fix-svc06-clean-slate-backing-db-residue, Req 2.1/3.2). svc06_provision
+    #     and svc06_clean_slate both REFERENCE these; neither redefines them.
+    #     (svc06_db_host_index and the other provision-only svc06_db_* knobs stay
+    #     in svc06_provision/defaults — consumed only on the provision branch.)
+    svc06_db_vmid: 1102
+    svc06_db_project_slug: "shared-zitadel"
+    svc06_db_vlan_id: 20
+
     # --- Permanent default-off mocks (dev/offline when SVC-09 is absent). ---
     zitadel_tls_self_signed: false
     zitadel_mock_edge_network: false

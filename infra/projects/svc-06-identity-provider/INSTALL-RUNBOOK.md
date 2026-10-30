@@ -189,6 +189,13 @@ Pct-destroys the ZITADEL LXC and orchestrates the backing DB's own clean-slate
 (child `svc-01-bootstrap -e clean_slate=true`), then verifies an empty baseline
 over both guests (`pct list` + `terraform state list`).
 
+> The backing-DB identity (`svc06_db_vmid=1102` / `shared-zitadel` / VLAN 20) is
+> carried at play level in `svc-06-bootstrap.yml` so the clean_slate branch (which
+> skips `svc06_provision`) still targets VMID 1102 for destruction; the
+> empty-baseline gate **fails closed** if the backing-DB VMID is unresolved —
+> a clean-slate that left the backing DB standing fails the gate rather than
+> reporting clean (spec `fix-svc06-clean-slate-backing-db-residue`).
+
 ---
 
 ## A.5 — ZITADEL reachable through Traefik (cross-guest file-provider route)
@@ -343,6 +350,166 @@ re-run of the A.1 bring-up is idempotent for the route (`changed=0` — the
 byte-identical fragment is not re-written); the A.4 clean-slate removes the
 delegated `zitadel-route.yml` from the Traefik_Guest so a torn-down ZITADEL leaves
 no dangling route pointing at a freed VLAN-20 IP.
+
+---
+
+## A.6 — Two-client onboarding (SPA + API): provision-then-test
+
+This is the provision-then-test walkthrough for the
+[`zitadel-spa-pkce-onboarding`](../../../.kiro/specs/zitadel-spa-pkce-onboarding/)
+feature: onboarding a single project with **both** a public **SPA** client
+(React PWA — Authorization Code + PKCE, no secret) **and** an **API** client
+(NestJS backend — resource server, JWT-profile bearer validation) in **one** role
+run, then running the live two-client onboarding test against the
+freshly-provisioned ZITADEL.
+
+It is additive to [**A.1–A.3**](#a-developer-b-automated-path--one-command-provision-then-test):
+stand ZITADEL up with A.1 first (that is the "build the live thing" half), then
+onboard both clients and run the live test below (the "test what you built" half).
+
+> **Placeholders only.** `<platform-domain>`, `<cluster-env-file>`,
+> `<traefik-guest-ip>`, and the project slug are placeholders. The API client's
+> created-once credential and every other secret are generated/stored in OpenBao
+> and never committed or echoed.
+
+### A.6.0 — Offline preflight (no cluster needed)
+
+Validate the helper's new flags render and the pure request-building logic +
+offline role-structure guards pass. These need no infrastructure:
+
+<!-- doctest: offline -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/python scripts/installer/zitadel_provision.py --help
+~/venv/devinfra/bin/pytest tests/installer/test_zitadel_provision.py \
+  tests/installer/test_zitadel_provision_app_builder.py \
+  tests/installer/test_zitadel_org_provision_role.py \
+  tests/installer/test_zitadel_openbao_path.py -q
+```
+
+Compile-check the onboarding play that drives the role:
+
+<!-- doctest: offline -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/ansible-playbook --syntax-check \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/zitadel-org-provision.yml
+```
+
+Validate the SVC-06 Terraform root (guest placement is unchanged by this feature,
+but the offline TF gate is part of the preflight — see [**A.0**](#a0--offline-preflight-no-cluster-needed)):
+
+<!-- doctest: offline -->
+<!-- cwd: . -->
+```bash
+cd infra/projects/svc-06-identity-provider
+terraform init -backend=false
+terraform validate
+```
+
+### A.6.1 — Stand ZITADEL up (requires-infra)
+
+Run the A.1 one-command install against your throwaway cluster env-file so a
+running ZITADEL (backing DB + IdP) exists to onboard into. In dev/offline add the
+two mock flags:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-06-bootstrap.yml \
+  -e cluster_env_file=<cluster-env-file> \
+  -e svc06_zitadel_vmid=1103 \
+  -e zitadel_tls_self_signed=true -e zitadel_mock_edge_network=true
+```
+
+### A.6.2 — Onboard the project with BOTH a SPA and an API client (requires-infra)
+
+Write a throwaway extra-vars file describing the two App_Registration entries,
+then onboard both in one role run. Both land in the **same** org `proj-<slug>`
+and project `<slug>` (R4.2); the SPA carries **no** secret, the API client's
+created-once credential is captured to its unique OpenBao path. `display-only`
+example of the extra-vars file:
+
+<!-- doctest: display-only -->
+```yaml
+# onboard-<slug>-two-client.yml
+zop_app_registrations:
+  - name: "<slug>-spa"
+    app_type: spa
+    auth_method: none
+    redirect_uris: ["https://<slug>.<platform-domain>/callback"]
+  - name: "<slug>-api"
+    app_type: api
+    auth_method: jwt
+    redirect_uris: []
+```
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+# OPENBAO_ADMIN_TOKEN must be in the env; the provisioning token is read from
+# OpenBao by default (no ZITADEL_PROVISION_TOKEN needed).
+~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+  ansible/playbooks/zitadel-org-provision.yml \
+  -e zop_project_slug=<slug> \
+  -e @onboard-<slug>-two-client.yml
+```
+
+On success: org `proj-<slug>`, project `<slug>`, a public SPA client
+`<slug>-spa` (no secret), and an API client `<slug>-api` whose credential is at
+`secret/proj-<slug>/zitadel/oidc/<slug>-api`. A re-run is a no-op success
+(already-exists) and re-emits no secret.
+
+### A.6.3 — Run the live two-client onboarding test against the fresh instance (requires-infra)
+
+The `requires-infra` live test onboards a throwaway project with a SPA entry and
+an API entry and asserts **both** a public SPA client **and** an API client exist
+in the single org/project. It polls the freshly-provisioned ZITADEL for readiness
+with a bounded timeout and fails with a diagnostic on timeout. It references
+`bao status` / HTTP-status fields only and never echoes a secret:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/pytest -m requires_infra \
+  tests/installer/test_zitadel_two_client_integration.py -q
+```
+
+> **⚠ Live-run interlock.** This is a destructive live run. It executes **only**
+> against a throwaway cluster listed in `scripts/installer/throwaway-clusters.yml`,
+> **only** when `AGENT_LIVE_AUTHORIZED` is armed and the fail-closed throwaway
+> guard authorizes it — **never** in CI, acceptance, or production
+> ([`testing-strategy.md`](../../../.kiro/steering/testing-strategy.md) → "Agent
+> Live-Test Authorization"). Any dependency not under test (ZITADEL itself, its
+> backing DB, OpenBao) is stood up / reset **only** through its own
+> `svc-NN-bootstrap.yml` automated path (A.1 above for ZITADEL), never
+> hand-driven.
+
+### A.6.4 — Role-claim shape for consumers `[display-only]`
+
+Once onboarded, the SPA and API resolve a user's project roles from the ZITADEL
+project-roles claim. The claim is a *role key → { org ID → org domain }* object;
+the SPA reads it from the **ID token**, the API from the validated **access
+token**. Example `[display-only]` payload:
+
+<!-- doctest: display-only -->
+```json
+{
+  "urn:zitadel:iam:org:project:roles": {
+    "owner":        { "<org-id>": "proj-<slug>.<platform-domain>" },
+    "collaborator": { "<org-id>": "proj-<slug>.<platform-domain>" }
+  }
+}
+```
+
+The full claim-name/structure/role-mapping reference — including the
+**live-confirm** items for the ZITADEL v4 claim name and the `apps/api`
+credential shape — is in the role's
+[ROLE-CLAIM-REFERENCE.md](../../../ansible/roles/zitadel-org-provision/ROLE-CLAIM-REFERENCE.md).
+Role usage and CLI-flag reference: the
+[zitadel-org-provision README](../../../ansible/roles/zitadel-org-provision/README.md).
 
 ---
 

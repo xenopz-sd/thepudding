@@ -45,6 +45,26 @@ services:
       - "{{ port }}"
 {% endfor %}
 {% endif %}
+{% if svc.user is defined %}
+    user: "{{ svc.user }}"
+{% endif %}
+{% if svc.environment is defined and svc.environment | length > 0 %}
+{#   Opt-in: a per-service `environment:` map of NON-secret runtime env vars,
+     rendered inline on the container. NO secret VALUE belongs here — runtime
+     secrets arrive via OpenBao/the Agent or a 0600 extra_env_files file
+     (integration-boundaries §2), never this committed template. The sole
+     current use is the openbao-agent SIDECAR setting BAO_SKIP_DROP_ROOT=1: the
+     openbao image entrypoint su-exec's `bao` subcommands to the non-root
+     `openbao` user unless this is set, and a dropped-root sidecar cannot read
+     its own root-owned 0640 agent.hcl nor the 0600 root:root role-id/secret-id
+     mounts — so it must stay root to match the primary's root posture WITHOUT
+     loosening those deliberately-0600 host secret files (security-standards /
+     integration-boundaries §2). Absent ⇒ renders exactly as before. #}
+    environment:
+{% for env_key, env_val in svc.environment | dictsort %}
+      {{ env_key }}: "{{ env_val }}"
+{% endfor %}
+{% endif %}
 {% if svc.cap_add is defined and svc.cap_add | length > 0 %}
     cap_add:
 {% for cap in svc.cap_add %}
@@ -53,6 +73,37 @@ services:
 {% endif %}
 {% if svc.mem_swappiness is defined %}
     mem_swappiness: {{ svc.mem_swappiness }}
+{% endif %}
+{% if svc.healthcheck is defined %}
+{#   Opt-in: a container healthcheck. Used by the openbao-workload-auth swap-gate
+     so a dependent service can wait on `condition: service_healthy`. `test` is a
+     list (CMD form); interval/timeout/retries/start_period are optional. #}
+    healthcheck:
+      test: {{ svc.healthcheck.test | to_json }}
+{% if svc.healthcheck.interval is defined %}
+      interval: "{{ svc.healthcheck.interval }}"
+{% endif %}
+{% if svc.healthcheck.timeout is defined %}
+      timeout: "{{ svc.healthcheck.timeout }}"
+{% endif %}
+{% if svc.healthcheck.retries is defined %}
+      retries: {{ svc.healthcheck.retries }}
+{% endif %}
+{% if svc.healthcheck.start_period is defined %}
+      start_period: "{{ svc.healthcheck.start_period }}"
+{% endif %}
+{% endif %}
+{% if svc.depends_on is defined and svc.depends_on | length > 0 %}
+{#   Opt-in: a long-form `depends_on` mapping of `<service>: { condition: ... }`.
+     The openbao-workload-auth swap-gate uses `condition: service_healthy` so the
+     workload starts ONLY after the Agent sidecar has rendered the secret file —
+     a sealed/unreachable Primary leaves the Agent unhealthy and the workload
+     never starts (fail-closed, composition-wiring.md). #}
+    depends_on:
+{% for dep_name, dep_cfg in svc.depends_on | dictsort %}
+      {{ dep_name }}:
+        condition: "{{ dep_cfg.condition }}"
+{% endfor %}
 {% endif %}
 {% if svc.env_file | default(true) %}
     env_file:
@@ -64,9 +115,26 @@ services:
      repo) on top of the non-secret .env — e.g. SVC-01 Postgres' POSTGRES_PASSWORD
      in /etc/postgresql/postgres.secret.env. No secret VALUE is rendered here; only
      the PATH is emitted (integration-boundaries §2 — the value lives in the 0600
-     file / OpenBao, not in this committed template). #}
+     file / OpenBao, not in this committed template).
+
+     Each entry is EITHER a plain string (the path; implicitly required — Compose
+     aborts at `up` if the file is absent) OR a mapping {path: <p>, required:
+     <bool>}. The mapping long-form exists for RUNTIME-RENDERED files that do not
+     exist at `up`-validation time — e.g. the openbao-agent Rendered_Secret_File,
+     written by the Agent sidecar only after it auto-auths. Compose eagerly
+     validates every REQUIRED env_file path before honoring depends_on, so a hard
+     reference to a not-yet-rendered file aborts the stack before the swap-gate
+     (depends_on: service_healthy) can run. `required: false` (long-form, Compose
+     v2.24+) suppresses ONLY that up-front existence check; the workload still
+     starts only once the Agent's healthcheck passes. Plain strings render
+     byte-identically to before — existing string callers are unaffected. #}
 {% for extra in svc.extra_env_files %}
+{% if extra is mapping %}
+      - path: "{{ extra.path }}"
+        required: {{ (extra.required | default(true)) | string | lower }}
+{% else %}
       - "{{ extra }}"
+{% endif %}
 {% endfor %}
 {% endif %}
 {% endif %}

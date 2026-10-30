@@ -601,17 +601,44 @@ def test_registry_read_is_delegated_to_localhost():
         )
 
 
-def test_policy_tmp_slurp_is_not_delegated():
-    """Complementary invariant: the /tmp/<policy>.hcl slurp must NOT be delegated —
-    that file is templated onto the GUEST earlier in the same run, so it is read
-    host-locally. Guards against a blanket delegate that would break it."""
+def _policy_render_task(tasks: list[dict]) -> dict | None:
+    """The ansible.builtin.template rendering /tmp/<policy>.hcl."""
+    for t in tasks:
+        spec = t.get("ansible.builtin.template") or t.get("template")
+        if isinstance(spec, dict) and str(spec.get("dest", "")).startswith("/tmp/"):
+            return t
+    return None
+
+
+def test_policy_tmp_slurp_stays_coherent_with_the_render():
+    """Complementary invariant (UPDATED — composed-onboarder primary-delegation
+    bugfix, option (a)): the /tmp/<policy>.hcl byte-compare slurp must read the
+    SAME host the policy was rendered on, so render/slurp/`docker cp` are coherent
+    on one host.
+
+    Originally this asserted the /tmp slurp carried NO delegate_to, because the
+    render always ran host-locally on the guest (standalone path). The
+    composed-onboarder bugfix now delegates BOTH the render and this slurp to the
+    primary via the conditional ternary (empty default = `inventory_hostname` =
+    run-in-place, so the standalone path is byte-for-byte unchanged). The intent
+    is preserved — the slurp must never diverge from the render's host — but it is
+    now expressed as `the slurp's delegate_to equals the render's delegate_to`,
+    NOT `the slurp has no delegate_to`. A blanket/divergent delegate that breaks
+    the render/slurp coherence is still forbidden; the projects.yaml localhost
+    slurp (a different file) is unaffected and checked separately above."""
     tasks = _onboard_tasks()
+    render = _policy_render_task(tasks)
+    assert render is not None, "onboard role must render the policy to /tmp for byte-compare"
     tmp_reads = [t for t in tasks if _slurp_src(t).startswith("/tmp/")]
     assert tmp_reads, "onboard role reads the rendered policy from /tmp for byte-compare"
+    render_delegate = render.get("delegate_to")
     for t in tmp_reads:
-        assert t.get("delegate_to") in (None, ""), (
-            "the /tmp/<policy>.hcl slurp must stay host-local (no delegate_to): the "
-            "policy is templated onto the guest in this same run."
+        assert t.get("delegate_to") == render_delegate, (
+            "the /tmp/<policy>.hcl slurp must carry the SAME delegate_to as the "
+            "policy render (option (a) coherence) so the byte-compare reads the "
+            "file the render created on that same host — not a bare/divergent "
+            "delegate. The run-in-place default (empty delegate host -> "
+            "inventory_hostname) keeps the standalone path unchanged."
         )
 
 

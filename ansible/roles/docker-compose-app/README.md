@@ -30,7 +30,17 @@ See [`defaults/main.yml`](./defaults/main.yml). Highlights:
 |---|---|
 | `dca_app_name` | Stack name; also the Compose project name and stack directory name. |
 | `dca_stack_dir` | Where `compose.yaml`/`.env` are written (default `/opt/compose/<app>`). |
-| `dca_services` | List of compose service dicts (image, command, volumes, labels, networks, `mem_swappiness`, `runtime_options`). |
+| `dca_services` | List of compose service dicts (image, command, volumes, labels, networks, `mem_swappiness`, `runtime_options`, optional `environment` map, optional `user`). |
+
+A service entry MAY set an optional `environment:` map of **non-secret** runtime
+env vars (rendered inline) and/or a `user:` string. Both are absent by default
+and render byte-identically to before when omitted. No secret value belongs in
+`environment:` — runtime secrets arrive via OpenBao/the Agent or a `0600`
+`extra_env_files` file (`integration-boundaries` §2), never this committed
+template. The sole current use of `environment:` is the openbao-agent sidecar
+setting `BAO_SKIP_DROP_ROOT=1` so it keeps running as root and can read its
+root-owned `0640` config and `0600` role-id/secret-id mounts without loosening
+those host file permissions.
 | `dca_volumes` | Named volumes declared at the top level. |
 | `dca_networks` | External/pre-existing networks to attach (e.g. Traefik's edge net). |
 | `dca_env` | Flat `KEY: value` mapping rendered into `.env` (non-secret config only). |

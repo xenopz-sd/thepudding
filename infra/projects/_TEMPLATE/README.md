@@ -208,6 +208,58 @@ terraform output gateway_ip
 
 ---
 
+## Consuming services
+
+This root provisions **only the network slice** (one VNet, one subnet, one
+applier) — it deliberately does **not** provision any catalog service. A project
+declares the services it consumes (a per-project database, SSO org/app
+registrations, a secrets policy/path + workload AppRole) in a separate
+**Consumer_Manifest** and stands them up with one orchestrator run. The
+consumer layer lives alongside this root, not inside it:
+
+- **Per-project database (`db/` root):** a per-project PostgreSQL guest on this
+  project's VLAN is provisioned by the SVC01_Consumer_Root at
+  `infra/projects/<slug>/db/` (its own `<slug>-db` Terraform state, distinct from
+  this root's `<slug>-infra` state). See
+  [`../dronefleet/db/README.md`](../dronefleet/db/README.md) for the root and
+  [`../dronefleet/INSTALL-RUNBOOK.md`](../dronefleet/INSTALL-RUNBOOK.md) for the
+  provision-then-test walkthrough (`dronefleet` is the scaffold example — copy
+  its `db/` directory to `infra/projects/<slug>/db/`).
+
+- **Declare the manifest:** create `infra/projects/<slug>/consumer-manifest.yml`
+  per the [manifest-format reference](../../../docs/CONSUMER-MANIFEST-REFERENCE.md).
+  Validate it offline:
+
+  <!-- doctest: offline -->
+  <!-- cwd: . -->
+  ```bash
+  ~/venv/devinfra/bin/python scripts/installer/consumer_manifest.py \
+    --check infra/projects/dronefleet/consumer-manifest.yml
+  ```
+
+- **Run the orchestrator:** one Ansible-only command wires the declared services
+  by composing the per-service onboarders (requires a live cluster):
+
+  <!-- doctest: requires-infra -->
+  <!-- cwd: . -->
+  ```bash
+  ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+    ansible/playbooks/project-consumer-bootstrap.yml \
+    -e cluster_env_file=cluster.dev.env \
+    -e project_slug=dronefleet \
+    -e svc01_vmid=1101
+  ```
+
+- **End-to-end journey:** the whole declare → run → wired DB/SSO/secrets → the
+  app consumes them story is the
+  [Consumer Journey Runbook](../../../docs/CONSUMER-JOURNEY.md).
+
+> This template's Terraform stays **network-only**; it is its *docs* that
+> reference the consumer layer (the DB is a separate `db/` root per project, so
+> one project's `terraform destroy` of its DB never touches its network slice).
+
+---
+
 ## Cross-cutting notes
 
 - **Multi-tenancy / VLAN isolation:** this root places one project on its own

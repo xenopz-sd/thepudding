@@ -1452,6 +1452,27 @@ The engine/auth/audit enablement and root-token-revoke detail live in the
 Terraform-root README
 [**Runbook 1 — One-time bootstrap**](./README.md#runbook-1--one-time-bootstrap-init-unseal-engines-root-token-revoke).
 
+> **Note — composing the onboarders OFF the primary guest (primary-delegation).**
+> `openbao_project_onboard` and `openbao_workload_approle` run every OpenBao
+> operation via `docker exec` (plus one `docker cp` in the former) against the
+> primary container. On the **standalone** path here (`openbao.yml` Play 2,
+> `hosts: openbao`, `become: true`) the play already runs ON the primary guest, so
+> you leave the delegate-host var **empty** — the roles run in place exactly as
+> shown (byte-for-byte unchanged, no SSH hop).
+>
+> When these roles are **composed from the control node** (e.g. the project-consumer
+> orchestrator `project-consumer-bootstrap.yml`, which runs `hosts: localhost`), an
+> undelegated `docker exec` would run where the primary container does not exist and
+> fail `No such container: openbao-openbao-1`. The composing caller therefore passes
+> the primary guest as `openbao_onboard_delegate_host` (for `openbao_project_onboard`)
+> and `openbao_workload_delegate_host` (for `openbao_workload_approle`); `consumer_bootstrap`
+> sets both to `10.0.20.10` (its `consumer_openbao_primary_host` default, the same
+> `root@10.0.20.10` SSH channel its STEP 1 DB-secret check already uses). Every
+> docker task then runs on the primary over SSH as root; the platform-admin token
+> stays in the `-e BAO_TOKEN=...` exec environment with `no_log` retained — nothing
+> moves to the argv. The empty default is a harmless self-delegation
+> (`inventory_hostname`), so the standalone path above is unaffected.
+
 **The Bootstrap_Transit_Token must be produced BEFORE the primary run — here is
 how.** The primary's seal `"transit"` stanza auto-unseals against the unsealer,
 and the primary bootstrap ("6.2-STEP-0" in `primary_bootstrap.yml`) reads
@@ -2194,3 +2215,268 @@ No repo-local Tier-1 doctest runner is wired yet; these annotations are ready fo
 the `documentation-testing.md` tooling (Tier-1 on every markdown save, all tiers
 on demand). All examples use placeholders only — no real tokens, TLS material, or
 hostnames — and no credential value is ever echoed.
+
+---
+
+## 6. Workload→OpenBao auth — provision-then-test (openbao-workload-auth)
+
+This section is the provision-then-test walkthrough for the
+[`openbao-workload-auth`](../../../.kiro/specs/openbao-workload-auth/) feature —
+the downstream **workload→OpenBao authentication path** SVC-07's server-side spec
+deliberately left out (`PF` §9/§11, `integration-boundaries.md` §2). It has
+`requires-infra`-gated tests (a live AppRole login + secret render can only be
+closed against a running Primary — `tests/installer/test_workload_auth_integration.py`),
+so per [`documentation-testing.md`](../../../.kiro/steering/documentation-testing.md)
+it needs **both halves**: **(a)** stand the live Primary up from nothing and
+onboard a slug via SVC-07's own automated path, then **(b)** enable AppRole, mint
+a Workload_AppRole, run the Agent sidecar, and run the live login/render tests
+**against the instance you just built**.
+
+It deliberately **reuses section A** for the "build the live thing" half rather
+than re-explaining it — the two feature roles
+([`openbao_workload_approle`](../../../ansible/roles/openbao_workload_approle/README.md)
+control-plane and [`openbao-agent`](../../../ansible/roles/openbao-agent/README.md)
+data-plane) run **day-2**, after the Primary is up, unsealed, and onboarded.
+
+> **Placeholders only.** Every token, role-id, secret-id, and hostname below is a
+> placeholder; secrets are referenced by environment-variable **name** only
+> (`OPENBAO_ADMIN_TOKEN`, `WORKLOAD_AUTH_TEST_*`), never by value — nothing here
+> is committed or echoed (Req 3.4, 3.5, 5.6; `security-standards.md`).
+
+> **⚠ Throwaway cluster only, interlock-gated.** Every live step below
+> **provisions, mutates, or writes to real infrastructure** and runs **only
+> against a throwaway cluster** listed in
+> [`../../../scripts/installer/throwaway-clusters.yml`](../../../scripts/installer/throwaway-clusters.yml),
+> **only** with the `AGENT_LIVE_AUTHORIZED` interlock armed and the fail-closed
+> throwaway guard authorizing, and **never** in CI/acceptance/production
+> (`testing-strategy.md` "Agent Live-Test Authorization"). The dependency Primary
+> is stood up / reset **only** through its own `svc-07-bootstrap.yml` automated
+> path + `clean_slate` contract (section A / section 2) — **never** ad-hoc
+> `ssh`/`docker`/`pct` surgery (`testing-strategy.md`
+> "Dependencies-not-under-test").
+
+### 6.0 — Offline preflight (no cluster needed)
+
+Lint the two feature roles and run the whole offline workload-auth suite (pure
+validators + `agent.hcl` renderer property tests, the role-structure / idempotency
+/ render-contract checks, and the swap-gate `docker compose config` test). These
+contact nothing — no Proxmox, no running OpenBao — so they are `offline`. Run from
+the `tests/installer` pytest root as its own invocation (its `conftest.py` collides
+with the `infra/tests` root if collected together — `testing-strategy.md`
+"Offline gate"); the `requires_infra` integration tests are DESELECTED here by the
+root `pytest.ini` default:
+
+<!-- doctest: offline -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/pytest \
+  tests/installer/test_workload_auth_unit.py \
+  tests/installer/test_workload_auth_properties.py \
+  tests/installer/test_workload_auth_role_structure.py \
+  tests/installer/test_workload_auth_idempotency_structure.py \
+  tests/installer/test_workload_auth_render_contract.py \
+  tests/installer/test_workload_auth_swap_gate.py -q
+```
+
+Lint the control-plane and data-plane roles (where `ansible-lint`/`yamllint` are
+installed in the venv; otherwise the role-structure PyYAML test above is the
+offline pin — see each role README's "Verify the role (offline, Tier-1)" section):
+
+<!-- doctest: offline -->
+<!-- cwd: ansible -->
+```bash
+~/venv/devinfra/bin/ansible-lint roles/openbao_workload_approle roles/openbao-agent
+```
+
+<!-- doctest: offline -->
+<!-- cwd: ansible -->
+```bash
+~/venv/devinfra/bin/yamllint roles/openbao_workload_approle roles/openbao-agent
+```
+
+### 6.1 — (a) Build the live thing: Primary up + slug onboarded
+
+This is the provisioning half. It is **exactly section A.2 + the onboard step** —
+do not re-run a different command here. Bring the Primary up from nothing on the
+throwaway cluster via the one-command orchestrator (writes `OPENBAO_ADMIN_TOKEN`
+to the cluster-env file at mode `0600`), then onboard the throwaway slug so its
+`policy-<slug>` isolation triple exists (the Workload_AppRole binds to it — Req
+2.5). Both **provision/mutate real infrastructure**, so they are `requires-infra`:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+# Stand the Primary up from nothing (section A.2). Mints + saves OPENBAO_ADMIN_TOKEN.
+~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-07-bootstrap.yml \
+  -e cluster_env_file=cluster.dev.env
+```
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+# Onboard the throwaway slug so policy-<slug> exists (section 2's onboard step).
+# The slug must be recorded in infra/platform-foundation/projects.yaml.
+~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/svc-07-secrets-manager.generated.yml \
+  ansible/playbooks/openbao.yml --tags onboard \
+  --extra-vars "project_slug=<throwaway-slug>" \
+  -e openbao_tls_self_signed=true
+```
+
+Export the platform-admin token the control role reads (captured by A.2 into the
+cluster-env file; referenced by env-var **name** only — never pasted here):
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+set -a; source cluster.dev.env; set +a   # exports OPENBAO_ADMIN_TOKEN for the role
+echo "admin token len: ${#OPENBAO_ADMIN_TOKEN}"   # > 0; value never printed
+```
+
+### 6.2 — Enable AppRole + mint the Workload_AppRole (control plane)
+
+Run the control-plane role against the Primary via the SVC-07 generated inventory.
+It enables the AppRole method once at `approle/` (check-then-write), creates
+`auth/approle/role/<slug>-workload` bound to exactly `[policy-<slug>]` (renewable,
+workload TTLs), reads the non-secret `role_id`, mints a `secret_id`, and hands
+both off to a **0600** service-owned file outside any git tree (homelab `file`
+channel) — or a GitLab protected+masked variable (`gitlab` channel, PF FR-8). The
+admin token rides in the process env (never on the command line); the `secret_id`
+is `no_log` and never echoed. It **writes to the live Primary**, so it is
+`requires-infra`:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/svc-07-secrets-manager.generated.yml \
+  ansible/playbooks/openbao.yml --tags workload-approle \
+  --extra-vars "project_slug=<throwaway-slug>" \
+  -e openbao_tls_self_signed=true
+# OPENBAO_ADMIN_TOKEN is read from the environment (exported in 6.1); never -var.
+```
+
+> If your checkout does not yet wire a `workload-approle` tag/play, drive the role
+> directly with a tiny one-play file (`hosts: openbao`, `import_role: { name:
+> openbao_workload_approle }`) — this is exactly what
+> `tests/installer/test_workload_auth_integration.py` does under the hood. The
+> `role_id`/`secret_id` land at mode `0600` under
+> `/etc/openbao-workload/<slug>/` on the workload host by default
+> (`openbao_workload_creds_dir`).
+
+### 6.3 — Run the Agent sidecar (data plane)
+
+Run the data-plane role on the workload host. It renders `agent.hcl` (AppRole
+`auto_auth` reading the on-host `role_id`/`secret_id`, one `template` stanza per
+secret mapping) and brings up the `bao agent` **sidecar** + the workload as a
+Compose stack via `docker-compose-app`, with the swap-gate: the workload's
+`depends_on … service_healthy` gate holds it until the Agent has rendered a
+non-empty Rendered_Secret_File. No secret value is templated; the sidecar
+publishes no host port and the workload is Traefik-only. It **brings up a live
+stack**, so it is `requires-infra`:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/svc-07-secrets-manager.generated.yml \
+  ansible/playbooks/openbao.yml --tags workload-agent \
+  --extra-vars '{"project_slug":"<throwaway-slug>","workload_image":"nginx:1.27","openbao_agent_secret_mappings":[{"kv_subpath":"db","kv_field":"password","env_key":"DB_PASSWORD"}]}' \
+  -e openbao_tls_self_signed=true
+```
+
+On success the Agent logs the composition-wiring INFO line (AppRole auto_auth in
+use, naming the Primary endpoint — Req 7.7), renders the Rendered_Secret_File at
+`0600`, and the workload reaches healthy. If the Primary is sealed/unreachable the
+Agent writes **no** file, logs a retry/ERROR, and the workload never becomes
+healthy — the fail-closed degraded mode (Req 6.1–6.6).
+
+### 6.4 — (b) Test what you built: the live login/render tests
+
+Point the `requires-infra` workload-auth integration suite
+(`tests/installer/test_workload_auth_integration.py`) at the instance 6.1–6.3 just
+built. The tests are `requires_infra` (DESELECTED by default) and `skipif`-gated on
+the env-var contract, so a bare run with nothing wired skips cleanly rather than
+touching anything. Wire them from what you built:
+
+- `WORKLOAD_AUTH_TEST_INVENTORY` — the SVC-07 generated inventory from 6.1
+  (`ansible/inventory/svc-07-secrets-manager.generated.yml`). Without it the
+  module skips.
+- `WORKLOAD_AUTH_TEST_SLUG` — the **same** `<throwaway-slug>` onboarded in 6.1.
+- `OPENBAO_ADMIN_TOKEN` — exported in 6.1 (by name only).
+- `OPENBAO_TEST_ADDR` / `OPENBAO_TEST_TOKEN` — the Primary API base URL + a
+  read-scoped token, to read back the AppRole state the role wrote (reuses the
+  SVC-07 contract-test variables; see
+  [`../../../TESTING.md`](../../../TESTING.md#svc-07-openbao-engineauthaudit-contract-tests)).
+- `WORKLOAD_AUTH_TEST_ALLOW_MUTATE` — set to `1` to arm the tests that enable
+  AppRole / mint a Secret_ID / bring up the stack (safety interlock; unset, the
+  mutating tests stay skipped).
+- `WORKLOAD_AUTH_TEST_PRIMARY_CONTAINER` — the primary Compose container name,
+  needed only by the sealed-Primary degraded-mode test (8.3).
+
+Then run the live suite with the mandatory `-m requires_infra` opt-in. This
+**writes to the throwaway Primary / brings up a stack**, so it is `requires-infra`:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+export WORKLOAD_AUTH_TEST_INVENTORY=ansible/inventory/svc-07-secrets-manager.generated.yml
+export WORKLOAD_AUTH_TEST_SLUG=<throwaway-slug>
+export WORKLOAD_AUTH_TEST_ALLOW_MUTATE=1
+export WORKLOAD_AUTH_TEST_PRIMARY_CONTAINER=openbao-openbao-1
+# OPENBAO_ADMIN_TOKEN / OPENBAO_TEST_ADDR / OPENBAO_TEST_TOKEN from 6.1 + .env (by name).
+~/venv/devinfra/bin/pytest -m requires_infra \
+  tests/installer/test_workload_auth_integration.py -v
+```
+
+The suite asserts the design's live acceptance: `approle/` enabled; the
+`<slug>-workload` role bound to `[policy-<slug>]`, renewable, with the configured
+TTLs; `role_id`/`secret_id` minted; the Agent auto-auths, renders the
+Rendered_Secret_File, and the workload reaches healthy (8.1); a converged re-run is
+`changed=0` and a divergence is rewritten `changed=1` (8.2); and the fail-closed
+paths — sealed/stopped Primary → no Rendered_Secret_File + non-healthy workload,
+unset `OPENBAO_ADMIN_TOKEN` → fail before any write, absent `policy-<slug>` → fail
+with the onboard remedy (8.3). No secret value appears in any captured output —
+tokens are referenced by name only.
+
+> **Self-signed mock-cert Primary (the homelab default).** The suite drives both
+> feature roles against the mock-cert Primary the 6.1–6.3 bring-up created
+> (`openbao_tls_self_signed=true`, no SVC-08/EJBCA), so its `_run_role` helper
+> threads `openbao_tls_self_signed=true` into **every** role run by default
+> (`_DEFAULT_ROLE_EXTRA_VARS`) — exactly the flag 6.2 and 6.3 pass by hand. Both
+> roles derive `openbao_primary_tls_skip_verify` from `openbao_tls_self_signed`
+> (default **false**), so WITHOUT this the roles' `bao` docker-exec calls and the
+> Agent's auto-auth would fail `x509: certificate signed by unknown authority`
+> against the self-signed cert. You do **not** pass the flag to `pytest` — the
+> harness owns it. When SVC-08/EJBCA issues a real trusted-CA cert, a run against
+> that Primary overrides the default to `false` per-test (the helper merges
+> caller extra-vars over the default).
+
+### 6.5 — Teardown
+
+Reset the throwaway Primary via its **own** automated path — the SVC-07
+`svc07_clean_slate` branch (section A.4), never ad-hoc surgery. The workload-auth
+feature creates no Terraform state of its own; tearing down the Primary (and the
+workload host's Compose stack) returns the cluster to an empty baseline:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/ansible-playbook \
+  -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-07-bootstrap.yml \
+  -e cluster_env_file=cluster.dev.env \
+  -e clean_slate=true \
+  -e clean_slate_confirm=force \
+  -e svc07_proxmox_host=<throwaway-proxmox-host-lan-ip>
+```
+
+> **Doctest tiers used in this section.** Offline (`<!-- doctest: offline -->`):
+> the 6.0 role lint + the offline workload-auth pytest suite. Requires-infra
+> (`<!-- doctest: requires-infra -->`): the 6.1 bootstrap + onboard + token
+> export, the 6.2 control-role run, the 6.3 Agent-sidecar run, the 6.4 live
+> integration suite, and the 6.5 clean-slate teardown — all skipped (not failed)
+> when infra/credentials are absent, and runnable only under the
+> `AGENT_LIVE_AUTHORIZED` + throwaway-guard interlock against a throwaway cluster.

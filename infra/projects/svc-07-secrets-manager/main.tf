@@ -70,8 +70,20 @@ locals {
   # "20". Each VLAN maps to a list of allocation entries; pull every host_index
   # on VLAN 20. If the ledger is absent/empty, fall back to the design §6 VLAN-20
   # map so the peer-set wiring is still meaningful offline.
-  svc07_vlan20_entries             = try(local.svc07_host_index_ledger[tostring(local.svc07_vlan_id)], [])
-  svc07_vlan20_indices_from_ledger = [for e in local.svc07_vlan20_entries : e.host_index]
+  svc07_vlan20_entries = try(local.svc07_host_index_ledger[tostring(local.svc07_vlan_id)], [])
+  # tonumber() COERCION GUARD: the ledger read above uses the
+  # `fileexists(p) ? yamldecode(file(p)) : {}` fallback, whose ternary unifies the
+  # populated map against the empty `object({})`. Once host-indices.yaml carries
+  # MORE THAN ONE top-level VLAN key whose entry-lists have differing object
+  # shapes (e.g. VLAN 20's rows carry optional component/anchor, a project VLAN's
+  # single svc01 row does not), terraform can no longer give the map a uniform
+  # element type and coerces every scalar — including host_index — to STRING.
+  # A bare `yamldecode(file(...))` (no `: {}` fallback) keeps numbers, but the
+  # fail-open-on-missing-file fallback here needs the ternary. tonumber() makes
+  # the index list numeric REGARDLESS of that coercion, so `contains(indices, 0)`
+  # and the `i != host_index` peer filter stay correct no matter how many project
+  # VLANs the shared ledger later gains (project-consumer-onboarding Task 6.3).
+  svc07_vlan20_indices_from_ledger = [for e in local.svc07_vlan20_entries : tonumber(e.host_index)]
   svc07_vlan20_indices             = length(local.svc07_vlan20_indices_from_ledger) > 0 ? local.svc07_vlan20_indices_from_ledger : [0, 1, 2, 4, 5, 6, 7, 8, 9, 10]
 
   # Per-guest peer-set view (design §Data Models / §5.1): all VLAN-20 indices

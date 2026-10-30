@@ -1,0 +1,192 @@
+---
+# defaults/main.yml — openbao-agent  (openbao-workload-auth, Task 4)
+#
+# DATA-PLANE role for the openbao-workload-auth feature. It runs on the WORKLOAD
+# host (a project VLAN guest) and holds NO admin token — only the
+# role_id/secret_id minted for it by the control-plane openbao_workload_approle
+# role. It:
+#
+#   (1) renders agent.hcl (templates/agent.hcl.j2) — the `bao agent` config with
+#       an AppRole auto_auth method (reading the on-host role_id/secret_id file
+#       paths), a token sink, and ONE `template` stanza per
+#       openbao_agent_secret_mappings entry (each reading
+#       secret/data/<slug>/<kv_subpath> into the single Rendered_Secret_File at
+#       0600). Kept STRUCTURALLY EQUIVALENT to the shared pure renderer
+#       scripts/installer/workload_auth.py::render_agent_hcl so the golden-file
+#       test cross-checks it.
+#   (2) builds the docker-compose-app variable set with the SWAP-GATE — the
+#       openbao-agent sidecar (healthcheck `test -s <RSF>`; NO published host
+#       port) and the workload service (extra_env_files for the RSF;
+#       depends_on openbao-agent condition service_healthy; Traefik labels;
+#       networks edge; NO ports:) — and includes docker-compose-app.
+#   (3) emits the composition-wiring INFO line naming openbao_primary_addr.
+#
+# FAIL-CLOSED: the workload's `depends_on … condition: service_healthy` gate on
+# the Agent's RSF-presence healthcheck is the composition-root swap-gate — real
+# secrets rendered ⇒ workload starts; Primary sealed/unreachable ⇒ no RSF ⇒ Agent
+# never healthy ⇒ workload never starts. No canned/empty secret is ever
+# substituted (composition-wiring.md unavailability principle).
+#
+# NO secret value is templated, echoed, or defaulted anywhere in this role. The
+# role_id/secret_id arrive at runtime (minted by openbao_workload_approle → 0600
+# host files); the rendered secrets arrive at container start (OpenBao → the
+# Agent). Every secret-bearing task carries `no_log: "{{ openbao_no_log }}"`.
+
+# =============================================================================
+# The project whose KV subtree the Agent reads (REQUIRED, no default)
+# =============================================================================
+# project_slug is the authoritative identifier recorded in projects.yaml. The
+# Agent's `template` stanzas read secret/data/<project_slug>/<kv_subpath>. Left
+# intentionally UNDEFINED so a run without an explicit slug fails loudly rather
+# than silently rendering for a wrong/empty project.
+# project_slug: "<slug>"        # REQUIRED — supplied by the caller, no default.
+
+# =============================================================================
+# Primary instance addressing (the Agent authenticates + reads over VLAN 20)
+# =============================================================================
+# The Primary API address the Agent auto-auths to and reads KV from (Req 4.4).
+openbao_primary_addr: "https://10.0.20.10:8200"
+
+# Render `tls_skip_verify = true` in agent.hcl when the Primary's TLS listener
+# uses the self-signed MOCK cert (Req 4.5). SAME expression as the sibling
+# roles (all derive from openbao_tls_self_signed); with a real SVC-08/EJBCA cert
+# chaining to a trusted CA this is false and the Agent verifies normally.
+openbao_primary_tls_skip_verify: "{{ openbao_tls_self_signed | default(false) | bool }}"
+
+# =============================================================================
+# The `bao agent` sidecar image
+# =============================================================================
+# Pinned, matching the server image line (openbao_install's openbao_image).
+openbao_agent_image: "openbao/openbao:2.4"
+
+# AppRole mount path the auto_auth stanza logs in against (matches the control
+# role's `approle/` enable; the full `auth/approle` form is the Agent's
+# mount_path).
+openbao_agent_approle_mount: "auth/approle"
+
+# =============================================================================
+# On-host / in-container credential + sink + config paths (Req 4.1, 4.9)
+# =============================================================================
+# In-container paths the auto_auth method reads the role_id/secret_id from and
+# writes the token sink to. The host-side creds files are mounted READ-ONLY onto
+# these paths by the sidecar (see the swap-gate dca_services below).
+openbao_agent_role_id_path: "/openbao/agent/role-id"
+openbao_agent_secret_id_path: "/openbao/agent/secret-id"
+openbao_agent_token_sink_path: "/openbao/agent/token"
+
+# Whether the Agent deletes the secret-id file after reading it. Default false
+# (the sidecar may restart and re-read); set true to harden a one-shot read.
+openbao_agent_remove_secret_id_after_read: false
+
+# The HOST paths of the role_id/secret_id files the control role wrote at 0600
+# (openbao_workload_approle's openbao_workload_creds_dir). Mounted read-only onto
+# the in-container paths above. Left matching the control role's default layout.
+openbao_agent_role_id_host_path: >-
+  /etc/openbao-workload/{{ project_slug }}/{{ project_slug }}-workload-role-id
+openbao_agent_secret_id_host_path: >-
+  /etc/openbao-workload/{{ project_slug }}/{{ project_slug }}-workload-secret-id
+
+# =============================================================================
+# Secret mappings — one `template` stanza each (Req 4.2, REQUIRED non-empty)
+# =============================================================================
+# A list of {kv_subpath, kv_field, env_key} dicts. Each renders one `template`
+# stanza reading secret/data/<slug>/<kv_subpath> and emitting
+# <env_key>=<.Data.data.<kv_field>> into the single Rendered_Secret_File. Left
+# EMPTY here; tasks/main.yml asserts it is non-empty (a workload with no secrets
+# does not need the Agent). Example:
+#   openbao_agent_secret_mappings:
+#     - { kv_subpath: "db",   kv_field: "password",      env_key: "DB_PASSWORD" }
+#     - { kv_subpath: "oidc", kv_field: "client_secret", env_key: "OIDC_CLIENT_SECRET" }
+openbao_agent_secret_mappings: []
+
+# =============================================================================
+# Rendered_Secret_File + agent.hcl locations (Req 4.9)
+# =============================================================================
+# The in-container dir holding the Rendered_Secret_File, and the file itself
+# (0600). The workload layers this file as an extra_env_files entry over its
+# non-secret .env.
+openbao_agent_rendered_dir: "/openbao/agent/rendered"
+openbao_agent_rendered_secret_file: "{{ openbao_agent_rendered_dir }}/secrets.env"
+
+# The Compose stack dir this role writes agent.hcl + the rendered-secrets dir
+# into, AND that docker-compose-app then writes compose.yaml/.env into and mounts
+# from. docker-compose-app defines its OWN `dca_stack_dir` as
+# `{{ dca_base_dir }}/{{ dca_app_name }}` (dca_base_dir defaulting to
+# /opt/compose) — but ONLY inside its own role scope. This role references the
+# stack dir in its OWN defaults (below) and tasks (STEP 1 dir creation + the
+# agent.hcl render) that run BEFORE `include_role: docker-compose-app`, so
+# `dca_stack_dir` is not yet in scope there. We therefore anchor our own
+# stack-dir var, reproducing docker-compose-app's default expression EXACTLY so
+# the path this role computes is byte-identical to the one docker-compose-app
+# will use (they MUST agree — this role writes agent.hcl + the rendered dir into
+# the same stack dir docker-compose-app then mounts). If a caller overrides
+# `dca_stack_dir` explicitly, that override is honoured here too.
+openbao_agent_stack_dir: >-
+  {{ dca_stack_dir | default((dca_base_dir | default('/opt/compose')) ~ '/' ~ dca_app_name) }}
+
+# The HOST dir the rendered-secrets volume is backed by + the HOST path of the
+# rendered agent.hcl. Both service-owned (Req 4.9). Anchored under the stack dir
+# above (NOT docker-compose-app's internal dca_stack_dir, which is out of scope
+# until that role is included).
+openbao_agent_host_rendered_dir: "{{ openbao_agent_stack_dir }}/rendered"
+openbao_agent_config_host_path: "{{ openbao_agent_stack_dir }}/agent.hcl"
+# The in-container path agent.hcl is mounted onto (read-only).
+openbao_agent_config_path: "/openbao/agent/agent.hcl"
+openbao_agent_pid_file: "/openbao/agent/agent.pid"
+
+# =============================================================================
+# Retry / render-timeout behaviour (Req 6.3, 6.5)
+# =============================================================================
+# vault.retry.num_retries in agent.hcl — 0 means retry indefinitely (Req 6.3).
+openbao_agent_num_retries: 0
+# Max seconds between auto-auth retries (documented in the degraded-mode
+# contract; the Agent's native backoff implements the interval) (Req 6.3).
+openbao_agent_retry_interval: 30
+# Seconds before an absent-RSF workload is deemed non-healthy. Drives the Agent
+# sidecar healthcheck retry count (retries = render_timeout / interval) (Req 6.5).
+openbao_agent_render_timeout: 120
+# The Agent sidecar healthcheck probe interval (seconds). retries is derived as
+# (render_timeout / healthcheck_interval) so the healthcheck keeps failing until
+# at most render_timeout has elapsed.
+openbao_agent_healthcheck_interval: 5
+
+# =============================================================================
+# The workload service (Req 4.3, 5.2, 5.4, 5.5)
+# =============================================================================
+# The workload container image (REQUIRED, no default — the caller supplies it).
+# workload_image: "<registry>/<image>:<tag>"   # REQUIRED.
+
+# The Compose stack/project name passed to docker-compose-app. Also the stack
+# dir name under /opt/compose. Keyed to the slug + -workload so it is distinct
+# from any other stack on the host.
+dca_app_name: "{{ project_slug }}-workload"
+
+# The internal workload container name within the stack.
+openbao_agent_workload_service_name: "workload"
+
+# Traefik router host rule for the workload (Req 5.4 — Traefik-only ingress, no
+# host ports). The caller SHOULD override with the project's real host. Left as
+# a placeholder host derived from the stack name; NO real hostname is committed.
+openbao_agent_workload_host_rule: "{{ dca_app_name }}.example.test"
+
+# The external Traefik `edge` network the workload registers on (Req 5.4).
+openbao_agent_edge_network: "edge"
+
+# =============================================================================
+# DEV-ONLY secret exposure opt-in (security-standards.md) — same as control role
+# =============================================================================
+# Default FALSE -> openbao_no_log is TRUE -> every secret-bearing task keeps
+# `no_log`. NON-NEGOTIABLE default for acceptance/production. A developer
+# debugging a THROWAWAY cluster MAY expose output for a SINGLE run with
+# `-e openbao_dev_expose_secrets=true` — never committed, never in CI/acc/prod.
+openbao_dev_expose_secrets: false
+# Resolved no_log value applied to every secret-bearing task.
+openbao_no_log: "{{ not (openbao_dev_expose_secrets | bool) }}"
+
+# =============================================================================
+# Non-secret config passed to the workload's .env (composition-wiring.md)
+# =============================================================================
+# A flat KEY: value mapping of NON-secret workload config written to the stack
+# .env by docker-compose-app. Real secrets NEVER go here — they arrive via the
+# Rendered_Secret_File (extra_env_files). Left empty by default.
+openbao_agent_workload_env: {}

@@ -84,6 +84,19 @@ The platform foundation and five shared services are released: SVC-07 (secrets),
 | **SVC-06 — Identity provider** ([ZITADEL](https://zitadel.com)) | ✅ Released | The shared OIDC/SAML SSO backbone: one ZITADEL LXC on VLAN 20 fronted by Traefik, backed by its own dedicated SVC-01 PostgreSQL instance; masterkey + OIDC client secrets in OpenBao; idempotent per-project org/OIDC-app onboarding via a pure-Python management-API helper, with the provisioning token auto-minted at first-init and stored in OpenBao so a from-scratch bring-up onboards the first org with no human-minted token. | [Install runbook](./infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md) | [`svc-06-identity-provider`](./.kiro/specs/svc-06-identity-provider/) |
 | **SVC-17/18 — Observability** ([Prometheus](https://prometheus.io) + [Grafana](https://grafana.com) + [Loki](https://grafana.com/oss/loki/)) | ✅ Released | The shared metrics/dashboards/logs stack on three VLAN-20 LXCs: Prometheus (+ Alertmanager) with 30-day local TSDB and `file_sd`-generated scrape targets, Grafana fronted by Traefik, and Loki with Promtail shipping fleet-wide logs. Its v1 scrape set wires up the four already-built services (SVC-01/06/07/09). Ships default-off mock stand-ins for the not-yet-built CA (SVC-08), the un-registered Grafana OIDC client (SVC-06) and the GPU host (SVC-23). | [Install runbook](./infra/projects/svc-17-18-observability/INSTALL-RUNBOOK.md) | [`svc-17-18-observability`](./.kiro/specs/svc-17-18-observability/) |
 
+## Implemented services
+
+This index lists the catalog services that are actually **built** — each with
+provisioning code, install/config automation, and a spec with validation — and
+links each to how to install it and where it was specced (per
+[`structure.md`](./.kiro/steering/structure.md)). The shared platform services
+are in [What's in the box](#whats-in-the-box) above; the table below adds the
+**per-project consumer path** built by the project-consumer-onboarding feature.
+
+| Implemented path | What it is | Install runbook | Spec |
+|---|---|---|---|
+| **Per-project SVC-01 consumer DB + consumer onboarding orchestrator** | A per-project PostgreSQL guest on the project's own VLAN (100+) via the `db/` SVC01_Consumer_Root, plus the manifest-driven `project-consumer-bootstrap.yml` orchestrator that wires a project's declared DB + SSO + secrets by composing the per-service onboarders. First per-project-VLAN SVC-01 consumer; validated end-to-end live (per-project DB coexisting with the shared VLAN-20 services, OpenBao isolation triple + workload AppRole, and a two-client SSO org — public SPA + API — in one ZITADEL org/project). | [Install runbook](./infra/projects/dronefleet/INSTALL-RUNBOOK.md) | [`project-consumer-onboarding`](./.kiro/specs/project-consumer-onboarding/) |
+
 ## Quick start
 
 > [!WARNING]
@@ -260,6 +273,9 @@ Services are delivered in tiers from the [service catalog](./00-developer-servic
 | [SVC-07 install runbook](./infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md) | OpenBao provision-then-test |
 | [SVC-06 install runbook](./infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md) | ZITADEL (+ backing DB) provision-then-test |
 | [SVC-17/18 install runbook](./infra/projects/svc-17-18-observability/INSTALL-RUNBOOK.md) | Observability stack (Prometheus + Grafana + Loki) provision-then-test |
+| [Consumer DB install runbook](./infra/projects/dronefleet/INSTALL-RUNBOOK.md) | Per-project SVC-01 consumer database provision-then-test |
+| [Consumer journey runbook](./docs/CONSUMER-JOURNEY.md) | End-to-end: declare a manifest → run the orchestrator → wired DB/SSO/secrets → the app consumes them |
+| [Consumer manifest reference](./docs/CONSUMER-MANIFEST-REFERENCE.md) | The Consumer_Manifest schema (fields + enumerated consumable services) |
 | [Maintainer README](./docs/README.md) | The in-depth Developer-A guide: quick starts, principles, network foundation, onboarding, docs map |
 | [TESTING.md](./docs/TESTING.md) | Offline and live test tiers, and the CI offline merge gate (`.gitlab-ci.yml`) |
 | [Steering docs](./.kiro/steering/) | Constitution, tech choices, structure, security standards |

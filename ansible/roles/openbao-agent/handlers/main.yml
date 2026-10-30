@@ -1,0 +1,11 @@
+---
+# handlers/main.yml — openbao-agent
+#
+# No handler is required by Task 4: agent.hcl is rendered idempotently and the
+# Compose stack is reconciled declaratively by docker-compose-app (which
+# recreates on config/.env drift). A changed agent.hcl is picked up by the
+# docker_compose_v2 reconcile on the same run, so no restart handler is needed.
+# This file is present as part of the standard role skeleton for consistency
+# with the sibling openbao_* roles.
+#
+# (intentionally empty)

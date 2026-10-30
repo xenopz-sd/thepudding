@@ -1,0 +1,139 @@
+---
+# tasks/main.yml — consumer_handoff (Consumer onboarding — Phase 4: Health/Handoff)
+#
+# Phase-4 "Health sanity & Developer B handoff" (Req 5.4). Bounded, READ-ONLY
+# health polls of the DECLARED dependencies (DB guest / OpenBao path / ZITADEL
+# clients), then a completion summary banner. The summary names secrets BY PATH
+# ONLY — never a value (Req 5.4). INFO phase banners throughout (observability).
+#
+# Each poll is bounded (retries/delay) and read-only — it never mutates a
+# dependency. A health failure propagates to the Phase-4 rescue in the
+# orchestrator play, which names Phase 4.
+
+- name: "Handoff | INFO — Phase 4 start (health sanity)"
+  ansible.builtin.debug:
+    msg: "INFO: Phase 4 (Health/Handoff) — bounded health polls for '{{ project_slug }}'."
+
+# --- DB guest reachability poll (bounded) — when a database was declared ------
+- name: "Handoff | Compute the DB guest endpoint (cidrhost 10.0.<vlan>.0/24, +10)"
+  ansible.builtin.set_fact:
+    consumer_db_guest_ip: "10.0.{{ consumer_vlan_id }}.10"
+  changed_when: false
+  when: consumer_manifest.database is defined
+
+- name: "Handoff | Poll the DB guest TCP port until reachable (bounded, read-only)"
+  ansible.builtin.wait_for:
+    host: "{{ consumer_db_guest_ip }}"
+    port: "{{ consumer_db_port | int }}"
+    timeout: "{{ (consumer_health_retries | int) * (consumer_health_delay | int) }}"
+    state: started
+  register: consumer_db_wait
+  failed_when: false
+  when: consumer_manifest.database is defined
+
+- name: "Handoff | Assert the DB guest is reachable (Req 5.4)"
+  ansible.builtin.assert:
+    that:
+      - "consumer_db_wait is not failed"
+      - "(consumer_db_wait.elapsed | default(0)) >= 0"
+    fail_msg: >-
+      The per-project DB guest {{ consumer_db_guest_ip }}:{{ consumer_db_port }}
+      did not become reachable within the bounded health budget. Check the DB
+      guest provisioned and started (Phase 2).
+    success_msg: "DB guest reachable at {{ consumer_db_guest_ip }}:{{ consumer_db_port }}."
+    quiet: true
+  when: consumer_manifest.database is defined
+
+# --- OpenBao path-present poll (bounded, read-only docker-exec) --------------
+- name: "Handoff | Bind the OpenBao admin token for the policy poll (no_log)"
+  ansible.builtin.set_fact:
+    consumer_handoff_bao_token: >-
+      {{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}
+  no_log: true
+  changed_when: false
+  when:
+    - (consumer_manifest.database is defined) or (consumer_manifest.secrets is defined)
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Handoff | Poll OpenBao for the project policy until present (bounded, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ consumer_handoff_bao_token,
+          consumer_openbao_primary_container_name, consumer_openbao_bao_bin, 'policy', 'read']
+         + (['-tls-skip-verify'] if (consumer_openbao_tls_skip_verify | bool) else [])
+         + ['policy-' ~ project_slug] }}
+  delegate_to: "{{ consumer_openbao_primary_ip }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ consumer_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ consumer_openbao_cli_python }}"
+  register: consumer_openbao_policy_poll
+  changed_when: false
+  failed_when: false
+  retries: "{{ consumer_health_retries | int }}"
+  delay: "{{ consumer_health_delay | int }}"
+  until: "consumer_openbao_policy_poll.rc == 0"
+  no_log: true
+  when:
+    - (consumer_manifest.database is defined) or (consumer_manifest.secrets is defined)
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Handoff | Assert the OpenBao project policy is present (Req 5.4)"
+  ansible.builtin.assert:
+    that:
+      - "consumer_openbao_policy_poll.rc == 0"
+    fail_msg: >-
+      The OpenBao project policy 'policy-{{ project_slug }}' is not present after
+      Phase 3. (No secret value is shown.)
+    success_msg: "OpenBao project policy 'policy-{{ project_slug }}' present."
+    quiet: true
+  no_log: true
+  when:
+    - (consumer_manifest.database is defined) or (consumer_manifest.secrets is defined)
+    - (openbao_addr | default('') | trim) | length > 0
+
+# --- Completion summary banner (secrets by name only, Req 5.4) ---------------
+- name: "Handoff | Resolve the absolute Cluster_Env_File path + banner fields"
+  ansible.builtin.set_fact:
+    consumer_cluster_env_abspath: >-
+      {{ (consumer_repo_root ~ '/' ~ cluster_env_file) | ansible.builtin.realpath }}
+  changed_when: false
+
+- name: "Handoff | Print the Developer B completion summary banner"
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Consumer onboarding complete for project '{{ project_slug }}'!"
+      - "============================================================"
+      - "Project:            {{ project_slug }}"
+      - "VLAN:               {{ consumer_vlan_id }} (Registry-resolved)"
+      - "Status:             healthy"
+      - >-
+        Database:           {{ (consumer_db_guest_ip | default('n/a')) ~ ':' ~ consumer_db_port
+        ~ ' (' ~ (consumer_manifest.database.engine | default('postgres')) ~ ', VLAN ' ~ consumer_vlan_id ~ ', private)'
+        if (consumer_manifest.database is defined) else 'not consumed' }}
+      - >-
+        DB credentials:     {{ consumer_db_secret_path ~ ' (OpenBao — password by name only, never shown)'
+        if (consumer_manifest.database is defined) else 'n/a' }}
+      - >-
+        SSO applications:   {{ (consumer_manifest.sso.app_registrations | map(attribute='name') | list | join(', '))
+        ~ '  (org ' ~ consumer_manifest.sso.org_name ~ ')'
+        if (consumer_manifest.sso is defined) else 'not consumed' }}
+      - >-
+        SSO secrets:        {{ consumer_sso_secret_path_prefix ~ '/<app> (OpenBao — client secrets by path only)'
+        if (consumer_manifest.sso is defined) else 'n/a' }}
+      - >-
+        Secrets policy:     {{ 'policy-' ~ project_slug ~ ' ; workload AppRole ' ~ consumer_workload_approle_ref
+        if (consumer_manifest.secrets is defined)
+        else ('policy-' ~ project_slug if (consumer_manifest.database is defined) else 'not consumed') }}
+      - "Config:             {{ consumer_cluster_env_abspath }}"
+      - ""
+      - "Next Steps for Project Developers:"
+      - "  The application's workload fetches its DB credential and OIDC client"
+      - "  secret from OpenBao via its own Agent/AppRole at container start —"
+      - "  never a plaintext secret in a repo."
+      - "============================================================"
+
+- name: "Handoff | INFO — Phase 4 complete"
+  ansible.builtin.debug:
+    msg: "INFO: Phase 4 (Health/Handoff) complete for '{{ project_slug }}'. Onboarding succeeded."

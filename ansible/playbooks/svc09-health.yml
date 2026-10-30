@@ -5,7 +5,9 @@
 # `ansible-playbook -i {{ svc09_generated_inventory }} svc09-health.yml`
 # (integration-boundaries.md §4). Runs `hosts: traefik` NATIVELY on the Traefik
 # LXC — no delegate_to. The generated inventory's `traefik` group entry carries
-# `ansible_host: 10.0.20.10` / `ansible_user: root` over SSH.
+# `ansible_host: 10.0.20.12` / `ansible_user: root` over SSH (cidrhost(
+# "10.0.20.0/24", 10 + 2), host_index 2 per the ADR-0015 ledger — moved off the
+# colliding 10.0.20.10 owned by the SVC-07 OpenBao primary).
 #
 # Two-stage recreate-robust gate (mirrors svc07-health.yml):
 #   Stage 1 — `docker inspect <container>`: wait for the Traefik container to

@@ -1,0 +1,35 @@
+---
+# defaults/main.yml — consumer_clean_slate (Consumer onboarding — clean-slate)
+#
+# Cross-phase constants (clean_slate, clean_slate_confirm, cluster_env_file,
+# consumer_repo_root, consumer_venv_python, project_slug, openbao_addr,
+# agent_live_run) are play-level vars; consumer_vlan_id / consumer_manifest are
+# Phase-1-style facts resolved below. NO secret here.
+
+# The sanctioned SVC-01 orchestrator whose OWN clean-slate contract the consumer
+# clean-slate COMPOSES for the DB teardown (ADR-0011 pattern, Req 9.5). The
+# consumer clean-slate NEVER pct-destroys or terraform-state-rm's the DB guest
+# directly — it invokes the DB's own reset path.
+consumer_svc01_bootstrap_playbook: ansible/playbooks/svc-01-bootstrap.yml
+
+# The composed onboarders' own reversal paths (Req 7.1, 9.5). OpenBao project
+# objects (policy-<slug>, <slug>-ci, <slug>-workload, KV path) and ZITADEL org/
+# clients are removed via the onboarders' own delete paths — never raw bao/zitadel
+# surgery from here. These reference the same roles/playbooks used to create them.
+consumer_openbao_project_onboard_role: openbao_project_onboard
+consumer_openbao_workload_approle_role: openbao_workload_approle
+
+# Per-project DB guest VMID (mirrors consumer_provision; threaded into the child
+# svc-01-bootstrap.yml clean-slate run).
+consumer_svc01_vmid: 1101
+
+# The Proxmox host SSH address for the DB reset path (pct runs on the node).
+# Supply the real LAN IP with -e consumer_proxmox_host=<real-proxmox-lan-ip>.
+# Fail-fast if a reset is requested without it (the composed svc01_clean_slate
+# asserts this itself).
+consumer_proxmox_host: ""
+
+# The Registry + network-slice artifacts the clean-slate MUST NEVER remove
+# (Req 7.7). Named here only for the explicit no-touch assertions/documentation.
+consumer_registry_path: infra/platform-foundation/projects.yaml
+consumer_network_slice_root: "infra/projects/{{ project_slug }}"

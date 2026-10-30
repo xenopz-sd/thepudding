@@ -1,0 +1,36 @@
+# MANAGED BY ANSIBLE (openbao-agent) — DO NOT EDIT BY HAND.
+pid_file = "/openbao/agent/agent.pid"
+
+vault {
+  address = "https://10.0.20.10:8200"
+  tls_skip_verify = true
+  retry { num_retries = 0 }
+}
+
+auto_auth {
+  method "approle" {
+    mount_path = "auth/approle"
+    config = {
+      role_id_file_path   = "/openbao/agent/role-id"
+      secret_id_file_path = "/openbao/agent/secret-id"
+      remove_secret_id_file_after_reading = false
+    }
+  }
+  sink "file" {
+    config = { path = "/openbao/agent/token" }
+  }
+}
+
+template {
+  contents    = "{{ with secret \"secret/data/demo-slug/db\" }}DB_PASSWORD={{ .Data.data.password }}{{ end }}"
+  destination = "/openbao/agent/rendered/secrets.env"
+  perms       = "0600"
+}
+
+template {
+  contents    = "{{ with secret \"secret/data/demo-slug/oidc\" }}OIDC_CLIENT_SECRET={{ .Data.data.client_secret }}{{ end }}"
+  destination = "/openbao/agent/rendered/secrets.env"
+  perms       = "0600"
+}
+
+exit_after_auth = false

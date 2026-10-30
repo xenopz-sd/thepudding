@@ -1,0 +1,28 @@
+---
+# defaults/main.yml — consumer_handoff (Consumer onboarding — Phase 4)
+#
+# Phase-4 phase-specific defaults. Cross-phase constants are play-level vars;
+# consumer_vlan_id / consumer_manifest are Phase-1 facts. NO secret here.
+
+# Bounded health-poll budget (Req 5.4 health sanity; mirrors the svcNN handoff
+# retry/delay knobs). A poll is read-only; it never mutates a dependency.
+consumer_health_retries: 12
+consumer_health_delay: 5
+
+# OpenBao primary addressing for the bounded path-present health poll (read-only
+# docker-exec, same pinning as the preflight probe).
+consumer_openbao_primary_ip: "10.0.20.10"
+consumer_openbao_primary_container_name: "openbao-openbao-1"
+consumer_openbao_bao_bin: "bao"
+consumer_openbao_tls_skip_verify: true
+consumer_openbao_cli_user: "root"
+consumer_openbao_cli_python: "/usr/bin/python3"
+
+# Secret paths referenced BY NAME ONLY in the completion summary (Req 5.4) —
+# values are NEVER shown.
+consumer_db_secret_path: "secret/proj-{{ project_slug }}/{{ consumer_manifest.database.engine | default('postgres') }}"
+consumer_workload_approle_ref: "auth/approle/role/{{ project_slug }}-workload"
+consumer_sso_secret_path_prefix: "secret/proj-{{ project_slug }}/zitadel/oidc"
+
+# DB endpoint fields for the summary (derived; single-guest project VLAN -> .10).
+consumer_db_port: "{{ 3306 if (consumer_manifest.database.engine | default('postgres')) == 'mariadb' else 5432 }}"

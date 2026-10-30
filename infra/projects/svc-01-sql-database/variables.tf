@@ -313,8 +313,20 @@ locals {
   # named (ledger_component; empty matches a row with no `component`). Used ONLY to
   # EXCLUDE self from the derived peer set — never to require a match (a present
   # VLAN with no matching self-row still computes peers from the present entries).
+  #
+  # tonumber() COERCION GUARD: the ledger read above uses the
+  # `fileexists(p) ? yamldecode(file(p)) : {}` fallback, whose ternary unifies the
+  # populated map against the empty `object({})`. Once host-indices.yaml carries
+  # MORE THAN ONE top-level VLAN key whose entry-lists have differing object
+  # shapes (VLAN 20's rows carry optional component/anchor; a project VLAN's
+  # single svc01 row does not), terraform can no longer give the decoded map a
+  # uniform element type and coerces every scalar — including host_index — to
+  # STRING. tonumber() makes the derived peer indices numeric regardless, so the
+  # proxmox-compute Guard 4 (`!contains(peer, host_index)`) compares number-to-
+  # number no matter how many project VLANs the shared ledger later gains
+  # (project-consumer-onboarding Task 6.3).
   svc01_peer_from_ledger = [
-    for e in local.svc01_vlan_entries : e.host_index
+    for e in local.svc01_vlan_entries : tonumber(e.host_index)
     if !(
       try(e.svc_code, "") == "svc01"
       && try(e.component, "") == var.ledger_component

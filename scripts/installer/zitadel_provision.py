@@ -60,7 +60,21 @@ EP_PROJECTS = "/management/v1/projects"
 EP_PROJECTS_SEARCH = "/management/v1/projects/_search"
 EP_PROJECT_ROLES = "/management/v1/projects/{project_id}/roles"
 EP_OIDC_APPS = "/management/v1/projects/{project_id}/apps/oidc"
+# ZITADEL API (resource-server) application endpoint. An API app is a different
+# ZITADEL app shape from an OIDC app (SPA/WEB) — it carries no redirect URIs and
+# no interactive grant/response types; it is created here, not under apps/oidc.
+EP_API_APPS = "/management/v1/projects/{project_id}/apps/api"
 EP_APPS_SEARCH = "/management/v1/projects/{project_id}/apps/_search"
+
+# Valid (app_type, auth_method) combinations (design Component 2 — R2.3). Any
+# pair not present here is rejected by validate_combination. The mapped value is
+# a human-readable description used only for documentation; the keys are the
+# authoritative accepted set.
+VALID_COMBINATIONS = {
+    ("spa", "none"): "public SPA / PKCE, no client secret",
+    ("web", "basic"): "confidential web, client secret (DEFAULT)",
+    ("api", "jwt"): "API resource server, JWT-profile key material",
+}
 
 # HTTP status ZITADEL returns when a resource already exists (gRPC code 6 maps
 # to HTTP 409 Conflict). Treated as idempotent success.
@@ -70,6 +84,90 @@ _DEFAULT_TIMEOUT = 30
 
 class ZitadelError(Exception):
     """A non-recoverable ZITADEL API error (not an already-exists conflict)."""
+
+
+class CombinationError(Exception):
+    """An invalid (app_type, auth_method) combination was requested (R2.4).
+
+    Raised by ``validate_combination`` for any pair not in ``VALID_COMBINATIONS``.
+    The message names the offending pair so ``main`` can surface it on stderr.
+    """
+
+
+def validate_combination(app_type: str, auth_method: str) -> None:
+    """Validate an (app_type, auth_method) pair against VALID_COMBINATIONS.
+
+    Pure function (R2.3/R2.4). Returns ``None`` for a valid pair; raises
+    ``CombinationError`` naming the pair for any combination not in the table —
+    e.g. a public SPA cannot hold a secret (``spa``/``basic``), a confidential
+    web app requires an auth method (``web``/``none``). Only the three documented
+    combinations ``spa/none``, ``web/basic``, ``api/jwt`` are accepted.
+    """
+    if (app_type, auth_method) not in VALID_COMBINATIONS:
+        raise CombinationError(
+            f"invalid app-type/auth-method combination: {app_type}/{auth_method}"
+        )
+    return None
+
+
+def build_app_request(app_type: str, auth_method: str, app_name: str,
+                      redirect_uris: list[str]) -> tuple[str, dict[str, Any]]:
+    """Build the (endpoint_template, request_body) for a validated combination.
+
+    Pure function (design Component 3). This is the core of the PBT surface: it
+    centralizes the previously-hardcoded WEB/BASIC body and adds the SPA and API
+    shapes, keyed on the validated ``(app_type, auth_method)`` pair.
+
+    * ``web``/``basic`` (DEFAULT) — MUST be byte-equivalent to the legacy
+      hardcoded body: appType WEB + authMethodType BASIC, Authorization-Code
+      grant + Code response, BEARER access token, posted to ``EP_OIDC_APPS``.
+    * ``spa``/``none`` — public SPA/USER_AGENT + authMethodType NONE,
+      Authorization-Code grant (PKCE by construction for a public user-agent
+      client), NO client-secret-bearing field, posted to ``EP_OIDC_APPS``.
+    * ``api``/``jwt`` — resource-server registration: just the name +
+      API_AUTH_METHOD_TYPE_PRIVATE_KEY_JWT, NO redirect/grant/response types,
+      posted to ``EP_API_APPS``.
+
+    Raises ``CombinationError`` (via ``validate_combination``) for any pair not
+    in ``VALID_COMBINATIONS``.
+    """
+    validate_combination(app_type, auth_method)
+
+    if app_type == "web":
+        # Byte-equivalent legacy confidential-web body (R2.5/R6.1 — golden).
+        body: dict[str, Any] = {
+            "name": app_name,
+            "redirectUris": redirect_uris,
+            "responseTypes": ["OIDC_RESPONSE_TYPE_CODE"],
+            "grantTypes": ["OIDC_GRANT_TYPE_AUTHORIZATION_CODE"],
+            "appType": "OIDC_APP_TYPE_WEB",
+            "authMethodType": "OIDC_AUTH_METHOD_TYPE_BASIC",
+            "accessTokenType": "OIDC_TOKEN_TYPE_BEARER",
+        }
+        return EP_OIDC_APPS, body
+
+    if app_type == "spa":
+        # Public SPA/PKCE (R1.1/R1.2): USER_AGENT + NONE. The Authorization-Code
+        # grant for a public user-agent client is PKCE by construction; no
+        # separate request field and NO client-secret-bearing field.
+        body = {
+            "name": app_name,
+            "redirectUris": redirect_uris,
+            "responseTypes": ["OIDC_RESPONSE_TYPE_CODE"],
+            "grantTypes": ["OIDC_GRANT_TYPE_AUTHORIZATION_CODE"],
+            "appType": "OIDC_APP_TYPE_USER_AGENT",
+            "authMethodType": "OIDC_AUTH_METHOD_TYPE_NONE",
+            "accessTokenType": "OIDC_TOKEN_TYPE_BEARER",
+        }
+        return EP_OIDC_APPS, body
+
+    # app_type == "api" (the only remaining valid type): resource server (R3.1).
+    # No redirect URIs, no grant/response types — not an interactive client.
+    body = {
+        "name": app_name,
+        "authMethodType": "API_AUTH_METHOD_TYPE_PRIVATE_KEY_JWT",
+    }
+    return EP_API_APPS, body
 
 
 class ZitadelClient:
@@ -206,38 +304,84 @@ class ZitadelClient:
         return created
 
     def ensure_oidc_app(self, project_id: str, org_id: str, app_name: str,
-                        redirect_uris: list[str]) -> dict[str, Any]:
-        """Create an OIDC application if absent. Returns a dict with keys:
-        app_name, client_id, client_secret (only when newly created),
-        already_existed (bool). ZITADEL returns the client secret ONLY at creation
-        time, so a re-run (already-exists) emits no secret — the role keeps the
-        secret it captured on first creation (idempotent, FR-3)."""
+                        redirect_uris: list[str], *, app_type: str = "web",
+                        auth_method: str = "basic") -> dict[str, Any]:
+        """Create an OIDC/API application if absent. Returns an ADDITIVE dict:
+        app_name, client_id, client_secret (only when newly created), app_type,
+        auth_method, already_existed (bool).
+
+        The request body is built by the pure ``build_app_request`` helper keyed
+        on the validated ``(app_type, auth_method)`` pair (design Component 3/4),
+        so the previously-hardcoded WEB/BASIC body now also covers the public SPA
+        (no secret) and API (resource-server) shapes:
+
+        * ``web``/``basic`` (DEFAULT) — byte-equivalent legacy confidential-web
+          body posted to ``EP_OIDC_APPS``; emits the created ``client_secret``.
+        * ``spa``/``none`` — public SPA/PKCE posted to ``EP_OIDC_APPS``; ZITADEL
+          returns no secret for ``authMethodType=NONE``, so ``client_secret`` is
+          always ``None`` (R1.3).
+        * ``api``/``jwt`` — resource-server registration posted to ``EP_API_APPS``
+          (see ``ensure_api_app`` / the ``apps/api`` branch below).
+
+        ZITADEL returns the client secret ONLY at creation time, so a re-run
+        (already-exists) emits no secret — the role keeps the secret it captured
+        on first creation (idempotent, FR-3, R1.4/R3.4)."""
+        # Validates the pair + selects endpoint/body (raises CombinationError on
+        # an invalid pair — surfaced by provision()/main as exit 2).
+        endpoint, body = build_app_request(app_type, auth_method, app_name, redirect_uris)
+
         existing = self._find_app_by_name(app_name, project_id, org_id)
         if existing is not None:
             return {"app_name": app_name, "client_id": existing, "client_secret": None,
+                    "app_type": app_type, "auth_method": auth_method,
                     "already_existed": True}
-        body = {
-            "name": app_name,
-            "redirectUris": redirect_uris,
-            "responseTypes": ["OIDC_RESPONSE_TYPE_CODE"],
-            "grantTypes": ["OIDC_GRANT_TYPE_AUTHORIZATION_CODE"],
-            "appType": "OIDC_APP_TYPE_WEB",
-            "authMethodType": "OIDC_AUTH_METHOD_TYPE_BASIC",
-            "accessTokenType": "OIDC_TOKEN_TYPE_BEARER",
-        }
+
         status, resp = self._request(
-            "POST", EP_OIDC_APPS.format(project_id=project_id), body, org_id=org_id,
+            "POST", endpoint.format(project_id=project_id), body, org_id=org_id,
         )
         if status == _ALREADY_EXISTS_STATUS:
             found = self._find_app_by_name(app_name, project_id, org_id)
             return {"app_name": app_name, "client_id": found, "client_secret": None,
+                    "app_type": app_type, "auth_method": auth_method,
                     "already_existed": True}
+
+        if app_type == "spa":
+            # A public SPA never carries a client secret (authMethodType=NONE):
+            # emit client_secret: null regardless of what the response carries.
+            client_secret: str | None = None
+        else:
+            # web (BASIC) and api (JWT-profile) both emit created-once credential
+            # material captured into the generic `client_secret` result key so
+            # the role's per-app OpenBao capture path is unchanged. ZITADEL's API
+            # app returns its key material under one of a few field names
+            # depending on version; try the common ones (live-confirm, design
+            # Open Risk 2) before falling back to the OIDC `clientSecret`.
+            client_secret = (
+                resp.get("clientSecret")
+                or resp.get("clientKey")
+                or resp.get("keyDetails")
+                or None
+            )
         return {
             "app_name": app_name,
             "client_id": resp.get("clientId"),
-            "client_secret": resp.get("clientSecret"),
+            "client_secret": client_secret,
+            "app_type": app_type,
+            "auth_method": auth_method,
             "already_existed": False,
         }
+
+    def ensure_api_app(self, project_id: str, org_id: str, app_name: str,
+                       *, auth_method: str = "jwt") -> dict[str, Any]:
+        """Create an API (resource-server) application if absent (R3.1/R3.2).
+
+        Thin convenience wrapper over ``ensure_oidc_app`` with ``app_type="api"``
+        — the shared ensure path already routes an ``api`` app to ``EP_API_APPS``
+        via ``build_app_request`` and captures the created-once credential
+        material into the ``client_secret`` result key. A redirect-URI list is
+        irrelevant for a resource server and is passed empty."""
+        return self.ensure_oidc_app(project_id, org_id, app_name, [],
+                                    app_type="api", auth_method=auth_method)
 
     # -- lookups ------------------------------------------------------------ #
     def _find_org_by_name(self, name: str) -> str | None:
@@ -277,15 +421,24 @@ def _is_already_exists(body: dict[str, Any]) -> bool:
 
 def provision(base_url: str, org_name: str, project_name: str, app_name: str,
               redirect_uris: list[str], roles: list[str], token: str,
-              *, host_header: str | None = None, insecure: bool = False) -> dict[str, Any]:
+              *, app_type: str = "web", auth_method: str = "basic",
+              host_header: str | None = None, insecure: bool = False) -> dict[str, Any]:
     """End-to-end idempotent provisioning. Returns a result dict suitable for
     JSON emission: org/project ids, created flags, roles created, and the OIDC
-    app result (with client_secret only when newly created)."""
+    app result (with client_secret only when newly created).
+
+    ``app_type``/``auth_method`` select the ZITADEL app shape (design Component
+    1-4); they default to the pre-existing confidential ``web``/``basic`` client
+    so an existing caller that omits them is byte-for-byte unchanged (R6.1). The
+    pair is validated up-front so an invalid combination raises
+    ``CombinationError`` before any ZITADEL mutation (R2.4)."""
+    validate_combination(app_type, auth_method)
     client = ZitadelClient(base_url, token, host_header=host_header, insecure=insecure)
     org_id, org_created = client.ensure_org(org_name)
     project_id, project_created = client.ensure_project(project_name, org_id)
     roles_created = client.ensure_roles(project_id, org_id, roles)
-    app = client.ensure_oidc_app(project_id, org_id, app_name, redirect_uris)
+    app = client.ensure_oidc_app(project_id, org_id, app_name, redirect_uris,
+                                 app_type=app_type, auth_method=auth_method)
     return {
         "org": {"name": org_name, "id": org_id, "created": org_created},
         "project": {"name": project_name, "id": project_id, "created": project_created},
@@ -313,6 +466,18 @@ def main(argv: list[str] | None = None) -> int:
                         help="OIDC redirect URI (repeatable)")
     parser.add_argument("--role", action="append", default=["admin", "member", "viewer"], dest="roles",
                         help="Project role key (repeatable; defaults admin/member/viewer)")
+    # App-shape selection (design Component 1). --app-type defaults to `web`
+    # (the pre-existing confidential-web client, backward compatible). When
+    # --auth-method is omitted it derives from the app type (spa->none,
+    # web->basic, api->jwt). argparse rejects out-of-domain values (R2.1/R2.2).
+    parser.add_argument("--app-type", choices=["spa", "web", "api"], default="web",
+                        dest="app_type",
+                        help="OIDC application shape: spa (public/PKCE, no secret), "
+                             "web (confidential, DEFAULT), api (resource server).")
+    parser.add_argument("--auth-method", choices=["none", "basic", "jwt"], default=None,
+                        dest="auth_method",
+                        help="Auth method; derived from --app-type when omitted "
+                             "(spa->none, web->basic, api->jwt).")
     # Dev/mock transport knobs (NOT secrets). In the Traefik-less dev path the
     # helper connects to the ZITADEL container IP:8080 and must present the
     # external-domain Host header; --insecure tolerates the self-signed mock cert.
@@ -329,10 +494,27 @@ def main(argv: list[str] | None = None) -> int:
               "must be supplied via that env var, never on the command line.", file=sys.stderr)
         return 2
 
+    # Derive the auth method from the app type when --auth-method is omitted
+    # (design Component 1): spa->none, web->basic, api->jwt.
+    _DEFAULT_AUTH_FOR = {"spa": "none", "web": "basic", "api": "jwt"}
+    auth_method = args.auth_method or _DEFAULT_AUTH_FOR[args.app_type]
+
+    # Validate the combination up-front so an invalid pair exits 2 naming the
+    # pair before any ZITADEL mutation (R2.4).
+    try:
+        validate_combination(args.app_type, auth_method)
+    except CombinationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
     try:
         result = provision(args.base_url, args.org, args.project, args.app,
                            args.redirect_uris, args.roles, token,
+                           app_type=args.app_type, auth_method=auth_method,
                            host_header=args.host_header, insecure=args.insecure)
+    except CombinationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

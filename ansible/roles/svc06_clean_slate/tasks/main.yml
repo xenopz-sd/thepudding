@@ -165,6 +165,96 @@
   changed_when: "'changed=0' not in (svc06_db_clean_slate.stdout | default(''))"
   no_log: true
 
+# ---- Clear the stale ZITADEL provision_token FIELD from OpenBao -------------
+# (spec fix-svc06-clean-slate-provision-token-residue.) The OpenBao primary guest
+# is NOT torn down by this role (it belongs to SVC-07), so a stale ZITADEL
+# provision_token at svc06_openbao_secret_path would SURVIVE this clean-slate, and
+# zitadel-server's ABSOLUTE persist guard (not (zitadel_provision_token_stored |
+# bool)) would refuse to replace it on the next re-bootstrap -> OpenBao keeps the
+# destroyed instance's token -> consumers get HTTP 401 Errors.Token.Invalid.
+# Clear ONLY the provision_token FIELD (a KV v2 patch-to-empty via the stdin `=-`
+# form, mirroring zitadel-server's WRITE) so the co-resident masterkey (SAME entry)
+# and the sibling app_password (secret/proj-shared-zitadel/postgres) are untouched.
+# NEVER `kv delete` / `kv metadata delete` (that would take the masterkey).
+#
+# Reachability gate: a full-platform teardown may be tearing down the OpenBao guest
+# too. A tolerant keyscan decides svc06_openbao_reachable; the mutating patch is
+# gated on it, so an unreachable/unwired OpenBao SKIPS cleanly (the token dies with
+# OpenBao — no residue possible), never a silent false-success and never a hard
+# failure. When reachable, a de-masked failed_when surfaces a genuine `bao kv`
+# error instead of swallowing it. Mirrors the Route_Fragment removal discipline
+# below, and zitadel-server's delegated `bao`-CLI docker-exec (token in ENV).
+- name: "Clean-Slate | Probe OpenBao primary reachability for the provision_token clear (tolerant)"
+  ansible.builtin.command:
+    argv:
+      - ssh-keyscan
+      - -T
+      - "30"
+      - "{{ svc06_openbao_cli_host }}"
+  register: svc06_openbao_keyscan
+  changed_when: false
+  failed_when: false
+  when: (svc06_openbao_addr | default('') | trim | length) > 0
+
+- name: "Clean-Slate | Resolve whether OpenBao is reachable for the provision_token clear"
+  ansible.builtin.set_fact:
+    svc06_openbao_reachable: >-
+      {{ (svc06_openbao_addr | default('') | trim | length) > 0
+         and (svc06_openbao_keyscan.rc | default(1)) == 0
+         and ((svc06_openbao_keyscan.stdout | default('') | trim | length) > 0) }}
+
+# Field-scoped PATCH-TO-EMPTY. The value is piped on STDIN via the `=-` form
+# (identical to zitadel-server's provision_token WRITE), so no value ever lands on
+# the argv. An empty stdin sets provision_token to "" -> zitadel-server step 1
+# treats it as no usable token (zitadel_provision_token_stored = false) -> step (4)
+# persists the fresh FirstInstance PAT. NOT `kv delete`/`kv metadata delete`.
+- name: "Clean-Slate | Clear the stale ZITADEL provision_token field in OpenBao (field-scoped, no_log)"
+  ansible.builtin.shell:
+    cmd: >-
+      printf '' | docker exec -i
+      -e BAO_ADDR={{ svc06_openbao_cli_bao_addr | quote }}
+      -e BAO_TOKEN={{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true)) | quote }}
+      {{ svc06_openbao_primary_container_name | quote }}
+      {{ svc06_openbao_bao_bin | quote }} kv patch
+      {{ '-tls-skip-verify' if (svc06_openbao_tls_skip_verify | bool) else '' }}
+      {{ svc06_openbao_secret_path | quote }}
+      {{ svc06_openbao_provision_token_field }}=-
+  delegate_to: "{{ svc06_openbao_cli_host }}"
+  vars:
+    # ansible_connection: ssh is REQUIRED here: the clean-slate branch runs in the
+    # `hosts: localhost` orchestrator play (connection: local). Without this, the
+    # delegated docker exec inherits connection: local and runs on the CONTROL NODE
+    # (which has no openbao-openbao-1 container -> "No such container"). Mirrors the
+    # working consumer_bootstrap STEP 1 `delegate_to: 10.0.20.10` + ansible_connection: ssh.
+    ansible_connection: ssh
+    ansible_user: "{{ svc06_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ svc06_openbao_cli_python }}"
+  register: svc06_provision_token_cleared
+  changed_when: "(svc06_provision_token_cleared.rc | default(1)) == 0"
+  failed_when:
+    - svc06_provision_token_cleared is failed
+    - "'unreachable' not in (svc06_provision_token_cleared.msg | default('') | lower)"
+    - "'connection refused' not in ((svc06_provision_token_cleared.stderr | default('')) | lower)"
+    - "'dial tcp' not in ((svc06_provision_token_cleared.stderr | default('')) | lower)"
+  when: svc06_openbao_reachable | bool
+  no_log: true
+
+- name: "Clean-Slate | INFO — ZITADEL provision_token clear outcome"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        ('ZITADEL provision_token clear SKIPPED: OpenBao primary '
+          ~ svc06_openbao_cli_host ~ ' was unreachable (or svc06_openbao_addr empty) '
+          ~ 'during a full teardown — the stored token dies with OpenBao, no stale '
+          ~ 'residue is possible. No action needed.')
+        if (not (svc06_openbao_reachable | default(false) | bool))
+        else ('Cleared the stale ZITADEL provision_token FIELD at '
+          ~ svc06_openbao_secret_path ~ ' on the reachable OpenBao primary '
+          ~ svc06_openbao_cli_host ~ ' (field-scoped patch — masterkey and the sibling '
+          ~ 'app_password untouched). The next re-bootstrap will persist a fresh PAT.')
+      }}
+  changed_when: false
+
 # ---- Remove the delegated ZITADEL cross-guest Route_Fragment ----------------
 # The ZITADEL guest is now destroyed (section A above). The Route_Fragment
 # ZITADEL delegated onto the Traefik_Guest's watched file-provider dir
@@ -313,11 +403,39 @@
   changed_when: false
   failed_when: false
 
-- name: "Clean-Slate | Compute the set of surviving SVC-06 container VMIDs"
+# Fix 2 (spec fix-svc06-clean-slate-backing-db-residue, Req 2.3): FAIL CLOSED if
+# either VMID is unresolved BEFORE the survivor computation. An empty
+# svc06_db_vmid (the backing-DB residue bug: its identity was out of scope on the
+# clean_slate branch) would otherwise make `"" in <stdout>` always true and
+# silently DROP the backing-DB VMID from the survivor set — so the gate would
+# report a clean baseline while VMID 1102 is still running. Refuse to run the
+# survivor check unless both VMIDs are resolved, non-empty, positive integers.
+- name: "Clean-Slate | Assert both SVC-06 VMIDs are resolved before the survivor check (Req 2.3)"
+  ansible.builtin.assert:
+    that:
+      - "svc06_zitadel_vmid is defined and (svc06_zitadel_vmid | string | trim) | length > 0"
+      - "(svc06_zitadel_vmid | string | trim) | int(0) > 0"
+      - "svc06_db_vmid is defined and (svc06_db_vmid | string | trim) | length > 0"
+      - "(svc06_db_vmid | string | trim) | int(0) > 0"
+    fail_msg: >-
+      Empty-baseline gate cannot run: a SVC-06 VMID is unresolved — zitadel=
+      '{{ svc06_zitadel_vmid | default("") }}', backing-db='{{ svc06_db_vmid | default("") }}'.
+      The backing-DB identity (svc06_db_vmid/svc06_db_project_slug/svc06_db_vlan_id)
+      MUST be in play-level scope on the clean_slate branch (svc-06-bootstrap.yml
+      vars). Refusing to report a baseline that could silently omit the backing DB.
+    success_msg: "Both SVC-06 VMIDs resolved — the survivor check can see the backing DB."
+
+# Whole-TOKEN membership (Req 2.3): `pct list` output is whitespace-separated
+# columns, so a VMID appears as its own token on its line. `.split()` turns
+# stdout into the list of tokens and `select('in', <list>)` is then a genuine
+# whole-element test ("1102" in ["1102","running",...]) — an empty string can
+# never satisfy it, and a VMID never matches as an accidental substring of
+# another field. (Was a bare substring `select('in', <raw stdout>)`.)
+- name: "Clean-Slate | Compute the set of surviving SVC-06 container VMIDs (whole-token match)"
   ansible.builtin.set_fact:
     svc06_surviving_vmids: >-
       {{ [svc06_zitadel_vmid | string, svc06_db_vmid | string]
-         | select('in', (svc06_pct_list.stdout | default(''))) | list }}
+         | select('in', (svc06_pct_list.stdout | default('')).split()) | list }}
 
 # Zero RESOURCES of ANY kind in the SVC-06 (ZITADEL) Terraform state. The
 # ZITADEL child clean-slate.yml run above destroyed the ZITADEL guest and

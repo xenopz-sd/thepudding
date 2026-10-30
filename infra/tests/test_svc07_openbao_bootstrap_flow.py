@@ -449,3 +449,29 @@ class TestPlatformAdminPolicy:
         assert "token" not in text.lower() or "Root_Token" in text  # comment mentions only
         pat = re.compile(r"(hvs\.[A-Za-z0-9]{8,}|s\.[A-Za-z0-9]{20,})")
         assert not pat.search(text)
+
+    def test_policy_grants_auth_method_management(self):
+        """platform-admin must ADMINISTER every auth method it onboards.
+
+        Regression guard for the third live-caught openbao-workload-auth defect:
+        the policy granted auth/jwt/* and auth/oidc/* but NOT auth/approle/*, so
+        the admin token could enable the approle method (via sys/auth/*) yet got
+        403 creating the Workload_AppRole (auth/approle/role/<slug>-workload).
+        The approle stanza must mirror the sibling jwt/oidc grants exactly.
+        """
+        text = _ADMIN_TMPL.read_text(encoding="utf-8")
+        full_crudl = '  capabilities = ["create", "read", "update", "delete", "list"]'
+        for method in ("jwt", "oidc", "approle"):
+            stanza = f'path "auth/{method}/*" {{'
+            assert stanza in text, (
+                f"platform-admin must grant management of the auth/{method}/* "
+                f"method it onboards (missing stanza: {stanza})"
+            )
+            # The approle stanza must carry the SAME full CRUDL set as its
+            # siblings — not a broadened (sudo/root) nor a narrowed grant.
+            body = text[text.index(stanza):]
+            body = body[: body.index("}")]
+            assert full_crudl in body, (
+                f"auth/{method}/* must grant exactly create/read/update/delete/"
+                f"list (mirroring the sibling auth-method stanzas)"
+            )

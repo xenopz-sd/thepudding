@@ -15,8 +15,12 @@
 zop_project_slug: ""
 zop_org_name: "proj-{{ zop_project_slug }}"
 zop_project_name: "{{ zop_project_slug }}"
-# The OIDC application registered for the project (one app proves the pattern;
-# more are added by extending this list per consumer in a later increment).
+# The OIDC application registered for the project. Historically this role
+# registered exactly ONE confidential-web app named `<slug>-webapp`; that remains
+# the default when no `zop_app_registrations` list is supplied (see below). The
+# two-client onboarding (spec: zitadel-spa-pkce-onboarding) adds the
+# `zop_app_registrations` list so a project can onboard multiple apps of multiple
+# types (public SPA + API resource server) in ONE run.
 zop_app_name: "{{ zop_project_slug }}-webapp"
 zop_redirect_uris:
   - "https://{{ zop_project_slug }}.{{ zop_platform_domain }}/oauth/callback"
@@ -25,9 +29,54 @@ zop_roles:
   - member
   - viewer
 
+# --- Two-client onboarding: the list of apps to register this run -----------
+# (spec: zitadel-spa-pkce-onboarding, design Component 5 + Variables table.)
+# Each entry is an App_Registration:
+#   - name:          OIDC/API app name, unique within the project.
+#   - app_type:      one of zop_valid_app_types (spa|web|api).
+#   - auth_method:   optional; derived from zop_app_type_default_auth_method when
+#                    omitted (spa->none, web->basic, api->jwt).
+#   - redirect_uris: list; required for spa/web, empty for api.
+# EMPTY (the default) means: synthesize exactly the pre-existing single
+# confidential-web `<slug>-webapp` entry, so a no-list run is byte-for-byte the
+# legacy behavior (R4.3/R6.1).
+zop_app_registrations: []
+
+# The synthesized legacy-default entry fields (used only when the list is empty).
+zop_default_app_name: "{{ zop_project_slug }}-webapp"
+zop_default_app_type: "web"
+zop_default_auth_method: "basic"
+
+# Accepted entry `app_type` values (the R4.5 assertion source) and the per-type
+# default auth method when an entry omits `auth_method`.
+zop_valid_app_types:
+  - spa
+  - web
+  - api
+zop_app_type_default_auth_method:
+  spa: none
+  web: basic
+  api: jwt
+
+# Per-app OpenBao KV path template — unique per application within the project so
+# two apps never resolve to the same path (R5.1). `{app_name}` is substituted
+# per entry (a Python str.format token, NOT a Jinja var, so it survives the
+# `zop_openbao_app_secret_path_tmpl` default being rendered once).
+zop_openbao_app_secret_path_tmpl: "{{ zop_openbao_kv_mount }}/proj-{{ zop_project_slug }}/zitadel/oidc/{app_name}"
+
 # --- ZITADEL endpoint ---
 zop_platform_domain: "platform.example.test"
 zop_base_url: "https://auth.{{ zop_platform_domain }}"
+
+# --- Production-path (control node -> Traefik HTTPS) TLS verification knob ----
+# The production path reaches ZITADEL through Traefik (SVC-09) at zop_base_url
+# (https://auth.<domain>). Traefik serves a self-signed cert by default (the
+# permanent, default-off traefik_tls_self_signed mock — ADR-0013 — because
+# SVC-08/Let's-Encrypt real certs are not deployed). Default TRUE so the helper
+# call tolerates that self-signed cert today; flip to FALSE once real certs are
+# deployed and verification should be enforced. Mirrors zop_openbao_tls_skip_verify
+# in this same file. Non-secret transport knob — safe on the helper argv.
+zop_base_url_tls_skip_verify: true
 
 # --- The provisioning helper (invoked via the project venv python) ---
 zop_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"

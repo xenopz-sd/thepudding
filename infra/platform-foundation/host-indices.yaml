@@ -128,3 +128,31 @@
     instance: 1
     host_index: 10            # -> 10.0.20.20
     status: allocated
+
+# =============================================================================
+# PROJECT VLANs (100+) — per-project dedicated tenancy (NET-00 §2, domain-rules
+# §1). Populated the FIRST time a project VLAN carries more than one Terraform
+# root OR a stateful per-project consumer guest. This is the first project-VLAN
+# block in this ledger (project-consumer-onboarding, ADR-0019 + ADR-0015):
+# before it, host-indices.yaml held only the shared VLAN-20 block.
+#
+# A single-guest project VLAN derives an EMPTY peer set (the only guest's own
+# index is excluded), so the proxmox-compute Guard 4 precondition is a strict
+# no-op and the apply behaves exactly as a pre-ledger single-guest apply
+# (backward-compatible). The guard engages only when a SECOND independent root
+# later places a guest on the same project VLAN — at which point that root reads
+# this block as its peer set and a within-VLAN host-index collision becomes a
+# hard PLAN-TIME failure instead of a silent live clash.
+# =============================================================================
+
+# VLAN 100 — project `dronefleet` (projects.yaml: slug dronefleet -> vlan_id
+# 100). The project's per-project SVC-01 consumer database (the FIRST real
+# per-project-VLAN SVC-01 consumer; SVC-01 previously ran only as the shared
+# ZITADEL backing DB on VLAN 20). The DB guest is the sole occupant of VLAN 100
+# today, so its peer set is empty (Guard 4 no-op).
+100:
+  - svc_code: svc01           # dronefleet per-project PostgreSQL database
+    instance: 1
+    host_index: 0             # -> 10.0.100.10
+    anchor: true              # stateful DB (prevent_destroy); index never reassigned
+    status: allocated

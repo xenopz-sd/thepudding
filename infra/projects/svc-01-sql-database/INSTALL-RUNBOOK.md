@@ -141,6 +141,21 @@ To stand the MariaDB alternative up instead, add `-e db_engine=mariadb`.
 Pct-destroys the DB LXC and removes it from this project's Terraform state, then
 verifies an empty baseline (`pct list` + `terraform state list`).
 
+> **Per-instance LOCAL state (Developer-B / offline backend).** On the local
+> backend the SVC-01 root now writes a **per-instance** state file
+> `infra/projects/svc-01-sql-database/<slug>-svc01-postgres.tfstate` (gitignored),
+> not a shared `terraform.tfstate` — so a second SVC-01 instance (e.g. a per-project
+> consumer DB on VLAN 100) never collides with the shared-zitadel backing DB on
+> VLAN 20 (spec `fix-svc01-local-backend-per-instance-state`; matches the GitLab
+> backend's per-slug isolation, ADR-0019). On a cluster provisioned **before** this
+> fix, a legacy shared `terraform.tfstate` may exist in that root; the shared-zitadel
+> backing DB re-reconciles under its new per-slug path — either **(default)** re-run
+> `svc-06-bootstrap.yml` (optionally `-e clean_slate=true`) to re-establish it via its
+> own orchestrator, or **(optional)** one-time rename the legacy `terraform.tfstate`
+> to `shared-zitadel-svc01-postgres.tfstate` to retain the existing state in place.
+> Do NOT hand-repair the backing DB with raw `ssh`/`pct`/`docker` — drive it through
+> its own orchestrator (`testing-strategy.md` dependency-automated-path rule).
+
 ---
 
 ## 0–3. Developer-A manual reference spine

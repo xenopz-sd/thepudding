@@ -1,0 +1,195 @@
+---
+# project-consumer-bootstrap.yml — Consumer_Onboarding_Orchestrator.
+# Spec: .kiro/specs/project-consumer-onboarding/ (requirements.md, design.md,
+# tasks.md); ADR-0019 (per-project SVC-01 consumer root), ADR-0020 (manifest-
+# driven consumer onboarding orchestrator).
+#
+# THIN, COMPOSING ORCHESTRATOR (Task 7): a Day-0 orchestrator that reads a
+# per-project Consumer_Manifest, resolves the project's VLAN from the Registry,
+# and performs the DECLARED onboarding under the mandatory 4-phase installer
+# contract by COMPOSING the existing per-service onboarders — it NEVER
+# reimplements them (Req 4.4-4.6, ADR-0020). It drives five focused roles, each
+# behind its own per-phase block/rescue that preserves a phase-naming `fail`
+# diagnostic in the play, mirroring svc-07-bootstrap.yml / svc-01-bootstrap.yml:
+#   * consumer_clean_slate — the destructive reset branch (clean_slate | bool)
+#   * consumer_preflight   — Phase 1: env-file resolve/validate, manifest schema
+#                            validation, Registry slug->vlan_id resolution,
+#                            bounded dependency probes (fail-closed gate).
+#   * consumer_provision   — Phase 2: compose the SVC01_Consumer_Root apply
+#                            (child svc-01-bootstrap.yml), regenerate inventory,
+#                            refresh known_hosts. Runs only when the manifest
+#                            declares a database.
+#   * consumer_bootstrap   — Phase 3: compose svc01_bootstrap (DB + password->
+#                            OpenBao) + openbao_project_onboard (isolation triple)
+#                            + openbao_workload_approle (feature-gated on secrets)
+#                            + zitadel-org-provision (feature-gated on sso).
+#   * consumer_handoff     — Phase 4: bounded health polls + completion summary.
+# The role internals hold the tasks; this play only sequences and phase-names.
+#
+# DUAL ROLE OF ANSIBLE (service-installer.md §2.1): this play runs as the Day-0
+# Workflow ORCHESTRATOR on hosts: localhost. Its roles drive Terraform (via the
+# child svc-01-bootstrap.yml run), generate_inventory.py, and the CONFIGURATOR
+# onboarder roles/plays against the file-mediated generated inventory
+# (integration-boundaries.md §4). It never parses .tfstate or queries Proxmox
+# for host discovery.
+#
+# NO BUILD TOOL BEYOND ANSIBLE (Req 4.2, 4.9): there is no make/just/task/bash
+# wrapper anywhere in this orchestrator; a lint check + the consumer_preflight
+# forbidden-tool gate assert this.
+#
+# Developer B entry point (service-installer.md §2):
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/project-consumer-bootstrap.yml \
+#     -e cluster_env_file=cluster.dev.env \
+#     -e project_slug=dronefleet
+#
+# Clean-slate reset (Req 7):
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/project-consumer-bootstrap.yml \
+#     -e clean_slate=true -e clean_slate_confirm=force \
+#     -e project_slug=dronefleet
+- name: Project consumer onboarding — Day-0 orchestrator (composes onboarders)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  # any_errors_fatal so a failed phase (or a child ansible-playbook non-zero
+  # exit) aborts the whole run immediately rather than starting the next phase
+  # (Req 5.1, 5.2; design "Error Handling": fail-closed at every phase boundary).
+  any_errors_fatal: true
+  vars:
+    # --- PlayLevelVars (design "Orchestrator variables") — cross-phase
+    #     constants only. Every phase-specific var lives in its role's
+    #     defaults/main.yml; only constants read by MORE THAN ONE role (or by
+    #     the play itself) stay here. ---
+
+    # Cluster_Env_File — the gitignored KEY=VALUE .env the installer reads its
+    # Proxmox/provider parameters from (Req 4.3). Read by preflight, provision,
+    # bootstrap, handoff, and clean_slate. Overridable with -e cluster_env_file=
+    cluster_env_file: cluster.env
+    # Repository root. The play runs on localhost from anywhere; roots and
+    # helpers are addressed relative to the repo root, anchored to the
+    # playbook's own location (…/ansible/playbooks/) two levels up. Read by
+    # every role.
+    consumer_repo_root: "{{ playbook_dir | dirname | dirname }}"
+    # Project venv python (dev-workflow.md Python Environment Invocation rule):
+    # helpers are invoked through the devinfra venv interpreter by absolute path.
+    consumer_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+
+    # --- The project being onboarded (REQUIRED via -e). ---
+    # project_slug is the per-instance identity. The orchestrator refuses to run
+    # without it (consumer_preflight asserts). vlan_id is NOT accepted here — it
+    # is resolved from the Registry in Phase 1 (Req 2.3).
+    project_slug: ""
+    # The Consumer_Manifest location (derived from the slug by default,
+    # Req 4.3 / design "Orchestrator variables").
+    consumer_manifest_path: "infra/projects/{{ project_slug }}/consumer-manifest.yml"
+
+    # --- Clean-slate reset controls (off by default, Req 7). ---
+    clean_slate: false
+    clean_slate_confirm: ""
+
+    # --- OpenBao primary address, bridged to the composed onboarders. ---
+    # Non-secret address; the admin token is resolved from the env / cluster env
+    # file inside the composing roles (never on the argv). Empty => a dev/offline
+    # run that skips the OpenBao writes.
+    openbao_addr: ""
+
+    # --- Bounded degraded-mode dependency-probe timeout (Req 9.1). ---
+    dependency_probe_timeout: 30
+
+    # --- Agent Live-Test Authorization (from AGENT_LIVE_AUTHORIZED env). ---
+    # Truthy ONLY when the interlock is set (non-empty) in the process
+    # environment. Gates the throwaway-guard consult carried by the composed
+    # svc-01-bootstrap.yml child run; an ordinary operator run (interlock unset)
+    # is byte-for-byte unaffected. Read from the ENVIRONMENT, never a committed
+    # default (testing-strategy.md "Agent Live-Test Authorization").
+    agent_live_run: "{{ (lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') | trim) | length > 0 }}"
+
+  tasks:
+    # ------------------------------------------------------------------ #
+    # TOP-LEVEL BRANCH: clean-slate reset vs. the normal 4-phase onboard. #
+    # Each phase is exactly one import_role wrapped in its own            #
+    # block/rescue; the rescue preserves the phase-naming diagnostic in   #
+    # the play (design "Components → Orchestrator"). All role tasks and    #
+    # phase-specific vars live in the roles, not here.                    #
+    # ------------------------------------------------------------------ #
+
+    # === Clean-Slate branch (Req 7) — runs ONLY when clean_slate is truthy. ===
+    - name: Clean-Slate reset
+      when: clean_slate | default(false) | bool
+      block:
+        - name: "Clean-Slate | Run the consumer_clean_slate role"
+          ansible.builtin.import_role:
+            name: consumer_clean_slate
+      rescue:
+        - name: Report Clean-Slate reset failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Consumer onboarding FAILED during the Clean-Slate reset:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # === Normal onboard path — Phases 1→4, skipped entirely on clean_slate. ===
+
+    # ---- Phase 1: Preflight validation (fail-fast gate) ----
+    # A failure here leaves ZERO provisioning side effect (Req 2.2/2.4/2.5, 5.3).
+    - name: "Phase 1 — Preflight & manifest/registry validation"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Preflight | Run the consumer_preflight role"
+          ansible.builtin.import_role:
+            name: consumer_preflight
+      rescue:
+        - name: Report Phase 1 (Preflight) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Consumer onboarding FAILED in Phase 1 (Preflight & validation):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # ---- Phase 2: Infrastructure provisioning (compose SVC01_Consumer_Root) ----
+    - name: "Phase 2 — Infrastructure provisioning (per-project DB)"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Provisioning | Run the consumer_provision role"
+          ansible.builtin.import_role:
+            name: consumer_provision
+      rescue:
+        - name: Report Phase 2 (Provisioning) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Consumer onboarding FAILED in Phase 2 (Infrastructure provisioning):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # ---- Phase 3: Service bootstrap (compose DB + OpenBao + ZITADEL onboarders) ----
+    - name: "Phase 3 — Service bootstrap (compose onboarders)"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Bootstrap | Run the consumer_bootstrap role"
+          ansible.builtin.import_role:
+            name: consumer_bootstrap
+      rescue:
+        - name: Report Phase 3 (Bootstrap) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Consumer onboarding FAILED in Phase 3 (Service bootstrap):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # ---- Phase 4: Health sanity & Developer B handoff ----
+    - name: "Phase 4 — Health sanity & Developer B handoff"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Handoff | Run the consumer_handoff role"
+          ansible.builtin.import_role:
+            name: consumer_handoff
+      rescue:
+        - name: Report Phase 4 (Handoff) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Consumer onboarding FAILED in Phase 4 (Health sanity & handoff):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}

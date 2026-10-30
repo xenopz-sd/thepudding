@@ -1,0 +1,42 @@
+# infra/projects/dronefleet/consumer-manifest.yml
+#
+# Consumer_Manifest for the scaffold/test project `dronefleet`
+# (project-consumer-onboarding, Task 7; design "Data Models" → Consumer_Manifest
+# schema). Declares the catalog services this project CONSUMES; the
+# Consumer_Onboarding_Orchestrator reads it and wires each declared service by
+# COMPOSING the per-service onboarders (never reimplementing them).
+#
+# Validated OFFLINE before any mutation by:
+#   ~/venv/devinfra/bin/python scripts/installer/consumer_manifest.py \
+#     --check infra/projects/dronefleet/consumer-manifest.yml
+#
+# Placeholders only — no real credential or hostname (documentation-testing.md).
+# The slug must match a `slug` recorded in infra/platform-foundation/projects.yaml
+# (dronefleet -> vlan_id 100); vlan_id is NEVER declared here (Req 2.3).
+
+slug: dronefleet
+
+database:
+  db_name: dronefleet
+  db_role: dronefleet_app
+  engine: postgres
+  tier: small
+
+sso:
+  org_name: proj-dronefleet
+  app_registrations:
+    - name: dronefleet-spa
+      app_type: public-spa
+      auth_method: none
+      redirect_uris: ["https://dronefleet.platform.example.test/oauth/callback"]
+    - name: dronefleet-api
+      app_type: api
+      auth_method: jwt-profile
+
+secrets:
+  policy: policy-dronefleet
+  path: secret/data/dronefleet
+  workload_token_ttl: 3600
+  workload_token_max_ttl: 14400
+  secret_id_ttl: 86400
+  secret_id_num_uses: 0

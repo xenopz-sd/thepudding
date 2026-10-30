@@ -1,0 +1,46 @@
+---
+# meta/main.yml — openbao_workload_approle
+galaxy_info:
+  role_name: openbao_workload_approle
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Control-plane role for the openbao-workload-auth feature (SVC-07 downstream).
+    For one project slug (read READ-ONLY from projects.yaml) it writes to the
+    PRIMARY OpenBao instance via `docker exec` to: enable the AppRole auth method
+    once at `approle/` (check-then-write, Req 1); create/reconcile the per-slug
+    Workload_AppRole `auth/approle/role/<slug>-workload` bound to EXACTLY
+    [policy-<slug>] as a renewable service token with workload-appropriate TTLs
+    (distinct from the sibling non-renewable `<slug>-ci` jwt role, Req 2); read
+    the non-secret Role_ID; mint a Secret_ID (no_log, fail-closed, Req 3); and
+    hand role_id/secret_id off over the sanctioned first-secret channel — a 0600
+    service-owned host file or a GitLab CI/CD protected+masked variable (PF FR-8,
+    Req 3). Validates the TTL / num_uses inputs before any write via the shared
+    pure validators in scripts/installer/workload_auth.py. Authenticates with a
+    platform-admin token (NOT the revoked Root_Token) supplied at runtime from a
+    never-committed env var; every secret-bearing task carries
+    `no_log: "{{ openbao_no_log }}"` and the Secret_ID + Admin_Token facts are
+    scrubbed at the end. Idempotent on its control-plane writes; the Secret_ID is
+    re-minted each run by design (a TTL/num_uses-bounded, un-rereadable credential).
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - openbao
+    - secrets
+    - approle
+    - workload
+    - svc07
+
+# No cross-role dependencies. This role runs day-2, after openbao_install +
+# openbao_init_unseal have brought up the primary, initialised/unsealed it, and
+# enabled the KV v2 engine, and after openbao_project_onboard has created the
+# policy-<slug> isolation triple the Workload_AppRole binds to. The ordering is
+# expressed in the playbook, not as a hard meta dependency here.
+dependencies: []

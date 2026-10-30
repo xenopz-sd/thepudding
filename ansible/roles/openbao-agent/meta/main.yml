@@ -1,0 +1,51 @@
+---
+# meta/main.yml — openbao-agent
+galaxy_info:
+  role_name: openbao_agent
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Data-plane role for the openbao-workload-auth feature (SVC-07 downstream).
+    Runs on the WORKLOAD host and holds NO admin token — only the
+    role_id/secret_id minted for it by the control-plane openbao_workload_approle
+    role. It renders agent.hcl (an AppRole auto_auth method reading the on-host
+    role_id/secret_id file paths, a token sink, and one `template` stanza per
+    secret mapping reading secret/data/<slug>/<kv_subpath> into a single 0600
+    Rendered_Secret_File — Req 4.1, 4.2), kept structurally equivalent to the
+    shared pure renderer scripts/installer/workload_auth.py::render_agent_hcl so
+    the golden-file test cross-checks it. It then builds the docker-compose-app
+    variable set with the SWAP-GATE — the `bao agent` sidecar (RSF-presence
+    healthcheck, no published host port) and the workload service (the
+    Rendered_Secret_File as an extra env_file, `depends_on` the Agent
+    `service_healthy`, Traefik labels, the `edge` network, NO host ports) — and
+    includes docker-compose-app (Req 4.3, 5.2, 5.4, 5.5, 7.5). The depends_on
+    gate on the RSF-presence healthcheck is the composition-root swap-gate: real
+    secrets rendered ⇒ workload starts; Primary sealed/unreachable ⇒ no RSF ⇒
+    Agent never healthy ⇒ workload never starts (fail-closed,
+    composition-wiring.md). agent.hcl renders idempotently (byte-identical on
+    re-run, changed=0). No secret value is templated, echoed, or defaulted; every
+    secret-bearing task carries `no_log: "{{ openbao_no_log }}"`.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - openbao
+    - secrets
+    - approle
+    - agent
+    - workload
+    - svc07
+
+# Depends on docker-compose-app at RUNTIME (included from tasks/main.yml to
+# render the Agent sidecar + workload Compose stack) and on the control-plane
+# openbao_workload_approle having already minted + handed off the
+# role_id/secret_id this role's Agent reads. Those orderings are expressed in the
+# playbook, not as a hard meta dependency here (so this role can be included
+# standalone once its credential files exist on the host).
+dependencies: []

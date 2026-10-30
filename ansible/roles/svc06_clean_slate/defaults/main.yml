@@ -52,3 +52,28 @@ svc06_traefik_dynamic_config_dir: "/etc/traefik/dynamic"
 # The delegated ZITADEL Route_Fragment the traefik_route role renders as
 # "{{ route_name }}-route.yml" with route_name=zitadel. Removed on clean-slate.
 svc06_zitadel_route_fragment: "{{ svc06_traefik_dynamic_config_dir }}/zitadel-route.yml"
+
+# --- OpenBao (SVC-07) provision_token residue clear ---------------------------
+# (spec fix-svc06-clean-slate-provision-token-residue.) The clean-slate clears
+# the STALE ZITADEL provision_token FIELD from OpenBao so the next re-bootstrap's
+# persist guard (not (zitadel_provision_token_stored | bool)) finds no token and
+# persists the fresh FirstInstance PAT. FIELD-SCOPED patch-to-empty — NEVER a
+# whole-entry delete (the same KV v2 entry at svc06_openbao_secret_path also holds
+# the ZITADEL masterkey; losing it forces a full data re-encryption). Names mirror
+# zitadel-server/defaults so the SAME source + container are targeted (the clear
+# undoes exactly what zitadel-server wrote). BAO_TOKEN is supplied from
+# OPENBAO_ADMIN_TOKEN in the task ENV (never argv); the clear task is no_log.
+#
+# svc06_openbao_addr is ALSO a play-level var in svc-06-bootstrap.yml (default
+# 10.0.20.10); it is repeated here as a role default so a standalone role run has
+# a value. Empty -> the clear is skipped (OpenBao unwired).
+svc06_openbao_addr: ""
+svc06_openbao_cli_host: "10.0.20.10"         # delegate_to the OpenBao primary (VLAN-20 IP)
+svc06_openbao_cli_user: "root"
+svc06_openbao_cli_python: "/usr/bin/python3"
+svc06_openbao_primary_container_name: "openbao-openbao-1"
+svc06_openbao_bao_bin: "bao"
+svc06_openbao_cli_bao_addr: "https://127.0.0.1:8200"   # BAO_ADDR inside the container netns
+svc06_openbao_secret_path: "secret/proj-shared-zitadel/zitadel"
+svc06_openbao_provision_token_field: "provision_token"
+svc06_openbao_tls_skip_verify: true
