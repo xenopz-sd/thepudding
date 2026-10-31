@@ -156,8 +156,38 @@
   register: postgres_openbao_write
   changed_when: "'Success' in (postgres_openbao_write.stdout | default('')) or postgres_openbao_write.rc == 0"
   no_log: true
+  # DECOUPLED from the install/version gate (bugfix: fix-svc01-openbao-credential-
+  # write-version-gate-decoupling). The write is gated ONLY on an OpenBao address
+  # being present — NOT on `not postgres_already_at_pinned_version`. Coupling the
+  # credential-ensure to the container-image lifecycle meant that once the container
+  # was pinned, a wired re-run skipped the write permanently, leaving the credential
+  # absent from OpenBao with no recovery short of a clean-slate. The read -> reuse ->
+  # generate steps above are already address-gated, so on a wired re-run the stored
+  # credential is read, reused (never rotated), and re-`bao kv put` of the identical
+  # value is a no-op change — idempotent and self-healing. The install steps
+  # (Compose deploy / config template) keep their own version gate.
   when:
-    - not postgres_already_at_pinned_version
+    - (openbao_addr | default(lookup('ansible.builtin.env', 'OPENBAO_ADDR'), true) | default('', true)) | length > 0
+
+# Loud signal: on a WIRED run (OpenBao address present), the credential MUST have
+# been persisted. If the write did not run or did not succeed, fail loudly rather
+# than proceeding silently (the silent-skip half of the decoupling defect, Req 2.6).
+# Stays INERT on a dev/offline (unwired) run — the whole assert is address-gated,
+# mirroring the write's own gate. no_log-safe: references only rc / skipped on the
+# already-no_log write register, never the secret-bearing stdout.
+- name: "Postgres | Assert the OpenBao credential write succeeded on a wired run"
+  ansible.builtin.assert:
+    that:
+      - not (postgres_openbao_write.skipped | default(false))
+      - (postgres_openbao_write.rc | default(1)) == 0
+    fail_msg: >-
+      OpenBao address is set (wired run) but the DB credential write to
+      secret/proj-{{ postgres_project_slug }}/postgres did NOT succeed
+      (skipped={{ postgres_openbao_write.skipped | default(false) }},
+      rc={{ postgres_openbao_write.rc | default('n/a') }}). The day-2 credential
+      handoff would be missing. Check OpenBao reachability/token, then re-run.
+    success_msg: "OpenBao credential handoff persisted for proj-{{ postgres_project_slug }}."
+  when:
     - (openbao_addr | default(lookup('ansible.builtin.env', 'OPENBAO_ADDR'), true) | default('', true)) | length > 0
 
 # --- 3. Dirs + config + 0600 secret env -------------------------------------

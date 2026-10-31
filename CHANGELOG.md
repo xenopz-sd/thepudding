@@ -5,6 +5,74 @@ All notable changes to the Developer Services Platform are documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.3] - 2026-10-29
+
+A second **operator-ergonomics** patch acting on the expanded `v0.11.0` deployment
+feedback. Where `v0.11.2` fixed the SVC-07 bring-up footguns (§1–§3), this release
+fixes the three **consumer-flow defects** the feedback flagged as genuine — they
+reproduce on a clean `failed=0` run and block a cleanly-onboarded project from
+actually starting (the documented consumer→deploy Step 6). Each is a spec'd
+bugfix, test-before-fix and offline-verified; no secret-hygiene control is removed
+or weakened. The fixes compose: §6 makes the DB credential reliably exist, §5 makes
+it reachable by the workload, §7 makes the handoff banner tell the truth about both.
+
+### Fixed
+
+- **Consumer DB credential written where the workload cannot read it** (feedback
+  §5; spec `fix-consumer-db-secret-workload-path-mismatch`): `postgres-server`
+  writes the DB credential to `secret/proj-<slug>/postgres`, but the
+  `<slug>-workload` policy and the `openbao-agent` template only grant/read
+  `secret/data/<slug>/*` — so a correctly-onboarded workload AppRole was **denied**
+  its own DB password, blocking Step 6. A new idempotent, `no_log`, never-rotate
+  **bridge step** in `consumer_bootstrap` composes a `DATABASE_URL` from the
+  authoritative source record and `bao kv put`s it into the already-granted
+  `secret/data/<slug>/db` (field `database_url`), with a default agent mapping
+  `{db, database_url, DATABASE_URL}` wiring the sidecar. `policy-<slug>` is
+  **unchanged** (the fix writes inside the existing least-privilege boundary), and
+  the agreed path is now documented in `CONSUMER-MANIFEST-REFERENCE.md`. A wired run
+  whose source is absent fails loud (the §5↔§6 seam).
+- **DB-credential OpenBao write coupled to the install/version gate** (feedback §6;
+  spec `fix-svc01-openbao-credential-write-version-gate-decoupling`): the
+  `postgres-server` `bao kv put` was gated on BOTH `not
+  postgres_already_at_pinned_version` AND an OpenBao address. A first run with an
+  empty `openbao_addr` skipped the write; every later re-run skipped it permanently
+  (the container was already at the pinned image), so the credential **never landed
+  in OpenBao** — unrecoverable without a clean-slate. The version-gate condition is
+  removed from the write (the address gate stays); read→reuse→ensure makes a wired
+  re-run self-healing and never rotating. The consumer orchestrator now defaults
+  `openbao_addr` to the deterministic primary `10.0.20.10` (NET-00 host_index 0,
+  mirroring SVC-06) so a standard bring-up wires the handoff by default — `-e
+  openbao_addr=` still opts out for dev/offline. A wired-but-not-persisted write now
+  fails loudly instead of proceeding silently. (The MariaDB engine, a skeleton with
+  no OpenBao write, is deferred — see notes.)
+- **Handoff banners asserted OpenBao paths that were never written** (feedback §7;
+  spec `fix-handoff-banner-openbao-path-honesty`): both completion banners printed
+  `secret/proj-<slug>/...` paths unconditionally as delivered artifacts.
+  `svc01_handoff` and `consumer_handoff` now read back each path with a bounded,
+  **read-only** `bao kv metadata get` presence probe and report its verified state
+  (`present` / `not written` / `not verified (OpenBao unwired)`). The
+  `consumer_handoff` SSO line is now **per-app**: a new
+  `consumer_oidc_app_type_has_secret` predicate (confidential-web only — mirroring
+  ZITADEL's `client_secret` gate) reports a stored path for secret-bearing clients
+  and `not applicable (public/JWT client — no client secret)` for secret-less SPA /
+  JWT clients, which legitimately have no stored secret. The probes never mutate
+  OpenBao, decide state from the rc only, never echo a value, and never fail the
+  handoff on a dev/offline run.
+
+### Notes — deferred operator-feedback items (tracked, not in this release)
+
+- **Feedback §4 — "deploy from a non-pristine host" story** remains deferred to its
+  own **feature** spec (empty-state adoption / reconcile-reality), unchanged from the
+  `v0.11.2` notes.
+- **Feedback §8 smaller items** remain as recorded in `v0.11.2`: §8.1 (one env
+  source) and §8.2 (from-scratch preflight) are substantially covered; §8.3
+  (`INJECT_FACTS_AS_VARS` migration) is deferred to its own spec.
+- **MariaDB OpenBao persistence (within §6):** the `mariadb-server` engine is a
+  skeleton that writes no credential to OpenBao, so there was no symmetric
+  version-gated write to decouple. Adding OpenBao persistence to the MariaDB engine
+  is net-new feature work, deferred to that engine's completion; for now a
+  `db_engine=mariadb` consumer honestly reports `not written` in the handoff banner.
+
 ## [0.11.2] - 2026-10-29
 
 An **operator-ergonomics** patch acting on third-party deployment feedback for
@@ -1025,6 +1093,7 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
+[0.11.3]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.2...v0.11.3
 [0.11.2]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.1...v0.11.2
 [0.11.1]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.0...v0.11.1
 [0.11.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.10.0...v0.11.0

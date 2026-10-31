@@ -26,3 +26,22 @@ consumer_sso_secret_path_prefix: "secret/proj-{{ project_slug }}/zitadel/oidc"
 
 # DB endpoint fields for the summary (derived; single-guest project VLAN -> .10).
 consumer_db_port: "{{ 3306 if (consumer_manifest.database.engine | default('postgres')) == 'mariadb' else 5432 }}"
+
+# --- Per-app OIDC "has client secret" predicate (Change 3) -------------------
+# (fix-handoff-banner-openbao-path-honesty.) Keyed on the manifest's DESCRIPTIVE
+# app_type vocabulary (the form the handoff banner sees — NOT the role short
+# forms). This is the SINGLE SOURCE OF TRUTH for which OIDC client type persists
+# a client secret, and it drives the per-app "SSO secrets:" banner line: a
+# secret-bearing app is named by its secret/proj-<slug>/zitadel/oidc/<app> path +
+# read-back state; a secret-less app is reported "not applicable".
+#
+# Mirrors zitadel-org-provision's `client_secret | length > 0` gate (confidential-
+# web only — a web/basic client). Keep in lockstep with that role: if ZITADEL
+# ever changes which client types persist a secret (e.g. an api app gaining a
+# stored secret), update this map AND test_handoff_banner_openbao_path_honesty's
+# BC5 / per-app PBT. (public-spa resolves an empty secret; api/jwt-profile
+# resolves JSON null — both skipped by the role's write `when`.)
+consumer_oidc_app_type_has_secret:
+  public-spa: false
+  confidential-web: true
+  api: false

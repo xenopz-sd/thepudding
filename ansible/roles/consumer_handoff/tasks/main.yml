@@ -92,6 +92,112 @@
     - (consumer_manifest.database is defined) or (consumer_manifest.secrets is defined)
     - (openbao_addr | default('') | trim) | length > 0
 
+# --- DB-credential presence probe (bounded, READ-ONLY, no_log) ---------------
+# (fix-handoff-banner-openbao-path-honesty, Change 2.) Read back the DB-credential
+# path so the "DB credentials:" banner line reports its VERIFIED state instead of
+# asserting it unconditionally. Reuses the EXISTING consumer_openbao_* delegation
+# vars + the already-bound consumer_handoff_bao_token (no_log). READ-ONLY
+# (`bao kv metadata get` — metadata only, never the value); failed_when:false so
+# an absent path / unreachable OpenBao DEGRADES to a reported state, never fails
+# the handoff. NOTHING here mutates OpenBao. Gated on a declared database AND a
+# wired openbao_addr (empty -> dev/offline -> "not verified").
+- name: "Handoff | Probe the DB-credential path presence in OpenBao (READ-ONLY, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ consumer_handoff_bao_token,
+          consumer_openbao_primary_container_name, consumer_openbao_bao_bin, 'kv', 'metadata', 'get']
+         + (['-tls-skip-verify'] if (consumer_openbao_tls_skip_verify | bool) else [])
+         + [consumer_db_secret_path] }}
+  delegate_to: "{{ consumer_openbao_primary_ip }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ consumer_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ consumer_openbao_cli_python }}"
+  register: consumer_db_cred_probe
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
+# NON-secret state fact from the probe RC ONLY (never its stdout):
+#   database not declared -> n/a (the banner line's unchanged branch)
+#   openbao_addr empty    -> not verified (OpenBao unwired)
+#   rc 0                  -> present
+#   else                  -> not written
+- name: "Handoff | Compute the DB-credential verified state (non-secret, from rc only)"
+  ansible.builtin.set_fact:
+    consumer_db_cred_state: >-
+      {{ 'n/a'
+         if (consumer_manifest.database is not defined)
+         else ('not verified (OpenBao unwired)'
+               if ((openbao_addr | default('') | trim) | length == 0)
+               else ('present' if ((consumer_db_cred_probe.rc | default(1)) == 0) else 'not written')) }}
+  changed_when: false
+
+# --- Per-app OIDC secret-path render (auth_method-gated, READ-ONLY probes) ----
+# (fix-handoff-banner-openbao-path-honesty, Change 3.) Replace the single
+# unconditional "SSO secrets:" line with a PER-APP computation. The banner sees
+# the manifest's DESCRIPTIVE vocabulary (public-spa/confidential-web/api); the
+# has-secret predicate (consumer_oidc_app_type_has_secret) is the single source
+# of truth and MUST track zitadel-org-provision's client_secret|length>0 gate.
+# For a secret-bearing app we name its per-app path + its read-back state; for a
+# secret-less app we report "not applicable"; when unwired we report
+# "not verified (OpenBao unwired)".
+- name: "Handoff | Read back each secret-bearing OIDC app secret (READ-ONLY, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ consumer_handoff_bao_token,
+          consumer_openbao_primary_container_name, consumer_openbao_bao_bin, 'kv', 'metadata', 'get']
+         + (['-tls-skip-verify'] if (consumer_openbao_tls_skip_verify | bool) else [])
+         + [consumer_sso_secret_path_prefix ~ '/' ~ item.name] }}
+  delegate_to: "{{ consumer_openbao_primary_ip }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ consumer_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ consumer_openbao_cli_python }}"
+  loop: "{{ consumer_manifest.sso.app_registrations }}"
+  loop_control:
+    label: "{{ item.name | default('<unnamed>') }}"
+  register: consumer_sso_secret_probe
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - consumer_manifest.sso is defined
+    - (consumer_oidc_app_type_has_secret[item.app_type] | default(false)) | bool
+    - (openbao_addr | default('') | trim) | length > 0
+
+# Build the NON-secret per-app line list. For a secret-bearing app: its path +
+# "present"/"not written" (from the matching probe rc, found by app name) or
+# "not verified (OpenBao unwired)" when unwired. For a secret-less app:
+# "not applicable (public/JWT client — no client secret)". Decided from rc ONLY.
+- name: "Handoff | Build the per-app SSO secret-path lines (non-secret, from rc only)"
+  ansible.builtin.set_fact:
+    consumer_sso_app_lines: >-
+      {{ consumer_sso_app_lines | default([]) + [
+           item.name ~ ': not applicable (public/JWT client — no client secret)'
+           if (not ((consumer_oidc_app_type_has_secret[item.app_type] | default(false)) | bool))
+           else (
+             item.name ~ ': ' ~ consumer_sso_secret_path_prefix ~ '/' ~ item.name ~ ' — not verified (OpenBao unwired)'
+             if ((openbao_addr | default('') | trim) | length == 0)
+             else (
+               item.name ~ ': ' ~ consumer_sso_secret_path_prefix ~ '/' ~ item.name ~ ' — '
+               ~ ('present'
+                  if (((consumer_sso_secret_probe.results | default([])
+                        | selectattr('item.name', 'equalto', item.name)
+                        | map(attribute='rc') | list | first) | default(1)) == 0)
+                  else 'not written')
+             )
+           )
+         ] }}
+  loop: "{{ consumer_manifest.sso.app_registrations }}"
+  loop_control:
+    label: "{{ item.name | default('<unnamed>') }}"
+  changed_when: false
+  when: consumer_manifest.sso is defined
+
 # --- Completion summary banner (secrets by name only, Req 5.4) ---------------
 - name: "Handoff | Resolve the absolute Cluster_Env_File path + banner fields"
   ansible.builtin.set_fact:
@@ -113,14 +219,16 @@
         ~ ' (' ~ (consumer_manifest.database.engine | default('postgres')) ~ ', VLAN ' ~ consumer_vlan_id ~ ', private)'
         if (consumer_manifest.database is defined) else 'not consumed' }}
       - >-
-        DB credentials:     {{ consumer_db_secret_path ~ ' (OpenBao — password by name only, never shown)'
+        DB credentials:     {{ consumer_db_secret_path ~ ' — ' ~ consumer_db_cred_state
+        ~ ' (password by name only, never shown)'
         if (consumer_manifest.database is defined) else 'n/a' }}
       - >-
         SSO applications:   {{ (consumer_manifest.sso.app_registrations | map(attribute='name') | list | join(', '))
         ~ '  (org ' ~ consumer_manifest.sso.org_name ~ ')'
         if (consumer_manifest.sso is defined) else 'not consumed' }}
       - >-
-        SSO secrets:        {{ consumer_sso_secret_path_prefix ~ '/<app> (OpenBao — client secrets by path only)'
+        SSO secrets:        {{ ((consumer_sso_app_lines | default([]) | join('; '))
+        ~ '  (OpenBao — by path only, never shown)')
         if (consumer_manifest.sso is defined) else 'n/a' }}
       - >-
         Secrets policy:     {{ 'policy-' ~ project_slug ~ ' ; workload AppRole ' ~ consumer_workload_approle_ref

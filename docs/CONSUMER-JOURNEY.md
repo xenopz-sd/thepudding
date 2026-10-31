@@ -161,7 +161,7 @@ automated path, then re-run.
 
 | Service | What the orchestrator wired | Where the secret lives |
 |---|---|---|
-| **Database** (SVC-01) | per-project PostgreSQL on VLAN 100+, DB + least-priv app role | DB password at `secret/proj-<slug>/postgres` in OpenBao |
+| **Database** (SVC-01) | per-project PostgreSQL on VLAN 100+, DB + least-priv app role | source record at `secret/proj-<slug>/postgres`; bridged for the workload to `secret/data/<slug>/db` (field `database_url`, env `DATABASE_URL`) — see the [workload-readable DB path](CONSUMER-MANIFEST-REFERENCE.md#workload-readable-db-credential-path-authoritative) |
 | **SSO** (SVC-06) | ZITADEL org + a public SPA client + an API client | OIDC client secret at `secret/proj-<slug>/zitadel/...` in OpenBao |
 | **Secrets** (SVC-07) | `policy-<slug>` + KV path + `<slug>-workload` AppRole (renewable TTL) | AppRole `role_id`/`secret_id` handed off per PF FR-8 |
 
@@ -175,8 +175,13 @@ summary names each by **path**, never by value.
 The application deploys as a Docker Compose stack, reverse-proxied by Traefik
 (no directly-exposed host port for HTTP/HTTPS). At container start its **OpenBao
 Agent** authenticates with the `<slug>-workload` AppRole and renders the DB
-password and OIDC client secret into the workload's environment — the day-2
-secrets-retrieval path (`integration-boundaries.md` §2). The application then:
+credential and OIDC client secret into the workload's environment — the day-2
+secrets-retrieval path (`integration-boundaries.md` §2). The DB credential is read
+from the agreed **workload-readable path** `secret/data/<slug>/db` (field
+`database_url`, surfaced as `DATABASE_URL`); the authoritative definition of that
+path lives in the
+[Consumer_Manifest reference](CONSUMER-MANIFEST-REFERENCE.md#workload-readable-db-credential-path-authoritative).
+The application then:
 
 - connects to its private per-project PostgreSQL on the project VLAN;
 - performs OIDC login against its ZITADEL SPA/API clients;

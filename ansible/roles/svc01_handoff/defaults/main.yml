@@ -8,3 +8,29 @@ svc01_postgres_container_name: "postgres-postgres-1"
 svc01_mariadb_container_name: "mariadb-mariadb-1"
 svc01_health_retries: 24
 svc01_health_delay: 5
+
+# --- OpenBao primary addressing for the bounded DB-credential presence probe --
+# (fix-handoff-banner-openbao-path-honesty, Change 1). Mirrors the
+# consumer_handoff / postgres-server pinning — the SAME shared primary at
+# 10.0.20.10, container openbao-openbao-1, admin token read from the
+# OPENBAO_ADMIN_TOKEN env (never argv), tls-skip-verify for the self-signed mock
+# cert. The probe is READ-ONLY (`bao kv metadata get`) and NEVER mutates OpenBao;
+# it exists only so the completion banner reports the DB credential's VERIFIED
+# state (present / not written / not verified) instead of asserting it blindly.
+svc01_openbao_primary_ip: "10.0.20.10"
+svc01_openbao_primary_container_name: "openbao-openbao-1"
+svc01_openbao_bao_bin: "bao"
+svc01_openbao_tls_skip_verify: true
+svc01_openbao_cli_user: "root"
+svc01_openbao_cli_python: "/usr/bin/python3"
+
+# DB-credential OpenBao path + the field the engine writes the app credential
+# under. postgres-server writes `app_password` at secret/proj-<slug>/postgres
+# (verified in postgres-server/tasks/main.yml). The MariaDB engine is a skeleton
+# that does NOT write to OpenBao at all (it writes only /etc/mariadb.secret.env
+# on the guest) — so for db_engine=mariadb the probe honestly reports
+# `not written`. The field name is the same analogue (`app_password`) for both
+# engines, so a single scalar is correct; no engine-aware map is needed. (See
+# the MariaDB field-name finding recorded in validation.md.)
+svc01_db_secret_path: "secret/proj-{{ project_slug }}/{{ db_engine | default('postgres') }}"
+svc01_db_secret_probe_field: "app_password"

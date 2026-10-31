@@ -70,3 +70,25 @@ consumer_auth_method_map:
   none: none
   basic: basic
   jwt-profile: jwt
+
+# --- DB-credential workload bridge (fix-consumer-db-secret-workload-path-mismatch,
+# Option A) -------------------------------------------------------------------
+# postgres-server writes the DB credential ONLY to secret/proj-<slug>/postgres — a
+# path OUTSIDE policy-<slug> (which grants only the five KV v2 sub-paths under the
+# bare <slug> prefix). STEP 2a BRIDGES the SAME value into the already-granted
+# secret/data/<slug>/<subpath> item (field <field>) so the <slug>-workload AppRole
+# and its openbao-agent sidecar reach it with no manual step and NO policy change.
+# Both are overridable; they use the EXISTING secret/data/<slug>/<kv_subpath> shape
+# so agent.hcl.j2 / workload_auth.py::render_agent_hcl are NOT touched.
+consumer_db_bridge_subpath: db
+consumer_db_bridge_field: database_url
+
+# The default openbao-agent secret mapping for a database-declaring project, so the
+# consumer→deploy Step 6 agent resolves the DB credential with no hand-authored
+# mapping. One {kv_subpath, kv_field, env_key} dict rendering a single `template`
+# stanza that reads secret/data/<slug>/db and emits DATABASE_URL into the
+# Rendered_Secret_File. Overridable and ADDITIVE — the openbao-agent role default
+# stays [] for standalone (non-DB) callers; a non-default workload may override.
+# Uses the existing secret/data/<slug>/<kv_subpath> shape (agent.hcl.j2 unchanged).
+consumer_db_agent_mapping:
+  - { kv_subpath: "db", kv_field: "database_url", env_key: "DATABASE_URL" }

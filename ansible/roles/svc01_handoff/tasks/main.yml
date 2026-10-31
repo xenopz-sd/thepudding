@@ -35,6 +35,57 @@
     svc01_banner_ip: "10.0.{{ vlan_id }}.{{ 10 + (host_index | default(0) | int) }}"
   changed_when: false
 
+# --- DB-credential OpenBao presence probe (bounded, READ-ONLY, no_log) --------
+# (fix-handoff-banner-openbao-path-honesty, Change 1.) BEFORE the banner, read
+# back the DB-credential path with a bounded, READ-ONLY presence probe so the
+# "Credentials:" line reports the credential's VERIFIED state instead of an
+# unconditional "stored" assertion. Mirrors the consumer_handoff policy-poll
+# pattern (delegated `docker exec bao` + no_log + failed_when:false +
+# changed_when:false). openbao_addr is a play-level var of svc-01-bootstrap.yml
+# (empty by default -> dev/offline unwired -> "not verified"). NOTHING here
+# mutates OpenBao, and NO secret value is ever echoed — only the probe rc is read.
+- name: "Handoff | Bind the OpenBao admin token for the DB-credential probe (no_log)"
+  ansible.builtin.set_fact:
+    svc01_handoff_bao_token: >-
+      {{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}
+  no_log: true
+  changed_when: false
+  when: (openbao_addr | default('') | trim) | length > 0
+
+# READ-ONLY presence probe: `bao kv metadata get` inspects the path's METADATA
+# only (never the secret value), delegated to the OpenBao primary over SSH (same
+# channel as consumer_handoff's policy poll). failed_when:false so an absent path
+# or an unreachable OpenBao DEGRADES to a reported state, never fails the handoff.
+- name: "Handoff | Probe the DB-credential path presence in OpenBao (READ-ONLY, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN=' ~ svc01_handoff_bao_token,
+          svc01_openbao_primary_container_name, svc01_openbao_bao_bin, 'kv', 'metadata', 'get']
+         + (['-tls-skip-verify'] if (svc01_openbao_tls_skip_verify | bool) else [])
+         + [svc01_db_secret_path] }}
+  delegate_to: "{{ svc01_openbao_primary_ip }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ svc01_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ svc01_openbao_cli_python }}"
+  register: svc01_db_cred_probe
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: (openbao_addr | default('') | trim) | length > 0
+
+# Compute the NON-secret state fact from the probe RC ONLY (never its stdout):
+#   openbao_addr empty -> not verified (OpenBao unwired)
+#   rc 0               -> present
+#   else               -> not written
+- name: "Handoff | Compute the DB-credential verified state (non-secret, from rc only)"
+  ansible.builtin.set_fact:
+    svc01_db_cred_state: >-
+      {{ 'not verified (OpenBao unwired)'
+         if ((openbao_addr | default('') | trim) | length == 0)
+         else ('present' if ((svc01_db_cred_probe.rc | default(1)) == 0) else 'not written') }}
+  changed_when: false
+
 - name: "Handoff | Print the Developer B completion summary banner"
   ansible.builtin.debug:
     msg:
@@ -47,7 +98,7 @@
       - "Endpoint:           {{ svc01_banner_ip }}:{{ svc01_banner_port }} (VLAN {{ vlan_id }}, private)"
       - "Database:           {{ project_slug | regex_replace('-', '_') }}"
       - "App role:           {{ (project_slug | regex_replace('-', '_')) ~ '_app' }} (least-privilege, no SUPERUSER)"
-      - "Credentials:        stored in OpenBao at secret/proj-{{ project_slug }}/{{ db_engine | default('postgres') }}"
+      - "Credentials:        {{ svc01_db_secret_path }} — {{ svc01_db_cred_state }}"
       - "                    (passwords by name only — never shown)"
       - "Config:             {{ svc01_cluster_env_abspath }}"
       - ""

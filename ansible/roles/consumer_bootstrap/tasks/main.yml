@@ -119,6 +119,169 @@
     - (consumer_manifest.database is defined) or (consumer_manifest.secrets is defined)
     - (openbao_addr | default('') | trim) | length > 0
 
+# === STEP 2a — Bridge the DB credential into the workload-readable tree ======
+# (fix-consumer-db-secret-workload-path-mismatch, Option A.) The DB credential is
+# written by postgres-server ONLY under secret/proj-<slug>/postgres — a path
+# OUTSIDE policy-<slug> (which grants only the five KV v2 sub-paths under the bare
+# <slug> prefix). The <slug>-workload AppRole and its openbao-agent sidecar can
+# therefore NEVER read it; a correctly-onboarded workload authenticates and is then
+# DENIED on proj-<slug>. This step BRIDGES the SAME value into the already-granted
+# secret/data/<slug>/db item (field database_url), so the workload reaches it with
+# no manual step and NO policy change (policy-<slug> is untouched — Option A).
+#
+# Placement: AFTER STEP 2 (openbao_project_onboard creates the secret/data/<slug>/
+# KV metadata path the put targets) and BEFORE STEP 3 (the <slug>-workload AppRole
+# + its agent mapping are minted with the DB credential already present).
+#
+# SECRET-SAFE (Req 2.4, security-standards.md): every task is no_log; the admin
+# token rides in the command ENVIRONMENT (-e BAO_TOKEN=...) never on argv; the
+# composed DATABASE_URL embeds the password and is itself secret-bearing, so it is
+# never echoed. IDEMPOTENT / NO ROTATION (Req 3.6): read-or-reuse — the put runs
+# only when the bridged value is absent or differs; the source password is read,
+# never re-minted. FAIL-LOUD (ties to §6): STEP 2a.2 asserts the source read rc==0
+# naming secret/proj-<slug>/postgres — an absent source halts rather than composing
+# an empty/partial URL. Delegation + TLS-skip mirror STEP 1 exactly.
+# Gated on a declared database AND a wired OpenBao (skip no-database / dev-offline).
+
+- name: "Bootstrap | STEP 2a.1 — Read the source DB fields from secret/proj-<slug>/postgres (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=https://127.0.0.1:' ~ 8200,
+          '-e', 'BAO_TOKEN=' ~ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true)),
+          'openbao-openbao-1', 'bao', 'kv', 'get']
+         + (['-tls-skip-verify'] if (consumer_openbao_tls_self_signed | bool) else [])
+         + ['-format=json', consumer_openbao_db_secret_path] }}
+  delegate_to: "{{ consumer_openbao_primary_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: root
+    ansible_python_interpreter: /usr/bin/python3
+  register: consumer_db_bridge_source
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Bootstrap | STEP 2a.2 — Assert the source DB record is present (fail-loud, ties to §6)"
+  ansible.builtin.assert:
+    that:
+      - "consumer_db_bridge_source.rc == 0"
+    fail_msg: >-
+      The authoritative DB credential is NOT present at
+      {{ consumer_openbao_db_secret_path }} — cannot bridge it into the
+      workload-readable secret/data/{{ project_slug }}/{{ consumer_db_bridge_subpath }}.
+      The bridge fails closed; no empty/partial DATABASE_URL is written. Re-run after
+      confirming the Phase-2 svc-01-bootstrap.yml composition wrote the DB credential
+      (this is the §5↔§6 ordering seam: §6 makes the source reliable, §5 reaches it).
+      (No secret value is shown.)
+    success_msg: "Source DB record present at {{ consumer_openbao_db_secret_path }} (value not shown)."
+    quiet: true
+  no_log: true
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Bootstrap | STEP 2a.3 — Read-or-reuse probe of the existing bridged record (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=https://127.0.0.1:' ~ 8200,
+          '-e', 'BAO_TOKEN=' ~ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true)),
+          'openbao-openbao-1', 'bao', 'kv', 'get']
+         + (['-tls-skip-verify'] if (consumer_openbao_tls_self_signed | bool) else [])
+         + ['-format=json',
+            'secret/data/' ~ project_slug ~ '/' ~ consumer_db_bridge_subpath] }}
+  delegate_to: "{{ consumer_openbao_primary_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: root
+    ansible_python_interpreter: /usr/bin/python3
+  register: consumer_db_bridge_existing
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Bootstrap | STEP 2a.4a — Extract the source DB fields into an in-memory dict (no_log)"
+  ansible.builtin.set_fact:
+    consumer_db_bridge_fields: "{{ (consumer_db_bridge_source.stdout | from_json).data.data }}"
+  no_log: true
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Bootstrap | STEP 2a.4 — Compose DATABASE_URL from the source fields (no_log, in-memory)"
+  ansible.builtin.set_fact:
+    consumer_db_bridge_url: >-
+      postgresql://{{ consumer_db_bridge_fields.app_role }}:{{
+      consumer_db_bridge_fields.app_password }}@{{
+      consumer_db_bridge_fields.host }}:{{
+      consumer_db_bridge_fields.port }}/{{
+      consumer_db_bridge_fields.db_name }}
+  no_log: true
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Bootstrap | STEP 2a.5 — Decide whether the bridged value must be (re)written (no_log)"
+  ansible.builtin.set_fact:
+    consumer_db_bridge_needs_write: >-
+      {{ (consumer_db_bridge_existing.rc | default(1)) != 0
+         or ((consumer_db_bridge_existing.stdout | default('') | trim) | length == 0)
+         or ((consumer_db_bridge_existing.stdout | from_json).data.data[consumer_db_bridge_field] | default('')
+             != consumer_db_bridge_url) }}
+  no_log: true
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Bootstrap | STEP 2a.6 — Bridge DATABASE_URL to secret/data/<slug>/db (no_log, idempotent)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=https://127.0.0.1:' ~ 8200,
+          '-e', 'BAO_TOKEN=' ~ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true)),
+          'openbao-openbao-1', 'bao', 'kv', 'put']
+         + (['-tls-skip-verify'] if (consumer_openbao_tls_self_signed | bool) else [])
+         + ['secret/data/' ~ project_slug ~ '/' ~ consumer_db_bridge_subpath,
+            consumer_db_bridge_field ~ '=' ~ consumer_db_bridge_url] }}
+  delegate_to: "{{ consumer_openbao_primary_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: root
+    ansible_python_interpreter: /usr/bin/python3
+  register: consumer_db_bridge_put
+  changed_when: "consumer_db_bridge_put.rc == 0"
+  no_log: true
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+    - consumer_db_bridge_needs_write | bool
+
+- name: "Bootstrap | STEP 2a.7 — Scrub the composed URL + source facts from memory (no_log)"
+  ansible.builtin.set_fact:
+    consumer_db_bridge_url: ""
+    consumer_db_bridge_fields: {}
+    consumer_db_bridge_source: {}
+    consumer_db_bridge_existing: {}
+  no_log: true
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
+- name: "Bootstrap | STEP 2a — INFO — workload-readable DB path (secret by name only)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: DB credential bridged for '{{ project_slug }}' to
+      secret/data/{{ project_slug }}/{{ consumer_db_bridge_subpath }}
+      (field {{ consumer_db_bridge_field }}, env DATABASE_URL) — readable by the
+      {{ project_slug }}-workload AppRole. No secret value is shown.
+  when:
+    - consumer_manifest.database is defined
+    - (openbao_addr | default('') | trim) | length > 0
+
 # === STEP 3 — OpenBao workload AppRole (FEATURE-GATED on `secrets`, Req 4.6/8.7) ==
 # Compose openbao_workload_approle as-is, threading the manifest `secrets` TTLs.
 # It mints auth/approle/role/<slug>-workload bound to [policy-<slug>] (renewable)

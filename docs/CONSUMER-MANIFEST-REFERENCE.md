@@ -118,3 +118,63 @@ or the offending/duplicate/unknown service entry (Req 1.7):
 ~/venv/devinfra/bin/python scripts/installer/consumer_manifest.py \
   --check infra/projects/dronefleet/consumer-manifest.yml
 ```
+
+---
+
+## Workload-readable DB credential path (authoritative)
+
+> This section is the **single source of truth** for where a database-declaring
+> project's DB credential is readable by its `<slug>-workload` AppRole. The
+> consumer→deploy walkthrough ([Consumer Journey Runbook](CONSUMER-JOURNEY.md))
+> cross-references this section rather than restating it.
+
+A project that declares a `database` block has its DB credential written by the
+`postgres-server` role to the **source record** `secret/proj-<slug>/postgres`
+(fields `app_role`, `app_password`, `host`, `port`, `db_name`, …). That `proj-`
+prefix is **outside** `policy-<slug>` — the per-project ACL grants capabilities on
+exactly the five KV v2 sub-paths under the bare `<slug>` prefix
+(`secret/{data,metadata,delete,undelete,destroy}/<slug>/*`) and nothing else — so
+the `<slug>-workload` AppRole cannot read the source record directly.
+
+Onboarding therefore **bridges** the credential into the workload-readable tree.
+The agreed path the workload reads is:
+
+| What | Value |
+|---|---|
+| KV path | `secret/data/<slug>/db` |
+| Field | `database_url` |
+| Value | a composed `postgresql://<app_role>:<app_password>@<host>:<port>/<db_name>` connection string |
+| Workload env var | `DATABASE_URL` |
+
+This path lives **inside** the existing `policy-<slug>` boundary, so no policy
+change is needed, and it is the same `secret/data/<slug>` prefix the manifest's
+`secrets.path` already advertises. The bridge is idempotent and **never rotates**
+the source password — it reads the value already stored at
+`secret/proj-<slug>/postgres` and re-composes the URL, writing only when absent or
+changed.
+
+The `openbao-agent` sidecar resolves it automatically via the default DB mapping
+`{ kv_subpath: db, kv_field: database_url, env_key: DATABASE_URL }` (a
+`consumer_bootstrap` role default, **not** a manifest key — the top-level
+allowlist `{slug, database, sso, secrets}` is unchanged). A non-default workload
+may override the mapping deliberately.
+
+### Confirming the bridged path (live, placeholders only)
+
+After onboarding a database-declaring project, an operator can confirm the
+workload-readable path resolves by logging in with the `<slug>-workload` AppRole
+and reading the agreed path. Substitute placeholders with values from your
+environment — never commit real tokens or hostnames (see
+[`documentation-testing.md`](../.kiro/steering/documentation-testing.md) placeholder rules).
+
+<!-- doctest: requires-infra -->
+```bash
+# Reads the bridged DB credential on the agreed workload path.
+# <SLUG>            — the project slug
+# <WORKLOAD_TOKEN>  — a token from a `<slug>-workload` AppRole login (never committed)
+bao kv get -field=database_url secret/data/<SLUG>/db
+```
+
+The source record at `secret/proj-<SLUG>/postgres` is **not** reachable by the
+workload AppRole by design (least-privilege); a read of it with a workload token
+returns a policy denial — that is correct, and is exactly why the bridge exists.

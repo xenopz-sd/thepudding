@@ -92,9 +92,15 @@
 
     # --- OpenBao primary address, bridged to the composed onboarders. ---
     # Non-secret address; the admin token is resolved from the env / cluster env
-    # file inside the composing roles (never on the argv). Empty => a dev/offline
-    # run that skips the OpenBao writes.
-    openbao_addr: ""
+    # file inside the composing roles (never on the argv).
+    # Defaults to the OpenBao (SVC-07) primary's VLAN-20 address (NET-00 host_index
+    # 0 -> 10.0.20.10) so a STANDARD consumer bring-up WIRES the credential handoff
+    # by default. Forwarded by consumer_provision as `openbao_addr` into the
+    # svc-01-bootstrap child, satisfying postgres-server's read-reuse + write gate.
+    # The SAME literal default SVC-06 uses (svc06_openbao_addr: "10.0.20.10"), the
+    # authoritative precedent this mirrors. Override to "" ONLY for a deliberate
+    # dev/offline run (an explicit -e openbao_addr= still disables the write).
+    openbao_addr: "10.0.20.10"
 
     # --- Bounded degraded-mode dependency-probe timeout (Req 9.1). ---
     dependency_probe_timeout: 30
