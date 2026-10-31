@@ -182,12 +182,37 @@
           ansible.builtin.import_role:
             name: svc07_bootstrap
       rescue:
+        # fix-svc07-bootstrap-failure-diagnostics (operator feedback §1): Task 8.4
+        # (the primary-bootstrap child run) is no_log: true because its captured
+        # stdout carries the revealed Admin_Token and its env carries the transit
+        # token, so ansible_failed_result.msg below is Ansible's {"censored": ...}
+        # placeholder — the child's OWN non-secret failure summary is double-
+        # censored, leaving a third-party operator blind. The STATIC pointer folded
+        # into this fail msg carries NO child stdout and references NO secret
+        # variable (only non-secret literals: the flag name, the artifact filename,
+        # the container name, the primary IP), so it is secret-free BY CONSTRUCTION.
+        # It is part of the single rescue `fail` (the thin-orchestrator invariant
+        # allows only import_role + fail at play level — a separate debug task would
+        # violate it), so it prints as the run aborts non-zero. The full child
+        # detail lives, on purpose, behind the off-by-default
+        # svc07_debug_instrumentation 0600 artifact this names — never a default raw
+        # dump of the secret-bearing child stdout.
         - name: Report Phase 3 (Bootstrap) failure and exit non-zero
           ansible.builtin.fail:
-            msg: >-
+            msg: |-
               SVC-07 installer FAILED in Phase 3 (Host hardening & ordered bootstrap):
               {{ ansible_failed_task.name | default('unknown step') }}
               — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+              The primary-bootstrap child run (Task 8.4) is no_log: true (its output
+              carries a live Admin_Token + transit token), so Ansible censored its
+              failure detail above. To see WHY it failed, WITHOUT exposing a secret:
+                1) Re-run the installer adding  -e svc07_debug_instrumentation=true
+                   — this captures the child run's full stdout+stderr to the
+                   gitignored, mode-0600  .svc07-task84-child.log  on THIS control
+                   node (it contains the revealed Admin_Token — delete after use).
+                2) Inspect the OpenBao primary guest directly, e.g. on 10.0.20.10:
+                     docker logs openbao-openbao-1      (or: docker compose logs)
 
     # ---- Phase 4: Health sanity & Developer B handoff ----
     - name: "Phase 4 — Health sanity & Developer B handoff"

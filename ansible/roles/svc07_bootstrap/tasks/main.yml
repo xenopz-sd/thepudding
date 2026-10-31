@@ -289,8 +289,30 @@
       - openbao_mint_admin_token=true
       - -e
       - openbao_dev_expose_secrets=true
+      # fix-svc07-external-copy-removal-fresh-mint: thread the external-copy
+      # signal + the one-source-of-truth dotenv path (both NON-secret -e flags;
+      # the transit token stays in environment: below, never on argv).
+      # external_copy_expected is keyed off the SAME Handoff_File-presence
+      # discriminator Task 8.2 uses: present => fresh in-memory mint => false (no
+      # external copy to remove); absent => operator-supplied ambient re-run =>
+      # true (external copy exists, fail-loud preserved). The dotenv path is the
+      # absolute control-node path to the operator's single cluster_env_file
+      # (repo-root-relative-or-absolute), so 6.2-STEP-7 strips the operator's own
+      # env file, not a hidden second one.
+      - -e
+      - "openbao_bootstrap_external_copy_expected={{ not svc07_seal_token_handoff_stat.stat.exists }}"
+      - -e
+      - "openbao_bootstrap_dotenv_path={{ svc07_bootstrap_dotenv_abspath }}"
   args:
     chdir: "{{ svc07_repo_root }}"
+  vars:
+    # Absolute control-node path to the operator's single cluster_env_file
+    # (repo-root-relative-or-absolute), threaded into the child run as the
+    # external-copy dotenv path (one source of env truth).
+    svc07_bootstrap_dotenv_abspath: >-
+      {{ (svc07_repo_root ~ '/' ~ cluster_env_file)
+         if not (cluster_env_file is match('^/'))
+         else cluster_env_file }}
   environment:
     OPENBAO_BOOTSTRAP_TRANSIT_TOKEN: "{{ svc07_primary_transit_token }}"
   register: svc07_primary_bootstrap

@@ -266,12 +266,27 @@ openbao_admin_token_ttl: "768h"
 # Auto-detected at runtime when left as "auto": dotenv if the .env file exists,
 # else gitlab if a CI token+project are present, else manual.
 openbao_bootstrap_external_source: "auto"
-# The homelab .env lives at the REPO ROOT (INSTALL-RUNBOOK §2 Step 4:
-# `echo "...=..." >> .env` from repo root), and the playbook is at
-# ansible/playbooks/openbao.yml, so the repo root is two levels up from
-# playbook_dir. The external-copy detect/removal below run with
-# `delegate_to: localhost` so this path is resolved on the CONTROL NODE (where
-# the operator's .env is), NOT on the primary LXC (33rd correction).
+# --- Signal: was an external copy of the Bootstrap_Transit_Token supplied? ----
+# (fix-svc07-external-copy-removal-fresh-mint.) Gates the 6.2-STEP-7 `manual`
+# outcome. DEFAULT true = backward-compatible: an operator-supplied path (a
+# gitignored .env line or a GitLab CI/CD variable) and any existing/standalone
+# caller keep the fail-loud behavior — an external copy must not outlive the KV
+# copy. The svc07_bootstrap ORCHESTRATOR flips it FALSE on the in-memory-mint
+# path (the seal token was minted in-memory and bridged via the Handoff_File +
+# ENV), where there is NOTHING external to remove, so 6.2-STEP-7's `manual`
+# outcome becomes a success no-op instead of a hard fail.
+openbao_bootstrap_external_copy_expected: true
+# ONE SOURCE OF ENV TRUTH (fix-svc07-external-copy-removal-fresh-mint): the
+# svc07_bootstrap ORCHESTRATOR OVERRIDES this at runtime with the ABSOLUTE
+# control-node path to the operator's single cluster_env_file (threaded as
+# `-e openbao_bootstrap_dotenv_path=<abs>` on the Task 8.4 child run), so the
+# `is exists` test and the `lineinfile` strip both target the operator's own env
+# file rather than a hidden second one. This DEFAULT is the no-orchestrator
+# STANDALONE FALLBACK for a bare `ansible-playbook openbao.yml` run: the homelab
+# .env at the REPO ROOT (INSTALL-RUNBOOK §2 Step 4: `echo "...=..." >> .env` from
+# repo root), two levels up from playbook_dir. The external-copy detect/removal
+# below run with `delegate_to: localhost` so this path is resolved on the CONTROL
+# NODE (where the operator's .env is), NOT on the primary LXC. Overridable.
 openbao_bootstrap_dotenv_path: "{{ playbook_dir }}/../../.env"
 
 # GitLab API removal inputs (pipeline path). These are NON-secret identifiers;

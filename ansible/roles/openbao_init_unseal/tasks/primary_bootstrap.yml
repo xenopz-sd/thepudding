@@ -523,10 +523,29 @@
   no_log: "{{ openbao_no_log }}"
   when: openbao_bootstrap_source_resolved == "gitlab"
 
-# --- manual path: refuse to finish silently ---
-# If this role cannot reach the external source, it FAILS LOUDLY so the operator
-# removes the copy — the invariant (external copy removed once KV copy is live)
-# is never silently skipped (Security AC 7).
+# --- manual path, no external copy expected: SUCCESS NO-OP ---
+# (fix-svc07-external-copy-removal-fresh-mint.) On the in-memory-mint path the
+# orchestrator sets openbao_bootstrap_external_copy_expected=false — the token was
+# minted in-memory and bridged via the Handoff_File + ENV, so there is NO .env
+# line and NO CI variable to strip. "manual" here means "no external copy exists",
+# NOT "cannot reach a supplied copy", so it is a success no-op, not a hard fail.
+# References no secret value.
+- name: "6.2 — No external copy to remove (in-memory mint, success no-op)"
+  ansible.builtin.debug:
+    msg: >-
+      No external copy to remove — the Bootstrap_Transit_Token was minted
+      in-memory and rotated into KV
+      ({{ openbao_kv_mount }}/{{ openbao_transit_token_kv_path }}); nothing to
+      strip or delete.
+  when:
+    - openbao_bootstrap_source_resolved == "manual"
+    - not (openbao_bootstrap_external_copy_expected | bool)
+
+# --- manual path, a copy WAS expected: refuse to finish silently -> FAIL LOUD ---
+# An external copy WAS supplied (openbao_bootstrap_external_copy_expected=true,
+# the default) but this role could not reach it to remove it. The invariant
+# (external copy removed once the KV copy is live) is never silently skipped for
+# the supplied-copy case (Security AC 7). Message unchanged; only newly gated.
 - name: "6.2 — Fail loudly if the external copy cannot be auto-removed"
   ansible.builtin.fail:
     msg: >-
@@ -537,7 +556,9 @@
       gitignored .env, or delete the GitLab CI/CD protected variable of that
       name. The external copy must not outlive the KV copy (Req 5.5;
       Security AC 7).
-  when: openbao_bootstrap_source_resolved == "manual"
+  when:
+    - openbao_bootstrap_source_resolved == "manual"
+    - openbao_bootstrap_external_copy_expected | bool
 
 # ----------------------------------------------------------------------------
 # 6.2-STEP-8 — Scrub the bootstrap token fact from memory.

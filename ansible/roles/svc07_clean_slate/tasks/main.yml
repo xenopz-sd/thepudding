@@ -158,6 +158,30 @@
     proxmox_node_name: "{{ (svc07_cs_env_resolve.stdout | from_json)['TF_VAR_proxmox_node_name'] }}"
   no_log: true
 
+# Change 1 (fix-svc07-clean-slate-proxmox-host-default): bind the Proxmox host
+# LAN IP from the SAME already-resolved cluster env. PROXMOX_HOST_LAN_IP is an
+# OPTIONAL schema row in cluster_env.py (emitted as TF_VAR_proxmox_host_lan_ip
+# only when set), so read it with an optional .get(...) default '' — a direct
+# [...] index would KeyError when the operator has not set it. no_log — the
+# source resolve dict carries the API token by key (matching the node-name bind).
+- name: "Clean-Slate | Bind the Proxmox host LAN IP from the cluster env (optional, no_log)"
+  ansible.builtin.set_fact:
+    svc07_cluster_env_proxmox_host: >-
+      {{ (svc07_cs_env_resolve.stdout | from_json).get('TF_VAR_proxmox_host_lan_ip', '')
+         | default('', true) }}
+  no_log: true
+
+# Change 2: compute the EFFECTIVE Proxmox host — an explicit -e svc07_proxmox_host
+# override WINS when supplied non-empty, else fall back to the cluster-env host.
+# NOT no_log: the assert below gates on this value and names it on failure, so it
+# must stay diagnosable; it references only the two non-secret facts (never the
+# token-bearing svc07_cs_env_resolve.stdout), so no token is re-exposed.
+- name: "Clean-Slate | Compute the effective Proxmox host (-e override wins, else cluster env)"
+  ansible.builtin.set_fact:
+    svc07_effective_proxmox_host: >-
+      {{ svc07_proxmox_host if (svc07_proxmox_host | trim | length) > 0
+         else svc07_cluster_env_proxmox_host }}
+
 # The delegated clean-slate.yml runs `pct` ON THE NODE, so it targets the
 # Proxmox-host inventory whose ansible_host is a committed placeholder —
 # the operator MUST supply the real LAN IP. Fail fast (naming the var) if
@@ -165,14 +189,17 @@
 - name: "Clean-Slate | Assert the Proxmox host SSH address was supplied"
   ansible.builtin.assert:
     that:
-      - "svc07_proxmox_host is defined"
-      - "(svc07_proxmox_host | trim | length) > 0"
+      - "svc07_effective_proxmox_host is defined"
+      - "(svc07_effective_proxmox_host | trim | length) > 0"
     fail_msg: >-
       The Clean-Slate reset delegates to clean-slate.yml against the
       Proxmox-host inventory ({{ svc07_proxmox_host_inventory }}), which
-      runs `pct` on the node over SSH. Supply the real Proxmox LAN IP with
-      -e svc07_proxmox_host=<real-proxmox-lan-ip>. Nothing was destroyed.
-    success_msg: "Proxmox host SSH address supplied for the reset."
+      runs `pct` on the node over SSH, and no Proxmox host LAN IP could be
+      resolved. Either set PROXMOX_HOST_LAN_IP in your cluster env file
+      ({{ cluster_env_file }}) — the normal path, the IP is already there —
+      or pass -e svc07_proxmox_host=<real-proxmox-lan-ip> (the explicit
+      override wins when both are set). Nothing was destroyed.
+    success_msg: "Proxmox host SSH address resolved for the reset (effective host set)."
 
 # The two SVC-07 clean_slate_targets (design "Clean-slate component"),
 # node computed from the independently-resolved proxmox_node_name.
@@ -205,7 +232,7 @@
       - "{{ svc07_proxmox_host_inventory }}"
       - ansible/playbooks/clean-slate.yml
       - --extra-vars
-      - "ansible_host={{ svc07_proxmox_host }}"
+      - "ansible_host={{ svc07_effective_proxmox_host }}"
       - -e
       - clean_slate_enabled=true
       - -e
@@ -366,7 +393,7 @@
       - -i
       - "{{ svc07_proxmox_host_inventory }}"
       - --extra-vars
-      - "ansible_host={{ svc07_proxmox_host }}"
+      - "ansible_host={{ svc07_effective_proxmox_host }}"
       - -m
       - ansible.builtin.command
       - -a

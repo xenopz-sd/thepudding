@@ -5,6 +5,78 @@ All notable changes to the Developer Services Platform are documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.2] - 2026-10-29
+
+An **operator-ergonomics** patch acting on third-party deployment feedback for
+`v0.11.0` (gathered deploying an external project against thepudding on a throwaway
+Proxmox instance). Three SVC-07 bring-up footguns that cost an outside operator a
+long investigation — without changing SVC-07's functional behavior — are fixed as
+spec'd bugfixes, each test-before-fix and offline-verified. The single
+highest-leverage fix is the first: a `no_log` that blanketed the whole
+orchestration wrapper hid the one secret-free error the operator needed. No secret
+is ever surfaced, and no `no_log` / secret-hygiene control is removed or weakened —
+the diagnostic is a static, secret-free pointer and the only new values threaded
+are non-secret. Patch bump: diagnostics + ergonomics + docs, no change to the
+provisioned OpenBao topology.
+
+### Fixed
+
+- **`no_log` hid the real error on orchestrated Phase-3 failures** (feedback §1;
+  spec `fix-svc07-bootstrap-failure-diagnostics`): the orchestrator's Phase-3
+  rescue only showed `{"censored": "...no_log: true..."}` and a generic "Phase 3
+  failed", double-censoring the (secret-free) child error an operator needed. The
+  single `fail` message now folds in a **static, secret-free pointer** — re-run
+  with `-e svc07_debug_instrumentation=true` to capture the underlying child error
+  to a `0600` `.svc07-task84-child.log`, and check `docker logs openbao-openbao-1`
+  on the primary guest. Folded into the one play-level `fail` (not a separate
+  `debug` task) to honor the thin-orchestrator invariant; full child detail stays
+  behind the off-by-default `0600` instrumentation log, never raw child stdout
+  (which can carry a token).
+- **External-copy removal failed closed on the clean from-scratch path** (feedback
+  §2; spec `fix-svc07-external-copy-removal-fresh-mint`): a genuine fresh-mint run
+  (Bootstrap_Transit_Token minted **in-memory**, no external copy to remove)
+  hard-failed at primary-bootstrap STEP-7 even though OpenBao was already healthy
+  and the token already rotated into KV. A new role var
+  `openbao_bootstrap_external_copy_expected` (default `true`) gates the outcome: a
+  **success no-op** when no external copy exists (in-memory mint), the preserved
+  **fail-loud** when a copy was actually supplied and can't be removed. The
+  orchestrator sets the signal off the in-memory-mint discriminator and threads the
+  dotenv path from the operator's single `cluster_env_file` — removing the hidden
+  second `{{ playbook_dir }}/../../.env`. The "external copy must not outlive the
+  KV copy" security invariant is fully preserved for the supplied-copy case.
+- **Clean-slate needed an undocumented `-e svc07_proxmox_host=`** (feedback §3;
+  spec `fix-svc07-clean-slate-proxmox-host-default`): the `svc07_clean_slate`
+  branch hard-failed without an argument that appeared only in the error text, even
+  though the Proxmox host LAN IP is already in the cluster env as
+  `PROXMOX_HOST_LAN_IP`. The host is now **auto-defaulted** from the resolved
+  cluster env (`TF_VAR_proxmox_host_lan_ip`) via a `no_log`
+  `svc07_cluster_env_proxmox_host` bind folded into `svc07_effective_proxmox_host`
+  (an explicit `-e svc07_proxmox_host=` override still wins when supplied; the
+  fail-fast assert fires only when **both** sources are empty, naming both
+  remedies). `INSTALL-RUNBOOK.md` §A.4 drops the now-optional argument and documents
+  the residue reality — `pct destroy <vmid> --purge` already purges the OpenBao
+  Raft/audit named volumes inside the LXC, and the SDN zone is a
+  `platform-foundation` resource the platform clean-slate owns.
+
+### Notes — deferred operator-feedback items (tracked, not in this release)
+
+- **Feedback §4 — "deploy from a non-pristine host" story** is deferred to its own
+  **feature** spec (not a bugfix): a fresh checkout has empty Terraform state and
+  cannot see/adopt a host's pre-existing guests + SDN resources. A documented,
+  idempotent "reset to from-nothing whatever the current state" / reconcile-reality
+  entry point is a larger capability and will be specced separately.
+- **Feedback §5 — smaller items:** §5.1 (one source of env truth) is substantially
+  resolved by the §2 fix (orchestrated runs now use the single `cluster_env_file`;
+  the repo-root `.env` remains only as a deliberate standalone-run fallback). §5.2
+  (from-scratch preflight) is substantially met by the existing `svc07_preflight`
+  role, which already fails fast before creating any guest on a missing/invalid env
+  + token, Proxmox unreachable/auth failure, absent `p20` bridge, no resolvable
+  datastore, and missing local prerequisites. §5.3 (ansible-core 2.21
+  `INJECT_FACTS_AS_VARS` deprecation noise) is **deferred**: the clean config toggle
+  would break 156 bare injected-fact references across 83 files, so silencing it
+  properly is a whole-Ansible-tree `ansible_facts.*` migration warranting its own
+  spec with full-suite verification — not an ergonomics patch.
+
 ## [0.11.1] - 2026-10-30
 
 A CI offline-gate hardening patch (spec `ci-offline-gate-hardening`, an evolution
@@ -953,6 +1025,7 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
+[0.11.2]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.1...v0.11.2
 [0.11.1]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.0...v0.11.1
 [0.11.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.10.0...v0.11.0
 [0.10.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.9.0...v0.10.0

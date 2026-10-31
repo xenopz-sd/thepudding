@@ -10,11 +10,18 @@
 # Proxmox host SSH address for the Clean_Slate_Reset path (Req 7.4). The
 # delegated clean-slate.yml runs `pct` ON THE NODE, so it targets the
 # Proxmox-host inventory (ansible/inventory/proxmox-hosts.yml), whose
-# ansible_host is a committed placeholder overridden at run time (design
-# "Open Risks": the clean-slate branch needs the Proxmox host's SSH address).
-# Supply the real LAN IP with `-e svc07_proxmox_host=<real-proxmox-lan-ip>`.
-# Unset by default; the clean-slate branch fails fast (naming this var) if a
-# reset is requested without it. Not needed on the normal install path.
+# ansible_host is a committed placeholder overridden at run time.
+#
+# OPTIONAL (fix-svc07-clean-slate-proxmox-host-default). This value stays
+# "" and the clean-slate branch now DEFAULTS the host from the resolved
+# cluster env's PROXMOX_HOST_LAN_IP (emitted as TF_VAR_proxmox_host_lan_ip,
+# bound into svc07_cluster_env_proxmox_host, then folded into
+# svc07_effective_proxmox_host). So on the normal path the IP is already in
+# the cluster env file and NO -e is needed. An explicit
+# `-e svc07_proxmox_host=<real-proxmox-lan-ip>` still WINS when supplied
+# non-empty. Only when PROXMOX_HOST_LAN_IP is absent is the -e override
+# required — and the branch still fails fast naming BOTH remedies. Not needed
+# on the normal install path.
 svc07_proxmox_host: ""
 # The Proxmox-host inventory clean-slate.yml expects (pct runs on the node).
 svc07_proxmox_host_inventory: ansible/inventory/proxmox-hosts.yml

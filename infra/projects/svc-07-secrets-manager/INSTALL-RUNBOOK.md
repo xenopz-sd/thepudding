@@ -253,8 +253,7 @@ AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
   ansible/playbooks/svc-07-bootstrap.yml \
   -e cluster_env_file=.env.throwaway \
   -e clean_slate=true \
-  -e clean_slate_confirm=force \
-  -e svc07_proxmox_host=<throwaway-proxmox-host-lan-ip>
+  -e clean_slate_confirm=force
 ```
 
 Once armed and AUTHORIZED, the run proceeds through A.2 (or the A.4 reset)
@@ -383,9 +382,25 @@ non-affirmative/absent response):
   ansible/playbooks/svc-07-bootstrap.yml \
   -e cluster_env_file=cluster.dev.env \
   -e clean_slate=true \
-  -e clean_slate_confirm=force \
-  -e svc07_proxmox_host=<throwaway-proxmox-host-lan-ip>
+  -e clean_slate_confirm=force
 ```
+
+> **The Proxmox host LAN IP is now defaulted from the cluster env.** The
+> clean-slate branch resolves the host from `PROXMOX_HOST_LAN_IP` in
+> `cluster.dev.env` (the same IP Terraform already uses, emitted as
+> `TF_VAR_proxmox_host_lan_ip`), so `-e svc07_proxmox_host=` is **optional** —
+> pass it only to override that value, or when `PROXMOX_HOST_LAN_IP` is absent
+> from the env file. An explicit `-e svc07_proxmox_host=<real-proxmox-lan-ip>`
+> still wins when supplied; if neither source resolves, the run fails fast
+> before destroying anything, naming both remedies.
+>
+> **Residue scope.** The `pct destroy <vmid> --purge` above already purges the
+> OpenBao Raft/audit named volumes that live inside each LXC's rootfs (see the
+> volume-residue walkthrough in §B2 / §0e), so no separate volume-removal step
+> is needed. The SDN zone (`vlanzone`) is deliberately **not** touched here: it
+> is a shared `platform-foundation` resource owned by the platform clean-slate
+> (one-state-per-service boundary), so SVC-07's reset correctly leaves it in
+> place for other shared-VLAN services.
 
 After this reports the empty-baseline completion, the cluster is ready for a fresh
 A.2 from-scratch run.
@@ -2469,8 +2484,7 @@ workload host's Compose stack) returns the cluster to an empty baseline:
   ansible/playbooks/svc-07-bootstrap.yml \
   -e cluster_env_file=cluster.dev.env \
   -e clean_slate=true \
-  -e clean_slate_confirm=force \
-  -e svc07_proxmox_host=<throwaway-proxmox-host-lan-ip>
+  -e clean_slate_confirm=force
 ```
 
 > **Doctest tiers used in this section.** Offline (`<!-- doctest: offline -->`):
