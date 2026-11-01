@@ -5,6 +5,73 @@ All notable changes to the Developer Services Platform are documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-11-01
+
+The **consumer last-mile** feature release. It closes the gap between a consumer
+onboarding run reporting `failed=0` and a project workload that can actually boot
+and pass a health check — the "onboarded ≠ deployable" story from the expanded
+`v0.11.0` deployment feedback. `v0.11.2`/`v0.11.3` removed the credential-path and
+banner-honesty footguns underneath this; this release makes the last mile **real
+and proven** end to end. Additive and backward compatible: a manifest with no
+`workload` block validates and provisions exactly as before. The full four-root
+offline suite is green; the `requires-infra` live hello-workload smoke is the
+standing orchestrator-owned follow-up (deselected by default, throwaway cluster
+under `AGENT_LIVE_AUTHORIZED`).
+
+### Added
+
+- **Optional `workload` block in the Consumer_Manifest** (spec
+  `consumer-last-mile-hello-workload` §B): a project may declare an optional
+  `workload: {enabled, tier, count}` block. The validator grows by exactly
+  `workload` (new `WORKLOAD_TIERS` + `_validate_workload`); unknown/duplicate
+  top-level keys are still rejected, and a manifest with no `workload` block is a
+  strict no-op. Documented in `CONSUMER-MANIFEST-REFERENCE.md`.
+- **Optional per-project workload guest** (§B): a `count`-gated LXC on the
+  project's own VLAN (within the project's existing per-project Terraform
+  root/state, `_TEMPLATE` + `dronefleet`), ledgered per ADR-0015, IP computed via
+  the NET-00 formula — never hand-chosen. Threaded through `consumer_provision`
+  (enabled from the manifest, inventory regenerated), torn down with the project
+  (non-anchor, one-state-per-service).
+- **Reference "hello-workload" + end-to-end smoke** (§A): a stock-busybox
+  `/healthz` server that returns 200 only once the agent-rendered `DATABASE_URL`
+  is present, stood up via the existing `openbao-agent` role through additive
+  optional inputs (no new agent wiring). The smoke is the onboarding
+  definition-of-done — happy path plus the fail-closed swap-gate (sealed Primary
+  ⇒ no rendered secret ⇒ sidecar never healthy ⇒ workload never starts). The
+  live walkthrough is Part 5 of the dronefleet install runbook.
+- **Agent runtime-contract + dev issuer-reachability documentation** (§C/§D):
+  the `openbao-agent` root posture / writable-dir / `required:false` swap-gate
+  contract; and a dev-only ZITADEL issuer-reachability recipe (`extra_hosts`
+  alias + self-signed JWKS posture) with the SVC-08/EJBCA production path stated.
+- **Supported workload topologies** documented in `CONSUMER-JOURNEY.md`: dedicated
+  guest / co-locate on the DB guest / bring-your-own, with their Docker +
+  reachability prerequisites.
+
+### Changed
+
+- **`proxmox-compute` gains a first-class, validated non-catalog guest identity**
+  (**ADR-0021**): the shared module now accepts exactly one of `svc_code`
+  (catalog `svcNN`, unchanged) or a non-catalog `role_code` (e.g. `workload`).
+  The hostname build and the plan-time guards accept the role-code form; a new
+  guard enforces exactly-one-of. `svc_code` keeps its single "stable catalog slot"
+  meaning — it is never overloaded. This replaces the feature's original
+  self-contradictory `svc_code: workload` design (which the module would have
+  rejected at plan time). Additive: every existing catalog caller is unchanged.
+- **`consumer_preflight` now carries the throwaway-cluster guard consult** for the
+  whole consumer run, since `consumer_provision` gained a direct destructive-live
+  `terraform apply` for the workload guest (mirrors the `svc01_preflight`
+  upstream-guard convention). Ordinary operator runs (`AGENT_LIVE_AUTHORIZED`
+  unset) are byte-for-byte unaffected.
+
+### Known limitations
+
+- The `requires-infra` live hello-workload smoke (happy + fail-closed) is the
+  standing orchestrator-owned follow-up — authored as the install-runbook
+  walkthrough, deselected by default, run only under `AGENT_LIVE_AUTHORIZED` on a
+  throwaway cluster, never in CI/acceptance/production.
+- `workload.count > 1` is schema-accepted but not the validated path; a
+  single-guest bring-up is the validated path (reserved for a later increment).
+
 ## [0.11.3] - 2026-10-29
 
 A second **operator-ergonomics** patch acting on the expanded `v0.11.0` deployment

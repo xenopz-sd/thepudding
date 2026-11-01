@@ -94,6 +94,7 @@ SLICES: dict[str, list[str]] = {
         "test_obs_terraform_shape.py",
     ],
     "svc01-09": [
+        "test_proxmox_compute_identity.py",
         "test_svc01_destroy_isolation.py",
         "test_svc01_openbao_token_failfast.py",
         "test_svc01_postgres_contract.py",
@@ -115,6 +116,7 @@ SLICES: dict[str, list[str]] = {
     ],
     "tfplan-b": [
         "test_consumer_db_offline_plan.py",
+        "test_consumer_workload_offline_plan.py",
         "test_degraded_modes.py",
         "test_degraded_sdn_use.py",
         "test_offline_plan_bug_condition.py",

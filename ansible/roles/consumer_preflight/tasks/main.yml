@@ -59,6 +59,54 @@
     consumer_proxmox_node_name: "{{ consumer_tfvars['TF_VAR_proxmox_node_name'] }}"
   no_log: true
 
+# --- Agent-live throwaway-guard consult (gated, fail-closed, before any mutation) ---
+# The consumer onboarding run drives DESTRUCTIVE live operations downstream — most
+# directly the Phase-2 consumer_provision per-project workload `terraform apply`
+# (consumer-last-mile-hello-workload §B), plus the composed svc-01-bootstrap child.
+# testing-strategy.md "Agent Live-Test Authorization" requires every destructive-
+# live ORCHESTRATOR entry point to consult the throwaway-cluster guard. The consult
+# lives HERE in Phase-1 preflight (it runs before any Phase-2 mutation in the same
+# play), so it covers the whole run UPSTREAM — mirroring svc01_preflight. All three
+# tasks are `when: agent_live_run` — an ordinary operator run (AGENT_LIVE_AUTHORIZED
+# unset) skips them and is byte-for-byte unaffected; nothing is touched or queried.
+- name: "Preflight | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ consumer_venv_python }}"
+      - "{{ consumer_throwaway_guard }}"
+      - --service
+      - consumer
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ consumer_throwaway_allowlist }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+
+- name: "Preflight | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (consumer_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Preflight | Refuse the agent-live run unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "consumer_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live consumer onboarding REFUSED by the throwaway-cluster guard:
+      {{ (consumer_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      Nothing was provisioned and no Proxmox resource was touched or queried.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live consumer run."
+  when: agent_live_run | default(false) | bool
+
 # === 3. Forbidden-build-tool gate (Ansible-only, Req 4.2, 4.9) ==============
 # The orchestrator must introduce NO build/automation tool beyond Ansible. An
 # operator may signal a configured orchestration tool via

@@ -6,8 +6,14 @@
 # input-guard preconditions are task 7.3 — neither is implemented here.
 #
 # Design contract fields (in-direction):
-#   project_slug | service_name | svc_code | vlan_id | host_index | instance
-#   component (optional)
+#   project_slug | service_name | {svc_code XOR role_code} | vlan_id |
+#   host_index | instance | component (optional)
+#
+# Guest identity (ADR-0021): a guest is identified by EXACTLY ONE of a catalog
+# `svc_code` (`svcNN`) OR a non-catalog `role_code` (a role name such as
+# `workload`), never both and never neither. `svc_code` keeps its single
+# "stable catalog slot" meaning; `role_code` is the first-class non-catalog
+# path. The exactly-one-of check is a cross-variable precondition (Guard 5).
 # Deliberately ABSENT: any operator-supplied IP literal input. IPs are
 # computed by the module (task 7.2) via the cidrhost() formula, never chosen
 # by an operator (Requirement 2.4, NET-00 §3). See the note at the bottom.
@@ -42,12 +48,56 @@ variable "svc_code" {
     `<svc-code>-<vlan_id>-<instance>`. MUST be derived from the stable
     catalog slot number, never a product/technology name (Requirement 3.5),
     so a technology swap within a slot never forces a rename.
+
+    OPTIONAL (default null) per ADR-0021: a guest is identified by EXACTLY ONE
+    of `svc_code` (a catalog service) OR `role_code` (a non-catalog, role-named
+    guest such as a consumer workload). When supplied it MUST be the strict
+    `svcNN` catalog form; `role_code` is the path for non-catalog guests. The
+    exactly-one-of cross-variable check is enforced in preconditions.tf (Guard
+    5) because a variable `validation` block cannot reference another variable.
   EOT
   type        = string
+  default     = null
 
   validation {
-    condition     = can(regex("^svc[0-9]{2}$", var.svc_code))
-    error_message = "svc_code must be the stable catalog slot rendered as 'svcNN' (lowercase, two digits), e.g. svc01 (NET-00 §4, Requirement 3.5)."
+    # When supplied, svc_code stays strictly the stable catalog slot `svcNN`
+    # (NET-00 §4, Req 3.5). A null is allowed through here (the guest is then
+    # identified by role_code instead); the exactly-one-of guard lives in
+    # preconditions.tf Guard 5 (ADR-0021).
+    condition     = var.svc_code == null || can(regex("^svc[0-9]{2}$", var.svc_code))
+    error_message = "svc_code, when set, must be the stable catalog slot rendered as 'svcNN' (lowercase, two digits), e.g. svc01 (NET-00 §4, Requirement 3.5). For a non-catalog, role-named guest use role_code instead (ADR-0021)."
+  }
+}
+
+variable "role_code" {
+  description = <<-EOT
+    NON-CATALOG role-code guest identity (ADR-0021). The sanctioned way to name
+    a guest that is NOT a catalog SVC-NN service — e.g. a per-project consumer
+    `workload` guest. Drives the machine-facing hostname
+    `<role_code>-<vlan_id>-<instance>` exactly as `svc_code` would, but is a
+    DISTINCT concept: it is keyed on a stable role name (also swap-stable),
+    never a catalog slot, so `svc_code` keeps its single "stable catalog slot"
+    meaning and is never overloaded.
+
+    OPTIONAL (default null). A guest supplies EXACTLY ONE of `svc_code` OR
+    `role_code` — never both, never neither (enforced in preconditions.tf
+    Guard 5). When supplied it must be a lowercase role name that is NOT itself
+    a catalog `svcNN` code (that is what `svc_code` is for).
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    # A role_code (when supplied) must be a lowercase alphanumeric role name
+    # starting with a letter, AND must NOT be a catalog `svcNN` form — a
+    # `svcNN` literal belongs in `svc_code`, not here (ADR-0021). A null is
+    # allowed through (the guest is then identified by svc_code); the
+    # exactly-one-of guard lives in preconditions.tf Guard 5.
+    condition = var.role_code == null || (
+      can(regex("^[a-z][a-z0-9]*$", var.role_code)) &&
+      !can(regex("^svc[0-9]{2}$", var.role_code))
+    )
+    error_message = "role_code, when set, must be a lowercase role name matching '^[a-z][a-z0-9]*$' (e.g. 'workload') and must NOT be a catalog 'svcNN' code — a catalog slot goes in svc_code, not role_code (ADR-0021)."
   }
 }
 

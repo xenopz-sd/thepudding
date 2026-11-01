@@ -1,0 +1,88 @@
+---
+# defaults/main.yml — hello_workload (consumer-last-mile-hello-workload §A)
+#
+# The REFERENCE "hello-workload" variable set — the §A artifact (Req 1.1, 1.2).
+# This role owns NO stand-up logic of its own: the reference workload is stood up
+# via the EXISTING `openbao-agent` role (task 4.2), which builds the Agent
+# sidecar + workload Compose stack through `docker-compose-app`. This file is the
+# discoverable, convention-matching "reference Compose var set" that task 4.2
+# threads into that role. (Task 4.1 adds the artifact + its entrypoint + the
+# /healthz logic; task 4.2 does the actual stand-up — no new agent wiring.)
+#
+# WHAT MAKES THE SWAP-GATE OBSERVABLE
+# -----------------------------------
+# The reference workload is a trivial HTTP server (files/healthz-entrypoint.sh)
+# on a STOCK busybox image whose /healthz returns 200 ONLY when DATABASE_URL is
+# present/non-empty, and 503 when it is absent. DATABASE_URL arrives at container
+# start from the agent-rendered Rendered_Secret_File (layered as an
+# extra_env_files entry by openbao-agent), NEVER from a committed/templated
+# secret. No rendered secret ⇒ /healthz 503 ⇒ the swap-gate is observable at the
+# workload layer, on top of the Agent sidecar's own RSF-presence healthcheck.
+#
+# IMAGE CHOICE (design.md "Component 3" decision): stock image + tiny entrypoint,
+# NOT a bespoke-built image. `busybox` is a Docker Official Image that ships both
+# `httpd` (with CGI) and a POSIX shell, so "200 iff DATABASE_URL present" is
+# expressible with a mounted entrypoint — no Dockerfile, no SVC-14 build, and
+# EU-sourcing-clean (no vendor/SaaS dependency).
+
+# --- Stock reference image (NOT bespoke-built) ------------------------------
+# Pinned Docker Official Image. Overridable to a SVC-14-mirrored tag in a
+# registry-gated environment; the default is the upstream official name so the
+# reference is runnable with no registry wiring.
+hello_workload_image: "busybox:1.37"
+
+# --- The secret the workload gates its health on ----------------------------
+# The env var the agent renders the DB credential into (the v0.11.3 bridge
+# default mapping {db, database_url, DATABASE_URL}). /healthz is 200 iff this is
+# present/non-empty. NOT a secret value — only the KEY NAME.
+hello_workload_secret_env: "DATABASE_URL"
+
+# --- The /healthz HTTP server ------------------------------------------------
+hello_workload_http_port: 8080
+hello_workload_webroot: "/tmp/hello-workload"
+
+# In-container path the entrypoint script is mounted onto (read-only) and the
+# command that runs it. Delivered as a mounted file (NOT a built image layer) so
+# the stock image stays stock. Task 4.2 mounts
+# `files/healthz-entrypoint.sh` -> this path and sets this command on the
+# workload service dict it passes to openbao-agent/docker-compose-app.
+hello_workload_entrypoint_container_path: "/usr/local/bin/healthz-entrypoint.sh"
+hello_workload_command:
+  - "sh"
+  - "/usr/local/bin/healthz-entrypoint.sh"
+
+# The env the entrypoint reads (NON-secret config only — never the DB secret,
+# which arrives via the Rendered_Secret_File). Passed through to the workload
+# service `environment:` by task 4.2.
+hello_workload_env:
+  HELLO_WORKLOAD_PORT: "{{ hello_workload_http_port }}"
+  HELLO_WORKLOAD_WEBROOT: "{{ hello_workload_webroot }}"
+  HELLO_WORKLOAD_SECRET_ENV: "{{ hello_workload_secret_env }}"
+
+# --- The Compose healthcheck probing /healthz --------------------------------
+# A container healthcheck hitting the local /healthz endpoint. It is HEALTHY only
+# once /healthz returns 200 — i.e. only once DATABASE_URL has been rendered. This
+# is the workload-layer swap-gate signal (distinct from, and on top of, the Agent
+# sidecar's own `test -s <RSF>` healthcheck). Shaped for the docker-compose-app
+# `healthcheck:` dict (test as a CMD list).
+hello_workload_healthcheck:
+  test:
+    - "CMD"
+    - "wget"
+    - "-q"
+    - "-O"
+    - "-"
+    - "http://127.0.0.1:{{ hello_workload_http_port }}/cgi-bin/healthz"
+  interval: "5s"
+  timeout: "3s"
+  retries: 12
+  start_period: "5s"
+
+# --- The agent secret mapping the reference workload needs -------------------
+# The default DB mapping from the v0.11.3 bridge: the agent reads
+# secret/data/<slug>/db field `database_url` and renders DATABASE_URL into the
+# Rendered_Secret_File. Task 4.2 passes this as `openbao_agent_secret_mappings`
+# (it mirrors `consumer_db_agent_mapping` in consumer_bootstrap/defaults). No
+# secret VALUE — only the KV reference and the env key.
+hello_workload_secret_mappings:
+  - { kv_subpath: "db", kv_field: "database_url", env_key: "DATABASE_URL" }

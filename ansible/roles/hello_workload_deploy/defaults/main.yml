@@ -1,0 +1,71 @@
+---
+# defaults/main.yml — hello_workload_deploy
+# (consumer-last-mile-hello-workload §A, task 4.2)
+#
+# The thin COMPOSITION role that STANDS UP the reference "hello-workload" via the
+# EXISTING `openbao-agent` role — no new agent/auth wiring (task 4.2). It owns
+# exactly two responsibilities:
+#   (1) stage the reference entrypoint (the task-4.1 `hello_workload` role's
+#       files/healthz-entrypoint.sh) onto the TARGET host at a service-owned
+#       path, read-only; and
+#   (2) include `openbao-agent`, threading the task-4.1 `hello_workload_*`
+#       reference var set into that role's EXISTING inputs (its optional,
+#       additive workload-service pass-throughs + the default DB secret mapping).
+#
+# It introduces NO agent/credential logic of its own: the Agent sidecar, the
+# AppRole auto_auth, the Rendered_Secret_File, and the swap-gate all come from
+# `openbao-agent` UNCHANGED. The reference var set lives in the `hello_workload`
+# role (defaults/main.yml + files/healthz-entrypoint.sh); this role depends on it
+# (meta/main.yml) so those `hello_workload_*` vars are in scope here.
+#
+# NO secret value appears anywhere in this role. The workload reads DATABASE_URL
+# ONLY from the Agent-rendered Rendered_Secret_File at container start (the
+# v0.11.3 {db, database_url, DATABASE_URL} bridge), never a committed/templated
+# value; every secret-bearing task inherits openbao-agent's `no_log`.
+
+# =============================================================================
+# REQUIRED input (no default): the project whose KV subtree the Agent reads
+# =============================================================================
+# project_slug is forwarded to openbao-agent (which asserts it). Left UNDEFINED
+# so a run without an explicit slug fails loudly in the composed role.
+# project_slug: "<slug>"   # REQUIRED — supplied by the caller / consumer flow.
+
+# =============================================================================
+# PLACEMENT — target-aware (workload guest when enabled, else co-locate target)
+# =============================================================================
+# The Ansible inventory GROUP (or host) the reference workload is stood up on.
+# The per-project workload guest's `service_role` is `workload` (the module's
+# service_name), and generate_inventory.py groups hosts by service_role — so the
+# provisioned workload guest lands in the `workload` inventory group. When the
+# manifest declares `workload.enabled: true` (task 2.2/3.1), that group exists
+# and is the default target. When NO workload guest is provisioned, an operator
+# co-locates the stand-up on the DB guest (or a bring-your-own host) by
+# overriding this to that target group/host (the documented topologies, task 8).
+# The composition playbook sets this from `hello_workload_enabled`; a direct
+# invocation overrides with `-e hello_workload_target=<group-or-host>`.
+hello_workload_target: workload
+
+# Whether a dedicated workload guest was provisioned (manifest workload.enabled).
+# Only used to DOCUMENT/choose the default target in the composition playbook;
+# this role itself always targets `hello_workload_target`.
+hello_workload_enabled: false
+
+# =============================================================================
+# Entrypoint staging (service-owned, read-only mount source)
+# =============================================================================
+# Source path of the reference entrypoint shipped by the `hello_workload` role
+# (task 4.1). Resolved relative to this role so the copy finds it regardless of
+# the invoking playbook's location. `role_path` is this role's own dir; the
+# sibling `hello_workload` role's files/ is one level up.
+hello_workload_entrypoint_src: "{{ role_path }}/../hello_workload/files/healthz-entrypoint.sh"
+
+# Host-side dir the entrypoint is staged into (service-owned, 0750). Anchored
+# under the SAME Compose stack dir openbao-agent/docker-compose-app use for this
+# project's workload stack (reproducing docker-compose-app's default expression
+# EXACTLY, as openbao-agent's own default does), so the mount source is stable.
+hello_workload_stack_dir: >-
+  {{ dca_stack_dir | default((dca_base_dir | default('/opt/compose')) ~ '/' ~ (project_slug ~ '-workload')) }}
+hello_workload_entrypoint_host_dir: "{{ hello_workload_stack_dir }}/bin"
+# The host path the entrypoint is staged to and the read-only mount built from
+# it (host:container:ro) threaded as openbao_agent_workload_volumes.
+hello_workload_entrypoint_host_path: "{{ hello_workload_entrypoint_host_dir }}/healthz-entrypoint.sh"

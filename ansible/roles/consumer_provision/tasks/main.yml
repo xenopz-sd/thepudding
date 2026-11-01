@@ -161,3 +161,319 @@
   ansible.builtin.debug:
     msg: "INFO: Phase 2 (Provision) skipped for '{{ project_slug }}' — the Consumer_Manifest declares no database."
   when: consumer_manifest.database is not defined
+
+# =============================================================================
+# Optional workload guest (consumer-last-mile-hello-workload §B, task 3.1)
+# =============================================================================
+# Thread the manifest `workload` block (consumer_manifest.workload) into a
+# count-gated `terraform apply` of the per-project Workload_Consumer_Root
+# (infra/projects/<slug>/workload/), then regenerate the workload inventory from
+# that root's `inventory_hosts` output so the workload guest appears ONLY when
+# enabled. Mirrors EXACTLY the SVC-01 provision pattern: the same backend
+# swap-gate (GitLab HTTP state vs local override), the same TF_VAR_* token
+# handoff (endpoint/token via environment, never argv; no_log), the same
+# generate_inventory.py + known_hosts refresh.
+#
+# STRICT NO-OP (Req 2.3): EVERY task below is gated on
+# `consumer_manifest.workload.enabled | default(false)`. A manifest with no
+# `workload` block — or `enabled: false` — provisions no guest and adds no host
+# to any inventory, behaving exactly as before this feature. The gate is
+# evaluated once into `consumer_workload_enabled` so a missing `workload` key
+# can never raise.
+#
+# AGENT-LIVE meta-guard: like the DB apply above, this role is LEAF-EXEMPT — the
+# throwaway-guard consult is carried UPSTREAM by consumer_preflight; no duplicate
+# guard here.
+
+- name: "Provisioning (workload) | Evaluate the workload gate (strict no-op when absent/false)"
+  ansible.builtin.set_fact:
+    consumer_workload_enabled: "{{ consumer_manifest.workload.enabled | default(false) | bool }}"
+    consumer_workload_count: "{{ consumer_manifest.workload.count | default(1) | int }}"
+    consumer_workload_tier: "{{ consumer_manifest.workload.tier | default('small') }}"
+  changed_when: false
+
+- name: "Provisioning (workload) | INFO — workload guest disabled (strict no-op)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Phase 2 (Provision) — no workload guest for '{{ project_slug }}'
+      (the Consumer_Manifest declares no `workload` block, or workload.enabled is
+      false). No guest provisioned, no workload host added to any inventory —
+      behavior identical to before the last-mile feature (Req 2.3).
+  when: not (consumer_workload_enabled | bool)
+
+# Everything below runs ONLY when the workload guest is enabled.
+- name: "Provisioning (workload) | Stand up the optional workload guest"
+  when: consumer_workload_enabled | bool
+  block:
+    - name: "Provisioning (workload) | INFO — provisioning the workload guest on VLAN {{ consumer_vlan_id }}"
+      ansible.builtin.debug:
+        msg: >-
+          INFO: Phase 2 (Provision) — applying the Workload_Consumer_Root
+          (infra/projects/{{ project_slug }}/workload/) with
+          workload_enabled=true, workload_count={{ consumer_workload_count }},
+          tier={{ consumer_workload_tier }} (state {{ consumer_workload_state_name }},
+          host_index read from the Host_Index_Authority ledger).
+
+    # --- Resolve the operator SSH public key into a JSON list (mirrors svc01) --
+    - name: "Provisioning (workload) | Bind + expanduser the operator SSH public-key file path"
+      ansible.builtin.set_fact:
+        consumer_workload_ssh_key_file: >-
+          {{ (consumer_tfvars['TF_VAR_operator_ssh_public_key_file'] | default('') | trim) | expanduser }}
+      no_log: true
+
+    - name: "Provisioning (workload) | Read + JSON-encode the operator SSH public key (1-element list)"
+      ansible.builtin.set_fact:
+        consumer_workload_ssh_keys_json: >-
+          {{ [lookup('ansible.builtin.file', consumer_workload_ssh_key_file) | trim] | to_json }}
+      when: (consumer_workload_ssh_key_file | default('') | length) > 0
+
+    - name: "Provisioning (workload) | Default the operator SSH public-key list to empty when no path is set"
+      ansible.builtin.set_fact:
+        consumer_workload_ssh_keys_json: "[]"
+      when: (consumer_workload_ssh_key_file | default('') | length) == 0
+
+    # --- Resolve the generic LXC template + datastore from the cluster env ----
+    - name: "Provisioning (workload) | Bind the resolved LXC template + datastore facts"
+      ansible.builtin.set_fact:
+        consumer_workload_template_file_id: "{{ consumer_tfvars['TF_VAR_openbao_template_file_id'] | default('') }}"
+        consumer_workload_resolved_datastore: "{{ consumer_tfvars['TF_VAR_openbao_datastore_id'] | default('') }}"
+      no_log: true
+
+    # --- Backend swap-gate selection (identical shape to svc01_provision) -----
+    - name: "Provisioning (workload) | Read the cluster env file to detect the state-backend signal"
+      ansible.builtin.slurp:
+        src: "{{ consumer_repo_root }}/{{ cluster_env_file }}"
+      register: consumer_workload_env_slurp
+      no_log: true
+
+    - name: "Provisioning (workload) | Reduce the env file to KEY=VALUE lines"
+      ansible.builtin.set_fact:
+        consumer_workload_env_pairs: >-
+          {{ (consumer_workload_env_slurp.content | b64decode).splitlines()
+             | map('trim')
+             | reject('match', '^\s*#')
+             | select('search', '=')
+             | list }}
+      no_log: true
+
+    - name: "Provisioning (workload) | Extract the set of env keys (names only, no values)"
+      ansible.builtin.set_fact:
+        consumer_workload_env_keys: >-
+          {{ consumer_workload_env_pairs | map('regex_replace', '^\s*([^=]+?)\s*=.*$', '\1') | list }}
+
+    - name: "Provisioning (workload) | Decide the Terraform backend (swap gate)"
+      ansible.builtin.set_fact:
+        consumer_workload_use_gitlab_backend: >-
+          {{ ('CI_API_V4_URL' in consumer_workload_env_keys)
+             and ('CI_PROJECT_ID' in consumer_workload_env_keys)
+             and ('CI_JOB_TOKEN' in consumer_workload_env_keys) }}
+
+    - name: "Provisioning (workload) | Extract GitLab CI state-backend values (GitLab backend only)"
+      ansible.builtin.set_fact:
+        consumer_workload_env_ci_values: >-
+          {{ dict(consumer_workload_env_keys | zip(
+               consumer_workload_env_pairs
+               | map('regex_replace', '^[^=]+=\s*(.*?)\s*$', '\1')
+               | map('regex_replace', '^"(.*)"$', '\1')
+               | list)) }}
+      when: consumer_workload_use_gitlab_backend | bool
+      no_log: true
+
+    - name: "Provisioning (workload) | Derive the per-slug GitLab state address + job token (GitLab backend only)"
+      ansible.builtin.set_fact:
+        consumer_workload_gitlab_state_address: >-
+          {{ consumer_workload_env_ci_values['CI_API_V4_URL'] }}/projects/{{
+             consumer_workload_env_ci_values['CI_PROJECT_ID'] }}/terraform/state/{{ consumer_workload_state_name }}
+        consumer_workload_ci_job_token: "{{ consumer_workload_env_ci_values['CI_JOB_TOKEN'] }}"
+      when: consumer_workload_use_gitlab_backend | bool
+      no_log: true
+
+    - name: "Provisioning (workload) | Log the Terraform backend selection (INFO)"
+      ansible.builtin.debug:
+        msg: >-
+          INFO: workload Terraform backend:
+          {{ 'GitLab HTTP state (' ~ consumer_workload_state_name ~ ')'
+             if (consumer_workload_use_gitlab_backend | bool)
+             else 'LOCAL (local_backend_override.tf) — solo/offline Developer-B default; '
+                  ~ 'per-instance state ' ~ consumer_workload_state_name }}
+
+    - name: "Provisioning (workload) | Ensure local_backend_override.tf is present (local backend)"
+      ansible.builtin.copy:
+        dest: "{{ consumer_workload_tf_root }}/local_backend_override.tf"
+        mode: "0644"
+        content: |
+          # Local, gitignored state backend for a solo/offline apply — overrides the
+          # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+          #
+          # PER-INSTANCE state keyed on the project slug (<slug>-workload.tfstate) so
+          # each project's workload guest gets its OWN isolated local state, matching
+          # the GitLab backend's per-slug isolation (integration-boundaries §5). A
+          # bare filename is relative to the root dir, so the state lands inside the
+          # workload/ root.
+          terraform {
+            backend "local" {
+              path = "{{ consumer_workload_state_name }}.tfstate"
+            }
+          }
+      when: not (consumer_workload_use_gitlab_backend | bool)
+
+    - name: "Provisioning (workload) | Remove any local_backend_override.tf (GitLab HTTP backend)"
+      ansible.builtin.file:
+        path: "{{ consumer_workload_tf_root }}/local_backend_override.tf"
+        state: absent
+      when: consumer_workload_use_gitlab_backend | bool
+
+    - name: "Provisioning (workload) | terraform init (local backend)"
+      ansible.builtin.command:
+        argv: [terraform, init, -input=false, -reconfigure]
+      args:
+        chdir: "{{ consumer_workload_tf_root }}"
+      environment: "{{ consumer_workload_tf_env }}"
+      register: consumer_workload_tf_init_local
+      changed_when: true
+      when: not (consumer_workload_use_gitlab_backend | bool)
+      no_log: true
+
+    - name: "Provisioning (workload) | terraform init (GitLab HTTP backend, per-slug state)"
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - init
+          - -input=false
+          - -reconfigure
+          - "-backend-config=address={{ consumer_workload_gitlab_state_address }}"
+          - "-backend-config=lock_address={{ consumer_workload_gitlab_state_address }}/lock"
+          - "-backend-config=unlock_address={{ consumer_workload_gitlab_state_address }}/lock"
+          - -backend-config=username=gitlab-ci-token
+          - "-backend-config=password={{ consumer_workload_ci_job_token }}"
+          - -backend-config=lock_method=POST
+          - -backend-config=unlock_method=DELETE
+          - -backend-config=retry_wait_min=5
+      args:
+        chdir: "{{ consumer_workload_tf_root }}"
+      environment: "{{ consumer_workload_tf_env }}"
+      register: consumer_workload_tf_init_gitlab
+      changed_when: true
+      when: consumer_workload_use_gitlab_backend | bool
+      no_log: true
+
+    # --- guest-variable assembly + apply --------------------------------------
+    - name: "Provisioning (workload) | Assert required guest variables are present (before apply)"
+      ansible.builtin.assert:
+        that:
+          - "consumer_proxmox_node_name is defined and (consumer_proxmox_node_name | trim | length > 0)"
+          - "consumer_workload_template_file_id is defined and (consumer_workload_template_file_id | trim | length > 0)"
+          - "consumer_workload_vmid is defined"
+          - "project_slug is defined and (project_slug | trim | length > 0)"
+          - "consumer_vlan_id is defined"
+        fail_msg: >-
+          A required workload guest variable is absent; refusing `terraform apply`.
+          Required: project_slug, resolved VLAN, proxmox_node_name, LXC template,
+          consumer_workload_vmid.
+        success_msg: "All required workload guest variables present; proceeding to terraform apply."
+
+    # The workload root resolves vlan_id from the Registry and host_index from the
+    # Host_Index_Authority ledger itself (main.tf) — so we thread ONLY the opt-in
+    # flags and the per-cluster plumbing, never vlan_id/host_index. The datastore
+    # is passed only when a real value resolved; the AUTODETECT sentinel (or empty)
+    # lets the root fall back to its own default (local-zfs). Booleans are lowered
+    # for terraform (Jinja renders Python True/False capitalized).
+    - name: "Provisioning (workload) | terraform apply (non-interactive, auto-approve)"
+      ansible.builtin.command:
+        argv: >-
+          {{ ['terraform', 'apply', '-input=false', '-auto-approve',
+              '-var=project_slug=' ~ project_slug,
+              '-var=workload_enabled=' ~ (consumer_workload_enabled | bool | string | lower),
+              '-var=workload_count=' ~ (consumer_workload_count | int),
+              '-var=tier=' ~ consumer_workload_tier,
+              '-var=proxmox_node_name=' ~ consumer_proxmox_node_name,
+              '-var=workload_vmid=' ~ (consumer_workload_vmid | int),
+              '-var=workload_template_file_id=' ~ consumer_workload_template_file_id,
+              '-var=operator_ssh_public_keys=' ~ consumer_workload_ssh_keys_json]
+             + (['-var=workload_datastore_id=' ~ consumer_workload_resolved_datastore]
+                if ((consumer_workload_resolved_datastore | default('') | trim | length > 0)
+                    and (consumer_workload_resolved_datastore != consumer_autodetect_sentinel))
+                else []) }}
+      args:
+        chdir: "{{ consumer_workload_tf_root }}"
+      environment: "{{ consumer_workload_tf_env }}"
+      register: consumer_workload_tf_apply
+      changed_when: "'0 added, 0 changed, 0 destroyed' not in consumer_workload_tf_apply.stdout"
+      no_log: true
+
+    # --- Regenerate the workload inventory from the root's inventory_hosts -----
+    # File-mediated handoff (integration-boundaries §4): generate_inventory.py
+    # runs `terraform output -json` in the workload root and renders the workload
+    # guest's host into <slug>-workload.generated.yml. The root's inventory_hosts
+    # output is the single-element list for the enabled guest (empty when
+    # disabled), so the workload host appears ONLY because the guest is enabled.
+    - name: "Provisioning (workload) | Generate the workload inventory from Terraform outputs"
+      ansible.builtin.command:
+        argv:
+          - "{{ consumer_venv_python }}"
+          - ansible/inventory/generate_inventory.py
+          - --root
+          - "infra/projects/{{ project_slug }}/workload"
+          - --out
+          - "{{ consumer_workload_generated_inventory }}"
+      args:
+        chdir: "{{ consumer_repo_root }}"
+      register: consumer_workload_gen_inventory
+      changed_when: true
+
+    - name: "Provisioning (workload) | Confirm the workload inventory file was written"
+      ansible.builtin.stat:
+        path: "{{ consumer_repo_root }}/{{ consumer_workload_generated_inventory }}"
+      register: consumer_workload_generated_inventory_stat
+
+    - name: "Provisioning (workload) | Assert the workload inventory exists (else halt before Phase 3)"
+      ansible.builtin.assert:
+        that:
+          - "consumer_workload_generated_inventory_stat.stat.exists"
+        fail_msg: >-
+          generate_inventory.py did not produce {{ consumer_workload_generated_inventory }};
+          halting before Phase 3 (Bootstrap).
+        success_msg: "Workload inventory present: {{ consumer_workload_generated_inventory }}."
+
+    # --- known_hosts refresh for the workload guest IP (mirrors svc01) --------
+    # host_index for the role_code=workload ledger row on this project VLAN is 1
+    # (-> .11) per the committed ledger; the authoritative IP is the workload
+    # root's output, this mirror is used only for the known_hosts refresh.
+    - name: "Provisioning (workload) | Compute the workload guest IP (cidrhost 10.0.<vlan>.0/24, +11)"
+      ansible.builtin.set_fact:
+        consumer_workload_guest_ip: "10.0.{{ consumer_vlan_id }}.11"
+      changed_when: false
+
+    - name: "Provisioning (workload) | Ensure ~/.ssh exists (0700)"
+      ansible.builtin.file:
+        path: "{{ ansible_env.HOME }}/.ssh"
+        state: directory
+        mode: "0700"
+
+    - name: "Provisioning (workload) | Remove stale known_hosts fingerprints for the workload guest IP"
+      ansible.builtin.command:
+        argv:
+          - ssh-keygen
+          - -R
+          - "{{ consumer_workload_guest_ip }}"
+          - -f
+          - "{{ ansible_env.HOME }}/.ssh/known_hosts"
+      register: consumer_workload_knownhosts_purge
+      changed_when: "'updated' in (consumer_workload_knownhosts_purge.stderr | default(''))"
+      failed_when: false
+
+    - name: "Provisioning (workload) | ssh-keyscan the workload guest IP (30s timeout)"
+      ansible.builtin.command:
+        argv: [ssh-keyscan, -T, "30", "{{ consumer_workload_guest_ip }}"]
+      register: consumer_workload_keyscan
+      changed_when: false
+      failed_when: false
+
+    - name: "Provisioning (workload) | Append current host keys to known_hosts"
+      ansible.builtin.blockinfile:
+        path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+        create: true
+        mode: "0600"
+        marker: "# {mark} consumer onboarding workload host keys for {{ project_slug }}"
+        block: "{{ consumer_workload_keyscan.stdout }}"
+      when: (consumer_workload_keyscan.stdout | default('') | trim | length) > 0

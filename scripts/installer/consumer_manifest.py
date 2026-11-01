@@ -68,6 +68,7 @@ __all__ = [
     "CONSUMABLE_SERVICE_KEYS",
     "DATABASE_ENGINES",
     "DATABASE_TIERS",
+    "WORKLOAD_TIERS",
     "APP_TYPES",
     "AUTH_METHODS",
     "SLUG_RE",
@@ -97,8 +98,10 @@ SLUG_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$")
 
 #: The enumerated consumable SVC-xx service blocks (Requirement 1.1, 1.7). Any
 #: other top-level service key is rejected. ``slug`` is the mandatory identifier
-#: key and is tracked separately.
-CONSUMABLE_SERVICE_KEYS = ("database", "sso", "secrets")
+#: key and is tracked separately. ``workload`` is the optional workload-guest
+#: block added by the consumer-last-mile-hello-workload feature (design
+#: Component 1; Requirements 2.1, 5.4).
+CONSUMABLE_SERVICE_KEYS = ("database", "sso", "secrets", "workload")
 
 #: The full set of permitted top-level keys: the mandatory ``slug`` plus the
 #: optional consumable service blocks.
@@ -109,6 +112,11 @@ DATABASE_ENGINES = ("postgres", "mariadb")
 
 #: ``database.tier`` enum (Requirement 1.2). ``small`` is the default.
 DATABASE_TIERS = ("small", "medium")
+
+#: ``workload.tier`` enum (consumer-last-mile-hello-workload, design Component 1;
+#: Requirement 2.1). Reuses the :data:`DATABASE_TIERS` sizing bands verbatim
+#: (small | medium); ``small`` is the default.
+WORKLOAD_TIERS = ("small", "medium")
 
 #: ``sso.app_registrations[].app_type`` enum (Requirement 1.3). These are the
 #: manifest's own DESCRIPTIVE forms; they are NOT reused verbatim by the sibling
@@ -247,6 +255,33 @@ def _validate_secrets(block: object) -> None:
     )
 
 
+def _validate_workload(block: object) -> None:
+    """Validate the optional ``workload`` block (Requirement 2.1, 5.4).
+
+    Mirrors :func:`_validate_database`: all three fields are OPTIONAL with
+    documented defaults (``enabled`` default ``false``, ``tier`` default
+    ``small``, ``count`` default ``1``), validated only when present, in a fixed
+    field order (``enabled`` → ``tier`` → ``count``) so the first offender is
+    well-defined. ``enabled`` must be a bool, ``tier`` ∈ :data:`WORKLOAD_TIERS`,
+    ``count`` a strictly-positive int. Pure/stdlib; additive and backward
+    compatible — a manifest with no ``workload`` block validates identically.
+    """
+    if not isinstance(block, dict):
+        raise ManifestValidationError(
+            f"service entry 'workload' must be a mapping, got {block!r}"
+        )
+    # enabled / tier / count are optional with documented defaults; validate
+    # only if present, in table order.
+    if "enabled" in block and not isinstance(block["enabled"], bool):
+        raise ManifestValidationError(
+            f"field 'workload.enabled' must be a bool, got {block['enabled']!r}"
+        )
+    if "tier" in block:
+        _require_enum(block["tier"], WORKLOAD_TIERS, "workload.tier")
+    if "count" in block:
+        _require_positive_int(block["count"], "workload.count")
+
+
 def validate_manifest(manifest: object) -> dict[str, Any]:
     """Validate an already-parsed Consumer_Manifest mapping; return it on accept.
 
@@ -315,13 +350,15 @@ def validate_manifest(manifest: object) -> dict[str, Any]:
             f"characters, matching {SLUG_RE.pattern!r} (Requirement 1.5)."
         )
 
-    # (3)-(5) optional service blocks, in a fixed order.
+    # (3)-(6) optional service blocks, in a fixed order.
     if "database" in manifest:
         _validate_database(manifest["database"])
     if "sso" in manifest:
         _validate_sso(manifest["sso"])
     if "secrets" in manifest:
         _validate_secrets(manifest["secrets"])
+    if "workload" in manifest:
+        _validate_workload(manifest["workload"])
 
     return manifest
 

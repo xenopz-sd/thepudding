@@ -93,6 +93,110 @@ guard applied to the secrets path.
   `openbao_agent_retry_interval` seconds, rather than exiting silently
   (Req 6.3, 6.4).
 
+## Runtime contract
+
+This section documents the sidecar's **runtime UID / file-ownership /
+writable-path** requirements that this role **already satisfies**. It is a
+description of existing behaviour (verified against
+[`tasks/main.yml`](./tasks/main.yml)), **not** a behaviour change — its purpose is
+so a hand-run or a custom (non-reference) workload reproduces the role's posture
+rather than rediscovering it by debugging `permission denied`. Nothing below
+loosens a host file permission; the root posture is what makes the 0600 files
+readable without doing so.
+
+### 1. The sidecar runs as **root** (`BAO_SKIP_DROP_ROOT=1`) — and why
+
+The `openbao-agent` sidecar service is rendered with
+`environment: { BAO_SKIP_DROP_ROOT: "1" }` (see STEP 3 of
+[`tasks/main.yml`](./tasks/main.yml), the `dca_services` `openbao-agent` entry).
+
+The `openbao/openbao` image entrypoint normalises `agent -config=...` to a `bao`
+subcommand and `su-exec`s it to the **non-root `openbao` user** *unless*
+`BAO_SKIP_DROP_ROOT` is set. A dropped-root sidecar cannot read its own
+root-owned mounts — `agent.hcl` (0640 `root:root` — carries no secret) and,
+critically, the `role_id`/`secret_id` files (**0600 `root:root`**). Those
+credential files are **deliberately** 0600 (never world-readable —
+`integration-boundaries.md` §2 / `security-standards.md`); loosening them to be
+readable by a non-root UID would **widen** secret exposure and is the wrong fix.
+Setting `BAO_SKIP_DROP_ROOT=1` matches the Primary's own root posture (it runs
+`uid=0` too) and lets the sidecar read the 0600 files **without touching their
+host permissions**. This is the image's own documented knob — the
+least-surprising mechanism.
+
+### 2. Ownership / mode the cred files and rendered dir must have
+
+The role creates and consumes these paths with a fixed ownership/mode contract
+(STEP 1 and STEP 3 of [`tasks/main.yml`](./tasks/main.yml)); a custom workload
+must reproduce it:
+
+| Path (by role/variable) | Owner | Mode | How it is mounted | Who writes it |
+|---|---|---|---|---|
+| `role_id` file (`openbao_agent_role_id_host_path`) | `root:root` | `0600` | read-only (`:ro`) | the control-plane `openbao_workload_approle` role, out of band (the sanctioned first-secret channel) |
+| `secret_id` file (`openbao_agent_secret_id_host_path`) | `root:root` | `0600` | read-only (`:ro`) | same as above |
+| `agent.hcl` (`openbao_agent_config_host_path`) | `root:root` | `0640` | read-only (`:ro`) | this role (rendered, **no secret value**) |
+| rendered-secrets dir (`openbao_agent_host_rendered_dir`) | `root:root` | `0700` | **read-write** (no `:ro`) | the Agent, at container start |
+| Rendered_Secret_File (`openbao_agent_rendered_secret_file`) | written by the Agent inside the rendered dir | `0600` | — | the Agent (only after auth+render succeed) |
+
+The decisive points: the credential inputs stay **0600 `root:root`** (not
+widened), and the rendered dir is mounted **read-write** so the Agent can write
+the Rendered_Secret_File into it. Because the sidecar runs as root (§1), the
+0600 inputs are readable and the RSF is written **with no manual `chown` /
+permission step** — which is exactly what Requirement 1.6's smoke asserts in
+practice.
+
+### 3. The `env_file`-must-exist-before-first-render chicken-and-egg
+
+The Agent renders the Rendered_Secret_File only *after* it auto-auths, so the RSF
+**does not exist at `up`-time**. A hard/required `env_file` reference would make
+Compose abort at its eager up-front existence check **before** it ever honours
+`depends_on: service_healthy`, defeating the swap-gate. The role resolves this
+with two cooperating mechanisms (the `openbao_agent_workload_service_wiring`
+`set_fact` in [`tasks/main.yml`](./tasks/main.yml)):
+
+- the RSF is layered as a **long-form `extra_env_files` entry with
+  `required: false`** (Compose v2.24+), which suppresses *only* the up-front
+  existence check; and
+- the **`service_healthy` swap-gate** (`depends_on … openbao-agent:
+  { condition: service_healthy }` on the Agent's `test -s <RSF>` RSF-presence
+  healthcheck) still blocks the workload from starting until the non-empty RSF
+  exists.
+
+Fail-closed is therefore preserved: `required: false` removes the *premature*
+failure, not the gate. A custom Compose wiring that references the RSF as a
+**required** `env_file` would reintroduce the eager-existence-check failure — use
+the long-form `required: false` + the `service_healthy` gate instead. For how a
+consuming workload layers the RSF, see
+[`WORKLOAD-CONSUMPTION-CONTRACT.md`](./WORKLOAD-CONSUMPTION-CONTRACT.md).
+
+### 4. Secrets referenced by path/role only
+
+Everything above names secret-bearing files by **path and role only**; no secret
+**value** appears in this document, in `agent.hcl`, or in any task output
+(`no_log` is preserved — `openbao_no_log` defaults closed). The `role_id` /
+`secret_id` values arrive at runtime over the sanctioned first-secret channel and
+the rendered secrets arrive at container start (OpenBao → the Agent); only file
+paths and KV references ever appear in the rendered artifacts.
+
+### 5. Optional cred-staging enhancement (NOT NOW)
+
+A future increment *could* have the control-plane
+[`openbao_workload_approle`](../openbao_workload_approle/README.md) role stage the
+`role_id`/`secret_id` files with an **agent-friendly owner/mode** (e.g. a
+dedicated non-root service UID) so the sidecar need not run as root. This is an
+**optional enhancement recorded for a later increment — not implemented here**.
+It is explicitly unnecessary today: the root posture (§1) already makes the 0600
+`root:root` files readable without widening them, so the runtime contract is
+satisfied by **this documentation plus the role's existing behaviour**, with no
+code change required.
+
+> **Dev issuer reachability (§D) — see the consumer journey.** A workload whose
+> server side validates ZITADEL tokens also needs to *reach and trust* the issuer
+> from inside its container in dev. That dev-only recipe (a Compose `extra_hosts`
+> alias to the Traefik ingress + the self-signed posture) lives in the
+> [SSO consumption: dev issuer-reachability recipe (§D)](../../../docs/CONSUMER-JOURNEY.md#sso-consumption-dev-issuer-reachability-recipe-d)
+> section of the consumer journey runbook; it is a distinct concern from the
+> agent runtime contract above.
+
 ## Role layout
 
 ```

@@ -149,6 +149,17 @@ _LEAF_EXEMPT = {
     # the armed from-scratch path. Provision has no cluster-identity/guard context
     # distinct from preflight, so it is exempt here (mirrors svc07/09_provision).
     "ansible/roles/obs_provision/tasks/main.yml",
+    # consumer_provision is the consumer-onboarding Phase-2 APPLY mechanism. As of
+    # the consumer-last-mile-hello-workload feature it runs a DIRECT per-project
+    # workload `terraform apply` (§B) in addition to composing the child
+    # svc-01-bootstrap, so its `terraform apply` marker makes it look like a
+    # destructive-live orchestrator. It is guarded UPSTREAM exactly like
+    # svc01_provision: in ansible/playbooks/project-consumer-bootstrap.yml the
+    # consumer_preflight role (Phase 1) runs BEFORE consumer_provision (Phase 2) in
+    # the SAME play and carries the gated throwaway-guard consult (--service
+    # consumer) for the armed path. Provision has no cluster-identity/guard context
+    # distinct from preflight, so it is exempt here (mirrors svc07/01_provision).
+    "ansible/roles/consumer_provision/tasks/main.yml",
 }
 
 # --------------------------------------------------------------------------- #
@@ -206,6 +217,13 @@ _PLAYBOOK_LEAF_EXEMPT = {
     # (the reset branch), BOTH of which the role scan already flags/checks. Exempt
     # for the same reason as svc-07/09-bootstrap.yml.
     "ansible/playbooks/svc-17-18-bootstrap.yml",
+    # project-consumer-bootstrap.yml drives its mutations via import_role
+    # (consumer_provision's per-project workload `terraform apply` + its composed
+    # svc-01-bootstrap child, consumer_clean_slate's child teardowns); its guard
+    # consult is NOT in the playbook — it is carried by consumer_preflight (Phase 1,
+    # which runs before any Phase-2 mutation in the same play) and composed-child
+    # guards, so the playbook is exempt for the same reason as svc-07/01-bootstrap.yml.
+    "ansible/playbooks/project-consumer-bootstrap.yml",
 }
 
 

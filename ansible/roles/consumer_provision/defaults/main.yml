@@ -25,3 +25,49 @@ consumer_generated_inventory: "ansible/inventory/{{ project_slug }}-consumer.gen
 # The per-project DB guest VMID. Supplied explicitly so instances get stable,
 # non-colliding IDs; a real per-project copy overrides via -e consumer_svc01_vmid=.
 consumer_svc01_vmid: 1101
+
+# --- Optional workload guest (consumer-last-mile-hello-workload §B, task 3.1) --
+#
+# The per-project Workload_Consumer_Root (infra/projects/<slug>/workload/, ADR-
+# 0021 + task 2.2). Threaded the SAME way the DB is driven: a count-gated
+# `terraform apply` against this root, with the Proxmox endpoint/token carried
+# via TF_VAR_* env (never argv; no_log), the GitLab-vs-local backend selected by
+# the same swap-gate the SVC-01 apply uses, and the inventory regenerated from
+# the root's `inventory_hosts` output. The whole block is a STRICT NO-OP unless
+# the manifest declares `workload.enabled: true` (Req 2.3).
+consumer_workload_tf_root: "{{ consumer_repo_root }}/infra/projects/{{ project_slug }}/workload"
+
+# Per-instance GitLab state name for the workload root — `<slug>-workload`,
+# DISTINCT from `<slug>-infra`, `<slug>-db`, and every service state
+# (one-state-per-service, integration-boundaries §5; workload/versions.tf).
+consumer_workload_state_name: "{{ project_slug }}-workload"
+
+# The workload root's own generated inventory (file-mediated handoff,
+# integration-boundaries §4). Regenerated from the workload root's
+# `inventory_hosts` output so the workload guest appears ONLY when enabled
+# (the output is an empty list while the guest is disabled).
+consumer_workload_generated_inventory: "ansible/inventory/{{ project_slug }}-workload.generated.yml"
+
+# The per-project workload guest VMID. Supplied explicitly so instances get
+# stable, non-colliding IDs; a real per-project copy overrides via
+# -e consumer_workload_vmid=. Distinct from the DB guest's VMID.
+consumer_workload_vmid: 1102
+
+# Datastore auto-detect sentinel emitted by cluster_env.py when PROXMOX_DATASTORE_ID
+# is absent. When the resolved datastore is this sentinel (or empty) we DO NOT
+# pass workload_datastore_id, letting the workload root fall back to its own
+# default (local-zfs). Mirrors svc01_autodetect_sentinel.
+consumer_autodetect_sentinel: "__AUTODETECT__"
+
+# Environment passed to the workload root's terraform init/apply. Proxmox
+# endpoint/token via TF_VAR_* (never argv); insecure derived from the homelab
+# self-signed tolerance. Evaluated LAZILY against the consumer_tfvars fact
+# resolved in Phase 1; every consumer sets no_log:true. NO secret literal here.
+consumer_workload_tf_env:
+  TF_VAR_proxmox_endpoint: >-
+    {{ (consumer_tfvars['TF_VAR_proxmox_endpoint'] | default('')) | trim
+       | regex_replace('/+$', '')
+       | regex_replace('/api2/json$', '')
+       | regex_replace('/+$', '') }}
+  TF_VAR_proxmox_api_token: "{{ consumer_tfvars['TF_VAR_proxmox_api_token'] | default('') }}"
+  TF_VAR_proxmox_insecure: "{{ (not (consumer_validate_certs | default(false) | bool)) | lower }}"

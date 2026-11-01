@@ -400,19 +400,29 @@ def test_preservation_agent_hcl_golden_byte_unchanged():
 def test_preservation_consumer_manifest_allowlist_unchanged():
     """Preservation (Validates: Req 3.4).
 
-    ``consumer_manifest.py`` still enforces the top-level allowlist
-    ``{slug, database, sso, secrets}`` — no new mandatory top-level key is added by
-    the fix (the bridge subpath/field come from role defaults, not the manifest).
+    ``consumer_manifest.py`` enforces the top-level allowlist — no new *mandatory*
+    top-level key is added by the bridge fix (the bridge subpath/field come from
+    role defaults, not the manifest).
+
+    The allowlist was later grown by the optional ``workload`` block
+    (consumer-last-mile-hello-workload feature; additive and backward compatible),
+    so the expected tuples include ``workload``. The bridge fix itself still adds
+    no manifest key — the assertion below is updated only to track the shared
+    ``consumer_manifest`` symbol's current value, not to introduce a bridge key.
     """
     # Import the validator from scripts/installer (conftest puts it on sys.path).
     import consumer_manifest as cm
 
-    assert cm.CONSUMABLE_SERVICE_KEYS == ("database", "sso", "secrets"), (
-        "The consumable service keys must remain (database, sso, secrets)."
+    assert cm.CONSUMABLE_SERVICE_KEYS == ("database", "sso", "secrets", "workload"), (
+        "The consumable service keys must be (database, sso, secrets, workload)."
     )
-    assert cm._ALLOWED_TOP_LEVEL_KEYS == ("slug", "database", "sso", "secrets"), (
-        "The top-level allowlist must remain {slug, database, sso, secrets}."
-    )
+    assert cm._ALLOWED_TOP_LEVEL_KEYS == (
+        "slug",
+        "database",
+        "sso",
+        "secrets",
+        "workload",
+    ), "The top-level allowlist must be {slug, database, sso, secrets, workload}."
     # An unknown top-level key is still rejected naming the offender.
     with pytest.raises(cm.ManifestValidationError):
         cm.validate_manifest({"slug": "demo", "bridge": {"subpath": "db"}})

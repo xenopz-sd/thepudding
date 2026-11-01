@@ -76,7 +76,11 @@ _INSTALLER_SCRIPTS_DIR = _INFRA_DIR.parent / "scripts" / "installer"
 if str(_INSTALLER_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_INSTALLER_SCRIPTS_DIR))
 
-from netfoundation import peer_host_indices  # noqa: E402  (after sys.path setup)
+from netfoundation import (  # noqa: E402  (after sys.path setup)
+    HostIndexCollisionError,
+    assert_unique_host_indices,
+    peer_host_indices,
+)
 from consumer_derivation import consumer_db_host_ip  # noqa: E402
 
 # --------------------------------------------------------------------------- #
@@ -95,25 +99,52 @@ _HOST_INDICES_YAML = _INFRA_DIR / "platform-foundation" / "host-indices.yaml"
 _PROJECTS_YAML = _INFRA_DIR / "platform-foundation" / "projects.yaml"
 
 
+def _ledger_entry_identity(entry: dict) -> str:
+    """Return a ledger entry's guest-identity code, enforcing exactly-one-of.
+
+    Per ADR-0021, every ledger row is keyed by EXACTLY ONE of ``svc_code`` (a
+    catalog guest, ``svcNN``) or ``role_code`` (a non-catalog guest, e.g.
+    ``workload``) — never both, never neither. This thin reader mirrors the
+    ``proxmox-compute`` module's two-way identity contract so a ``role_code``
+    row (the dronefleet workload guest) is a well-formed guest identity rather
+    than a row rejected for a missing ``svc_code``. The uniqueness guarantee
+    itself is unchanged — it is enforced downstream on ``host_index`` by the
+    pure ``netfoundation`` guards, which are identity-key-agnostic.
+
+    Raises:
+        ValueError: if an entry supplies both identity keys or neither (fail
+            closed, matching the module's Guard 5 exactly-one-of precondition).
+    """
+    has_svc = entry.get("svc_code") is not None
+    has_role = entry.get("role_code") is not None
+    if has_svc == has_role:
+        raise ValueError(
+            "host-indices.yaml entry must carry EXACTLY ONE of 'svc_code' or "
+            f"'role_code' (ADR-0021 exactly-one-of); got entry={entry!r}"
+        )
+    return entry["svc_code"] if has_svc else entry["role_code"]
+
+
 def _load_read_view_ledger() -> dict:
     """Load host-indices.yaml into the READ-VIEW shape the shared
     ``netfoundation.peer_host_indices`` consumes.
 
-    The committed ledger keys each entry by ``svc_code`` (+ optional
-    ``component`` / ``instance``); the thin reader layer derives a stable
-    ``guest_key`` from ``svc_code[-component]`` (mirroring
-    ``_vlan20_read_view_ledger`` in the derivation-layer tests). This keeps the
-    Python side a genuine REUSE of the shared peer-set symbol rather than a
-    forked re-implementation.
+    The committed ledger keys each entry by ONE of ``svc_code`` / ``role_code``
+    (+ optional ``component`` / ``instance``); the thin reader layer derives a
+    stable ``guest_key`` from ``<identity>[-component]`` (mirroring
+    ``_vlan20_read_view_ledger`` in the derivation-layer tests, extended for the
+    ADR-0021 non-catalog ``role_code`` identity). This keeps the Python side a
+    genuine REUSE of the shared peer-set symbol rather than a forked
+    re-implementation.
     """
     raw = yaml.safe_load(_HOST_INDICES_YAML.read_text(encoding="utf-8"))
     view: dict[int, list[dict]] = {}
     for vlan_key, entries in raw.items():
         rows = []
         for e in entries:
-            guest_key = e["svc_code"]
+            guest_key = _ledger_entry_identity(e)
             if e.get("component"):
-                guest_key = f"{e['svc_code']}-{e['component']}"
+                guest_key = f"{guest_key}-{e['component']}"
             rows.append({"guest_key": guest_key, "host_index": e["host_index"]})
         view[int(vlan_key)] = rows
     return view
@@ -134,10 +165,12 @@ def _python_expected_hostname() -> str:
 
 def _python_expected_peer_set() -> list[int]:
     """Python side of the peer-set VERDICT: every OTHER host index on VLAN 100,
-    excluding this svc01 guest's own. On a single-guest VLAN this is empty, so the
-    proxmox-compute Guard 4 (``!contains(peer, self)``) is a strict no-op."""
+    excluding this svc01 DB guest's own. VLAN 100 now also carries the
+    non-catalog consumer workload guest (role_code ``workload``, host_index 1 —
+    ADR-0021), so this set is ``[1]`` and the proxmox-compute Guard 4 engages."""
     ledger = _load_read_view_ledger()
-    # The single-SVC-01 project-VLAN guest's read-view key is its svc_code.
+    # The SVC-01 DB guest's read-view key is its svc_code; the workload guest
+    # (role_code) is its peer.
     return peer_host_indices(ledger, _VLAN_ID, "svc01")
 
 
@@ -314,12 +347,20 @@ class TestConsumerDbProjectVlanCrossCheck:
         assert hcl_peers == python_peers, (
             f"HCL peer_host_indices verdict {hcl_peers} must equal the Python "
             f"ledger-derived peer set {python_peers} for svc01 on VLAN {_VLAN_ID}. "
-            "On this single-guest project VLAN both must be empty (Guard 4 no-op)."
+            "The HCL ledger derivation and the Python derivation must never drift "
+            "(ADR-0015 cross-check)."
         )
-        # And on a single-guest VLAN 100 that verdict is specifically empty.
-        assert hcl_peers == [], (
-            "single-guest project VLAN 100 must derive an EMPTY peer set so the "
-            f"proxmox-compute Guard 4 is a strict no-op; got {hcl_peers}"
+        # VLAN 100 now carries TWO occupants: the stateful DB guest (svc01,
+        # host_index 0) and the non-catalog consumer workload guest (role_code
+        # workload, host_index 1 — consumer-last-mile-hello-workload §B, ADR-0021).
+        # So the DB guest's peer set is the workload guest's index, and the
+        # proxmox-compute Guard 4 (`!contains(peer, self)`) now ENGAGES (it is no
+        # longer the single-guest no-op) — exactly as the ledger's VLAN-100 header
+        # documents. A within-VLAN host-index collision between the two roots is a
+        # hard plan-time failure rather than a silent live clash.
+        assert hcl_peers == [1], (
+            "VLAN 100 has two occupants (svc01 DB at index 0 + the workload guest "
+            f"at index 1), so the DB guest's peer set must be [1]; got {hcl_peers}"
         )
 
     def test_hcl_resolved_vlan_and_index_from_committed_sources(self, input_guard):
@@ -334,3 +375,88 @@ class TestConsumerDbProjectVlanCrossCheck:
             f"HCL must read host_index={_HOST_INDEX} from host-indices.yaml for svc01 on "
             f"VLAN {_VLAN_ID} (Req 3.8); plan recorded {input_guard.get('host_index')}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0021 — the ledger reader accepts a non-catalog `role_code` identity
+# alongside the catalog `svc_code`, enforcing EXACTLY ONE of the two. These are
+# OFFLINE (ungated) tests: they exercise the thin reader (`_ledger_entry_
+# identity` / `_load_read_view_ledger`) over the committed ledger and over
+# synthetic rows — no terraform binary, no provider, no network.
+# --------------------------------------------------------------------------- #
+class TestLedgerRoleCodeIdentity:
+    """The ledger reader honors the ADR-0021 two-way guest identity."""
+
+    def test_committed_workload_row_keys_on_role_code(self):
+        """The dronefleet VLAN-100 workload guest resolves to guest_key 'workload'.
+
+        After the ADR-0021 follow-up the committed row is keyed on
+        ``role_code: workload`` (not ``svc_code``); the reader must still admit
+        it as a well-formed guest identity with guest_key ``workload`` (ADR-0021).
+        """
+        view = _load_read_view_ledger()
+        assert _VLAN_ID in view, "VLAN 100 must be present in the committed ledger"
+        keys = {row["guest_key"] for row in view[_VLAN_ID]}
+        assert "workload" in keys, (
+            "the role_code: workload guest must load with guest_key 'workload' "
+            f"(ADR-0021); VLAN-100 keys were {sorted(keys)}"
+        )
+        # The catalog DB guest on the same VLAN still keys on its svc_code.
+        assert "svc01" in keys, "the catalog svc01 DB guest must still load"
+
+    def test_committed_ledger_fully_parses_under_exactly_one_of(self):
+        """Every committed ledger row satisfies the exactly-one-of identity rule.
+
+        Loading the whole committed ledger must not raise — proving no existing
+        row carries both identity keys or neither after the re-key.
+        """
+        view = _load_read_view_ledger()
+        # Sanity: every row carries a non-empty guest_key and an int host_index.
+        for vlan_id, rows in view.items():
+            for row in rows:
+                assert row["guest_key"], f"empty guest_key on VLAN {vlan_id}: {row!r}"
+                assert isinstance(row["host_index"], int)
+
+    def test_role_code_row_accepted_as_identity(self):
+        """A standalone ``role_code`` row is a valid identity (guest_key = role)."""
+        assert _ledger_entry_identity(
+            {"role_code": "workload", "host_index": 1}
+        ) == "workload"
+
+    def test_svc_code_row_still_accepted_as_identity(self):
+        """A catalog ``svc_code`` row is unchanged (guest_key = svc code)."""
+        assert _ledger_entry_identity(
+            {"svc_code": "svc07", "host_index": 0}
+        ) == "svc07"
+
+    def test_both_identity_keys_rejected(self):
+        """A row carrying BOTH svc_code and role_code is rejected (exactly-one-of)."""
+        with pytest.raises(ValueError) as excinfo:
+            _ledger_entry_identity(
+                {"svc_code": "svc07", "role_code": "workload", "host_index": 0}
+            )
+        assert "exactly-one-of" in str(excinfo.value).lower() or "exactly one" in str(
+            excinfo.value
+        ).lower()
+
+    def test_neither_identity_key_rejected(self):
+        """A row carrying NEITHER identity key is rejected (exactly-one-of)."""
+        with pytest.raises(ValueError):
+            _ledger_entry_identity({"instance": 1, "host_index": 1})
+
+    def test_uniqueness_still_enforced_over_mixed_identity_rows(self):
+        """host_index uniqueness is unchanged for a mixed svc_code/role_code VLAN.
+
+        The pure guard operates on host_index via guest_key and is
+        identity-key-agnostic, so a collision between a catalog guest and a
+        role-code guest on the same VLAN is still rejected, VLAN named.
+        """
+        view = _load_read_view_ledger()
+        # The real VLAN-100 set (svc01 -> 0, workload -> 1) is distinct and passes.
+        indices = [row["host_index"] for row in view[_VLAN_ID]]
+        assert assert_unique_host_indices(_VLAN_ID, indices) is None
+        # Force the workload guest onto the DB guest's index -> rejected.
+        colliding = [0 if i == 1 else i for i in indices]
+        with pytest.raises(HostIndexCollisionError) as excinfo:
+            assert_unique_host_indices(_VLAN_ID, colliding)
+        assert str(_VLAN_ID) in str(excinfo.value)

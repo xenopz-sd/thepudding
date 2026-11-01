@@ -29,10 +29,11 @@ The manifest may declare exactly these top-level service blocks, and no others:
 | `database` | SVC-01 (per-project PostgreSQL/MariaDB) | [`database`](#database-block-svc-01) |
 | `sso` | SVC-06 (ZITADEL org + app registrations) | [`sso`](#sso-block-svc-06) |
 | `secrets` | SVC-07 (OpenBao policy/path + workload AppRole) | [`secrets`](#secrets-block-svc-07) |
+| `workload` | the per-project **workload guest** (an LXC on the project VLAN to run the app) | [`workload`](#workload-block) |
 
 Any other top-level service key — or a **duplicate** of one of these — is
 rejected at preflight, naming the offending entry (Req 1.7). The only permitted
-top-level keys are `slug`, `database`, `sso`, and `secrets`.
+top-level keys are `slug`, `database`, `sso`, `secrets`, and `workload`.
 
 ---
 
@@ -56,7 +57,10 @@ top-level keys are `slug`, `database`, `sso`, and `secrets`.
 | `secrets.workload_token_max_ttl` | integer > 0 | 1.4 | |
 | `secrets.secret_id_ttl` | integer > 0 | 1.4 | |
 | `secrets.secret_id_num_uses` | integer ≥ 0 | 1.4 | `0` = unlimited uses within the TTL |
-| *(top-level key)* | one of `slug` / `database` / `sso` / `secrets` | 1.7 | unknown/duplicate key → reject naming it |
+| `workload.enabled` | bool | 2.1 | default `false`; `false`/absent = no workload guest |
+| `workload.tier` | enum `small` \| `medium` | 2.1 | default `small` (reuses the `database` sizing bands) |
+| `workload.count` | integer ≥ 1 | 2.1 | default `1`; `>1` reserved for a later increment |
+| *(top-level key)* | one of `slug` / `database` / `sso` / `secrets` / `workload` | 1.7 | unknown/duplicate key → reject naming it |
 
 ### `app_type` / `auth_method` combinations
 
@@ -68,6 +72,41 @@ spec. The typical valid combinations:
 | `public-spa` | `none` | Browser single-page app (PKCE, no client secret) |
 | `confidential-web` | `basic` | Server-rendered web app with a client secret |
 | `api` | `jwt-profile` | Machine/API client authenticating with a JWT profile |
+
+### `workload` block
+
+The optional `workload` block provisions a **workload guest** — an LXC on the
+project's own VLAN (100+), within the project's existing per-project Terraform
+root/state — to run the application's Compose stack (the agent sidecar + the app
+container). It answers "where does my app run?" with a documented, provisioned
+guest instead of defaulting to the database guest. Its three fields are all
+optional with documented defaults (Req 2.1):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | `true` provisions the guest; `false`/absent provisions **nothing** |
+| `tier` | `small` | sizing band `small` \| `medium` (reuses the `database` tiers verbatim) |
+| `count` | `1` | number of workload guests; `>1` is schema-accepted but **reserved for a later increment** (a single guest is the validated path) |
+
+**Strict no-op when absent or disabled (Req 2.3).** A manifest with no `workload`
+block — or `workload.enabled: false` — provisions no workload guest and behaves
+exactly as before this block existed. The gate is a strict no-op; adding the
+block is additive and backward compatible.
+
+**Derived, never hand-chosen addressing.** When enabled, the guest is placed on
+the project VLAN with its `host_index` read from the per-VLAN host-index ledger
+([`infra/platform-foundation/host-indices.yaml`](../infra/platform-foundation/host-indices.yaml),
+ADR-0015) and its IP computed via the NET-00 formula
+`cidrhost("10.0.<vlan_id>.0/24", 10 + host_index)` — never typed by hand. Its
+hostname follows the ADR-0021 **non-catalog role-code** form
+`workload-<vlan_id>-<instance>` (e.g. `workload-100-01`) and its `tags` attribute
+is `proj-<slug>-workload`. A workload guest is deliberately **not** a catalog
+`SVC-NN` slot: the `proxmox-compute` module identifies it by the stable role code
+`workload` rather than overloading `svc_code` (ADR-0021).
+
+For the supported topologies (dedicated guest vs. co-locate on the DB guest vs.
+bring-your-own host) and the end-to-end last-mile walkthrough, see the
+[Consumer Journey Runbook](CONSUMER-JOURNEY.md#the-last-mile--where-your-workload-runs-b).
 
 ---
 
@@ -101,6 +140,11 @@ secrets:                            # OPTIONAL — SVC-07 (Req 1.4)
   workload_token_max_ttl: 14400     # workload AppRole token_max_ttl (seconds)
   secret_id_ttl: 86400              # Secret_ID usage TTL (seconds)
   secret_id_num_uses: 0             # 0 = unlimited uses within TTL
+
+workload:                           # OPTIONAL — per-project workload guest (Req 2.1)
+  enabled: true                     # false/absent (default) => no guest, strict no-op
+  tier: small                       # small (default) | medium
+  count: 1                          # >=1 (default 1); >1 reserved for a later increment
 ```
 
 ---

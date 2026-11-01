@@ -13,6 +13,7 @@
 #   | vlan_id == 10 requested for a guest      | reject: management-VLAN placement | 1.7 |
 #   | hostname not unique within its VLAN      | reject: within-VLAN collision     | 3.6 |
 #   | host index pushes IP past .254           | surface host-IP exhaustion        | 2.6 |
+#   | not exactly one of svc_code / role_code  | reject: ambiguous/absent identity | ADR-0021 |
 #
 # Formatting note: terraform is not installed in this environment, so
 # `terraform fmt`/`validate` could not be run here. This file is hand-formatted
@@ -35,11 +36,13 @@
 # without ever touching Proxmox — satisfying "reject/​surface BEFORE any
 # resource is created" (Req 1.7, 2.6, 3.6).
 #
-# Pure-input range checks that DON'T need computed values stay as `validation`
-# blocks in variables.tf (e.g. host_index >= 0, instance in 01..99, svc_code
-# shape). This file holds only the computed-value / cross-value guards, per the
-# task's "preconditions for computed-value checks, validation for pure input
-# ranges" split.
+# Pure-input range/shape checks that DON'T need computed values or another
+# variable stay as `validation` blocks in variables.tf (e.g. host_index >= 0,
+# instance in 01..99, svc_code shape when set, role_code shape when set). This
+# file holds only the computed-value / cross-value guards, per the task's
+# "preconditions for computed-value checks, validation for pure input ranges"
+# split — including the ADR-0021 exactly-one-of-identity XOR (Guard 5), which is
+# a CROSS-variable check and so cannot live in a single variable's validation.
 
 resource "terraform_data" "input_guards" {
   # Nothing to manage — this anchor exists solely to host the preconditions
@@ -52,6 +55,8 @@ resource "terraform_data" "input_guards" {
     hostname          = local.hostname
     last_octet        = 10 + var.host_index
     peer_host_indices = var.peer_host_indices
+    svc_code          = var.svc_code
+    role_code         = var.role_code
   }
 
   lifecycle {
@@ -112,9 +117,38 @@ resource "terraform_data" "input_guards" {
     # a `!contains(var.peer_hostnames, local.hostname)` condition — the guard
     # structure is intentionally shaped to receive that list.
     # ---------------------------------------------------------------------
+    #
+    # ADR-0021 — the identity segment is EITHER a catalog `svc_code` (`svcNN`)
+    # OR a non-catalog `role_code` (a lowercase role name, e.g. `workload`), so
+    # the well-formedness regex accepts BOTH forms as the leading segment. The
+    # intent is unchanged (structural well-formedness; cross-instance
+    # set-uniqueness still lives at the calling layer + the Python
+    # assert_unique_hostnames guard). An exactly-one-of-identity guard (Guard 5)
+    # separately guarantees the leading segment came from exactly one of the two
+    # inputs.
+    # ---------------------------------------------------------------------
     precondition {
-      condition     = can(regex("^svc[0-9]{2}(-[a-z0-9]([a-z0-9-]*[a-z0-9])?)?-${var.vlan_id}-[0-9]{2}$", local.hostname))
-      error_message = "Requirement 3.6 (within-VLAN hostname collision): computed hostname '${local.hostname}' is not a well-formed '<svc-code>[-<component>]-${var.vlan_id}-<instance>' name carrying the -<vlan_id>-<instance> discriminator that keeps hosts distinct within VLAN ${var.vlan_id}. NOTE: full cross-instance set-uniqueness within the VLAN is enforced at the calling layer (project-root fan-out) and by the Python assert_unique_hostnames guard, since a single module instance sees only its own hostname."
+      condition     = can(regex("^(svc[0-9]{2}|[a-z][a-z0-9]*)(-[a-z0-9]([a-z0-9-]*[a-z0-9])?)?-${var.vlan_id}-[0-9]{2}$", local.hostname))
+      error_message = "Requirement 3.6 (within-VLAN hostname collision): computed hostname '${local.hostname}' is not a well-formed '<identity>[-<component>]-${var.vlan_id}-<instance>' name — where <identity> is a catalog svc_code ('svcNN') or a non-catalog role_code (a lowercase role name, e.g. 'workload'; ADR-0021) — carrying the -<vlan_id>-<instance> discriminator that keeps hosts distinct within VLAN ${var.vlan_id}. NOTE: full cross-instance set-uniqueness within the VLAN is enforced at the calling layer (project-root fan-out) and by the Python assert_unique_hostnames guard, since a single module instance sees only its own hostname."
+    }
+
+    # ---------------------------------------------------------------------
+    # Guard 5 — Exactly-one-of guest identity (ADR-0021).
+    #
+    # A guest is identified by EXACTLY ONE of a catalog `svc_code` (`svcNN`) OR
+    # a non-catalog `role_code` (a role name such as `workload`) — never both,
+    # never neither. The shapes of each (when supplied) are validated in their
+    # own variable `validation` blocks; this cross-variable XOR check cannot
+    # live in a variable `validation` block (those cannot reference another
+    # variable), so it is a plan-time precondition here, failing closed before
+    # any Proxmox resource is created and naming the offending combination.
+    # `locals.identity_code = coalesce(svc_code, role_code)` relies on this: it
+    # would error on (null, null) and silently ignore role_code on (set, set),
+    # so this guard is what makes the coalesce well-defined.
+    # ---------------------------------------------------------------------
+    precondition {
+      condition     = (var.svc_code == null) != (var.role_code == null)
+      error_message = "ADR-0021 (exactly-one-of guest identity): a guest must supply EXACTLY ONE of svc_code (a catalog 'svcNN' slot) or role_code (a non-catalog role name, e.g. 'workload') — not both, not neither. Got svc_code=${var.svc_code == null ? "<null>" : var.svc_code}, role_code=${var.role_code == null ? "<null>" : var.role_code}. A catalog service sets svc_code; a non-catalog role-named guest (e.g. a consumer workload) sets role_code."
     }
 
     # ---------------------------------------------------------------------

@@ -30,6 +30,7 @@ from netfoundation.derivation import (
     proxmox_tag,
     reject_ip_literal,
     reject_management_vlan,
+    role_hostname,
     subnet_cidr,
 )
 from netfoundation.registry_views import (
@@ -64,5 +65,6 @@ __all__ = [
     "proxmox_tag",
     "reject_ip_literal",
     "reject_management_vlan",
+    "role_hostname",
     "subnet_cidr",
 ]

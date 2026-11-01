@@ -1,0 +1,40 @@
+---
+# meta/main.yml — hello_workload
+galaxy_info:
+  role_name: hello_workload
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    The REFERENCE "hello-workload" for the consumer-last-mile-hello-workload
+    feature (§A, Req 1.1/1.2) — a trivial HTTP server on a STOCK busybox image
+    whose /healthz returns 200 ONLY when the agent-rendered DATABASE_URL is
+    present/non-empty (503 otherwise), making the OpenBao swap-gate observable at
+    the workload layer. This role carries NO stand-up logic of its own: it is the
+    discoverable variable set + entrypoint artifact that the existing
+    openbao-agent role (task 4.2) stands up via docker-compose-app. Image choice
+    is stock image + tiny mounted entrypoint (files/healthz-entrypoint.sh), NOT a
+    bespoke-built image — busybox ships httpd + a POSIX shell, so "200 iff
+    DATABASE_URL present" needs no Dockerfile and no SVC-14 build, and stays
+    EU-sourcing-clean. The entrypoint reads DATABASE_URL from the environment
+    only (via the Rendered_Secret_File at container start) and NEVER logs, echoes,
+    or writes the secret value — only its boolean presence.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - reference
+    - workload
+    - healthcheck
+    - swapgate
+    - consumer
+
+# No hard meta dependency: the reference workload is stood up by the openbao-agent
+# role (task 4.2) composing this role's variable set, with the ordering expressed
+# in the consumer/smoke playbook, not as a meta dependency here.
+dependencies: []

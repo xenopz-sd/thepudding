@@ -1,0 +1,42 @@
+---
+# meta/main.yml — hello_workload_deploy
+galaxy_info:
+  role_name: hello_workload_deploy
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    The thin COMPOSITION role that STANDS UP the reference "hello-workload"
+    (consumer-last-mile-hello-workload §A, task 4.2) via the EXISTING
+    `openbao-agent` role — no new agent/auth wiring. It stages the task-4.1
+    `hello_workload` reference entrypoint onto the target host and includes
+    `openbao-agent`, threading the `hello_workload_*` reference var set
+    (the default DB secret mapping {db, database_url, DATABASE_URL}, the mounted
+    entrypoint, command, non-secret env, and /healthz healthcheck) into that
+    role's existing optional, additive inputs. The Agent sidecar, AppRole
+    auto_auth, Rendered_Secret_File, and the depends_on service_healthy swap-gate
+    all come from `openbao-agent` UNCHANGED. Placement is target-aware: the
+    provisioned workload guest (service_role `workload`) when enabled, else the
+    documented co-locate target. No secret value appears anywhere; DATABASE_URL
+    is read only from the Agent-rendered Rendered_Secret_File at container start.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - reference
+    - workload
+    - consumer
+    - openbao
+
+# Depend on the task-4.1 `hello_workload` artifact role so its reference var set
+# (defaults/main.yml: hello_workload_image/_command/_env/_healthcheck/
+# _secret_mappings/_entrypoint_container_path) is in scope when this role runs.
+# `hello_workload` carries NO tasks of its own, so this dependency contributes
+# only its defaults (no stand-up logic is pulled in).
+dependencies:
+  - role: hello_workload

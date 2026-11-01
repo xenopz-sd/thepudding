@@ -1,0 +1,112 @@
+---
+# tasks/main.yml — hello_workload_deploy
+# (consumer-last-mile-hello-workload §A, task 4.2)
+#
+# STAND UP the reference "hello-workload" via the EXISTING `openbao-agent` role —
+# COMPOSITION, not new agent wiring. Two steps:
+#   STEP 1 — stage the task-4.1 reference entrypoint (files/healthz-entrypoint.sh
+#            from the `hello_workload` role) onto the TARGET host, read-only.
+#   STEP 2 — include `openbao-agent`, threading the `hello_workload_*` reference
+#            var set into that role's EXISTING inputs (its optional, additive
+#            workload-service pass-throughs + the default DB secret mapping).
+#
+# The Agent sidecar, AppRole auto_auth, Rendered_Secret_File, and the
+# `depends_on … service_healthy` swap-gate come from `openbao-agent` UNCHANGED —
+# this role adds NO credential/auth logic. The workload reads DATABASE_URL ONLY
+# from the Agent-rendered Rendered_Secret_File at container start (the v0.11.3
+# {db, database_url, DATABASE_URL} bridge), never a committed/templated value.
+# No secret value appears here; the composed role's `no_log` covers the
+# secret-bearing tasks.
+
+# ============================================================================
+# STEP 0 — Guard: a project slug is required (openbao-agent asserts it too)
+# ============================================================================
+- name: "Hello-workload | Assert project_slug is supplied"
+  ansible.builtin.assert:
+    that:
+      - project_slug is defined
+      - project_slug | string | length > 0
+    fail_msg: >-
+      project_slug is required to stand up the reference hello-workload — it
+      selects the KV subtree (secret/data/<slug>/db) the Agent renders
+      DATABASE_URL from. Supply it as an extra-var or play var.
+    success_msg: "Standing up the reference hello-workload for project '{{ project_slug }}'."
+    quiet: true
+
+# ============================================================================
+# STEP 1 — Stage the reference entrypoint onto the target host (service-owned)
+# ============================================================================
+# The reference image is STOCK (busybox); the /healthz-iff-secret behaviour is
+# delivered by MOUNTING this entrypoint read-only into the container (NOT a
+# bespoke image). Stage it under the project's workload stack dir so the mount
+# source is stable and service-owned. Non-secret artifact (the script logs only
+# the boolean presence of DATABASE_URL, never its value — task 4.1).
+- name: "Hello-workload | Ensure the entrypoint stage dir exists (service-owned)"
+  ansible.builtin.file:
+    path: "{{ hello_workload_entrypoint_host_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: "Hello-workload | Stage the reference /healthz entrypoint (read-only mount source)"
+  ansible.builtin.copy:
+    src: "{{ hello_workload_entrypoint_src }}"
+    dest: "{{ hello_workload_entrypoint_host_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+# ============================================================================
+# STEP 2 — Stand up the Agent sidecar + reference workload via openbao-agent
+# ============================================================================
+# COMPOSE the EXISTING `openbao-agent` role (no new agent wiring). Thread the
+# task-4.1 `hello_workload_*` reference var set into its inputs:
+#   * openbao_agent_secret_mappings  <- hello_workload_secret_mappings
+#       the v0.11.3 default DB mapping {db, database_url, DATABASE_URL}, so the
+#       Agent renders DATABASE_URL into the Rendered_Secret_File (Req 1.2).
+#   * workload_image                 <- hello_workload_image  (stock busybox)
+#   * openbao_agent_workload_command <- hello_workload_command
+#       runs the MOUNTED entrypoint on the stock image.
+#   * openbao_agent_workload_volumes <- the read-only entrypoint mount
+#       (host staged path : hello_workload_entrypoint_container_path : ro).
+#   * openbao_agent_workload_environment <- hello_workload_env
+#       NON-secret config only (port/webroot/secret-env-name); NEVER the secret.
+#   * openbao_agent_workload_healthcheck <- hello_workload_healthcheck
+#       the workload-layer /healthz probe (healthy only once DATABASE_URL is
+#       present) — ON TOP OF the Agent sidecar's own RSF-presence healthcheck.
+# The RSF `extra_env_files` layering, the `depends_on … service_healthy`
+# swap-gate, the Traefik label, and the no-host-port posture are all provided by
+# `openbao-agent` UNCHANGED (its FIXED wiring) — not re-stated here (Req 1.1/1.6).
+- name: "Hello-workload | Stand up the reference workload via the existing openbao-agent role"
+  ansible.builtin.include_role:
+    name: openbao-agent
+  vars:
+    # The default DB mapping {db, database_url, DATABASE_URL} (Req 1.2). Only the
+    # KV reference + env key — no secret value.
+    openbao_agent_secret_mappings: "{{ hello_workload_secret_mappings }}"
+    # Stock reference image (task 4.1).
+    workload_image: "{{ hello_workload_image }}"
+    # Run the MOUNTED entrypoint on the stock image.
+    openbao_agent_workload_command: "{{ hello_workload_command }}"
+    # Mount the staged entrypoint read-only at the in-container path the command
+    # runs (host:container:ro). This is the only reason the workload needs a
+    # volume — a non-secret script, never a credential.
+    openbao_agent_workload_volumes:
+      - "{{ hello_workload_entrypoint_host_path }}:{{ hello_workload_entrypoint_container_path }}:ro"
+    # NON-secret per-container env (port/webroot/secret-env-NAME). The DB secret
+    # itself arrives via the Rendered_Secret_File, never here.
+    openbao_agent_workload_environment: "{{ hello_workload_env }}"
+    # The workload-layer /healthz healthcheck (Req 1.1) — distinct from, and on
+    # top of, the Agent sidecar's RSF-presence healthcheck + the swap-gate.
+    openbao_agent_workload_healthcheck: "{{ hello_workload_healthcheck }}"
+
+- name: "Hello-workload | INFO — reference workload stood up via openbao-agent (secret by name only)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: reference hello-workload stood up for '{{ project_slug }}' on target
+      '{{ hello_workload_target }}' via the EXISTING openbao-agent role
+      (image={{ hello_workload_image }}). DATABASE_URL is rendered by the Agent
+      into the Rendered_Secret_File and read at container start; /healthz returns
+      200 only once it is present (swap-gate observable at the workload layer).
+      No new agent wiring; no secret value shown.

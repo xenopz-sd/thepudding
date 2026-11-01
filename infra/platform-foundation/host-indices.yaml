@@ -45,10 +45,20 @@
 # Field schema:
 #   <vlan_id>   integer top-level key (e.g. 20). Each VLAN maps to a list of
 #               allocation entries.
-#   Each entry:
+#   Each entry is keyed by EXACTLY ONE guest-identity field — either svc_code
+#   (a catalog guest) OR role_code (a non-catalog guest), never both, never
+#   neither — mirroring the proxmox-compute module's two-way identity contract
+#   (ADR-0021):
 #     svc_code    string, the stable catalog service-slot code (e.g. "svc07").
 #                 Keyed on the SVC-NN slot, so a technology swap within a slot
-#                 never changes the key (NET-00 §4).
+#                 never changes the key (NET-00 §4). Present for a CATALOG guest;
+#                 mutually exclusive with role_code.
+#     role_code   string, a non-catalog guest's role name (e.g. "workload"),
+#                 lowercase and NOT a catalog "svcNN" form. Keyed on the stable
+#                 role (itself swap-stable) for a guest that occupies no catalog
+#                 slot — e.g. a per-project consumer workload guest. Present for
+#                 a NON-CATALOG guest; mutually exclusive with svc_code. See
+#                 ADR-0021 (proxmox-compute first-class non-catalog identity).
 #     component   string, optional — distinguishes multiple guests of one
 #                 service (e.g. "unsealer", "backing-db"). Omit for the
 #                 service's primary/sole guest.
@@ -148,11 +158,27 @@
 # VLAN 100 — project `dronefleet` (projects.yaml: slug dronefleet -> vlan_id
 # 100). The project's per-project SVC-01 consumer database (the FIRST real
 # per-project-VLAN SVC-01 consumer; SVC-01 previously ran only as the shared
-# ZITADEL backing DB on VLAN 20). The DB guest is the sole occupant of VLAN 100
-# today, so its peer set is empty (Guard 4 no-op).
+# ZITADEL backing DB on VLAN 20). VLAN 100 now has TWO independent occupants —
+# the stateful DB guest (index 0) and the stateless consumer workload guest
+# (index 1, consumer-last-mile-hello-workload §B) — so its peer set is no longer
+# empty and the proxmox-compute Guard 4 (peer_host_indices) precondition now
+# ENGAGES: a within-VLAN host-index collision between the two roots becomes a
+# hard plan-time failure instead of a silent live clash.
 100:
   - svc_code: svc01           # dronefleet per-project PostgreSQL database
     instance: 1
     host_index: 0             # -> 10.0.100.10
     anchor: true              # stateful DB (prevent_destroy); index never reassigned
+    status: allocated
+  # --- Consumer workload guest (consumer-last-mile-hello-workload §B). Runs the
+  #     project's application Compose stack (agent sidecar + workload container).
+  #     Keyed on role_code (the ADR-0021 non-catalog identity): a workload guest
+  #     occupies no catalog SVC-NN slot, so its identity is the stable role
+  #     "workload" — admitted alongside svc_code as EXACTLY-ONE-OF, mirroring the
+  #     proxmox-compute module contract (task 2.2 threads role_code = "workload"
+  #     into the module). NON-ANCHOR: stateless, torn down with the project (no
+  #     prevent_destroy); the DB guest above remains the sole anchor. ---
+  - role_code: workload       # dronefleet per-project application workload guest
+    instance: 1
+    host_index: 1             # -> 10.0.100.11
     status: allocated

@@ -9,8 +9,10 @@
 #
 # STATUS (task 7.2 done; 7.3 preconditions pending):
 #   - project_slug : REAL — echoes the input directly, final.
-#   - hostname     : REAL — `<svc-code>[-<component>]-<vlan_id>-<instance>`
-#                    (Req 3.1, 3.2), computed in locals.tf.
+#   - hostname     : REAL — `<identity>[-<component>]-<vlan_id>-<instance>`
+#                    (Req 3.1, 3.2), computed in locals.tf, where <identity> is
+#                    the catalog `svc_code` or the non-catalog `role_code`
+#                    (ADR-0021).
 #   - ipv4_address : REAL — cidrhost("10.0.<vlan_id>.0/24", 10 + host_index)
 #                    (Req 2.1, 2.3), computed in locals.tf.
 #   - ip_config    : REAL — cloud-init initialization.ip_config.ipv4 structure
@@ -26,7 +28,7 @@
 # collision, host-IP exhaustion) are task 7.3 and are not yet added.
 
 output "hostname" {
-  description = "Machine-facing hostname `<svc-code>[-<component>]-<vlan_id>-<instance>` (NET-00 §4, Req 3.1/3.2)."
+  description = "Machine-facing hostname `<identity>[-<component>]-<vlan_id>-<instance>` where <identity> is the catalog `svc_code` or the non-catalog `role_code` (NET-00 §4, Req 3.1/3.2, ADR-0021)."
   value       = local.hostname
 }
 

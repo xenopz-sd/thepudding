@@ -177,6 +177,13 @@ MAX_INSTANCE = 99
 #: no hyphen, e.g. ``svc01``, ``svc14`` (Requirement 3.1, 3.5).
 _SVC_CODE_RE = re.compile(r"^svc\d{2,}$")
 
+#: A NON-CATALOG role code (ADR-0021): a lowercase role name starting with a
+#: letter (e.g. ``workload``) that is NOT itself a catalog ``svcNN`` form. This
+#: mirrors the ``proxmox-compute`` module's ``role_code`` validation exactly
+#: (``variables.tf``: ``^[a-z][a-z0-9]*$`` AND not ``^svc[0-9]{2}$``) so the
+#: Python derivation and the HCL contract agree on what a valid role code is.
+_ROLE_CODE_RE = re.compile(r"^[a-z][a-z0-9]*$")
+
 #: A hostname component / service / slug token: lowercase alphanumeric with
 #: internal hyphens permitted, but no leading/trailing hyphen and no other
 #: punctuation. Used for the optional ``<component>`` field and for the tag's
@@ -287,6 +294,70 @@ def hostname(
             )
         return f"{svc_code}-{component}-{vlan_id}-{instance_str}"
     return f"{svc_code}-{vlan_id}-{instance_str}"
+
+
+def role_hostname(
+    role_code: str,
+    vlan_id: int,
+    instance: int = 1,
+    component: str | None = None,
+) -> str:
+    """Construct a NON-CATALOG role-code hostname (ADR-0021, NET-00 §4 analogue).
+
+    A per-project consumer workload guest (and any other non-catalog, role-named
+    guest) occupies no catalog ``SVC-NN`` slot, so its machine-facing hostname is
+    keyed on a stable **role code** (e.g. ``workload``) rather than an
+    ``svc_code``. The produced name follows the SAME positional convention as
+    :func:`hostname` — ``<role_code>-<vlan_id>-<instance>`` (or
+    ``<role_code>-<component>-<vlan_id>-<instance>``) — so it slots into the
+    ``<identity>[-<component>]-<vlan_id>-<instance>`` form the ``proxmox-compute``
+    module builds in ``locals.tf`` and Guard 3 accepts.
+
+    This is a deliberate EXTENSION of the stable hostname abstraction for the
+    role-code identity (ADR-0021), not a fork of the formula: it reuses the exact
+    instance-padding / component rules of :func:`hostname`, differing only in
+    that the leading segment is a validated ``role_code`` (``^[a-z][a-z0-9]*$``,
+    and never a catalog ``svcNN`` — that belongs in :func:`hostname`). The role
+    code is swap-stable (keyed on the role, never a technology), exactly as
+    ``svc_code`` is keyed on the stable catalog slot.
+
+    Args:
+        role_code: A lowercase role name, e.g. ``workload`` (ADR-0021). Must not
+            be a catalog ``svcNN`` form (use :func:`hostname` for those).
+        vlan_id: The host's numeric VLAN ID.
+        instance: Replica counter in 1-99; defaults to 1 -> ``01``.
+        component: Optional lowercase component name, same semantics as
+            :func:`hostname`.
+
+    Returns:
+        The constructed role-code hostname, e.g. ``workload-100-01``.
+
+    Raises:
+        ValueError: If ``role_code``, ``component``, ``vlan_id``, or ``instance``
+            is malformed / out of range, or if ``role_code`` is a catalog
+            ``svcNN`` form (which must use :func:`hostname`).
+    """
+    if not isinstance(role_code, str) or not _ROLE_CODE_RE.match(role_code):
+        raise ValueError(
+            f"role_code {role_code!r} must be a lowercase role name matching "
+            "'^[a-z][a-z0-9]*$' (e.g. 'workload'), per ADR-0021."
+        )
+    if _SVC_CODE_RE.match(role_code):
+        raise ValueError(
+            f"role_code {role_code!r} is a catalog 'svcNN' form; a catalog slot "
+            "belongs in svc_code via hostname(), not role_hostname() (ADR-0021)."
+        )
+    if not isinstance(vlan_id, int) or isinstance(vlan_id, bool) or vlan_id < 0:
+        raise ValueError(f"vlan_id must be a non-negative int, got {vlan_id!r}")
+    instance_str = _validate_instance(instance)
+    if component is not None:
+        if not isinstance(component, str) or not _TOKEN_RE.match(component):
+            raise ValueError(
+                f"component {component!r} must be lowercase alphanumeric with "
+                "internal hyphens only (no leading/trailing hyphen)."
+            )
+        return f"{role_code}-{component}-{vlan_id}-{instance_str}"
+    return f"{role_code}-{vlan_id}-{instance_str}"
 
 
 def parse_hostname(name: str) -> dict[str, object]:

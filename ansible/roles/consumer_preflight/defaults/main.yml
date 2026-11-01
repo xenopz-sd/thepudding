@@ -16,6 +16,19 @@ consumer_registry_helper: scripts/installer/consumer_registry.py
 # the TF_VAR_* mapping + asserts the mandatory cluster vars are present.
 consumer_cluster_env_helper: scripts/installer/cluster_env.py
 
+# --- Agent-live throwaway-cluster guard (testing-strategy.md "Agent Live-Test
+#     Authorization") -----------------------------------------------------------
+# The Phase-1 preflight carries the gated throwaway-guard consult for the WHOLE
+# consumer onboarding run (it is the first role in the play and runs before any
+# Phase-2 mutation), exactly as svc01_preflight does for the SVC-01 installer.
+# This makes the consult UPSTREAM of consumer_provision's direct per-project
+# workload `terraform apply` (consumer-last-mile-hello-workload §B) — so
+# consumer_provision is leaf-exempt rather than carrying a duplicate consult.
+# An ordinary operator run (AGENT_LIVE_AUTHORIZED unset -> agent_live_run false)
+# skips all three gated tasks and is byte-for-byte unaffected.
+consumer_throwaway_guard: scripts/installer/throwaway_guard.py
+consumer_throwaway_allowlist: scripts/installer/throwaway-clusters.yml
+
 # The FORBIDDEN build/automation tools (Req 4.2, 4.9). If any of these is named
 # as a configured orchestration tool the run halts naming it. The orchestrator
 # is Ansible-only (service-installer.md §2.1, ADR-0020 alt B rejected).

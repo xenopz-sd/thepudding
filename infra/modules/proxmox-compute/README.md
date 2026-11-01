@@ -21,11 +21,30 @@ dynamic inventory. See the roots it pairs with:
 |---|---|
 | `project_slug` | Project identity; drives the `tags` value `proj-<slug>-<service>`. |
 | `service_name` | Human-facing service name for the `tags` value. |
-| `svc_code` | Stable catalog slot as `svcNN` (e.g. `svc01`); drives the hostname. |
-| `vlan_id` | The project's assigned VLAN ID (`vlan_id == 10` is rejected in task 7.3). |
+| `svc_code` | Catalog guest identity — the stable catalog slot as `svcNN` (e.g. `svc01`); drives the hostname. Optional (default null); supply this XOR `role_code`. |
+| `role_code` | **Non-catalog** guest identity (ADR-0021) — a lowercase role name (e.g. `workload`) for a guest that is NOT a catalog SVC-NN (e.g. a per-project consumer workload); drives the hostname `<role_code>-<vlan_id>-<instance>` exactly as `svc_code` would. Optional (default null); supply this XOR `svc_code`. Must NOT itself be a `svcNN` form. |
+| `vlan_id` | The project's assigned VLAN ID (`vlan_id == 10` is rejected). |
 | `host_index` | Zero-based host position; IP = `cidrhost("10.0.<vlan_id>.0/24", 10 + host_index)`. |
 | `instance` | Zero-padded 2-digit replica counter (default `01`). |
-| `component` | Optional; hostname becomes `<svc-code>-<component>-<vlan_id>-<instance>`. |
+| `component` | Optional; hostname becomes `<identity>-<component>-<vlan_id>-<instance>`. |
+
+### Guest identity: `svc_code` XOR `role_code` (ADR-0021)
+
+Every guest is identified by **exactly one** of two mutually-exclusive inputs —
+never both, never neither (enforced at plan time by a precondition, Guard 5):
+
+- **`svc_code`** — for a **catalog** service. Strictly the stable catalog slot
+  `svcNN` (NET-00 §4, Req 3.5), so a technology swap within a slot never forces
+  a rename.
+- **`role_code`** — for a **non-catalog**, role-named guest (ADR-0021), e.g. a
+  per-project consumer `workload`. A lowercase role name that is NOT a `svcNN`
+  code. Keyed on the stable role (also swap-stable), so `svc_code` keeps its
+  single "catalog slot" meaning and is never overloaded.
+
+The computed hostname is `<identity>[-<component>]-<vlan_id>-<instance>`, where
+`<identity>` is whichever of `svc_code` / `role_code` was supplied. A catalog
+caller (`svc_code` set, `role_code` null) produces exactly the same hostname as
+before this contract change.
 
 There is deliberately **no** operator-supplied IP-literal input — the absence is
 the contract (Requirement 2.4).

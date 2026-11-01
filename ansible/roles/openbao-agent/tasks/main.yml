@@ -133,6 +133,87 @@
 # The depends_on gate on the RSF-presence healthcheck is the swap-gate: real
 # secrets rendered ⇒ workload starts; no RSF ⇒ Agent unhealthy ⇒ workload never
 # starts (fail-closed, composition-wiring.md).
+
+# --- Pre-assemble the workload service dict (base + fixed wiring + OPTIONAL) --
+# The workload service dict is COMPOSED from three parts so the OPTIONAL,
+# ADDITIVE non-secret fields (command/volumes/environment/healthcheck) are
+# PRESENT only when the caller set them — never carrying an `omit` sentinel into
+# the data structure docker-compose-app inspects with `is defined`:
+#   * base    — name/image/restart (always present);
+#   * wiring  — the FIXED swap-gate + Traefik + no-ports contract (always the
+#               same; the agent sidecar, auto_auth, RSF, extra_env_files,
+#               depends_on service_healthy, labels, networks are UNCHANGED);
+#   * optional — command/volumes/environment/healthcheck, included ONLY when the
+#               corresponding default (defaults/main.yml) is non-empty.
+# When the caller passes none of the optional fields (postgres/zitadel/grafana/
+# nginx), `openbao_agent_workload_service_optional` is {} and the combine is a
+# no-op, so the rendered service is byte-identical to before. This is COMPOSITION
+# surface for a reference workload (the consumer-last-mile `hello_workload` set,
+# task 4.2) — NOT agent/auth wiring. NO secret value appears in any part; real
+# secrets arrive only via the Rendered_Secret_File (extra_env_files).
+- name: "4 — Assemble the FIXED workload wiring (swap-gate + Traefik, unchanged)"
+  ansible.builtin.set_fact:
+    openbao_agent_workload_service_wiring:
+      # The Rendered_Secret_File (0600) layered over the non-secret .env — a
+      # later env_file wins on key conflicts (Req 5.1). Only the PATH is
+      # emitted; the secret VALUE lives in the 0600 file, never the repo.
+      # LONG-FORM with `required: false` (Compose v2.24+): the Agent renders
+      # this file only AFTER it auto-auths, so it does NOT exist at `up`-time.
+      # A hard/required env_file reference makes Compose abort at its eager
+      # up-front existence check BEFORE honoring `depends_on: service_healthy`,
+      # defeating the swap-gate. `required: false` suppresses only that up-front
+      # check; the START-GATE (depends_on service_healthy on the Agent's
+      # `test -s <RSF>` healthcheck) still blocks the workload until the non-empty
+      # file exists — fail-closed is preserved (composition-wiring.md).
+      extra_env_files:
+        - path: "{{ openbao_agent_rendered_secret_file }}"
+          required: false
+      # START-GATE: the workload starts only after the Agent is healthy, i.e.
+      # only after the Rendered_Secret_File exists (Req 5.2, 6.2).
+      depends_on:
+        openbao-agent:
+          condition: "service_healthy"
+      # Traefik-only ingress via Docker labels — NO host `ports:` (Req 5.4, 5.5).
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.{{ dca_app_name }}.rule=Host(`{{ openbao_agent_workload_host_rule }}`)"
+      networks:
+        - "{{ openbao_agent_edge_network }}"
+      # NO ports: entry (Req 5.5).
+  vars:
+    dca_app_name: "{{ project_slug }}-workload"
+
+- name: "4 — Assemble the OPTIONAL, ADDITIVE non-secret workload fields (present only when set)"
+  ansible.builtin.set_fact:
+    # combine() starts from {} and folds in each optional field ONLY when its
+    # default is non-empty, so an unset field leaves NO key behind (byte-
+    # identical render for callers that pass none). NO secret value here.
+    openbao_agent_workload_service_optional: >-
+      {{ {}
+         | combine({'command': openbao_agent_workload_command}
+                   if (openbao_agent_workload_command | length > 0) else {})
+         | combine({'volumes': openbao_agent_workload_volumes}
+                   if (openbao_agent_workload_volumes | length > 0) else {})
+         | combine({'environment': openbao_agent_workload_environment}
+                   if (openbao_agent_workload_environment | length > 0) else {})
+         | combine({'healthcheck': openbao_agent_workload_healthcheck}
+                   if (openbao_agent_workload_healthcheck | length > 0) else {}) }}
+
+- name: "4 — Compose the final workload service dict (base ∪ optional ∪ fixed wiring)"
+  ansible.builtin.set_fact:
+    # base (name/image/restart) ∪ the optional non-secret fields ∪ the FIXED
+    # swap-gate/Traefik/no-ports wiring. Wiring is folded LAST so it always wins
+    # (a caller can never override the swap-gate). Assembled here so the
+    # dca_services entry below is a single var reference (no inline multi-line
+    # Jinja). Byte-identical to the historical inline dict for callers passing no
+    # optional fields. NO secret value anywhere.
+    openbao_agent_workload_service: >-
+      {{ {'name': openbao_agent_workload_service_name,
+          'image': workload_image,
+          'restart': 'unless-stopped'}
+         | combine(openbao_agent_workload_service_optional)
+         | combine(openbao_agent_workload_service_wiring) }}
+
 - name: "4 — Deploy the Agent sidecar + workload Compose stack (swap-gate, Req 4.3/7.5)"
   ansible.builtin.include_role:
     name: docker-compose-app
@@ -184,35 +265,12 @@
         # NO published host port — the Agent speaks only to the Primary over
         # VLAN 20 and writes a local file (Req 4.3).
       # --- the workload (Traefik-only ingress; gated on the Agent) ------------
-      - name: "{{ openbao_agent_workload_service_name }}"
-        image: "{{ workload_image }}"
-        restart: "unless-stopped"
-        # The Rendered_Secret_File (0600) layered over the non-secret .env — a
-        # later env_file wins on key conflicts (Req 5.1). Only the PATH is
-        # emitted; the secret VALUE lives in the 0600 file, never the repo.
-        # LONG-FORM with `required: false` (Compose v2.24+): the Agent renders
-        # this file only AFTER it auto-auths, so it does NOT exist at `up`-time.
-        # A hard/required env_file reference makes Compose abort at its eager
-        # up-front existence check BEFORE honoring `depends_on: service_healthy`,
-        # defeating the swap-gate. `required: false` suppresses only that
-        # up-front check; the START-GATE below (depends_on service_healthy on the
-        # Agent's `test -s <RSF>` healthcheck) still blocks the workload until the
-        # non-empty file exists — fail-closed is preserved (composition-wiring.md).
-        extra_env_files:
-          - path: "{{ openbao_agent_rendered_secret_file }}"
-            required: false
-        # START-GATE: the workload starts only after the Agent is healthy, i.e.
-        # only after the Rendered_Secret_File exists (Req 5.2, 6.2).
-        depends_on:
-          openbao-agent:
-            condition: "service_healthy"
-        # Traefik-only ingress via Docker labels — NO host `ports:` (Req 5.4, 5.5).
-        labels:
-          - "traefik.enable=true"
-          - "traefik.http.routers.{{ dca_app_name }}.rule=Host(`{{ openbao_agent_workload_host_rule }}`)"
-        networks:
-          - "{{ openbao_agent_edge_network }}"
-        # NO ports: entry (Req 5.5).
+      # The workload service dict, pre-assembled in the set_fact tasks above as
+      # base ∪ OPTIONAL non-secret fields ∪ FIXED swap-gate/Traefik/no-ports
+      # wiring. A caller that passes no optional fields is byte-identical to
+      # before; a reference workload (hello_workload, task 4.2) gets its mounted
+      # entrypoint command/volumes/env/healthcheck threaded in.
+      - "{{ openbao_agent_workload_service }}"
     # The workload needs the shared Traefik `edge` network; the Agent does not.
     dca_networks:
       - name: "{{ openbao_agent_edge_network }}"

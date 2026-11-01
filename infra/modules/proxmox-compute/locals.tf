@@ -10,7 +10,9 @@
 #
 #   * ipv4_address  = cidrhost("10.0.<vlan_id>.0/24", 10 + host_index)   (Req 2.1, 2.3)
 #   * gateway       = cidrhost("10.0.<vlan_id>.0/24", 1) = 10.0.<vlan_id>.1 (Req 2.1)
-#   * hostname      = <svc-code>[-<component>]-<vlan_id>-<instance>       (Req 3.1, 3.2)
+#   * hostname      = <identity>[-<component>]-<vlan_id>-<instance>       (Req 3.1, 3.2)
+#                     where <identity> is the catalog svc_code OR the non-catalog
+#                     role_code (ADR-0021)
 #   * tags          = ["proj-<slug>-<service>"]  (distinct from hostname)  (Req 3.4)
 #   * ip_config     = a cloud-init initialization.ip_config.ipv4 structure that a
 #                     compute resource injects; SDN IPAM/DHCP stays disabled    (Req 2.5)
@@ -54,14 +56,28 @@ locals {
   ipv4_cidr    = "${local.ipv4_address}/24"                       # e.g. 10.0.102.10/24
 
   # ------------------------------------------------------------------------
-  # Hostname (Requirement 3.1, 3.2, NET-00 §4) — machine-facing, VLAN-correlated.
-  # <svc-code>-<vlan_id>-<instance>, or <svc-code>-<component>-<vlan_id>-<instance>
-  # WHERE one catalog line item deploys more than one distinct running service.
-  # The instance is already validated as a zero-padded 2-digit "01".."99" in
-  # variables.tf, and svc_code is validated as the stable catalog slot "svcNN"
-  # (never a product/technology name — Requirement 3.5).
+  # Guest identity code (ADR-0021). A guest is identified by EXACTLY ONE of a
+  # catalog `svc_code` (`svcNN`) OR a non-catalog `role_code` (a role name such
+  # as `workload`). `coalesce` picks whichever is non-null — the exactly-one-of
+  # invariant (never both, never neither) is enforced at plan time by Guard 5
+  # in preconditions.tf, so here exactly one is guaranteed to be set and
+  # `identity_code` is that value. For a catalog caller (svc_code set, role_code
+  # null) this is identical to the pre-ADR-0021 behavior: identity_code ==
+  # svc_code, so the hostname below is byte-for-byte unchanged.
   # ------------------------------------------------------------------------
-  hostname = var.component == null ? "${var.svc_code}-${var.vlan_id}-${var.instance}" : "${var.svc_code}-${var.component}-${var.vlan_id}-${var.instance}"
+  identity_code = coalesce(var.svc_code, var.role_code)
+
+  # ------------------------------------------------------------------------
+  # Hostname (Requirement 3.1, 3.2, NET-00 §4) — machine-facing, VLAN-correlated.
+  # <identity_code>-<vlan_id>-<instance>, or
+  # <identity_code>-<component>-<vlan_id>-<instance> WHERE one catalog line item
+  # deploys more than one distinct running service. The identity code is the
+  # catalog `svc_code` ("svcNN", stable catalog slot — Requirement 3.5) or the
+  # non-catalog `role_code` (a role name, e.g. "workload" — ADR-0021); both are
+  # swap-stable. The instance is already validated as a zero-padded 2-digit
+  # "01".."99" in variables.tf.
+  # ------------------------------------------------------------------------
+  hostname = var.component == null ? "${local.identity_code}-${var.vlan_id}-${var.instance}" : "${local.identity_code}-${var.component}-${var.vlan_id}-${var.instance}"
 
   # ------------------------------------------------------------------------
   # Proxmox tags (Requirement 3.4, PF §4) — human-facing, project-correlated.

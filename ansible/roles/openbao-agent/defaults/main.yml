@@ -190,3 +190,45 @@ openbao_no_log: "{{ not (openbao_dev_expose_secrets | bool) }}"
 # .env by docker-compose-app. Real secrets NEVER go here — they arrive via the
 # Rendered_Secret_File (extra_env_files). Left empty by default.
 openbao_agent_workload_env: {}
+
+# =============================================================================
+# OPTIONAL, ADDITIVE workload-service pass-through fields (NO agent/auth change)
+# =============================================================================
+# These let a CALLER supply the non-secret compose fields a particular reference
+# workload needs (a mounted entrypoint, the command that runs it, non-secret
+# per-container env, a container healthcheck) WITHOUT this role gaining any
+# service-specific knowledge and WITHOUT touching the agent sidecar, the AppRole
+# auto_auth, the Rendered_Secret_File, or the swap-gate. They are THREADED onto
+# the workload service dict only when set; every one defaults to ABSENT, so an
+# existing caller that passes none (postgres/zitadel/grafana, nginx in the
+# swap-gate test) renders byte-identically to before (the docker-compose-app
+# template emits each key only `if defined`). They are the composition surface
+# the consumer-last-mile reference `hello_workload` var set is threaded through
+# (consumer-last-mile-hello-workload §A, task 4.2) — NOT new agent wiring.
+#
+# IMPORTANT: NONE of these may carry a secret VALUE. Real secrets arrive ONLY via
+# the Agent-rendered Rendered_Secret_File (extra_env_files). `openbao_agent_
+# workload_environment` is NON-secret per-container config only (identical rule
+# to dca_env / the sidecar's BAO_SKIP_DROP_ROOT), and `openbao_agent_workload_
+# volumes` must mount only non-secret artifacts (e.g. a read-only entrypoint).
+
+# The workload container command (list form). Absent ⇒ the image's own default
+# CMD/ENTRYPOINT runs, exactly as today.
+openbao_agent_workload_command: []
+
+# Extra read-only/host volume mounts for the workload (e.g. a mounted entrypoint
+# script). List of compose `source:target[:mode]` strings. Absent ⇒ no volumes
+# key is rendered for the workload (unchanged).
+openbao_agent_workload_volumes: []
+
+# A per-container NON-secret `environment:` map for the workload (NOT the stack
+# .env — that is openbao_agent_workload_env/dca_env). Absent ⇒ no `environment:`
+# block, byte-identical to before. NEVER a secret value.
+openbao_agent_workload_environment: {}
+
+# A container healthcheck for the workload (the docker-compose-app healthcheck
+# dict shape: {test: [...], interval, timeout, retries, start_period}). This is
+# the WORKLOAD-layer health signal, distinct from (and on top of) the Agent
+# sidecar's own RSF-presence healthcheck + the depends_on service_healthy
+# swap-gate, which are unchanged. Absent ⇒ no workload healthcheck (unchanged).
+openbao_agent_workload_healthcheck: {}

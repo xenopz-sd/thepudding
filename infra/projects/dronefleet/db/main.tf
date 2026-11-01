@@ -65,9 +65,15 @@ locals {
   # project-VLAN case) no component. Resolve its host_index as the Assigned
   # index. `one()` returns the sole match, or null if the ledger has no such row
   # (caught by the precondition below).
+  #
+  # ADR-0021: a VLAN may now also carry NON-catalog rows keyed on `role_code`
+  # (e.g. the per-project `workload` guest) with NO `svc_code` key. Read the
+  # identity key-safely with lookup(e, "svc_code", null) so iterating a mixed
+  # svc_code/role_code VLAN does not raise "Missing map element" on a role_code
+  # row — those rows simply don't match svc01 and are skipped.
   assigned_host_index = one([
     for e in local.vlan_entries : e.host_index
-    if e.svc_code == "svc01" && lookup(e, "component", null) == null
+    if lookup(e, "svc_code", null) == "svc01" && lookup(e, "component", null) == null
   ])
 }
 

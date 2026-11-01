@@ -1,0 +1,62 @@
+---
+# hello-workload-deploy.yml — stand up the reference "hello-workload"
+# Spec: .kiro/specs/consumer-last-mile-hello-workload/ (§A, Req 1.1/1.2/1.6;
+# task 4.2). ADR-0021 (workload guest identity), composition-wiring.md (swap-gate).
+#
+# THIN COMPOSITION playbook (task 4.2): it stands up the reference workload via
+# the EXISTING `openbao-agent` role — it adds NO new agent/credential wiring. All
+# the real work lives in the `hello_workload_deploy` role, which stages the
+# task-4.1 reference entrypoint and includes `openbao-agent` with the
+# `hello_workload_*` reference var set threaded into that role's existing inputs
+# (its optional, additive workload-service pass-throughs + the v0.11.3 default DB
+# secret mapping {db, database_url, DATABASE_URL}). The Agent sidecar, AppRole
+# auto_auth, Rendered_Secret_File, and the depends_on service_healthy swap-gate
+# all come from `openbao-agent` UNCHANGED.
+#
+# PLACEMENT (target-aware): the per-project workload guest's `service_role` is
+# `workload`, and generate_inventory.py groups hosts by service_role — so when a
+# dedicated workload guest was provisioned (manifest `workload.enabled: true`,
+# task 2.2/3.1) it lands in the `workload` inventory group, which is the default
+# target. When NO workload guest exists, co-locate on the DB guest (or a
+# bring-your-own host) by overriding `-e hello_workload_target=<group-or-host>`
+# (the documented topologies — task 8). Pass `-e hello_workload_enabled=true`
+# when a dedicated guest was provisioned; the default target follows from it.
+#
+# DUAL ROLE OF ANSIBLE (service-installer.md §2.1): this play runs as a HOST
+# CONFIGURATOR against the file-mediated generated inventory
+# (<slug>-workload.generated.yml when enabled, or the DB/consumer inventory when
+# co-located) — it never parses Terraform state or queries Proxmox.
+#
+# Entry point (configurator run against the generated workload inventory):
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/dronefleet-workload.generated.yml \
+#     ansible/playbooks/hello-workload-deploy.yml \
+#     -e project_slug=dronefleet -e hello_workload_enabled=true
+#
+# Co-locate on the DB guest (no dedicated workload guest):
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/dronefleet-consumer.generated.yml \
+#     ansible/playbooks/hello-workload-deploy.yml \
+#     -e project_slug=dronefleet -e hello_workload_target=postgres
+- name: Stand up the reference hello-workload via the existing openbao-agent role
+  # Target-aware: the `workload` inventory group when a dedicated guest was
+  # provisioned (the default), else the operator-supplied co-locate target.
+  # Defaulted here so a direct `-e hello_workload_target=` override is honoured,
+  # and the group name `workload` matches the provisioned guest's service_role.
+  hosts: "{{ hello_workload_target | default('workload') }}"
+  gather_facts: true
+  vars:
+    # REQUIRED via -e: the project whose KV subtree the Agent renders from.
+    project_slug: ""
+    # Whether a dedicated workload guest was provisioned (manifest workload.enabled).
+    # The default target follows from it: a dedicated guest -> the `workload`
+    # group; co-located -> the operator overrides hello_workload_target.
+    hello_workload_enabled: false
+    # The default target: the provisioned workload guest's inventory group
+    # (`workload`) when enabled, else left to the operator's -e override. When
+    # hello_workload_enabled is false and no override is given, `workload`
+    # simply matches no hosts (a no-op) — the operator must point it at the
+    # co-locate target (e.g. the DB guest group) for a co-located stand-up.
+    hello_workload_target: "workload"
+  roles:
+    - role: hello_workload_deploy
