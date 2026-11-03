@@ -207,7 +207,10 @@ resource "proxmox_virtual_environment_container" "prometheus" {
   description = "SVC-17/18 Prometheus (+ co-located Alertmanager) — metrics scraping, local TSDB, PromQL, baseline alert routing. Managed by Terraform; see .kiro/specs/svc-17-18-observability."
 
   node_name = var.proxmox_node_name
-  vm_id     = var.prometheus_vmid
+  # Operator override wins when non-zero (grandfathers a live VMID, no
+  # force-replace); otherwise the module-computed deterministic VMID
+  # (vlan_id * 1000 + host_index = 20008) is used (ADR-0022).
+  vm_id = var.prometheus_vmid != 0 ? var.prometheus_vmid : module.prometheus.vmid
 
   unprivileged = true
   features {
@@ -302,7 +305,10 @@ resource "proxmox_virtual_environment_container" "grafana" {
   description = "SVC-17/18 Grafana — dashboards + Prometheus/Loki datasources, reached externally only via Traefik (SVC-09). Config-as-code (dashboards are version-controlled JSON). Managed by Terraform; see .kiro/specs/svc-17-18-observability."
 
   node_name = var.proxmox_node_name
-  vm_id     = var.grafana_vmid
+  # Operator override wins when non-zero (grandfathers a live VMID, no
+  # force-replace); otherwise the module-computed deterministic VMID
+  # (vlan_id * 1000 + host_index = 20009) is used (ADR-0022).
+  vm_id = var.grafana_vmid != 0 ? var.grafana_vmid : module.grafana.vmid
 
   unprivileged = true
   features {
@@ -378,7 +384,10 @@ resource "proxmox_virtual_environment_container" "loki" {
   description = "SVC-17/18 Loki — centralized log aggregation (monolithic mode, local filesystem store, 30-day retention), internal-only push API on VLAN 20. Managed by Terraform; see .kiro/specs/svc-17-18-observability."
 
   node_name = var.proxmox_node_name
-  vm_id     = var.loki_vmid
+  # Operator override wins when non-zero (grandfathers a live VMID, no
+  # force-replace); otherwise the module-computed deterministic VMID
+  # (vlan_id * 1000 + host_index = 20010) is used (ADR-0022).
+  vm_id = var.loki_vmid != 0 ? var.loki_vmid : module.loki.vmid
 
   unprivileged = true
   features {

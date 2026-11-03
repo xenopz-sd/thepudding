@@ -69,3 +69,66 @@ hello_workload_entrypoint_host_dir: "{{ hello_workload_stack_dir }}/bin"
 # The host path the entrypoint is staged to and the read-only mount built from
 # it (host:container:ro) threaded as openbao_agent_workload_volumes.
 hello_workload_entrypoint_host_path: "{{ hello_workload_entrypoint_host_dir }}/healthz-entrypoint.sh"
+
+# =============================================================================
+# Workload AppRole credential STAGING — control node -> workload guest
+# (fix-workload-guest-creds-staging)
+# =============================================================================
+# The openbao-agent sidecar bind-mounts its AppRole role-id/secret-id READ-ONLY
+# from host paths ON THE GUEST (openbao_agent_role_id_host_path /
+# openbao_agent_secret_id_host_path, default /etc/openbao-workload/<slug>/...).
+# But the control-plane openbao_workload_approle role (composed by
+# consumer_bootstrap STEP 3) hands the minted 0600 creds to the CONTROL NODE
+# (consumer_workload_creds_dir = $HOME/.openbao-workload/<slug>), never the
+# guest. On a DEDICATED workload guest (a separate host from the control node)
+# nothing bridges that gap: the sidecar's mount sources are absent, Docker
+# auto-creates empty DIRECTORIES at them, and the Agent reads a directory where a
+# file must be ("read /openbao/agent/role-id: is a directory") -> auth crash-loop
+# -> workload never healthy. STEP 2 of tasks/main.yml stages these creds onto the
+# guest BEFORE composing openbao-agent.
+#
+# SOURCE dir on the CONTROL NODE — where consumer_bootstrap -> openbao_workload_
+# approle wrote the 0600 creds. Default MATCHES consumer_workload_creds_dir
+# ($HOME/.openbao-workload/<slug>) so it finds them with no override on the
+# consumer path; overridable for the standalone / bring-your-own topologies (e.g.
+# a run where the handoff used the role default /etc/openbao-workload/<slug>).
+hello_workload_creds_src_dir: >-
+  {{ lookup('ansible.builtin.env', 'HOME') }}/.openbao-workload/{{ project_slug }}
+
+# The two SOURCE file paths on the control node. Filenames match the control
+# role's handoff pattern <slug>-workload-{role,secret}-id
+# (openbao_workload_approle: {{ openbao_workload_role_name }}-{role,secret}-id
+# where openbao_workload_role_name = <slug>-workload). The role_id is non-secret;
+# the secret_id is sensitive (staged under no_log).
+hello_workload_role_id_src_path: "{{ hello_workload_creds_src_dir }}/{{ project_slug }}-workload-role-id"
+hello_workload_secret_id_src_path: "{{ hello_workload_creds_src_dir }}/{{ project_slug }}-workload-secret-id"
+
+# The two DESTINATION file paths ON THE GUEST that STEP 2 stages the creds to,
+# and that STEP 3 threads INTO openbao-agent as its mount sources
+# (openbao_agent_role_id_host_path / openbao_agent_secret_id_host_path). These
+# are defined HERE, in THIS role's own defaults, so they are IN SCOPE at STEP 2
+# — the openbao-agent defaults that also compute these do NOT enter scope until
+# the STEP 3 `include_role: openbao-agent` (an included role's defaults are
+# scoped at the point of inclusion). The VALUE is byte-identical to the
+# openbao-agent default expression (/etc/openbao-workload/<slug>/<slug>-workload-
+# {role,secret}-id), so the staged path and the agent's mount source are the
+# SAME location. Threading these two vars into the include (STEP 3) makes THIS
+# role the single source of truth for the dest paths and guarantees
+# staged == mounted (no drift). A caller that invokes openbao-agent DIRECTLY,
+# without threading these, still gets the agent role's own default
+# (unchanged) — the standalone-caller fallback.
+hello_workload_role_id_dest_path: "/etc/openbao-workload/{{ project_slug }}/{{ project_slug }}-workload-role-id"
+hello_workload_secret_id_dest_path: "/etc/openbao-workload/{{ project_slug }}/{{ project_slug }}-workload-secret-id"
+
+# =============================================================================
+# DEV-ONLY secret-exposure opt-in (security-standards.md "Secrets handling")
+# =============================================================================
+# Mirrors the sibling openbao-agent / openbao_workload_approle convention so the
+# secret_id staging task can reference `openbao_no_log` in THIS role's own scope
+# (the composed openbao-agent role's default is not in scope for a task that runs
+# BEFORE the include). Default FALSE -> openbao_no_log TRUE -> the secret_id copy
+# is no_log. NON-NEGOTIABLE acceptance/production default; a developer debugging a
+# THROWAWAY cluster MAY expose output for a SINGLE run with
+# `-e openbao_dev_expose_secrets=true` — never committed, never in CI/acc/prod.
+openbao_dev_expose_secrets: false
+openbao_no_log: "{{ not (openbao_dev_expose_secrets | bool) }}"

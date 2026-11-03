@@ -33,6 +33,15 @@ module "db" {
   ssh_public_keys = var.operator_ssh_public_keys # forward-compat echo; injection on the guest below
 }
 
+locals {
+  # Effective VMID (ADR-0022 grandfather posture): the operator override wins
+  # when non-zero (grandfathers an already-provisioned, prevent_destroy DB guest
+  # — no force-replace); otherwise the module-computed deterministic VMID
+  # (vlan_id * 1000 + host_index) is used. A SINGLE local so the container's
+  # vm_id and the firewall rules' container_id can never diverge.
+  svc01_effective_vmid = var.svc01_vmid != 0 ? var.svc01_vmid : module.db.vmid
+}
+
 # The dedicated database container. Unprivileged, nesting (for in-LXC Docker),
 # tier-sized, on the project's SDN VNet p<vlan>, stock template (Docker +
 # Compose per host by the common role, ADR-0003). prevent_destroy because a DB
@@ -41,7 +50,7 @@ resource "proxmox_virtual_environment_container" "db" {
   description = "SVC-01 dedicated ${var.db_engine} database for project '${var.project_slug}'. Managed by Terraform; see .kiro/specs/svc-01-sql-database."
 
   node_name = var.proxmox_node_name
-  vm_id     = var.svc01_vmid
+  vm_id     = local.svc01_effective_vmid # operator override or computed (ADR-0022)
 
   unprivileged = true
   features {
@@ -118,7 +127,7 @@ resource "proxmox_virtual_environment_firewall_rules" "db" {
   count = var.enable_firewall_rules ? 1 : 0
 
   node_name    = var.proxmox_node_name
-  container_id = var.svc01_vmid
+  container_id = local.svc01_effective_vmid # same effective VMID as the container (ADR-0022)
 
   rule {
     type    = "in"

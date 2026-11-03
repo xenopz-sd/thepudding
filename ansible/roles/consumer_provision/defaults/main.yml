@@ -48,10 +48,16 @@ consumer_workload_state_name: "{{ project_slug }}-workload"
 # (the output is an empty list while the guest is disabled).
 consumer_workload_generated_inventory: "ansible/inventory/{{ project_slug }}-workload.generated.yml"
 
-# The per-project workload guest VMID. Supplied explicitly so instances get
-# stable, non-colliding IDs; a real per-project copy overrides via
-# -e consumer_workload_vmid=. Distinct from the DB guest's VMID.
-consumer_workload_vmid: 1102
+# The per-project workload guest VMID — OPERATOR OVERRIDE, default 0 = "use the
+# module-computed deterministic VMID" (ADR-0022). Threaded to the workload root
+# as `-var workload_vmid=`; 0 lets proxmox-compute derive vlan_id * 1000 +
+# host_index (VLAN 100 idx 1 -> 100001), which is collision-free by construction.
+# This REPLACES the former hardcoded 1102, which collided with the ZITADEL
+# backing-DB guest (svc06_db_vmid: 1102) and caused the live workload bring-up to
+# match that existing guest instead of creating a new LXC. A real per-project
+# copy MAY still pin a specific VMID via -e consumer_workload_vmid=<id> (it then
+# wins); leaving it 0 is the recommended path.
+consumer_workload_vmid: 0
 
 # Datastore auto-detect sentinel emitted by cluster_env.py when PROXMOX_DATASTORE_ID
 # is absent. When the resolved datastore is this sentinel (or empty) we DO NOT

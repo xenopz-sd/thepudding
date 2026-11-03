@@ -66,11 +66,14 @@ variable "traefik_datastore_id" {
 
 variable "traefik_vmid" {
   description = <<-EOT
-    Proxmox VMID for the Traefik LXC (svc09-20-01). Supplied explicitly so the
-    SVC-09 container gets a stable, non-colliding ID assigned by the
-    operator/allocation scheme rather than auto-assigned.
+    OPERATOR OVERRIDE for the Traefik LXC's (svc09-20-01) Proxmox VMID (ADR-0022
+    grandfather posture). Non-zero wins and is used verbatim (grandfathers a live
+    1090, no force-replace); 0 (the "use computed" sentinel default) uses the
+    module-computed deterministic VMID (vlan_id * 1000 + host_index = 20 * 1000 +
+    2 = 20002).
   EOT
   type        = number
+  default     = 0
 }
 
 variable "letsencrypt_email" {

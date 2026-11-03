@@ -52,6 +52,28 @@ resource "proxmox_virtual_environment_vm" "guest" {
 }
 ```
 
+**VMID assignment within a VLAN — computed by Terraform, not chosen by a human (parallels the IP):** a guest's Proxmox VM/LXC ID is derived from the *same* two stable inputs as its IP — the VLAN ID and the host index — via
+
+```
+vmid = vlan_id * 1000 + host_index
+```
+
+This is the VMID-side analogue of the host-IP formula: deterministic, collision-free, and reversible by inspection, so nobody chooses a VMID and two guests can never be handed the same ID.
+
+| VLAN | host_index | Host IP | VMID |
+|---|---|---|---|
+| 20 (shared) | 0 | `10.0.20.10` | `20000` |
+| 20 (shared) | 1 | `10.0.20.11` | `20001` |
+| 100 (project #1) | 0 | `10.0.100.10` | `100000` |
+| 100 (project #1) | 1 | `10.0.100.11` | `100001` |
+| … | … | … | `<vlan_id>*1000 + <host_index>` |
+
+- **Collision-free:** `host_index` is bounded `0`–`244` (the same bound the host-IP formula's `.10`-onward / `.254`-ceiling imposes), so `host_index < 1000` and each VLAN owns a distinct 1000-wide block — distinct `(vlan_id, host_index)` pairs always map to distinct VMIDs, platform-wide, with no overflow or aliasing.
+- **Reversible by inspection:** `vlan_id = vmid / 1000`, `host_index = vmid % 1000` — reading `100001` recovers VLAN 100, host_index 1, exactly as reading `10.0.100.11` does.
+- **Legal band:** the computed range `20000`–`254244` sits well inside Proxmox's `100`–`999999999` VMID band.
+- **Grandfathering:** adopting this scheme does not force-replace already-provisioned guests. Each consuming Terraform root keeps an operator-override VMID input that *wins when supplied* (so a live guest keeps its existing ID), and the module-computed value is used only when no override is given. See [ADR-0022](../.kiro/decisions/0022-proxmox-compute-deterministic-vmid.md).
+- The formula lives in the shared `proxmox-compute` module (`locals.tf`) with an independent pure-Python mirror (`netfoundation.proxmox_vmid`) cross-checked against the HCL by a golden `terraform plan` test, exactly like the IP/hostname derivations (the standing HCL-vs-Python drift caveat in `project-constitution.md`, extended by ADR-0022).
+
 **Cross-root uniqueness on shared VLANs — the `index` assumption, and when it does *not* hold:** the formula above derives a host's fourth octet from `index`, "that host's position in Terraform's `for_each`/`count` over the VLAN's service list." That phrasing silently assumes **one** Terraform root enumerates the whole VLAN, so `for_each` ordering makes every `index` distinct within the VLAN by construction. That assumption holds for a per-project VLAN whose guests are all fanned out by a single project root. It does **not** hold on VLAN 20, nor on any project VLAN populated by **more than one independent service root**: each shared service is its own Terraform root (`svc-07-secrets-manager`, `svc-09-reverse-proxy`, `svc-06-identity-provider`, …), each picks its `index` from zero with no shared counter, and no single `terraform plan` sees the full VLAN's host set — so two roots can independently pick the same `index` and collide on one IP (e.g. two guests both at `index 0` → `10.0.20.10`). On such VLANs, within-VLAN `index` (host-index) uniqueness is therefore a **cross-root property that is NOT automatic and must be coordinated explicitly** — not a guarantee the `for_each` formula provides on its own.
 
 The coordination mechanism is the committed per-VLAN host-index allocation ledger `infra/platform-foundation/host-indices.yaml` (the **Host_Index_Authority**): an append-only, diff-reviewable file, keyed by `vlan_id`, recording each guest's assigned `host_index`. Each root reads its own assigned index **and** its VLAN's peer-index set from the ledger as read-only input (never Terraform state) — the fourth-octet analogue of how `projects.yaml` (§7) governs the third octet (the VLAN ID). Uniqueness is enforced in two composing layers: a pure Python `assert_unique_host_indices` guard that rejects any within-VLAN duplicate in CI/onboarding, feeding a `proxmox-compute` `peer_host_indices` plan-time precondition that fails closed at `terraform plan` — before any Proxmox resource — if a root's `host_index` collides with a peer on the same VLAN. The `cidrhost("10.0.<vlan_id>.0/24", 10 + index)` formula itself is unchanged; only *how `index` is made unique across roots* is coordinated.
@@ -69,7 +91,7 @@ Two separate conventions serve two separate purposes — this was previously con
   - `<instance>` is a zero-padded two-digit counter, `01` for a singleton service, incrementing only if a service is ever scaled/replicated within the same VLAN.
   - If one catalog line item deploys more than one distinct running service (e.g. SVC-17/18 Prometheus + Grafana + Loki), append the component name before the instance number: `<svc-code>-<component>-<vlan_id>-<instance>` (e.g. `svc17-prometheus-20-01`).
 
-**Worked example:** a project onboarded third gets VLAN 102 (`10.0.102.0/24`). Its dedicated Postgres (SVC-01) is `svc01-102-01` at `10.0.102.10`; its dedicated Redis (SVC-02) is `svc02-102-01` at `10.0.102.11`. The shared container registry (SVC-14, Zot, VLAN 20) is `svc14-20-01` at `10.0.20.10`. Nobody needed to choose either the VLAN ID or the IP for any of these — both fall out of the onboarding order and the formulas in §2/§3; only the hostname's readability is a deliberate human-facing design choice.
+**Worked example:** a project onboarded third gets VLAN 102 (`10.0.102.0/24`). Its dedicated Postgres (SVC-01) is `svc01-102-01` at `10.0.102.10` with VMID `102000`; its dedicated Redis (SVC-02) is `svc02-102-01` at `10.0.102.11` with VMID `102001`. The shared container registry (SVC-14, Zot, VLAN 20) is `svc14-20-01` at `10.0.20.10`. Nobody needed to choose the VLAN ID, the IP, or the VMID for any of these — all three fall out of the onboarding order and the formulas in §2/§3; only the hostname's readability is a deliberate human-facing design choice.
 
 **Cross-root note:** this hostname's IP (`<svc-code>-<vlan_id>-<instance>` → the `.10`-onward host IP) is the *same* host-index allocation that §3's cross-root uniqueness note governs. On a shared VLAN populated by more than one independent root (VLAN 20, or any project VLAN running >1 service root), the host index behind a hostname's IP is coordinated through the `host-indices.yaml` Host_Index_Authority (§3), not by `for_each` ordering within a single root — so two shared services keep distinct IPs even though their hostnames (e.g. `svc07-20-01` vs `svc09-20-01`) already differ by `<svc-code>`.
 
@@ -89,7 +111,7 @@ Proxmox offers two materially different ways to realize a VLAN on the hypervisor
 
 - **New shared foundation resources** (live in the platform-foundation Terraform root, not per-project): one `proxmox_sdn_zone_vlan` (the single VLAN-type zone all VNets attach to), one `proxmox_sdn_applier` wired via `replace_triggered_by` to react to any zone/VNet/subnet change, **plus the shared-services VLAN-20 VNet + subnet**: one `proxmox_sdn_vnet` (id `p20`, VLAN tag 20) and one `proxmox_sdn_subnet` (`cidr = "10.0.20.0/24"`, `gateway = "10.0.20.1"`) for the shared-services tier. VLAN 20 is shared and cluster-wide, not per-project — every "Shared"-tenancy service (SVC-06/07/09/13/14/17-18) attaches to it — so its VNet belongs to the foundation root alongside the zone and applier. Rationale: the per-project VNet mechanism below is deliberately limited to VLAN 100–254, so the shared VLAN-20 VNet has no per-project owner and must be foundation-owned.
 - **Per-project resources** (created by the project's own onboarding Terraform, per PF §4's "every project gets its own root module" rule): one `proxmox_sdn_vnet` (VLAN tag = the project's assigned `vlan_id`, range 100–254) and one `proxmox_sdn_subnet` (`cidr = "10.0.<vlan_id>.0/24"`, `gateway = "10.0.<vlan_id>.1"`) per project.
-- **Module inputs added to the shared `proxmox-compute` module** (PF §8): `vlan_id` now flows through to the guest's cloud-init static IP config via the §3 formula, rather than being paired with an operator-supplied static IP.
+- **Module inputs added to the shared `proxmox-compute` module** (PF §8): `vlan_id` now flows through to the guest's cloud-init static IP config via the §3 formula, rather than being paired with an operator-supplied static IP. The module also COMPUTES the guest's VMID from `vlan_id` + `host_index` (`vlan_id * 1000 + host_index`, §3) and exposes it as a `vmid` output, so a consuming root reads `module.<x>.vmid` instead of an operator-chosen ID (grandfathered by an override that wins when supplied — ADR-0022).
 - **Terraform service-account privilege:** the `terraform@pve` custom PVE role (PF §11 / FR-1) must additionally include the `SDN.Allocate` privilege for SDN zone/VNet/subnet management to succeed. (`SDN.Use` is a separate, later-required privilege for attaching a guest NIC to an existing VNet, not for creating the SDN objects.)
 - **Outputs:** `vlan_id`, `subnet_cidr`, `gateway_ip` — consumed by every service's own Terraform (to compute its own host IP per §3) and by the Ansible dynamic inventory generator.
 

@@ -49,12 +49,15 @@ variable "zitadel_datastore_id" {
 
 variable "zitadel_vmid" {
   description = <<-EOT
-    Proxmox VMID for the ZITADEL LXC (svc06-20-01). Supplied explicitly so the
-    container gets a stable, non-colliding ID from the operator/allocation scheme
-    rather than auto-assigned. MUST differ from the backing DB's VMID
+    OPERATOR OVERRIDE for the ZITADEL LXC's (svc06-20-01) Proxmox VMID (ADR-0022
+    grandfather posture). Non-zero wins and is used verbatim (grandfathers a live
+    1103, no force-replace); 0 (the "use computed" sentinel default) uses the
+    module-computed deterministic VMID (vlan_id * 1000 + host_index = 20 * 1000 +
+    5 = 20005). When operator-supplied it MUST differ from the backing DB's VMID
     (svc06_db_vmid in the installer) and every other VLAN-20 guest.
   EOT
   type        = number
+  default     = 0
 }
 
 variable "zitadel_host_index" {

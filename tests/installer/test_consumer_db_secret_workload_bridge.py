@@ -14,9 +14,12 @@ Nothing bridges the credential into the workload-readable tree.
 
 Option A adds one bridge step (STEP 2a) to ``consumer_bootstrap/tasks/main.yml`` that
 reads the authoritative source record ``secret/proj-<slug>/postgres`` and
-``bao kv put``s a composed ``DATABASE_URL`` to ``secret/data/<slug>/db`` (field
-``database_url``) — a path INSIDE the already-granted ``policy-<slug>`` tree, so the
-policy is UNCHANGED and ``agent.hcl.j2`` / ``render_agent_hcl`` are UNTOUCHED.
+``bao kv put``s a composed ``DATABASE_URL`` to the bare logical path
+``secret/<slug>/db`` (field ``database_url``; the KV-v2 CLI injects ``data/`` itself so
+the secret is stored at API path ``secret/data/<slug>/db`` — path corrected by
+fix-consumer-db-bridge-kv-v2-path) — a path INSIDE the already-granted ``policy-<slug>``
+tree, so the policy is UNCHANGED and ``agent.hcl.j2`` / ``render_agent_hcl`` are
+UNTOUCHED.
 
 These tests are pure-logic (PyYAML parse of the committed role files + source-string
 checks) — they need no infrastructure. They are the mergeable Tier-1 gate.
@@ -24,7 +27,8 @@ checks) — they need no infrastructure. They are the mergeable Tier-1 gate.
 Two layers (design.md Correctness Properties):
 
 * **Exploration / Fix-Checking (Property 1):** a bridge step ``bao kv put``s into
-  ``secret/data/<slug>/db`` field ``database_url`` composing a ``DATABASE_URL`` from
+  the bare logical path ``secret/<slug>/db`` field ``database_url`` composing a
+  ``DATABASE_URL`` from
   the source fields; it is ``no_log``, DB-declared- and wired-gated, carries the admin
   token in ``-e BAO_TOKEN=`` (never argv), and a fail-loud source assert precedes the
   put; and the defaults define the default DB agent mapping. On UNFIXED code these
@@ -129,14 +133,17 @@ def _normalise(text: str) -> str:
 
 
 def _is_bao_kv_put_to_slug_db(task: dict) -> bool:
-    """True iff a command task does ``bao kv put`` targeting ``secret/data/<slug>/db``.
+    """True iff a command task does ``bao kv put`` targeting the ``<slug>/db`` record.
 
-    Matches the bare ``<slug>`` KV v2 data tree (NOT ``proj-<slug>``). The argv is a
-    Jinja folded expression; the path is composed either as a literal
-    ``secret/data/{{ project_slug }}/db`` or via string concatenation
-    (``'secret/data/' ~ project_slug ~ '/' ~ consumer_db_bridge_subpath``). So match
-    on the ``bao ... kv ... put`` token sequence + the ``secret/data/`` prefix +
-    ``project_slug`` reference, with NO ``proj-`` prefix on the data tree.
+    KV-v2 NOTE (corrected by fix-consumer-db-bridge-kv-v2-path): the ``bao kv`` CLI is
+    v2-aware and injects the ``data/`` infix ITSELF, so the bridge put passes the BARE
+    logical path ``secret/<slug>/<subpath>`` (NOT ``secret/data/<slug>/...`` — that
+    doubled the infix, the bug). The argv is a Jinja folded expression; the path is
+    composed either as a literal ``secret/{{ project_slug }}/db`` or via string
+    concatenation (``'secret/' ~ project_slug ~ '/' ~ consumer_db_bridge_subpath``). So
+    match on the ``bao ... kv ... put`` token sequence + a ``secret/`` path + a
+    ``project_slug`` reference + the ``db`` subpath, and EXCLUDE the ``proj-<slug>``
+    source tree.
     """
     argv = _command_argv_text(task)
     if argv is None:
@@ -146,12 +153,12 @@ def _is_bao_kv_put_to_slug_db(task: dict) -> bool:
     # ("bao kv put" after quote/comma normalisation collapses to the same).
     if "bao kv put" not in flat:
         return False
-    if "secret/data/" not in argv:
+    if "secret/" not in argv:
         return False
-    # A proj-<slug> data path would be the SOURCE tree, not the bridge target.
-    if "secret/data/proj-" in argv:
+    # A proj-<slug> path would be the SOURCE tree, not the bridge target.
+    if "proj-" in argv:
         return False
-    # The target is the bare <slug> data tree: either the literal /db form or the
+    # The target is the bare <slug> logical tree: either the literal /db form or the
     # subpath-var form. Require a project_slug reference and a reference to the db
     # subpath (literal 'db' or the consumer_db_bridge_subpath var).
     references_slug = "project_slug" in argv
@@ -163,7 +170,7 @@ def _is_bao_kv_put_to_slug_db(task: dict) -> bool:
 
 
 def _step2a_bridge_put_task(tasks):
-    """Return the bridge ``bao kv put secret/data/<slug>/db`` task, or None."""
+    """Return the bridge ``bao kv put secret/<slug>/db`` task (bare logical), or None."""
     for t in tasks:
         if _is_bao_kv_put_to_slug_db(t):
             return t
@@ -181,17 +188,18 @@ def _str(x) -> str:
 def test_bridge_step_writes_database_url_to_workload_readable_slug_db_tree():
     """Property 1 (Validates: Req 2.1, 2.2).
 
-    A bridge step ``bao kv put``s ``database_url=`` into ``secret/data/<slug>/db``
-    (the bare ``<slug>`` KV v2 data tree inside ``policy-<slug>``, NOT
-    ``proj-<slug>``). FAILS on unfixed code (no such task) — the counterexample
-    (``isBugCondition``: DB credential written only under ``secret/proj-<slug>/<engine>``,
-    not readable under ``secret/data/<slug>/*``).
+    A bridge step ``bao kv put``s ``database_url=`` into the bare logical path
+    ``secret/<slug>/db`` (inside ``policy-<slug>``'s ``<slug>`` tree, NOT
+    ``proj-<slug>``; the KV-v2 CLI injects ``data/`` so it is stored at API path
+    ``secret/data/<slug>/db``). FAILS on unfixed code (no such task) — the
+    counterexample (``isBugCondition``: DB credential written only under
+    ``secret/proj-<slug>/<engine>``, not readable under ``secret/data/<slug>/*``).
     """
     tasks = _load_role_tasks(_CONSUMER_BOOTSTRAP_TASKS)
     put_task = _step2a_bridge_put_task(tasks)
     assert put_task is not None, (
         "consumer_bootstrap has NO bridge step that `bao kv put`s into "
-        "secret/data/<slug>/db — nothing bridges the DB credential into the "
+        "secret/<slug>/db — nothing bridges the DB credential into the "
         "workload-readable <slug> tree (the bug). The <slug>-workload AppRole can "
         "only read secret/{data,...}/<slug>/*, never secret/proj-<slug>/postgres."
     )
@@ -204,10 +212,16 @@ def test_bridge_step_writes_database_url_to_workload_readable_slug_db_tree():
         "(the composed, secret-bearing connection string) — literal or via "
         "consumer_db_bridge_field."
     )
-    # It must NOT target the proj-<slug> tree (that is the source, read-only).
-    assert "secret/data/proj-" not in argv, (
-        "The bridge must write the bare <slug> tree (secret/data/<slug>/db), not "
-        "secret/data/proj-<slug>/* (which is outside policy-<slug>)."
+    # It must NOT target the proj-<slug> tree (that is the source, read-only), and it
+    # must NOT pass a doubled-data/ path to the KV-v2-aware CLI (the corrected bug).
+    assert "proj-" not in argv, (
+        "The bridge must write the bare <slug> logical tree (secret/<slug>/db), not "
+        "secret/proj-<slug>/* (which is outside policy-<slug>)."
+    )
+    assert "secret/data/" not in argv, (
+        "The bridge `bao kv put` must pass the BARE logical path secret/<slug>/db — "
+        "not secret/data/<slug>/db. `bao kv` injects data/ itself, so a secret/data/ "
+        "argument doubles the infix (the fix-consumer-db-bridge-kv-v2-path bug)."
     )
 
 

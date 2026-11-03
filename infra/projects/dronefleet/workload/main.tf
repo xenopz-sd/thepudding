@@ -182,7 +182,13 @@ resource "proxmox_virtual_environment_container" "workload" {
   description = "Consumer workload guest for project '${var.project_slug}' (consumer-last-mile-hello-workload §B). Runs the application Compose stack (OpenBao Agent sidecar + workload container). Managed by Terraform; stateless, torn down with the project."
 
   node_name = var.proxmox_node_name
-  vm_id     = var.workload_vmid
+  # Operator override wins when non-zero (grandfathers a live VMID, no
+  # force-replace); otherwise the module-computed deterministic VMID
+  # (vlan_id * 1000 + host_index, e.g. VLAN 100 idx 1 -> 100001) is used. THIS IS
+  # THE MOTIVATING FIX: the workload guest no longer defaults to a hardcoded,
+  # colliding 1102 — it gets the collision-free computed value distinct from the
+  # DB guest's VMID (ADR-0022).
+  vm_id = var.workload_vmid != 0 ? var.workload_vmid : module.workload[count.index].vmid
 
   unprivileged = true
   features {

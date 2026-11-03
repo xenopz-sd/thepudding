@@ -58,7 +58,93 @@
     mode: "0755"
 
 # ============================================================================
-# STEP 2 — Stand up the Agent sidecar + reference workload via openbao-agent
+# STEP 2 — Stage the workload AppRole creds onto the GUEST (BEFORE the agent)
+# ============================================================================
+# (fix-workload-guest-creds-staging) The openbao-agent sidecar (composed in
+# STEP 3) bind-mounts role-id/secret-id READ-ONLY from host paths ON THIS GUEST
+# (openbao_agent_role_id_host_path / openbao_agent_secret_id_host_path). The
+# control-plane openbao_workload_approle role (consumer_bootstrap STEP 3) minted
+# those creds and handed them to the CONTROL NODE
+# (hello_workload_creds_src_dir = consumer_workload_creds_dir =
+# $HOME/.openbao-workload/<slug>), NOT this guest. On a dedicated workload guest
+# the two are different hosts, so without this step the mount sources are absent,
+# Docker auto-creates empty DIRECTORIES at them, and the Agent reads a directory
+# where a file must be ("read /openbao/agent/role-id: is a directory") ->
+# AppRole auto-auth crash-loops -> the workload never becomes healthy.
+#
+# This step COPIES the 0600 creds from the control node onto this guest at
+# EXACTLY the two paths openbao-agent mounts (0600 root:root, parent dir 0700
+# root:root). `ansible.builtin.copy` reads the local src on the control node and
+# writes it to the remote guest over the Ansible SSH connection — the secret_id
+# value never touches a repo file or stdout (no_log on that task). It adds NO
+# agent/auth logic: it only places the files the EXISTING openbao-agent mounts
+# expect. Fail-closed if the source creds are absent (clear remedy).
+
+- name: "Hello-workload | Assert the workload AppRole creds exist on the control node (fail-closed)"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ hello_workload_role_id_src_path }}"
+    - "{{ hello_workload_secret_id_src_path }}"
+  loop_control:
+    label: "{{ item }}"
+  delegate_to: localhost
+  run_once: true
+  register: hello_workload_cred_src_stat
+
+- name: "Hello-workload | Fail closed if the workload AppRole creds were never handed off"
+  ansible.builtin.assert:
+    that:
+      - hello_workload_cred_src_stat.results | selectattr('stat.exists') | list | length
+        == hello_workload_cred_src_stat.results | length
+    fail_msg: >-
+      The workload AppRole role_id/secret_id were not found on the control node at
+      {{ hello_workload_creds_src_dir }} (expected
+      {{ project_slug }}-workload-role-id and {{ project_slug }}-workload-secret-id).
+      Nothing can be staged onto the workload guest. REMEDY: run the consumer
+      bootstrap for '{{ project_slug }}' first to mint + hand off the workload
+      AppRole (it writes the 0600 creds to that dir), then re-run this deploy. If
+      the handoff used a different dir, override hello_workload_creds_src_dir.
+    success_msg: >-
+      Workload AppRole creds present on the control node — staging them onto the
+      guest for project '{{ project_slug }}'.
+    quiet: true
+  delegate_to: localhost
+  run_once: true
+
+- name: "Hello-workload | Ensure the guest cred dir exists (service-owned, 0700 root:root)"
+  ansible.builtin.file:
+    # The dest-path vars are THIS role's own defaults (in scope here, at STEP 2,
+    # unlike the openbao_agent_* defaults which enter scope only at the STEP 3
+    # include). Same canonical value; threaded INTO openbao-agent at STEP 3.
+    path: "{{ hello_workload_role_id_dest_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: "Hello-workload | Stage the role_id onto the guest (0600 root:root, non-secret)"
+  ansible.builtin.copy:
+    src: "{{ hello_workload_role_id_src_path }}"
+    dest: "{{ hello_workload_role_id_dest_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: "Hello-workload | Stage the secret_id onto the guest (0600 root:root, sensitive)"
+  ansible.builtin.copy:
+    src: "{{ hello_workload_secret_id_src_path }}"
+    dest: "{{ hello_workload_secret_id_dest_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  # The secret_id is sensitive: the value crosses control-node -> guest over SSH
+  # only, and the task output is suppressed by DEFAULT (openbao_no_log resolves to
+  # true unless the dev-only expose opt-in is set). NEVER committed/templated/echoed.
+  no_log: "{{ openbao_no_log }}"
+
+# ============================================================================
+# STEP 3 — Stand up the Agent sidecar + reference workload via openbao-agent
 # ============================================================================
 # COMPOSE the EXISTING `openbao-agent` role (no new agent wiring). Thread the
 # task-4.1 `hello_workload_*` reference var set into its inputs:
@@ -82,6 +168,15 @@
   ansible.builtin.include_role:
     name: openbao-agent
   vars:
+    # Thread the guest DEST paths STEP 2 staged to INTO the agent as its mount
+    # sources, so what was staged is EXACTLY what the sidecar bind-mounts
+    # read-only (staged == mounted, no drift). THIS role is the single source of
+    # truth for the dest paths; passing them via the include `vars:` is in scope
+    # inside the include (unlike referencing the agent defaults before it, which
+    # was the bug). A direct openbao-agent caller that omits these still gets the
+    # agent role's own default (the standalone fallback, unchanged).
+    openbao_agent_role_id_host_path: "{{ hello_workload_role_id_dest_path }}"
+    openbao_agent_secret_id_host_path: "{{ hello_workload_secret_id_dest_path }}"
     # The default DB mapping {db, database_url, DATABASE_URL} (Req 1.2). Only the
     # KV reference + env key — no secret value.
     openbao_agent_secret_mappings: "{{ hello_workload_secret_mappings }}"

@@ -182,6 +182,42 @@ class TestIdentityContractStatic:
             "`(var.svc_code == null) != (var.role_code == null)` (ADR-0021)"
         )
 
+    # --- ADR-0022: deterministic VMID formula (static source inspection) ----
+
+    def test_vmid_local_is_computed_not_null(self, locals_hcl):
+        """locals.tf computes vmid = var.vlan_id * 1000 + var.host_index
+        (ADR-0022) and no longer leaves it a null stand-in."""
+        assert re.search(
+            r"vmid\s*=\s*var\.vlan_id\s*\*\s*1000\s*\+\s*var\.host_index",
+            locals_hcl,
+        ), (
+            "locals.tf must compute vmid = var.vlan_id * 1000 + var.host_index "
+            "(the deterministic, collision-free, reversible VMID formula; ADR-0022)"
+        )
+        assert not re.search(r"vmid\s*=\s*null", locals_hcl), (
+            "vmid must no longer be the null stand-in — it is computed (ADR-0022)"
+        )
+
+    def test_vmid_output_is_the_computed_local(self):
+        """outputs.tf's vmid output value is local.vmid (the computed value)."""
+        outputs_hcl = _strip_hcl_comments((_COMPUTE_MODULE_DIR / "outputs.tf").read_text())
+        block = _extract_named_block(outputs_hcl, "output", "vmid")
+        assert block is not None, "vmid output block not found"
+        assert re.search(r"value\s*=\s*local\.vmid", block), (
+            "the vmid output must expose local.vmid (the computed value; ADR-0022)"
+        )
+
+    def test_vmid_band_guard_present(self, preconditions_hcl):
+        """Guard 6 asserts the computed VMID is in the legal Proxmox band
+        100..999999999 (defensive; ADR-0022)."""
+        assert re.search(
+            r"local\.vmid\s*>=\s*100\s*&&\s*local\.vmid\s*<=\s*999999999",
+            preconditions_hcl,
+        ), (
+            "preconditions.tf must carry a band-safety guard "
+            "`local.vmid >= 100 && local.vmid <= 999999999` (ADR-0022 Guard 6)"
+        )
+
 
 # --------------------------------------------------------------------------- #
 # 2. Plan-harness inspection (secondary — gated on the toolchain).
@@ -323,3 +359,89 @@ class TestIdentityPlanBehavior:
         assert "role_code" in out.lower(), (
             f"the rejection should reference the role_code validation:\n{out}"
         )
+
+    # --- ADR-0022: the planned vmid output equals vlan_id*1000 + host_index --
+
+    @staticmethod
+    def _run_vmid_harness(vlan_id: int, host_index: int) -> tuple[int, str, str]:
+        """Plan a module call with the given vlan_id/host_index and return
+        (plan_returncode, plan_output, planned_vmid_string|"")."""
+        binary = _terraform_binary()
+        assert binary is not None  # gated by @requires_terraform
+        tmp = Path(tempfile.mkdtemp(prefix="pc_vmid_"))
+        try:
+            (tmp / "main.tf").write_text(
+                'module "t" {\n'
+                f'  source = "{_COMPUTE_MODULE_DIR}"\n'
+                '  project_slug = "dronefleet"\n'
+                '  service_name = "workload"\n'
+                '  role_code    = "workload"\n'
+                f"  vlan_id      = {vlan_id}\n"
+                f"  host_index   = {host_index}\n"
+                '  instance     = "01"\n'
+                "}\n"
+                'output "vmid" {\n'
+                "  value = module.t.vmid\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            init = subprocess.run(
+                [binary, "init", "-backend=false", "-input=false", "-no-color"],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+            )
+            if init.returncode != 0:
+                combined = (init.stdout + init.stderr).lower()
+                if any(
+                    m in combined
+                    for m in (
+                        "failed to install provider",
+                        "could not retrieve",
+                        "failed to query available provider",
+                        "network is unreachable",
+                        "dial tcp",
+                        "timeout",
+                    )
+                ):
+                    pytest.skip(
+                        "requires-infra, skipped: terraform init could not install "
+                        "the provider offline (environmental, unrelated to the "
+                        "ADR-0022 VMID formula under test)."
+                    )
+                return init.returncode, init.stdout + init.stderr, ""
+            plan = subprocess.run(
+                [binary, "plan", "-input=false", "-no-color"],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+            )
+            out = plan.stdout + plan.stderr
+            m = re.search(r"vmid\s*=\s*(\d+)", out)
+            return plan.returncode, out, (m.group(1) if m else "")
+        finally:
+            import shutil
+
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_vmid_output_equals_formula(self):
+        """The planned vmid output equals vlan_id*1000 + host_index (ADR-0022).
+
+        Spot-checks the shared-services band floor (20, 0 -> 20000), the consumer
+        workload anchor (100, 1 -> 100001), and the band ceiling (254, 244 ->
+        254244) — the HCL side of the golden HCL<->Python cross-check.
+        """
+        for vlan_id, host_index, expected in [
+            (20, 0, "20000"),
+            (100, 1, "100001"),
+            (254, 244, "254244"),
+        ]:
+            rc, out, vmid = self._run_vmid_harness(vlan_id, host_index)
+            assert rc == 0, (
+                f"module plan for vlan={vlan_id} idx={host_index} must succeed, "
+                f"got rc={rc}:\n{out}"
+            )
+            assert vmid == expected, (
+                f"planned vmid for vlan={vlan_id} idx={host_index} must be "
+                f"{expected} (= vlan_id*1000 + host_index), got {vmid!r} (ADR-0022)"
+            )

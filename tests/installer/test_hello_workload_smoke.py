@@ -158,23 +158,46 @@ def test_workload_depends_on_agent_service_healthy(agent_wiring):
 
 
 # --------------------------------------------------------------------------- #
-# 2. NO HOST PORT — Traefik-only ingress (integration-boundaries §1).
+# 2. NO LAN-FACING HOST PORT — Traefik-fronted ingress (integration-boundaries
+#    §1). UPDATED for the ADR-0018 cross-guest fix
+#    (fix-openbao-agent-cross-guest-edge-ingress): the workload almost always
+#    runs on a DEDICATED guest, not the Traefik guest, so the DEFAULT real path
+#    publishes a VLAN-IP-BOUND port (the ADR-0018 private-VLAN-bound-port
+#    exception — consumed only by Traefik over VLAN L3, never 0.0.0.0/LAN) and
+#    delegates a file-provider Route_Fragment. `ports` is now a PATH-SELECTED
+#    Jinja conditional ([] on mock-edge, VLAN-bound on real) rather than absent.
+#    The intent is unchanged: no LAN-facing host port; Traefik stays the only
+#    LAN ingress. (Previously these asserted the pre-fix co-located shape where
+#    the workload published nothing and relied on local `edge` labels.)
 # --------------------------------------------------------------------------- #
-def test_workload_wiring_publishes_no_host_port(agent_wiring):
-    """The fixed workload wiring declares no `ports:` entry — HTTP ingress is
-    Traefik-only (integration-boundaries §1), never a published host port."""
-    assert "ports" not in agent_wiring, (
-        "the hello-workload wiring must publish NO host `ports:` (Traefik-only "
-        f"ingress); got {agent_wiring.get('ports')!r}"
+def test_workload_wiring_port_is_path_selected_and_never_wildcard(agent_wiring):
+    """The workload wiring's `ports` is a PATH-SELECTED Jinja conditional on
+    `openbao_agent_mock_edge_network`: empty ([]) on the mock-edge path, and a
+    VLAN-IP-bound mapping (`openbao_agent_workload_bind_ip`, never 0.0.0.0/LAN)
+    on the default real cross-guest path. Never a bare LAN host port
+    (integration-boundaries §1 / ADR-0018 private-VLAN-bound-port exception)."""
+    ports = agent_wiring.get("ports")
+    assert isinstance(ports, str) and "{{" in ports, (
+        "the workload `ports` must be a PATH-SELECTED Jinja conditional (ADR-0018 "
+        f"real-vs-mock-edge); got {ports!r}"
     )
+    compact = ports.replace(" ", "")
+    assert "openbao_agent_mock_edge_network" in compact, (
+        "`ports` must be conditional on openbao_agent_mock_edge_network"
+    )
+    assert "openbao_agent_workload_bind_ip" in compact, (
+        "the real-path port must bind the guest's OWN VLAN IP (bind_ip), never a "
+        "bare host-wide/LAN port"
+    )
+    assert "0.0.0.0" not in compact, "the workload port must NEVER bind 0.0.0.0/LAN"
+    assert "[]" in compact, "`ports` mock-edge branch must resolve to [] (no published port)"
 
 
-def test_agent_tasks_render_no_workload_host_port(agent_tasks):
-    """Belt-and-braces: the openbao-agent tasks file sets no `ports` key on the
-    workload service dict anywhere (neither in the wiring set_fact nor the
-    dca_services entry). The only sanctioned ingress is the Traefik label."""
-    # The workload service dict is the wiring set_fact + base/optional combine;
-    # none of those three parts may introduce a `ports` key.
+def test_agent_tasks_workload_port_only_vlan_bound_never_wildcard(agent_tasks):
+    """Belt-and-braces: wherever the openbao-agent tasks file sets a `ports` key
+    on the workload service dict, it is the PATH-SELECTED VLAN-IP-bound mapping
+    (bind_ip, never 0.0.0.0) — never an unconditional LAN host port. The sidecar
+    still publishes nothing (asserted elsewhere)."""
     for key in (
         "openbao_agent_workload_service_wiring",
         "openbao_agent_workload_service_optional",
@@ -182,27 +205,67 @@ def test_agent_tasks_render_no_workload_host_port(agent_tasks):
     ):
         sf = _find_set_fact(agent_tasks, key)
         payload = sf[key]
-        if isinstance(payload, dict):
-            assert "ports" not in payload, (
-                f"{key} must not introduce a `ports` key; got {payload!r}"
+        if isinstance(payload, dict) and "ports" in payload:
+            compact = str(payload["ports"]).replace(" ", "")
+            assert "openbao_agent_mock_edge_network" in compact, (
+                f"{key} `ports` must be path-selected on the mock-edge flag; got {payload['ports']!r}"
+            )
+            assert "0.0.0.0" not in compact, (
+                f"{key} `ports` must never bind 0.0.0.0/LAN; got {payload['ports']!r}"
             )
 
 
 # --------------------------------------------------------------------------- #
-# 3. TRAEFIK LABEL — traefik.enable=true + a Host() router rule.
+# 3. CROSS-GUEST INGRESS — the DEFAULT real path delegates a Traefik
+#    file-provider Route_Fragment (ADR-0018), and the MOCK-EDGE path keeps the
+#    `traefik.enable=true` + Host() labels (path-selected). UPDATED for the
+#    fix-openbao-agent-cross-guest-edge-ingress bugfix: on a dedicated workload
+#    guest Traefik cannot read this guest's Docker labels, so the labels are now
+#    MOCK-EDGE-ONLY (a path-selected conditional) and the real path uses the
+#    reusable `traefik_route` role instead.
 # --------------------------------------------------------------------------- #
-def test_workload_carries_traefik_enable_and_host_rule(agent_wiring):
-    """Ingress via Docker labels, not a host port (integration-boundaries §1):
-    the workload wiring carries `traefik.enable=true` and a `Host()` router
-    rule label."""
-    labels = agent_wiring.get("labels") or []
-    joined = " ".join(str(x) for x in labels)
-    assert "traefik.enable=true" in joined, (
-        f"the hello-workload must carry `traefik.enable=true`; got {labels!r}"
+def test_workload_labels_are_path_selected_mock_edge_only(agent_wiring):
+    """The workload wiring's `labels` is a PATH-SELECTED Jinja conditional: the
+    Traefik discovery labels (`traefik.enable=true` + Host() rule) apply ONLY on
+    the mock-edge path (co-located Traefik) and resolve to [] on the default real
+    cross-guest path (where a file-provider route supersedes them)."""
+    labels = agent_wiring.get("labels")
+    assert isinstance(labels, str) and "{{" in labels, (
+        "the workload `labels` must be a PATH-SELECTED Jinja conditional (mock-edge "
+        f"only); got {labels!r}"
     )
-    assert "traefik.http.routers" in joined and ".rule=Host(" in joined, (
-        "the hello-workload must declare a Traefik `Host()` router-rule label; "
-        f"got {labels!r}"
+    compact = labels.replace(" ", "")
+    assert "openbao_agent_mock_edge_network" in compact, (
+        "`labels` must be conditional on openbao_agent_mock_edge_network"
+    )
+    assert "[]" in compact, "`labels` real-path branch must resolve to [] (no labels cross-guest)"
+
+
+def test_agent_delegates_cross_guest_traefik_route_on_real_path(agent_tasks):
+    """The DEFAULT real path delegates a Traefik file-provider Route_Fragment via
+    the reusable `traefik_route` role (ADR-0018), gated
+    `when: not (openbao_agent_mock_edge_network | bool)`, with a Host() rule and
+    an http:// backend — the cross-guest ingress that replaces Docker-label
+    discovery when the workload is NOT co-located with Traefik."""
+    includes = [
+        t for t in agent_tasks
+        if isinstance(
+            t.get("ansible.builtin.include_role") or t.get("include_role"), dict
+        ) and (t.get("ansible.builtin.include_role") or t.get("include_role")).get("name")
+        == "traefik_route"
+    ]
+    assert len(includes) == 1, (
+        f"openbao-agent must delegate the cross-guest Route_Fragment via traefik_route "
+        f"exactly once (ADR-0018); got {len(includes)}"
+    )
+    tvars = includes[0].get("vars") or {}
+    assert str(tvars.get("route_backend_url", "")).strip().startswith("http://"), (
+        f"the route backend must be plain http:// (cleartext workload); got "
+        f"{tvars.get('route_backend_url')!r}"
+    )
+    when = str(includes[0].get("when", "")).replace(" ", "")
+    assert "not(openbao_agent_mock_edge_network|bool)" in when, (
+        f"the traefik_route include must be gated on the real path; got {includes[0].get('when')!r}"
     )
 
 

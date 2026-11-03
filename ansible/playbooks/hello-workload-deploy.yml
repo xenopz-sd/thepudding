@@ -59,4 +59,12 @@
     # co-locate target (e.g. the DB guest group) for a co-located stand-up.
     hello_workload_target: "workload"
   roles:
+    # Docker CE + Compose plugin install + baseline hardening (ADR-0003). A
+    # freshly-provisioned workload guest boots the stock debian-12 template with
+    # NO Docker, so the openbao-agent docker-compose-app reconcile below cannot
+    # even start without this — every service bootstrap runs `common` first, and
+    # the dedicated-workload-guest topology needs it too. Idempotent
+    # (`state: present`, never `latest`), so a re-run against a converged guest
+    # is a no-op (changed=0). Must run BEFORE hello_workload_deploy.
+    - role: common
     - role: hello_workload_deploy

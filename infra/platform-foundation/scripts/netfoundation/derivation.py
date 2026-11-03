@@ -55,6 +55,19 @@ FIRST_HOST_OFFSET = 10
 #: Largest usable last octet for a host address under the ``/24`` formula.
 MAX_HOST_OCTET = 254
 
+#: Proxmox VMID legal band (proxmox-compute-deterministic-vmid, ADR-0022). The
+#: Proxmox API accepts VM/LXC IDs in ``100``-``999999999``; the computed scheme
+#: (``vlan_id * 1000 + host_index``) always lands well inside this — min 20000
+#: (VLAN 20, index 0), max 254244 (VLAN 254, index 244).
+MIN_PROXMOX_VMID = 100
+MAX_PROXMOX_VMID = 999_999_999
+
+#: One 1000-wide VMID band per VLAN. Because ``host_index`` is bounded 0..244
+#: (``< 1000``), each ``vlan_id`` owns a distinct block, so distinct
+#: ``(vlan_id, host_index)`` pairs map to distinct VMIDs (collision-free) and the
+#: value is reversible by ``// 1000`` / ``% 1000``.
+_VMID_VLAN_MULTIPLIER = 1000
+
 
 class VlanExhaustionError(Exception):
     """Raised when the per-project VLAN-ID space (100-254) is exhausted.
@@ -72,6 +85,17 @@ class HostAddressExhaustionError(Exception):
     Surfaced by :func:`host_ip` when ``FIRST_HOST_OFFSET + index`` exceeds
     :data:`MAX_HOST_OCTET`. The scheme never wraps, duplicates, or emits an
     out-of-range address (Requirement 2.6, Property 10).
+    """
+
+
+class VmidOutOfBandError(Exception):
+    """Raised when a computed/parsed VMID falls outside the legal Proxmox band.
+
+    Surfaced by :func:`proxmox_vmid` when ``host_index`` is outside ``0``-``999``
+    (which would make the ``% 1000`` inverse ambiguous) or the result leaves
+    ``[100, 999999999]``, and by :func:`parse_vmid` when given a VMID outside
+    that band. The VMID scheme never wraps, aliases, or emits an out-of-band ID
+    (proxmox-compute-deterministic-vmid Requirements 1.1, 1.2; Properties 1, 2).
     """
 
 
@@ -145,6 +169,91 @@ def host_ip(vlan_id: int, index: int) -> str:
         )
     network = ipaddress.ip_network(subnet_cidr(vlan_id))
     return str(network[offset])
+
+
+def proxmox_vmid(vlan_id: int, host_index: int) -> int:
+    """Return the deterministic Proxmox VMID for a guest (ADR-0022).
+
+    The VMID-side analogue of :func:`host_ip`: it derives the VMID from the SAME
+    two stable inputs as the host IP (``vlan_id`` + ``host_index``) via
+
+        ``vmid = vlan_id * 1000 + host_index``
+
+    This is the pure Python mirror of the identical HCL computation in the
+    shared ``proxmox-compute`` module's ``locals.tf``; the golden
+    ``terraform plan`` cross-check diffs the two so they can never drift
+    (proxmox-compute-deterministic-vmid, ADR-0022).
+
+    COLLISION-FREE: ``host_index`` is bounded ``0``-``999`` here (and ``0``-``244``
+    in practice, by the module's host-IP-exhaustion guard), so each ``vlan_id``
+    owns a distinct 1000-wide band and distinct ``(vlan_id, host_index)`` pairs
+    map to distinct VMIDs. REVERSIBLE: :func:`parse_vmid` recovers the inputs.
+
+    Args:
+        vlan_id: The guest's VLAN ID (20 for shared, 100-254 for a project).
+        host_index: Zero-based position of the guest within its VLAN
+            (0-999; the real ceiling is 244 via the host-IP formula).
+
+    Returns:
+        The computed VMID, in the legal Proxmox band ``[100, 999999999]``.
+
+    Raises:
+        VmidOutOfBandError: If ``host_index`` is outside ``0``-``999`` (the
+            ``% 1000`` inverse would be ambiguous) or the computed VMID leaves
+            the legal Proxmox band.
+    """
+    if not isinstance(vlan_id, int) or isinstance(vlan_id, bool) or vlan_id < 0:
+        raise ValueError(f"vlan_id must be a non-negative int, got {vlan_id!r}")
+    if (
+        not isinstance(host_index, int)
+        or isinstance(host_index, bool)
+        or not (0 <= host_index < _VMID_VLAN_MULTIPLIER)
+    ):
+        raise VmidOutOfBandError(
+            f"host_index {host_index!r} must be an int in 0..{_VMID_VLAN_MULTIPLIER - 1} "
+            "so the VMID formula vlan_id*1000 + host_index stays collision-free and "
+            "reversible by %/// 1000 (ADR-0022)."
+        )
+    vmid = vlan_id * _VMID_VLAN_MULTIPLIER + host_index
+    if not (MIN_PROXMOX_VMID <= vmid <= MAX_PROXMOX_VMID):
+        raise VmidOutOfBandError(
+            f"Computed VMID {vmid} (= vlan_id {vlan_id} * {_VMID_VLAN_MULTIPLIER} + "
+            f"host_index {host_index}) is outside the legal Proxmox band "
+            f"{MIN_PROXMOX_VMID}..{MAX_PROXMOX_VMID} (ADR-0022)."
+        )
+    return vmid
+
+
+def parse_vmid(vmid: int) -> dict[str, int]:
+    """Recover ``(vlan_id, host_index)`` from a VMID built by :func:`proxmox_vmid`.
+
+    Round-trip inverse of :func:`proxmox_vmid` (ADR-0022, Property 2). The
+    decomposition is unambiguous because ``host_index < 1000``:
+    ``vlan_id = vmid // 1000`` and ``host_index = vmid % 1000`` — so an operator
+    reading ``100001`` recovers VLAN 100, host_index 1 (the direct analogue of
+    reading ``10.0.100.11``).
+
+    Args:
+        vmid: A VMID produced by :func:`proxmox_vmid`.
+
+    Returns:
+        A dict with integer keys ``vlan_id`` and ``host_index``.
+
+    Raises:
+        VmidOutOfBandError: If ``vmid`` is outside the legal Proxmox band.
+    """
+    if not isinstance(vmid, int) or isinstance(vmid, bool):
+        raise VmidOutOfBandError(f"vmid must be an int, got {vmid!r}")
+    if not (MIN_PROXMOX_VMID <= vmid <= MAX_PROXMOX_VMID):
+        raise VmidOutOfBandError(
+            f"vmid {vmid} is outside the legal Proxmox band "
+            f"{MIN_PROXMOX_VMID}..{MAX_PROXMOX_VMID}; it was not produced by the "
+            "proxmox_vmid scheme (ADR-0022)."
+        )
+    return {
+        "vlan_id": vmid // _VMID_VLAN_MULTIPLIER,
+        "host_index": vmid % _VMID_VLAN_MULTIPLIER,
+    }
 
 # --- Hostname / tag construction and input guards (task 5.2) -------------
 #

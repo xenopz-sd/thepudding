@@ -75,22 +75,29 @@ variable "openbao_datastore_id" {
 
 variable "openbao_primary_vmid" {
   description = <<-EOT
-    Proxmox VMID for the primary OpenBao LXC (svc07-20-01). Supplied explicitly
-    so the two SVC-07 containers get stable, non-colliding IDs assigned by the
-    operator/allocation scheme rather than auto-assigned. The unsealer's VMID is
-    a separate input (openbao_unsealer_vmid).
+    OPERATOR OVERRIDE for the primary OpenBao LXC's (svc07-20-01) Proxmox VMID
+    (ADR-0022 grandfather posture). When non-zero, this operator-supplied value
+    WINS and is used verbatim — so an already-provisioned guest keeps its live
+    VMID (e.g. 1070) and is never force-replaced by adopting the computed scheme.
+    When 0 (the "use computed" sentinel default) the module-computed deterministic
+    VMID is used instead (vlan_id * 1000 + host_index = 20 * 1000 + 0 = 20000).
+    The orchestrator still passes the live value via -e, so nothing changes for a
+    standing SVC-07.
   EOT
   type        = number
+  default     = 0
 }
 
 variable "openbao_unsealer_vmid" {
   description = <<-EOT
-    Proxmox VMID for the Transit unsealer OpenBao LXC (svc07-unsealer-20-01).
-    Supplied explicitly so the two SVC-07 containers get stable, non-colliding
-    IDs assigned by the operator/allocation scheme rather than auto-assigned.
-    Must differ from openbao_primary_vmid.
+    OPERATOR OVERRIDE for the Transit unsealer OpenBao LXC's (svc07-unsealer-20-01)
+    Proxmox VMID (ADR-0022 grandfather posture). Non-zero wins (grandfathers a live
+    1071, no force-replace); 0 (the sentinel default) uses the module-computed
+    deterministic VMID (20 * 1000 + 1 = 20001). Must differ from
+    openbao_primary_vmid when both are operator-supplied.
   EOT
   type        = number
+  default     = 0
 }
 variable "operator_ssh_public_keys" {
   description = <<-EOT

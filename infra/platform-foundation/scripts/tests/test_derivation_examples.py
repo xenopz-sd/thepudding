@@ -44,6 +44,7 @@ from netfoundation import (
     HostAddressExhaustionError,
     HostIndexCollisionError,
     VlanExhaustionError,
+    VmidOutOfBandError,
     assert_unique_host_indices,
     assigned_host_index,
     gateway_ip,
@@ -51,8 +52,10 @@ from netfoundation import (
     hostname,
     next_vlan_id,
     parse_hostname,
+    parse_vmid,
     peer_host_indices,
     proxmox_tag,
+    proxmox_vmid,
     subnet_cidr,
 )
 from onboard_project import OnboardingError, validate_slug
@@ -331,3 +334,66 @@ def test_svc09_peer_host_indices_exclude_self():
     peers = peer_host_indices(ledger, 20, "svc09")
     assert peers == [0, 1, 4, 5]
     assert 2 not in peers
+
+
+# =========================================================================
+# Feature: proxmox-compute-deterministic-vmid — VMID formula anchors
+# =========================================================================
+#
+# Example-based complements to the Property 1-2 Hypothesis tests in
+# test_property_derivation.py: they pin the deterministic VMID formula
+# (vlan_id * 1000 + host_index, ADR-0022) to inspectable band-edge anchors and
+# the out-of-band guards, and pin the specific dronefleet collision the fix
+# removes.
+
+
+def test_vmid_shared_vlan_band_floor():
+    """VLAN 20, index 0 -> 20000 (the band floor; ADR-0022)."""
+    assert proxmox_vmid(20, 0) == 20000
+
+
+def test_vmid_consumer_workload_anchor():
+    """VLAN 100, index 1 -> 100001 (the consumer workload guest; ADR-0022).
+
+    This is the value the workload guest now gets by computation instead of the
+    hardcoded, colliding 1102.
+    """
+    assert proxmox_vmid(100, 1) == 100001
+
+
+def test_vmid_band_ceiling():
+    """VLAN 254, index 244 -> 254244 (the band ceiling; still well under the
+    Proxmox 999999999 max; ADR-0022)."""
+    assert proxmox_vmid(254, 244) == 254244
+
+
+def test_vmid_round_trip_anchor():
+    """parse_vmid is the exact inverse of proxmox_vmid (reversible; ADR-0022)."""
+    assert parse_vmid(100001) == {"vlan_id": 100, "host_index": 1}
+    assert parse_vmid(proxmox_vmid(254, 244)) == {"vlan_id": 254, "host_index": 244}
+
+
+def test_vmid_host_index_out_of_range_raises():
+    """host_index >= 1000 (the %/// 1000 inverse would be ambiguous) -> VmidOutOfBandError."""
+    with pytest.raises(VmidOutOfBandError):
+        proxmox_vmid(100, 1000)
+
+
+def test_parse_vmid_below_band_raises():
+    """A VMID below the Proxmox floor (100) is rejected (ADR-0022)."""
+    with pytest.raises(VmidOutOfBandError):
+        parse_vmid(0)
+
+
+def test_vmid_dronefleet_collision_is_removed():
+    """The dronefleet DB (index 0) and workload (index 1) get DISTINCT VMIDs.
+
+    The live defect was both guests effectively sharing 1102; under the computed
+    scheme they are 100000 (DB) and 100001 (workload) — distinct by construction
+    (ADR-0022, Requirement 1.2).
+    """
+    db_vmid = proxmox_vmid(100, 0)       # dronefleet DB guest
+    workload_vmid = proxmox_vmid(100, 1)  # dronefleet workload guest
+    assert db_vmid == 100000
+    assert workload_vmid == 100001
+    assert db_vmid != workload_vmid

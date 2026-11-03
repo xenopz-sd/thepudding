@@ -91,7 +91,10 @@ resource "proxmox_virtual_environment_container" "zitadel" {
   description = "SVC-06 ZITADEL identity provider (OIDC/SAML SSO, PostgreSQL-backed). Managed by Terraform; see .kiro/specs/svc-06-identity-provider."
 
   node_name = var.proxmox_node_name
-  vm_id     = var.zitadel_vmid
+  # Operator override wins when non-zero (grandfathers a live VMID, no
+  # force-replace); otherwise the module-computed deterministic VMID
+  # (vlan_id * 1000 + host_index = 20005) is used (ADR-0022).
+  vm_id = var.zitadel_vmid != 0 ? var.zitadel_vmid : module.zitadel.vmid
 
   # Unprivileged container (PF LXC-default). `nesting` is required so the
   # in-container Docker engine (which the Compose stack needs) runs inside an

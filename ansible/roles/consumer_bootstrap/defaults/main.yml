@@ -72,14 +72,28 @@ consumer_auth_method_map:
   jwt-profile: jwt
 
 # --- DB-credential workload bridge (fix-consumer-db-secret-workload-path-mismatch,
-# Option A) -------------------------------------------------------------------
+# Option A; KV-v2 path corrected by fix-consumer-db-bridge-kv-v2-path) ----------
 # postgres-server writes the DB credential ONLY to secret/proj-<slug>/postgres — a
 # path OUTSIDE policy-<slug> (which grants only the five KV v2 sub-paths under the
 # bare <slug> prefix). STEP 2a BRIDGES the SAME value into the already-granted
-# secret/data/<slug>/<subpath> item (field <field>) so the <slug>-workload AppRole
-# and its openbao-agent sidecar reach it with no manual step and NO policy change.
-# Both are overridable; they use the EXISTING secret/data/<slug>/<kv_subpath> shape
-# so agent.hcl.j2 / workload_auth.py::render_agent_hcl are NOT touched.
+# <slug>/<subpath> item (field <field>) so the <slug>-workload AppRole and its
+# openbao-agent sidecar reach it with no manual step and NO policy change.
+#
+# KV v1 vs v2 — WHY THE WRITE AND THE READ PATHS LOOK DIFFERENT (do not "fix" this
+# apparent mismatch): `secret/` is KV v2. The `bao kv` CLI is v2-aware and injects
+# the `data/` infix itself, so STEP 2a WRITES the BARE logical path
+# `secret/<slug>/<subpath>` via `bao kv put secret/<slug>/<subpath>` (the CLI stores
+# it at API path `secret/data/<slug>/<subpath>`). The openbao-agent consul-template
+# READS the SAME secret as `secret "secret/data/<slug>/<subpath>"` — the raw KV-v2
+# API path, which consul-template (and `bao read`/`bao write` / the HTTP API) require
+# but `bao kv` must NOT be given. policy-<slug> grants `secret/data/<slug>/*` (the API
+# path = logical `secret/<slug>/*`). All three address ONE stored secret. The earlier
+# bug passed `secret/data/<slug>/<subpath>` to `bao kv`, doubling the infix.
+#
+# consumer_db_bridge_subpath/field are overridable; the Agent/mapping side uses the
+# EXISTING raw-API secret/data/<slug>/<kv_subpath> shape (see consumer_db_agent_mapping
+# and agent.hcl.j2 below) so agent.hcl.j2 / workload_auth.py::render_agent_hcl are
+# NOT touched by this fix.
 consumer_db_bridge_subpath: db
 consumer_db_bridge_field: database_url
 

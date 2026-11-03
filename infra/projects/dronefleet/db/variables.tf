@@ -58,8 +58,17 @@ variable "proxmox_node_name" {
 }
 
 variable "svc01_vmid" {
-  description = "Proxmox VMID for the DB LXC. Supplied explicitly so instances get stable, non-colliding IDs."
+  description = <<-EOT
+    OPERATOR OVERRIDE for the DB LXC's Proxmox VMID, threaded into the reused
+    SVC-01 module (ADR-0022 grandfather posture). Non-zero wins verbatim
+    (grandfathers an already-provisioned consumer DB — e.g. dronefleet's live
+    1101 — so the stateful prevent_destroy guest is never force-replaced); 0 (the
+    "use computed" sentinel default) lets the module compute the deterministic
+    VMID (vlan_id * 1000 + host_index). The consumer orchestrator passes the live
+    value via -e consumer_svc01_vmid, so a standing DB is untouched.
+  EOT
   type        = number
+  default     = 0
 }
 
 variable "svc01_template_file_id" {

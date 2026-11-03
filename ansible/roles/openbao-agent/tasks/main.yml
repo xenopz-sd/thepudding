@@ -151,49 +151,167 @@
 # surface for a reference workload (the consumer-last-mile `hello_workload` set,
 # task 4.2) — NOT agent/auth wiring. NO secret value appears in any part; real
 # secrets arrive only via the Rendered_Secret_File (extra_env_files).
-- name: "4 — Assemble the FIXED workload wiring (swap-gate + Traefik, unchanged)"
+# ----------------------------------------------------------------------------
+# CROSS-GUEST INGRESS PATH SELECTION (ADR-0018) — real route vs mock-edge.
+# Traefik (SVC-09, 10.0.20.12) almost always runs on a SEPARATE guest from the
+# workload (the consumer last-mile §B dedicated workload guest on a project
+# VLAN). A host-local `edge` network can never bridge two guests and Traefik
+# never reads another guest's Docker labels, so the REAL cross-guest path
+# (default, openbao_agent_mock_edge_network=false) publishes the workload's
+# VLAN-IP-bound HTTP port + delegates a Traefik file-provider Route_Fragment
+# onto the Traefik_Guest. The MOCK-EDGE path (opt-in, co-located dev only,
+# permanent per mock-stand-ins.md) keeps the old local-`edge` + Docker-label
+# discovery. The workload serves cleartext HTTP, so the backend hop has NO TLS
+# and NO backend cert — the Route_Mechanism's optional serversTransport vars are
+# left EMPTY (the default-inert path, exactly the Grafana shape). The two paths
+# are MUTUALLY EXCLUSIVE. Mirrors zitadel-server 5a-5d / openbao_install (a)-(d).
+# ----------------------------------------------------------------------------
+
+# --- INFO swap-gate decision (Req 2.4) --------------------------------------
+# composition-wiring.md §"Swap-Gate Pattern" step 4 / mock-stand-ins.md: emit an
+# INFO line stating WHICH ingress path was selected and WHY, so the real-route
+# vs mock-edge choice is visible in the play output. (The traefik_route role
+# emits its own INFO too; this one names the workload-side VLAN-port + http
+# backend decision.) Mirrors zitadel-server 5a / grafana 6a.
+- name: "4 — Cross-guest ingress swap-gate decision (INFO, Req 2.4)"
+  ansible.builtin.debug:
+    msg: >-
+      openbao-agent[{{ project_slug }}] cross-guest ingress (swap-gate):
+      openbao_agent_mock_edge_network={{ openbao_agent_mock_edge_network }}
+      -> {{
+        ('MOCK_EDGE (dev/offline, co-located Traefik ONLY — permanent default-off '
+          ~ 'placeholder per mock-stand-ins.md): attach the workload to the local `'
+          ~ openbao_agent_edge_network ~ '` network + emit Traefik discovery labels; '
+          ~ 'NO published port, NO file-provider route. NEVER use on a host where '
+          ~ 'SVC-09 owns the real `edge` (ADR-0013).')
+        if (openbao_agent_mock_edge_network | bool)
+        else ('REAL cross-guest file-provider route (default production posture, '
+          ~ 'Req 2.1/2.2): publish the workload HTTP port '
+          ~ openbao_agent_workload_bind_ip ~ ':' ~ (openbao_agent_workload_http_port | string)
+          ~ ' (bound to the guest''s OWN VLAN IP, never 0.0.0.0/LAN) and delegate a '
+          ~ 'Traefik Route_Fragment onto the Traefik_Guest '
+          ~ openbao_agent_traefik_guest_host ~ ', backend http://'
+          ~ openbao_agent_workload_bind_ip ~ ':' ~ (openbao_agent_workload_http_port | string)
+          ~ ' (cleartext HTTP hop — NO backend cert, NO serversTransport, NO CA '
+          ~ 'delegate); NO cross-guest `edge` network, NO Docker labels (Traefik on '
+          ~ 'another guest cannot read them).')
+      }}
+  changed_when: false
+
+# --- Compose the MOCK-EDGE Traefik labels (MOCK-EDGE PATH ONLY) --------------
+# Only meaningful when Traefik's Docker provider is on the SAME daemon (the
+# co-located dev box). On the real cross-guest path these labels are inert
+# (Traefik is on another guest) and are NOT attached. These are the two existing
+# traefik.* labels moved into a set_fact so they are path-selectable. Mirrors
+# zitadel-server 5b / grafana 6b.
+- name: "4 — Compose the workload Traefik labels (mock-edge path only)"
+  ansible.builtin.set_fact:
+    openbao_agent_workload_traefik_labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.{{ dca_app_name }}.rule=Host(`{{ openbao_agent_workload_host_rule }}`)"
+  vars:
+    dca_app_name: "{{ project_slug }}-workload"
+  changed_when: false
+  when: openbao_agent_mock_edge_network | bool
+
+- name: "4 — Assemble the FIXED workload wiring (swap-gate UNCHANGED; ingress path-selected)"
   ansible.builtin.set_fact:
     openbao_agent_workload_service_wiring:
       # The Rendered_Secret_File (0600) layered over the non-secret .env — a
       # later env_file wins on key conflicts (Req 5.1). Only the PATH is
       # emitted; the secret VALUE lives in the 0600 file, never the repo.
-      # LONG-FORM with `required: false` (Compose v2.24+): the Agent renders
-      # this file only AFTER it auto-auths, so it does NOT exist at `up`-time.
-      # A hard/required env_file reference makes Compose abort at its eager
-      # up-front existence check BEFORE honoring `depends_on: service_healthy`,
-      # defeating the swap-gate. `required: false` suppresses only that up-front
-      # check; the START-GATE (depends_on service_healthy on the Agent's
-      # `test -s <RSF>` healthcheck) still blocks the workload until the non-empty
-      # file exists — fail-closed is preserved (composition-wiring.md).
+      #
+      # HOST PATH (env-file host-path bugfix). Docker Compose resolves `env_file`
+      # entries (short-form AND long-form path:/required:) on the HOST filesystem
+      # at `up`/container-creation time — NOT from inside the container. So this
+      # MUST be the HOST path openbao_agent_host_rendered_secret_file
+      # (= openbao_agent_host_rendered_dir/secrets.env), which is exactly the file
+      # the Agent sidecar writes on the host. Referencing the in-container
+      # openbao_agent_rendered_secret_file here was the bug: that path does not
+      # exist on the host, so Compose silently skipped the `required: false` entry
+      # and never injected DATABASE_URL. The Agent's OWN in-container paths (its
+      # `test -s` healthcheck probe and the agent.hcl destination) correctly stay
+      # the in-container openbao_agent_rendered_secret_file.
+      #
+      # LONG-FORM with `required: false` (Compose v2.24+): the Agent renders this
+      # file only AFTER it auto-auths, so it does NOT exist at `up`-time. A
+      # hard/required env_file reference makes Compose abort at its eager up-front
+      # existence check BEFORE honoring `depends_on: service_healthy`, defeating
+      # the swap-gate. `required: false` suppresses only that up-front check; the
+      # START-GATE (depends_on service_healthy on the Agent's `test -s <RSF>`
+      # healthcheck) still blocks the workload until the non-empty file exists —
+      # fail-closed is preserved (composition-wiring.md). UNCHANGED.
       extra_env_files:
-        - path: "{{ openbao_agent_rendered_secret_file }}"
+        - path: "{{ openbao_agent_host_rendered_secret_file }}"
           required: false
       # START-GATE: the workload starts only after the Agent is healthy, i.e.
-      # only after the Rendered_Secret_File exists (Req 5.2, 6.2).
+      # only after the Rendered_Secret_File exists (Req 5.2, 6.2). UNCHANGED.
       depends_on:
         openbao-agent:
           condition: "service_healthy"
-      # Traefik-only ingress via Docker labels — NO host `ports:` (Req 5.4, 5.5).
-      labels:
-        - "traefik.enable=true"
-        - "traefik.http.routers.{{ dca_app_name }}.rule=Host(`{{ openbao_agent_workload_host_rule }}`)"
-      networks:
-        - "{{ openbao_agent_edge_network }}"
-      # NO ports: entry (Req 5.5).
-  vars:
-    dca_app_name: "{{ project_slug }}-workload"
+      # INGRESS — PATH-SELECTED on openbao_agent_mock_edge_network (ADR-0018):
+      #   REAL (default): publish the VLAN-IP-bound HTTP port (never 0.0.0.0),
+      #     NO `edge` network, NO Traefik labels — a file-provider Route_Fragment
+      #     (delegated below) supersedes label discovery.
+      #   MOCK-EDGE (opt-in): NO published port, attach the local `edge`, emit
+      #     the Traefik discovery labels (co-located dev box only).
+      ports: >-
+        {{ []
+           if (openbao_agent_mock_edge_network | bool)
+           else [openbao_agent_workload_bind_ip ~ ':'
+                 ~ (openbao_agent_workload_http_port | string) ~ ':'
+                 ~ (openbao_agent_workload_http_port | string)] }}
+      labels: >-
+        {{ openbao_agent_workload_traefik_labels
+           if (openbao_agent_mock_edge_network | bool) else [] }}
+      networks: >-
+        {{ [openbao_agent_edge_network]
+           if (openbao_agent_mock_edge_network | bool) else [] }}
+      # RSF-SHARING MOUNT (RSF-mount bugfix — Option A; env-channel rationale
+      # CORRECTED by the env-file host-path bugfix). The workload mounts the
+      # shared host rendered dir (openbao_agent_host_rendered_dir) at the
+      # in-container openbao_agent_rendered_dir, READ-ONLY, so the RSF is visible
+      # as a FILE inside the workload container.
+      #
+      # IMPORTANT — this mount is NOT the env-injection channel. The Agent-rendered
+      # secret reaches the workload ENV HOST-SIDE: Docker Compose resolves the
+      # workload's extra_env_files on the HOST and now reads it from the HOST path
+      # openbao_agent_host_rendered_secret_file (see extra_env_files above). The
+      # mount is KEPT as defense-in-depth / a file-access convenience (anything in
+      # the workload that wants to read the RSF file directly — not via env — still
+      # finds it in-container); it is harmless and cheap. (The earlier belief that
+      # this mount is what makes extra_env_files resolve was wrong: env_file is
+      # host-side, so an in-container mount can never satisfy it.)
+      #
+      # The fixed wiring OWNS the full `volumes` list: the RSF mount CONCATENATED
+      # with the caller's OPTIONAL openbao_agent_workload_volumes (e.g. a reference
+      # workload's read-only entrypoint mount). openbao_agent_workload_volumes
+      # defaults to [] ⇒ a caller passing none gets exactly [rsf_mount]; a caller
+      # passing some gets [rsf_mount, ...caller volumes]. Because this set_fact is
+      # folded LAST into the workload service dict (wiring wins), the RSF mount is
+      # always present and can never be overwritten by a caller. The `volumes` fold
+      # was removed from the optional set above so the two do not collide.
+      volumes: >-
+        {{ [openbao_agent_host_rendered_dir ~ ':' ~ openbao_agent_rendered_dir ~ ':ro']
+           + openbao_agent_workload_volumes }}
 
 - name: "4 — Assemble the OPTIONAL, ADDITIVE non-secret workload fields (present only when set)"
   ansible.builtin.set_fact:
     # combine() starts from {} and folds in each optional field ONLY when its
     # default is non-empty, so an unset field leaves NO key behind (byte-
     # identical render for callers that pass none). NO secret value here.
+    # NOTE (RSF-mount bugfix, Option A): `volumes` is NO LONGER folded here — the
+    # workload `volumes` list is now OWNED by the FIXED wiring below, which
+    # concatenates the MANDATORY RSF read-only mount with the caller's optional
+    # openbao_agent_workload_volumes. Folding `volumes` in BOTH the optional set
+    # and the fixed wiring would make the wiring's combine() (folded LAST)
+    # OVERWRITE the optional volumes, dropping the caller's mount — so volume
+    # ownership is consolidated in the wiring. command/environment/healthcheck are
+    # unchanged (still optional, still additive).
     openbao_agent_workload_service_optional: >-
       {{ {}
          | combine({'command': openbao_agent_workload_command}
                    if (openbao_agent_workload_command | length > 0) else {})
-         | combine({'volumes': openbao_agent_workload_volumes}
-                   if (openbao_agent_workload_volumes | length > 0) else {})
          | combine({'environment': openbao_agent_workload_environment}
                    if (openbao_agent_workload_environment | length > 0) else {})
          | combine({'healthcheck': openbao_agent_workload_healthcheck}
@@ -213,6 +331,33 @@
           'restart': 'unless-stopped'}
          | combine(openbao_agent_workload_service_optional)
          | combine(openbao_agent_workload_service_wiring) }}
+
+# --- Render + delegate the workload Route_Fragment (REAL PATH, Req 2.2) ------
+# Consume the reusable traefik_route role to drop <stack>-route.yml onto the
+# Traefik_Guest's watched file-provider dir. route_tls=true + the fragment's
+# `tls: {}` (default store) means the LAN->Traefik hop TERMINATES AT TRAEFIK via
+# SVC-09's file-provider default cert; the backend hop is cleartext HTTP (the
+# workload's own plain-HTTP listener) — the `http://` scheme rides through the
+# server url verbatim. Because the hop is cleartext there is NO backend cert to
+# verify, so route_servers_transport_name / route_backend_root_cas are NOT passed
+# (left empty — the default-inert path, exactly the Grafana shape): the fragment
+# carries NO serversTransport block. The role fails closed if the backend url /
+# delegate target is unresolved. Skipped entirely on the mock-edge path (the two
+# ingress paths are mutually exclusive). Mirrors zitadel-server 5c / grafana.
+- name: "4 — Render + delegate the workload cross-guest Route_Fragment (real path, Req 2.2)"
+  ansible.builtin.include_role:
+    name: traefik_route
+  vars:
+    traefik_route_enabled: "{{ openbao_agent_traefik_route_enabled | bool }}"
+    route_name: "{{ project_slug }}-workload"
+    route_host_rule: "{{ openbao_agent_workload_host_rule }}"
+    route_backend_url: "http://{{ openbao_agent_workload_bind_ip }}:{{ openbao_agent_workload_http_port }}"
+    route_entrypoint: "websecure"
+    route_tls: true
+    # Delegate target = the Traefik_Guest (ADR-0015, 10.0.20.12). NO
+    # serversTransport vars: the cleartext HTTP hop has no backend cert to verify.
+    traefik_guest_host: "{{ openbao_agent_traefik_guest_host }}"
+  when: not (openbao_agent_mock_edge_network | bool)
 
 - name: "4 — Deploy the Agent sidecar + workload Compose stack (swap-gate, Req 4.3/7.5)"
   ansible.builtin.include_role:
@@ -271,10 +416,15 @@
       # before; a reference workload (hello_workload, task 4.2) gets its mounted
       # entrypoint command/volumes/env/healthcheck threaded in.
       - "{{ openbao_agent_workload_service }}"
-    # The workload needs the shared Traefik `edge` network; the Agent does not.
-    dca_networks:
-      - name: "{{ openbao_agent_edge_network }}"
-        external: true
+    # Edge-network dependency — PATH-SELECTED on openbao_agent_mock_edge_network
+    # (ADR-0018). REAL path (default): NO external `edge` dependency (the
+    # file-provider route handles cross-guest ingress; a dedicated workload guest
+    # has no `edge`). MOCK-EDGE path: `edge` is created+owned by SVC-09
+    # (traefik_install); attach to it (external: true). The Agent sidecar needs
+    # no network either way.
+    dca_networks: >-
+      {{ [{'name': openbao_agent_edge_network, 'external': true}]
+         if (openbao_agent_mock_edge_network | bool) else [] }}
     # Non-secret workload config only. Real secrets arrive via the
     # Rendered_Secret_File (extra_env_files), never here (integration-boundaries §2).
     dca_env: "{{ openbao_agent_workload_env }}"

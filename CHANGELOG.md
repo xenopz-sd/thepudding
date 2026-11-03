@@ -5,6 +5,118 @@ All notable changes to the Developer Services Platform are documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **SVC-06 provision-token re-mint — opt-in OpenBao-wipe recovery** (spec
+  `svc06-provision-token-remint`, **ADR-0023**, extends ADR-0016): an additive,
+  default-OFF `svc06_remint_provision_token` path on `svc-06-bootstrap.yml` that
+  restores the ZITADEL `provision-sa` provisioning PAT in OpenBao after an OpenBao
+  clean-slate that wiped it while ZITADEL stayed initialized — **without
+  re-initializing ZITADEL**. It mints a fresh bounded PAT for the EXISTING
+  `provision-sa` identity (no new identity, no scope change) via a new additive
+  `remint` subcommand on `scripts/installer/zitadel_provision.py`, stores it at the
+  existing `secret/proj-shared-zitadel/zitadel` → `provision_token` field via the
+  stdin `bao kv patch` + read-back pattern, and optionally (non-fatally) revokes the
+  replaced PAT. The bootstrap `IAM_OWNER` credential is read only from the
+  never-committed env var `ZITADEL_REMINT_BOOTSTRAP_TOKEN` (fail-closed when absent;
+  never argv, never a committed file, every handling task `no_log`). A default run
+  (flag OFF) is byte-identical to before. Live-validated on the throwaway cluster via
+  a full teardown → from-scratch bring-up → re-mint with **no human-minted token**
+  (the auto-minted first-init `provision_token` is used in-memory as the bootstrap
+  credential).
+- **ADR-0023**
+  (`.kiro/decisions/0023-svc06-provision-token-remint-bootstrap-auth.md`) + a
+  project-constitution Decision Log row: the re-mint bootstrap-authentication design
+  (operator-supplied one-shot `IAM_OWNER` token; Option A), extending — not changing
+  — ADR-0016.
+
+### Fixed
+- **SVC-06 §6b re-mint delegation/become/HOME wiring** (surfaced by the live
+  Task-11.1 acceptance): (1) a `delegate_to`-before-`when` reference to an
+  undefined fact crashed a NORMAL (re-mint-OFF) ZITADEL bring-up — fixed with
+  `| default(false)`; (2) the §6b production mint/revoke tasks lacked
+  `delegate_to: localhost` (the play is `hosts: zitadel`), so the control-node
+  venv/repo helper ran on the guest — fixed; (3) `become`/`HOME` leakage on those
+  localhost-delegated tasks — fixed with `become: false` + a control-node
+  `lookup('env','HOME')`.
+- **§6-vs-§6b obtain-once ordering** (spec
+  `fix-svc06-remint-obtain-once-fail-fast-ordering`): the §6 obtain-once fail-fast
+  pre-empted the §6b re-mint block in exactly the OpenBao-wipe recovery state;
+  the §6 fail-fast + emit-wait now yield to §6b when the opt-in re-mint is ON.
+
+### Known limitations
+- OpenBao-wipe recovery is **not zero-touch**: the re-mint requires an existing
+  `IAM_OWNER`-capable bootstrap credential (ADR-0023). A from-scratch
+  teardown→rebuild avoids the recovery path entirely (first-init auto-mints the
+  token). Automating the bootstrap credential (a durable OpenBao-stored machinekey)
+  is a deliberate future posture decision, not done here.
+- Two out-of-scope follow-ups recorded in
+  `.kiro/specs/svc06-provision-token-remint/DEFERRED-FOLLOWUPS.md`: the SVC-06
+  clean-slate `provision_token` residue (`bao kv patch` errors when the KV entry is
+  absent post-wipe; spec `fix-svc06-clean-slate-provision-token-residue`), and
+  `zitadel-org-provision` having no delete/reversal entry point (throwaway org/app
+  left behind; needs its own spec).
+
+## [0.13.0] - 2026-11-03
+
+Adds the **deterministic, collision-free `proxmox-compute` VMID** feature
+(**ADR-0022**) and lands the **consumer last-mile hello-workload** correctness
+chain surfaced by that feature's live acceptance, plus documentation
+release-readiness fixes. Minor version bump: the VMID computation is additive
+(every already-provisioned guest keeps its live VMID via a grandfather override;
+only a guest with no override gets the computed value) and every other change is a
+fix or docs — no breaking changes. The full four-root offline suite is green.
+This release does **not** include the SVC-06 provision-token re-mint feature
+(ADR-0023) — that remains under **[Unreleased]** pending its own merge.
+
+### Added
+- **Deterministic, collision-free VMID in `proxmox-compute`** (spec
+  `proxmox-compute-deterministic-vmid`, **ADR-0022**, builds on ADR-0015/ADR-0021):
+  the shared module now COMPUTES each guest's Proxmox VMID from the same two stable
+  inputs as its IP — `vmid = vlan_id * 1000 + host_index` — instead of an
+  operator-chosen id. Collision-free by construction (each VLAN owns a disjoint
+  1000-wide band), reversible by inspection, and legal within Proxmox's id range. A
+  defensive module precondition asserts the computed VMID is in-band, and a pure
+  Python mirror (`netfoundation.proxmox_vmid`/`parse_vmid`) is cross-checked against
+  the HCL by a golden `terraform plan` test + Hypothesis property tests.
+  **Migration = grandfather, not force-migrate:** each root keeps an operator VMID
+  override that WINS when supplied (sentinel `0` = "use computed"), so every
+  already-provisioned guest keeps its live VMID and is never force-replaced; only a
+  guest with no override (the per-project consumer `workload` guest) gets the
+  computed value. Fixes the live `1102` collision between the consumer workload
+  guest and the ZITADEL backing DB (workload now `100001`).
+
+### Fixed
+- **hello-workload cold-boot RSF race** (spec
+  `fix-consumer-hello-workload-cold-boot-rsf-race`): `/healthz` presence is now
+  derived from the live mounted rendered-secret file rather than a boot-time marker,
+  so a cold boot no longer reports healthy before the secret is actually rendered.
+- **hello-workload `/healthz` CGI secret visibility**: presence is signalled via a
+  boot-time marker without exposing the secret value to the CGI surface.
+- **openbao-agent workload RSF wiring**: the workload mounts the shared
+  rendered-secret-file directory so the agent-rendered secret resolves; the Compose
+  `env_file` references the HOST RSF path (Compose reads `env_file` host-side); and
+  cross-guest `edge` ingress is wired for dedicated workload guests.
+- **consumer DB-bridge KV path**: dropped the doubled `data/` infix from the
+  consumer DB-bridge KV-v2 paths.
+- **workload AppRole creds staging/scope** (two fixes): the creds are staged onto
+  the guest in `hello_workload_deploy`, and the creds DEST-path variable scope is
+  corrected.
+- **SVC-06 ZITADEL compose reconcile decoupled from the image-version gate** (spec
+  `fix-svc06-zitadel-compose-ingress-version-gate-decoupling`): the
+  `docker-compose-app` reconcile is declarative every run, so the mock→real ingress
+  flip is applied even when the image is already at the pinned version (the former
+  gate left Traefik returning 502 once pinned).
+
+### Changed
+- **Documentation release-readiness** (spec `svc06-login-v2` requirements authored
+  separately; this is the docs pass): the root `CHANGELOG.md` gained an
+  `[Unreleased]` section and its link-reference block was rebuilt so every version
+  header resolves (13 previously had no compare-link definition and rendered as
+  broken links). The live hello-workload acceptance (happy + fail-closed) was
+  recorded with two follow-ups.
+
 ## [0.12.0] - 2026-11-01
 
 The **consumer last-mile** feature release. It closes the gap between a consumer
@@ -1160,11 +1272,26 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
+[Unreleased]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.13.0...HEAD
+[0.13.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.12.0...v0.13.0
+[0.12.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.3...v0.12.0
 [0.11.3]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.2...v0.11.3
 [0.11.2]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.1...v0.11.2
 [0.11.1]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.0...v0.11.1
 [0.11.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.10.0...v0.11.0
 [0.10.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.9.0...v0.10.0
 [0.9.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.8.0...v0.9.0
+[0.8.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.7.6...v0.8.0
+[0.7.6]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.7.5...v0.7.6
+[0.7.5]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.7.4...v0.7.5
+[0.7.4]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.7.3...v0.7.4
+[0.7.3]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.7.2...v0.7.3
+[0.7.2]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.7.1...v0.7.2
+[0.7.1]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.7.0...v0.7.1
+[0.7.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.6.0...v0.7.0
+[0.6.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.5.0...v0.6.0
+[0.5.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.4.0...v0.5.0
+[0.4.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.3.0...v0.4.0
+[0.3.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.2.0...v0.3.0
 [0.2.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.1.0...v0.2.0
 [0.1.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/releases/v0.1.0

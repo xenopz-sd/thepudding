@@ -120,17 +120,31 @@
     - (openbao_addr | default('') | trim) | length > 0
 
 # === STEP 2a — Bridge the DB credential into the workload-readable tree ======
-# (fix-consumer-db-secret-workload-path-mismatch, Option A.) The DB credential is
-# written by postgres-server ONLY under secret/proj-<slug>/postgres — a path
-# OUTSIDE policy-<slug> (which grants only the five KV v2 sub-paths under the bare
-# <slug> prefix). The <slug>-workload AppRole and its openbao-agent sidecar can
-# therefore NEVER read it; a correctly-onboarded workload authenticates and is then
-# DENIED on proj-<slug>. This step BRIDGES the SAME value into the already-granted
-# secret/data/<slug>/db item (field database_url), so the workload reaches it with
-# no manual step and NO policy change (policy-<slug> is untouched — Option A).
+# (fix-consumer-db-secret-workload-path-mismatch, Option A; KV-v2 path corrected by
+# fix-consumer-db-bridge-kv-v2-path.) The DB credential is written by postgres-server
+# ONLY under secret/proj-<slug>/postgres — a path OUTSIDE policy-<slug> (which grants
+# only the five KV v2 sub-paths under the bare <slug> prefix). The <slug>-workload
+# AppRole and its openbao-agent sidecar can therefore NEVER read it; a correctly-
+# onboarded workload authenticates and is then DENIED on proj-<slug>. This step
+# BRIDGES the SAME value into the already-granted <slug>/db item (field database_url),
+# so the workload reaches it with no manual step and NO policy change (policy-<slug>
+# is untouched — Option A).
 #
-# Placement: AFTER STEP 2 (openbao_project_onboard creates the secret/data/<slug>/
-# KV metadata path the put targets) and BEFORE STEP 3 (the <slug>-workload AppRole
+# KV-v2 PATH SEMANTICS (the bug this fix corrects — read before touching the paths):
+# the `secret/` mount is KV v2, and the `bao kv` CLI (get/put/list/metadata) is
+# v2-AWARE — given a BARE LOGICAL path it injects the `data/` (or `metadata/`) infix
+# ITSELF to form the HTTP API path. So the bridge WRITES logical `secret/<slug>/db`
+# via `bao kv put secret/<slug>/db` (the CLI turns that into API `secret/data/<slug>/db`).
+# The Agent READS the SAME stored secret as `secret "secret/data/<slug>/db"` — but that
+# raw `data/` form is correct ONLY for consul-template / `bao read`/`bao write` / the
+# HTTP API, which take the raw API path; it is NEVER passed to `bao kv`. policy-<slug>
+# grants `secret/data/<slug>/*` (the API path = logical `secret/<slug>/*`). Passing
+# `secret/data/<slug>/db` to `bao kv` would DOUBLE the infix (stored at
+# secret/data/data/<slug>/db), which is the defect fix-consumer-db-bridge-kv-v2-path
+# removed — the `bao kv` calls below use the BARE logical `secret/<slug>/<subpath>`.
+#
+# Placement: AFTER STEP 2 (openbao_project_onboard creates the KV metadata path for
+# the <slug> prefix the put targets) and BEFORE STEP 3 (the <slug>-workload AppRole
 # + its agent mapping are minted with the DB credential already present).
 #
 # SECRET-SAFE (Req 2.4, security-standards.md): every task is no_log; the admin
@@ -171,7 +185,8 @@
     fail_msg: >-
       The authoritative DB credential is NOT present at
       {{ consumer_openbao_db_secret_path }} — cannot bridge it into the
-      workload-readable secret/data/{{ project_slug }}/{{ consumer_db_bridge_subpath }}.
+      workload-readable logical path secret/{{ project_slug }}/{{ consumer_db_bridge_subpath }}
+      (API path secret/data/{{ project_slug }}/{{ consumer_db_bridge_subpath }}).
       The bridge fails closed; no empty/partial DATABASE_URL is written. Re-run after
       confirming the Phase-2 svc-01-bootstrap.yml composition wrote the DB credential
       (this is the §5↔§6 ordering seam: §6 makes the source reliable, §5 reaches it).
@@ -183,6 +198,8 @@
     - consumer_manifest.database is defined
     - (openbao_addr | default('') | trim) | length > 0
 
+# STEP 2a.3 reads the BARE logical path secret/<slug>/<subpath> (the `bao kv` CLI
+# injects the data/ infix itself — see the KV-v2 PATH SEMANTICS note above).
 - name: "Bootstrap | STEP 2a.3 — Read-or-reuse probe of the existing bridged record (no_log)"
   ansible.builtin.command:
     argv: >-
@@ -191,7 +208,7 @@
           'openbao-openbao-1', 'bao', 'kv', 'get']
          + (['-tls-skip-verify'] if (consumer_openbao_tls_self_signed | bool) else [])
          + ['-format=json',
-            'secret/data/' ~ project_slug ~ '/' ~ consumer_db_bridge_subpath] }}
+            'secret/' ~ project_slug ~ '/' ~ consumer_db_bridge_subpath] }}
   delegate_to: "{{ consumer_openbao_primary_host }}"
   vars:
     ansible_connection: ssh
@@ -238,14 +255,17 @@
     - consumer_manifest.database is defined
     - (openbao_addr | default('') | trim) | length > 0
 
-- name: "Bootstrap | STEP 2a.6 — Bridge DATABASE_URL to secret/data/<slug>/db (no_log, idempotent)"
+# STEP 2a.6 writes the BARE logical path secret/<slug>/<subpath> via `bao kv put`;
+# the v2-aware CLI stores it at API path secret/data/<slug>/<subpath> — the exact
+# path policy-<slug> grants and the Agent consul-template reads (KV-v2 note above).
+- name: "Bootstrap | STEP 2a.6 — Bridge DATABASE_URL to logical secret/<slug>/db (no_log, idempotent)"
   ansible.builtin.command:
     argv: >-
       {{ ['docker', 'exec', '-e', 'BAO_ADDR=https://127.0.0.1:' ~ 8200,
           '-e', 'BAO_TOKEN=' ~ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true)),
           'openbao-openbao-1', 'bao', 'kv', 'put']
          + (['-tls-skip-verify'] if (consumer_openbao_tls_self_signed | bool) else [])
-         + ['secret/data/' ~ project_slug ~ '/' ~ consumer_db_bridge_subpath,
+         + ['secret/' ~ project_slug ~ '/' ~ consumer_db_bridge_subpath,
             consumer_db_bridge_field ~ '=' ~ consumer_db_bridge_url] }}
   delegate_to: "{{ consumer_openbao_primary_host }}"
   vars:
@@ -274,9 +294,10 @@
 - name: "Bootstrap | STEP 2a — INFO — workload-readable DB path (secret by name only)"
   ansible.builtin.debug:
     msg: >-
-      INFO: DB credential bridged for '{{ project_slug }}' to
-      secret/data/{{ project_slug }}/{{ consumer_db_bridge_subpath }}
-      (field {{ consumer_db_bridge_field }}, env DATABASE_URL) — readable by the
+      INFO: DB credential bridged for '{{ project_slug }}' to logical path
+      secret/{{ project_slug }}/{{ consumer_db_bridge_subpath }}
+      (API path secret/data/{{ project_slug }}/{{ consumer_db_bridge_subpath }};
+      field {{ consumer_db_bridge_field }}, env DATABASE_URL) — readable by the
       {{ project_slug }}-workload AppRole. No secret value is shown.
   when:
     - consumer_manifest.database is defined

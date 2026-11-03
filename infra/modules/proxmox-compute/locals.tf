@@ -28,10 +28,11 @@
 # ip_config + hostname; reject operator IP literals"). Per the task's
 # documented fallback, this module therefore produces the computed locals and a
 # ready-to-consume cloud-init `ip_config` structure; the actual guest resource
-# (and its concrete vmid) is wired when the guest-provisioning inputs are added
-# in a later increment. vmid/service_role outputs are documented stand-ins
-# until then (see outputs.tf). The address/hostname/tags derivation IS final
-# and matches the design contract exactly.
+# still lives in each calling root. The `vmid` local is now COMPUTED
+# deterministically (vlan_id * 1000 + host_index — proxmox-compute-deterministic-vmid,
+# ADR-0022), the VMID-side analogue of the computed IP, so a root's container can
+# read `module.<x>.vmid` instead of an operator-chosen ID. The address / hostname
+# / tags / vmid derivation IS final and matches the design contract exactly.
 #
 # Input-guard preconditions (reject vlan_id == 10, within-VLAN hostname
 # collision, host-IP exhaustion) are task 7.3 and are intentionally NOT here.
@@ -120,13 +121,43 @@ locals {
   }
 
   # ------------------------------------------------------------------------
-  # vmid — documented stand-in (see scope decision above). No guest resource
-  # exists in this module yet, so there is no provider-assigned VMID to echo.
-  # Left null so the output is present in the contract; a later increment that
-  # adds the guest resource sets this to
-  # proxmox_virtual_environment_{vm,container}.this.vm_id.
+  # vmid — deterministic, collision-free, reversible Proxmox VMID
+  # (proxmox-compute-deterministic-vmid, ADR-0022). This is the VMID-side
+  # analogue of the host-IP formula above: it derives the VMID from the SAME two
+  # stable inputs (vlan_id + host_index), so no operator chooses a VMID and
+  # collisions are impossible platform-wide.
+  #
+  #   vmid = vlan_id * 1000 + host_index
+  #     VLAN 20  idx 0 -> 20000 ; VLAN 100 idx 1 -> 100001 ; VLAN 254 idx 244 -> 254244
+  #
+  # COLLISION-FREE: host_index is bounded 0..244 (preconditions.tf Guard 2:
+  # 10 + host_index <= 254), so host_index < 1000 and each vlan_id owns a
+  # distinct 1000-wide band. For two guests vmid1 = v1*1000+h1, vmid2 =
+  # v2*1000+h2 with 0 <= h < 1000: vmid1 == vmid2 forces v1 == v2 AND h1 == h2
+  # (the right side of (v1-v2)*1000 = h2-h1 has magnitude < 1000). Distinct
+  # (vlan_id, host_index) pairs => distinct VMIDs, no overflow/aliasing.
+  # REVERSIBLE by inspection, exactly like the IP: vlan_id = vmid / 1000,
+  # host_index = vmid % 1000 — an operator reading 100001 knows VLAN 100,
+  # host_index 1 (cf. reading 10.0.100.11).
+  # LEGAL BAND: min 20000 (VLAN 20, idx 0), max 254244 (VLAN 254, idx 244) — well
+  # within Proxmox's 100..999999999 (asserted defensively in preconditions.tf
+  # Guard 6, which cannot fire while Guards 1/2 hold but guards a future bound
+  # relaxation).
+  #
+  # The committed per-VLAN host-index ledger + Guard 4 (ADR-0015) already make
+  # (vlan_id, host_index) unique WITHIN a VLAN across independent roots, so a
+  # formula keyed on that pair inherits within-VLAN collision-freeness; distinct
+  # VLANs never collide because each owns its own 1000-block. The parallel pure
+  # Python mirror (netfoundation.proxmox_vmid) is cross-checked against this HCL
+  # computation by the golden terraform-plan test (ADR-0022 drift guard).
+  #
+  # Each consuming root's container `vm_id` is
+  #   var.<service>_vmid != 0 ? var.<service>_vmid : module.<x>.vmid
+  # so an operator override wins when supplied (grandfathers an already-
+  # provisioned guest's live VMID — no force-replace) and this computed value is
+  # used otherwise (ADR-0022 grandfather posture).
   # ------------------------------------------------------------------------
-  vmid = null
+  vmid = var.vlan_id * 1000 + var.host_index
 
   # ------------------------------------------------------------------------
   # service_role — the role the Ansible dynamic inventory groups this host by

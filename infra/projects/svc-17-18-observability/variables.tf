@@ -71,11 +71,14 @@ variable "prometheus_datastore_id" {
 
 variable "prometheus_vmid" {
   description = <<-EOT
-    Proxmox VMID for the Prometheus LXC (svc17-prometheus-20-01). Supplied explicitly so
-    the container gets a stable, non-colliding ID assigned by the
-    operator/allocation scheme rather than auto-assigned.
+    OPERATOR OVERRIDE for the Prometheus LXC's (svc17-prometheus-20-01) Proxmox
+    VMID (ADR-0022 grandfather posture). Non-zero wins verbatim (grandfathers a
+    live 1170, no force-replace); 0 (the "use computed" sentinel default) uses the
+    module-computed deterministic VMID (vlan_id * 1000 + host_index = 20 * 1000 +
+    8 = 20008).
   EOT
   type        = number
+  default     = 0
 }
 
 # --- Grafana guest (svc17-grafana-20-01) template ----------------------------
@@ -124,11 +127,14 @@ variable "grafana_datastore_id" {
 
 variable "grafana_vmid" {
   description = <<-EOT
-    Proxmox VMID for the Grafana LXC (svc17-grafana-20-01). Supplied explicitly so the
-    container gets a stable, non-colliding ID assigned by the operator/allocation
-    scheme rather than auto-assigned.
+    OPERATOR OVERRIDE for the Grafana LXC's (svc17-grafana-20-01) Proxmox VMID
+    (ADR-0022 grandfather posture). Non-zero wins verbatim (grandfathers a live
+    1171, no force-replace); 0 (the "use computed" sentinel default) uses the
+    module-computed deterministic VMID (vlan_id * 1000 + host_index = 20 * 1000 +
+    9 = 20009).
   EOT
   type        = number
+  default     = 0
 }
 
 # --- Loki guest (svc18-loki-20-01) template ----------------------------------
@@ -177,11 +183,14 @@ variable "loki_datastore_id" {
 
 variable "loki_vmid" {
   description = <<-EOT
-    Proxmox VMID for the Loki LXC (svc18-loki-20-01). Supplied explicitly so the
-    container gets a stable, non-colliding ID assigned by the operator/allocation
-    scheme rather than auto-assigned.
+    OPERATOR OVERRIDE for the Loki LXC's (svc18-loki-20-01) Proxmox VMID (ADR-0022
+    grandfather posture). Non-zero wins verbatim (grandfathers a live 1180, no
+    force-replace); 0 (the "use computed" sentinel default) uses the module-
+    computed deterministic VMID (vlan_id * 1000 + host_index = 20 * 1000 + 10 =
+    20010).
   EOT
   type        = number
+  default     = 0
 }
 
 # --- Cross-guest inputs ------------------------------------------------------

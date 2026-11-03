@@ -57,6 +57,7 @@ resource "terraform_data" "input_guards" {
     peer_host_indices = var.peer_host_indices
     svc_code          = var.svc_code
     role_code         = var.role_code
+    vmid              = local.vmid
   }
 
   lifecycle {
@@ -178,6 +179,26 @@ resource "terraform_data" "input_guards" {
     precondition {
       condition     = !contains(var.peer_host_indices, var.host_index)
       error_message = "Requirement 1.2 (within-VLAN host-index collision): host_index ${var.host_index} on VLAN ${var.vlan_id} (IP 10.0.${var.vlan_id}.${10 + var.host_index}) collides with another guest already allocated that index on this VLAN — a within-VLAN host-IP collision across independent Terraform roots. Rejected at plan time before any Proxmox resource is created. Pick a distinct host_index for this guest from the per-VLAN host-index ledger (infra/platform-foundation/host-indices.yaml)."
+    }
+
+    # ---------------------------------------------------------------------
+    # Guard 6 — Computed VMID is in the legal Proxmox band
+    # (proxmox-compute-deterministic-vmid, Requirement 1.1; ADR-0022).
+    #
+    # The VMID is COMPUTED as `vlan_id * 1000 + host_index` (locals.tf), the
+    # VMID-side analogue of the computed IP. Proxmox requires a VMID in
+    # 100..999999999. Given the current Guard 1 (vlan_id != 10) and Guard 2
+    # (host_index <= 244) the computed value is always in [20000, 254244] — well
+    # within band — so this guard CANNOT fire today. It is DEFENSIVE: if a future
+    # change ever loosens the vlan_id/host_index bounds, this fails the plan
+    # CLOSED before any Proxmox resource is created rather than letting an illegal
+    # VMID reach the API. (host_index < 1000 is also what keeps the formula
+    # collision-free — each vlan_id owns a distinct 1000-wide band — and is
+    # already guaranteed by Guard 2.)
+    # ---------------------------------------------------------------------
+    precondition {
+      condition     = local.vmid >= 100 && local.vmid <= 999999999
+      error_message = "Requirement 1.1 (VMID legal band): computed VMID ${local.vmid} (= vlan_id ${var.vlan_id} * 1000 + host_index ${var.host_index}) is outside the legal Proxmox range 100..999999999. This cannot occur while Guard 1 (vlan_id != 10) and Guard 2 (host_index <= 244) hold; it is a defensive gate against a future relaxation of those bounds. Failing closed before any resource is created (ADR-0022)."
     }
   }
 }

@@ -36,12 +36,15 @@ from netfoundation.derivation import (
     MAX_HOST_OCTET,
     MAX_PROJECT_VLAN_ID,
     MIN_PROJECT_VLAN_ID,
+    MAX_PROXMOX_VMID,
+    MIN_PROXMOX_VMID,
     HostAddressExhaustionError,
     HostIndexCollisionError,
     HostnameCollisionError,
     ManagementVlanPlacementError,
     OperatorIpLiteralError,
     VlanExhaustionError,
+    VmidOutOfBandError,
     assert_unique_host_indices,
     assert_unique_hostnames,
     assigned_host_index,
@@ -50,8 +53,10 @@ from netfoundation.derivation import (
     hostname,
     next_vlan_id,
     parse_hostname,
+    parse_vmid,
     peer_host_indices,
     proxmox_tag,
+    proxmox_vmid,
     reject_ip_literal,
     reject_management_vlan,
     subnet_cidr,
@@ -652,3 +657,95 @@ def test_fix_collision_property_4_address_formula_preserved(vlan_id, indices):
     for index in indices:
         expected = str(ipaddress.ip_network(cidr)[FIRST_HOST_OFFSET + index])
         assert host_ip(vlan_id, index) == expected
+
+
+# =========================================================================
+# Feature: proxmox-compute-deterministic-vmid — Correctness Properties 1-2
+# =========================================================================
+#
+# These two property tests cover the pure deterministic-VMID derivation
+# (``proxmox_vmid`` / ``parse_vmid`` + ``VmidOutOfBandError``) added to
+# ``derivation.py`` for the proxmox-compute-deterministic-vmid spec (ADR-0022).
+# They are the VMID analogue of the addressing/host-index properties above:
+# pure, offline, >=100 examples each, tagged with their design property. The
+# HCL side (the identical ``vlan_id * 1000 + host_index`` formula in the
+# proxmox-compute module) is held equal to this Python side by the golden
+# ``terraform plan`` cross-check in infra/tests, so proving the properties here
+# proves them for the apply-time formula too.
+
+
+# --- Reusable strategies for the VMID properties -------------------------
+
+# A valid VLAN ID for a guest: the shared-services VLAN 20 OR a per-project
+# VLAN 100-254 (VLAN 10 is guest-free by proxmox-compute Guard 1, and 30-99 is
+# reserved/unallocated). These are exactly the vlan_ids the formula must cover.
+vmid_vlan_ids = st.one_of(
+    st.just(20),
+    st.integers(min_value=MIN_PROJECT_VLAN_ID, max_value=MAX_PROJECT_VLAN_ID),
+)
+
+# A valid host index: 0..244, the range the module's host-IP-exhaustion guard
+# (Guard 2: 10 + host_index <= 254) permits, which is also where the VMID
+# formula is collision-free (host_index < 1000).
+vmid_host_indices = st.integers(min_value=0, max_value=MAX_HOST_OCTET - FIRST_HOST_OFFSET)
+
+
+# --- Property 1: Computed VMID is deterministic and in the legal band ----
+
+
+@PROPERTY_SETTINGS
+@given(vlan_id=vmid_vlan_ids, host_index=vmid_host_indices)
+def test_vmid_property_1_deterministic_and_in_band(vlan_id, host_index):
+    """Feature: proxmox-compute-deterministic-vmid, Property 1: Computed VMID is deterministic and in the legal Proxmox band
+
+    For any valid (vlan_id, host_index) pair the platform can produce
+    (vlan_id in {20} U [100, 254], host_index in [0, 244]), proxmox_vmid SHALL
+    return vlan_id * 1000 + host_index, that value SHALL lie within the legal
+    Proxmox VMID band [100, 999999999], and computing it twice SHALL produce the
+    identical value.
+
+    Validates: Requirements 1.1
+    """
+    vmid = proxmox_vmid(vlan_id, host_index)
+
+    # Matches the documented formula exactly.
+    assert vmid == vlan_id * 1000 + host_index
+    # Lies within the legal Proxmox band.
+    assert MIN_PROXMOX_VMID <= vmid <= MAX_PROXMOX_VMID
+    # Deterministic — a second call is identical.
+    assert proxmox_vmid(vlan_id, host_index) == vmid
+
+
+# --- Property 2: Computed VMID is reversible and collision-free ----------
+
+
+@PROPERTY_SETTINGS
+@given(
+    vlan_a=vmid_vlan_ids,
+    index_a=vmid_host_indices,
+    vlan_b=vmid_vlan_ids,
+    index_b=vmid_host_indices,
+)
+def test_vmid_property_2_reversible_and_collision_free(
+    vlan_a, index_a, vlan_b, index_b
+):
+    """Feature: proxmox-compute-deterministic-vmid, Property 2: Computed VMID is reversible and collision-free
+
+    For any valid (vlan_id, host_index) pair, parse_vmid(proxmox_vmid(...)) SHALL
+    recover the original vlan_id and host_index (round-trip reversibility); and
+    for any two valid pairs, the computed VMIDs SHALL be equal if and only if the
+    pairs are equal — so two distinct guests SHALL always receive distinct VMIDs
+    (collision-free / injective).
+
+    Validates: Requirements 1.1, 1.2
+    """
+    vmid_a = proxmox_vmid(vlan_a, index_a)
+    vmid_b = proxmox_vmid(vlan_b, index_b)
+
+    # Round-trip reversibility recovers the exact inputs.
+    assert parse_vmid(vmid_a) == {"vlan_id": vlan_a, "host_index": index_a}
+    assert parse_vmid(vmid_b) == {"vlan_id": vlan_b, "host_index": index_b}
+
+    # Injective: equal VMIDs iff equal pairs (distinct guests => distinct VMIDs).
+    pairs_equal = (vlan_a, index_a) == (vlan_b, index_b)
+    assert (vmid_a == vmid_b) == pairs_equal

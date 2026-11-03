@@ -107,7 +107,15 @@ variable "proxmox_node_name" {
 }
 
 variable "workload_vmid" {
-  description = "Proxmox VMID for the workload LXC. Supplied explicitly so instances get stable, non-colliding IDs. Required only when the workload guest is enabled."
+  description = <<-EOT
+    OPERATOR OVERRIDE for the workload LXC's Proxmox VMID (ADR-0022 grandfather
+    posture). Non-zero wins verbatim (grandfathers a live VMID, no force-replace);
+    0 (the DEFAULT "use computed" sentinel) uses the module-computed deterministic
+    VMID (vlan_id * 1000 + host_index — e.g. VLAN 100 idx 1 -> 100001). The
+    default is 0 so the consumer workload guest gets the collision-free computed
+    value instead of a hardcoded ID — this is the fix for the live 1102 collision
+    that matched the ZITADEL backing-DB guest.
+  EOT
   type        = number
   default     = 0
 }

@@ -183,8 +183,16 @@ variable "svc01_datastore_id" {
 }
 
 variable "svc01_vmid" {
-  description = "Proxmox VMID for the DB LXC. Supplied explicitly so instances get stable, non-colliding IDs."
+  description = <<-EOT
+    OPERATOR OVERRIDE for the DB LXC's Proxmox VMID (ADR-0022 grandfather
+    posture). Non-zero wins and is used verbatim (grandfathers an already-
+    provisioned DB guest's live VMID — e.g. the shared ZITADEL DB's 1102, or a
+    consumer DB's 1101 — so the stateful, prevent_destroy guest is never
+    force-replaced); 0 (the "use computed" sentinel default) uses the module-
+    computed deterministic VMID (vlan_id * 1000 + host_index).
+  EOT
   type        = number
+  default     = 0
 }
 
 variable "enable_pgvector" {

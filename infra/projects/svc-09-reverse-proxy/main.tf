@@ -122,7 +122,10 @@ resource "proxmox_virtual_environment_container" "traefik" {
   description = "SVC-09 Traefik reverse proxy / TLS termination (shared ingress, owns the external `edge` Docker network). Managed by Terraform; see .kiro/specs/svc-09-reverse-proxy."
 
   node_name = var.proxmox_node_name
-  vm_id     = var.traefik_vmid
+  # Operator override wins when non-zero (grandfathers a live VMID, no
+  # force-replace); otherwise the module-computed deterministic VMID
+  # (vlan_id * 1000 + host_index = 20002) is used (ADR-0022).
+  vm_id = var.traefik_vmid != 0 ? var.traefik_vmid : module.traefik.vmid
 
   # Unprivileged container (PF LXC-default). `nesting` is required so the
   # in-container Docker engine (which the Compose stack needs) runs inside an

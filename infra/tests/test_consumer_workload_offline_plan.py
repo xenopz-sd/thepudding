@@ -88,6 +88,7 @@ if str(_INSTALLER_SCRIPTS_DIR) not in sys.path:
 
 from netfoundation import (  # noqa: E402  (after sys.path setup)
     peer_host_indices,
+    proxmox_vmid,
     role_hostname,
 )
 from consumer_derivation import consumer_db_host_ip  # noqa: E402
@@ -179,16 +180,11 @@ def _python_expected_peer_set() -> list[int]:
 _DUMMY_ENDPOINT = "https://dummy.invalid:8006/"
 _DUMMY_TOKEN = "terraform@pve!ci=00000000-0000-0000-0000-000000000000"
 _DUMMY_TEMPLATE = "local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
-_DUMMY_VARS = (
-    "-var", f"proxmox_endpoint={_DUMMY_ENDPOINT}",
-    "-var", f"proxmox_api_token={_DUMMY_TOKEN}",
-    "-var", "proxmox_node_name=pve-test",
-    "-var", "workload_vmid=4100",
-    "-var", f"workload_template_file_id={_DUMMY_TEMPLATE}",
-    # ENABLE the otherwise-default-off workload guest so the plan materializes
-    # the container + the proxmox-compute module instance to cross-check.
-    "-var", "workload_enabled=true",
-)
+# The dummy non-contacting plan vars are built by `_dummy_vars(workload_vmid)`
+# below, parameterized so a test can exercise either the computed-VMID path
+# (workload_vmid=0) or the operator-override grandfather path (non-zero) — the
+# ADR-0022 cross-check. `workload_enabled=true` is always set so the plan
+# materializes the container + the proxmox-compute module instance.
 _OVERRIDE_FILENAME = "zz_consumer_workload_offline_backend_override.tf"
 _OVERRIDE_CONTENT = (
     "# Transient, test-scoped local backend override written into a SANDBOX\n"
@@ -209,8 +205,25 @@ _ENV_MARKERS = (
 )
 
 
+def _dummy_vars(workload_vmid: int) -> list[str]:
+    """The dummy non-contacting plan vars, parameterized by workload_vmid.
+
+    ADR-0022 grandfather cross-check: pass ``workload_vmid=0`` to exercise the
+    module-computed deterministic VMID path, or a non-zero value to exercise the
+    operator-override (grandfather) path.
+    """
+    return [
+        "-var", f"proxmox_endpoint={_DUMMY_ENDPOINT}",
+        "-var", f"proxmox_api_token={_DUMMY_TOKEN}",
+        "-var", "proxmox_node_name=pve-test",
+        "-var", f"workload_vmid={workload_vmid}",
+        "-var", f"workload_template_file_id={_DUMMY_TEMPLATE}",
+        "-var", "workload_enabled=true",
+    ]
+
+
 @contextmanager
-def _consumer_workload_offline_plan() -> Iterator[list[dict]]:
+def _consumer_workload_offline_plan(workload_vmid: int = 4100) -> Iterator[list[dict]]:
     binary = _terraform_binary()
     assert binary is not None, "gated by requires_terraform"
     sandbox = Path(tempfile.mkdtemp(prefix="consumer_workload_offline_plan_"))
@@ -245,7 +258,7 @@ def _consumer_workload_offline_plan() -> Iterator[list[dict]]:
         plan = subprocess.run(
             [
                 binary, "plan", "-input=false", "-no-color", "-refresh=false",
-                *_DUMMY_VARS,
+                *_dummy_vars(workload_vmid),
                 f"-out={plan_path}",
             ],
             cwd=target, capture_output=True, text=True,
@@ -391,4 +404,64 @@ class TestConsumerWorkloadProjectVlanCrossCheck:
             f"HCL must read host_index={_HOST_INDEX} from host-indices.yaml for "
             f"role_code=workload on VLAN {_VLAN_ID} (ADR-0015/ADR-0021); plan recorded "
             f"{input_guard.get('host_index')}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0022 — deterministic VMID: golden HCL<->Python cross-check + grandfather.
+# --------------------------------------------------------------------------- #
+@requires_terraform
+class TestConsumerWorkloadVmidCrossCheck:
+    """The workload guest's planned `vm_id` under both ADR-0022 paths.
+
+    Extends the host-IP/hostname/peer-set cross-check above to the VMID: the
+    workload root's container `vm_id` is
+    `var.workload_vmid != 0 ? var.workload_vmid : module.workload[*].vmid`, so
+
+      * with `workload_vmid=0` the planned vm_id must equal the module-computed
+        deterministic VMID — which must equal the Python
+        `proxmox_vmid(100, 1) == 100001` (HCL<->Python drift guard), and must NOT
+        be the old colliding 1102;
+      * with `workload_vmid=4100` (an operator override) the planned vm_id must
+        be 4100 verbatim — the grandfather path that leaves an already-
+        provisioned guest's live VMID untouched (no force-replace).
+    """
+
+    @staticmethod
+    def _planned_vm_id(workload_vmid: int) -> int:
+        with _consumer_workload_offline_plan(workload_vmid=workload_vmid) as changes:
+            containers = [
+                c["change"]["after"]
+                for c in changes
+                if c["type"] == _CONTAINER_TYPE
+            ]
+            assert len(containers) == 1, (
+                f"the ENABLED workload/ root must plan exactly one {_CONTAINER_TYPE}; "
+                f"planned {len(containers)}"
+            )
+            return containers[0].get("vm_id")
+
+    def test_computed_vm_id_matches_python_and_is_not_the_old_collision(self):
+        """workload_vmid=0 -> planned vm_id == proxmox_vmid(100, 1) == 100001."""
+        planned = self._planned_vm_id(0)
+        expected = proxmox_vmid(_VLAN_ID, _HOST_INDEX)  # 100001
+        assert expected == 100001  # sanity: the Python side
+        assert planned == expected, (
+            f"with workload_vmid=0 the planned container vm_id {planned!r} must equal "
+            f"the module-computed deterministic VMID == Python proxmox_vmid("
+            f"{_VLAN_ID}, {_HOST_INDEX}) == {expected}. A mismatch is HCL-vs-Python VMID "
+            "drift (ADR-0022)."
+        )
+        assert planned != 1102, (
+            "the computed workload VMID must NOT be the old hardcoded 1102 that "
+            "collided with the ZITADEL backing-DB guest (the motivating defect; ADR-0022)"
+        )
+
+    def test_operator_override_wins_grandfather_path(self):
+        """workload_vmid=4100 -> planned vm_id == 4100 (override wins, no replace)."""
+        planned = self._planned_vm_id(4100)
+        assert planned == 4100, (
+            f"with an operator override workload_vmid=4100 the planned container vm_id "
+            f"must be 4100 verbatim (grandfather path — an already-provisioned guest keeps "
+            f"its live VMID and is never force-replaced); got {planned!r} (ADR-0022)"
         )

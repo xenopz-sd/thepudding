@@ -9,41 +9,31 @@
 # never the committed .env.
 #
 # Order:
-#   1. Idempotency version-check guard.
-#   2. (opt-in mock) self-signed TLS cert (control-node generation).
-#   3. (opt-in mock) placeholder `edge` network when Traefik is absent.
-#   4. Resolve the masterkey (gen-once + persist to OpenBao) + DB password.
-#   5. Ensure dirs; write the 0600 secret env.
-#   6. Deploy the Compose stack via docker-compose-app (Traefik labels, no host
+#   1. (opt-in mock) self-signed TLS cert (control-node generation).
+#   2. (opt-in mock) placeholder `edge` network when Traefik is absent.
+#   3. Resolve the masterkey (gen-once + persist to OpenBao) + DB password.
+#   4. Ensure dirs; write the 0600 secret env.
+#   5. Deploy the Compose stack via docker-compose-app (Traefik labels, no host
 #      port, extra_env_files secret env).
+#
+# NOTE: there is deliberately NO image-version idempotency gate on the deploy.
+# The docker-compose-app reconcile is DECLARATIVE and runs on every invocation,
+# so a config change — the mock->real ingress swap-gate (zitadel_mock_edge_network
+# true->false once SVC-09 Traefik owns the real `edge`), or any dca_env/ports/
+# networks change — is applied and the container recreated as needed, while a
+# converged stack is a changed=0 no-op. Gating the reconcile behind an image
+# check previously skipped the ingress flip once pinned (502 at Traefik); removed
+# per .kiro/specs/fix-svc06-zitadel-compose-ingress-version-gate-decoupling/.
+# Mirrors the Grafana / OpenBao deploys, which carry no version gate either.
 
-# --- 1. IDEMPOTENCY: version-check guard ------------------------------------
-- name: "ZITADEL | Inspect any running container at the pinned image (idempotency guard)"
-  ansible.builtin.command:
-    argv:
-      - docker
-      - inspect
-      - "--format={{ '{{' }}index .Config.Image{{ '}}' }}"
-      - "{{ zitadel_container_name }}"
-  register: zitadel_running_image
-  failed_when: false
-  changed_when: false
-
-- name: "ZITADEL | Set fact — already at the pinned image?"
-  ansible.builtin.set_fact:
-    zitadel_already_at_pinned_version: >-
-      {{ (zitadel_running_image.rc == 0)
-         and ((zitadel_running_image.stdout | default('') | trim) == zitadel_image) }}
-  changed_when: false
-
-# --- 2. (opt-in mock) self-signed TLS cert ----------------------------------
+# --- 1. (opt-in mock) self-signed TLS cert ----------------------------------
 # NOT gated on the version guard — a crash-looping host missing its cert must
 # still get one. The include itself is gated on the mock flag.
 - name: "ZITADEL | Include the self-signed TLS mock (opt-in, dev/offline only)"
   ansible.builtin.include_tasks: tls_self_signed.yml
   when: zitadel_tls_self_signed | bool
 
-# --- 3. (opt-in mock) placeholder edge network ------------------------------
+# --- 2. (opt-in mock) placeholder edge network ------------------------------
 # When SVC-09/Traefik is NOT on this host, create a LOCAL placeholder `edge`
 # network so the Compose stack's `networks: ["edge"]` resolves. OFF when the real
 # Traefik owns `edge`. Idempotent (create-if-absent). Clone of SVC-07's
@@ -54,7 +44,7 @@
     state: present
   when: zitadel_mock_edge_network | bool
 
-# --- 4. Masterkey + DB password from OpenBao --------------------------------
+# --- 3. Masterkey + DB password from OpenBao --------------------------------
 # The masterkey is generated ONCE (32 random bytes, base64) and persisted to
 # OpenBao; on every subsequent run it is READ back (never regenerated — a changed
 # masterkey corrupts the instance, requirements §6). The DB password is READ from
@@ -193,7 +183,7 @@
          else (zitadel_db_password_override | default('')) }}
   no_log: true
 
-# --- 5. Dirs + 0600 secret env ----------------------------------------------
+# --- 4. Dirs + 0600 secret env ----------------------------------------------
 - name: "ZITADEL | Ensure the config directory exists"
   ansible.builtin.file:
     path: /etc/zitadel
@@ -224,7 +214,7 @@
   notify: Restart zitadel
 
 # ============================================================================
-# 6. CROSS-GUEST INGRESS PATH SELECTION (task 1.2) — real route vs dev/offline
+# 5. CROSS-GUEST INGRESS PATH SELECTION (task 1.2) — real route vs dev/offline
 #    mock-edge. Traefik (SVC-09, 10.0.20.12) runs on a SEPARATE guest from
 #    ZITADEL (10.0.20.15); a host-local `edge` network can never bridge two
 #    guests and Traefik never reads another guest's Docker labels, so the REAL
@@ -239,7 +229,7 @@
 #    SVC-07). The two paths are MUTUALLY EXCLUSIVE.
 # ============================================================================
 
-# --- 6a. INFO swap-gate decision (R3.3) -------------------------------------
+# --- 5a. INFO swap-gate decision (R3.3) -------------------------------------
 # composition-wiring.md §"Swap-Gate Pattern" step 4 / mock-stand-ins.md: emit an
 # INFO line stating WHICH ingress path was selected and WHY, so the real-route
 # vs mock-edge choice is visible in the play output. (The traefik_route role
@@ -268,7 +258,7 @@
       }}
   changed_when: false
 
-# --- 6b. Compose the ZITADEL Traefik ingress labels (MOCK-EDGE PATH ONLY) ----
+# --- 5b. Compose the ZITADEL Traefik ingress labels (MOCK-EDGE PATH ONLY) ----
 # Only meaningful when Traefik's Docker provider is on the SAME daemon (the
 # co-located dev box). On the real cross-guest path these labels are inert
 # (Traefik is on another guest) and are NOT attached. These are the six
@@ -288,7 +278,7 @@
   changed_when: false
   when: zitadel_mock_edge_network | bool
 
-# --- 6c. Render + delegate the ZITADEL Route_Fragment (REAL PATH) -----------
+# --- 5c. Render + delegate the ZITADEL Route_Fragment (REAL PATH) -----------
 # Consume the reusable (already h2c-ready) traefik_route role to drop
 # zitadel-route.yml onto the Traefik_Guest's watched file-provider dir.
 # route_tls=true + the fragment's `tls: {}` (default store) means the
@@ -317,7 +307,7 @@
     traefik_guest_host: "{{ zitadel_traefik_guest_host }}"
   when: not (zitadel_mock_edge_network | bool)
 
-# --- 6d. Deploy the Compose stack via docker-compose-app --------------------
+# --- 5d. Deploy the Compose stack via docker-compose-app --------------------
 # ZITADEL is a single Compose stack on its own guest. The ingress discovery
 # wiring (ports / networks / labels / dca_networks) is PATH-SELECTED, mirroring
 # grafana.yml 6d / openbao (d). REAL path (default): publish the VLAN20_Port
@@ -434,10 +424,17 @@
       ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: "{{ zitadel_provision_sa_name }}"
       ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "{{ zitadel_provision_pat_expiration }}"
     dca_state: "{{ zitadel_state }}"
-  when: not zitadel_already_at_pinned_version
+  # NO image-version gate: the docker-compose-app reconcile is DECLARATIVE and
+  # runs every invocation, so the mock->real ingress flip (and any dca_env/ports/
+  # networks change) is applied + the container recreated, while a converged
+  # stack is changed=0. (Decoupled per
+  # fix-svc06-zitadel-compose-ingress-version-gate-decoupling — the former
+  # image-version `when:` skipped the flip once the image was pinned and left
+  # Traefik returning 502. Matches the Grafana/OpenBao deploys, which also carry
+  # no version gate on their docker-compose-app reconcile.)
 
-# --- 7. Provisioning token: obtain-once at first-init + persist to OpenBao ---
-# Mirrors the masterkey check-then-write idempotency pattern (§4) EXACTLY in
+# --- 6. Provisioning token: obtain-once at first-init + persist to OpenBao ---
+# Mirrors the masterkey check-then-write idempotency pattern (§3) EXACTLY in
 # structure, but runs AFTER the Compose deploy because the PAT is EMITTED BY the
 # ZITADEL container during first-init setup (not generated by the role). On a
 # re-run against an already-initialized DB, ZITADEL skips FirstInstance and

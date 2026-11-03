@@ -147,7 +147,10 @@ resource "proxmox_virtual_environment_container" "primary" {
   description = "SVC-07 primary OpenBao instance (Raft storage, KV v2 / database / aws / jwt / oidc / audit). Managed by Terraform; see .kiro/specs/svc-07-secrets-manager."
 
   node_name = var.proxmox_node_name
-  vm_id     = var.openbao_primary_vmid
+  # Operator override wins when non-zero (grandfathers a live VMID, no
+  # force-replace); otherwise the module-computed deterministic VMID
+  # (vlan_id * 1000 + host_index = 20000) is used (ADR-0022).
+  vm_id = var.openbao_primary_vmid != 0 ? var.openbao_primary_vmid : module.primary.vmid
 
   # Unprivileged container (Requirement 9.2; PF LXC-default). `nesting` is
   # required so the in-container Docker engine (which the Compose stack needs)
@@ -295,7 +298,10 @@ resource "proxmox_virtual_environment_container" "unsealer" {
   description = "SVC-07 seal-only Transit unsealer OpenBao instance (Transit engine + minimal Raft, no KV/database/aws/PKI mount). Managed by Terraform; see .kiro/specs/svc-07-secrets-manager."
 
   node_name = var.proxmox_node_name
-  vm_id     = var.openbao_unsealer_vmid
+  # Operator override wins when non-zero (grandfathers a live VMID, no
+  # force-replace); otherwise the module-computed deterministic VMID
+  # (vlan_id * 1000 + host_index = 20001) is used (ADR-0022).
+  vm_id = var.openbao_unsealer_vmid != 0 ? var.openbao_unsealer_vmid : module.unsealer.vmid
 
   # Unprivileged container (Requirement 9.3; PF LXC-default). `nesting` is
   # required so the in-container Docker engine (which the Compose stack needs)

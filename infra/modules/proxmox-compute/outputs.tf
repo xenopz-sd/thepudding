@@ -19,9 +19,11 @@
 #                    (CIDR address + gateway) a guest resource injects (Req 2.5).
 #   - tags         : REAL — ["proj-<slug>-<service>"], distinct from hostname
 #                    (Req 3.4).
-#   - vmid         : stand-in (null) — no guest resource exists in this module's
-#                    current scope; set from the created VM/LXC in a later
-#                    increment (see locals.tf scope decision).
+#   - vmid         : REAL — deterministic `vlan_id * 1000 + host_index`
+#                    (proxmox-compute-deterministic-vmid, ADR-0022), computed in
+#                    locals.tf. Collision-free + reversible, the VMID analogue of
+#                    the computed IP. A consuming root reads this when no operator
+#                    override VMID is supplied (grandfather ternary).
 #   - service_role : REAL — the service identity the Ansible inventory groups by.
 #
 # The input-guard preconditions (reject vlan_id == 10, within-VLAN hostname
@@ -64,7 +66,7 @@ output "tags" {
 }
 
 output "vmid" {
-  description = "Proxmox VMID of the provisioned guest. Stand-in (null) until the guest resource is wired in a later increment; see the scope decision in locals.tf."
+  description = "Deterministic Proxmox VMID `vlan_id * 1000 + host_index` (proxmox-compute-deterministic-vmid, ADR-0022) — collision-free + reversible, the VMID analogue of the computed IP. A consuming root's container reads this as `vm_id` when no operator override VMID is supplied (the grandfather ternary: `var.<service>_vmid != 0 ? var.<service>_vmid : module.<x>.vmid`)."
   value       = local.vmid
 }
 
