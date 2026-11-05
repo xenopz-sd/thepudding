@@ -45,3 +45,16 @@ consumer_oidc_app_type_has_secret:
   public-spa: false
   confidential-web: true
   api: false
+
+# §6 (fix-consumer-ingress-browser-reachable-oidc): the platform base domain the
+# expose subdomain label is appended to for the handoff ingress banner line.
+# Placeholder default (single source of truth; set per-env).
+consumer_platform_domain: "platform.example.test"
+# §6 post-deploy route check: the Traefik ingress IP (ADR-0015 host_index 2 ->
+# 10.0.20.12) the exposed-route probe is sent to, with the exposed FQDN as Host.
+consumer_traefik_ingress_host: "10.0.20.12"
+# Certificate verification for that probe. Default OFF because the dev Traefik
+# serves the self-signed mock cert (SVC-09 traefik_tls_self_signed); the probe
+# is read-only and sends no credential. Set true where Traefik presents a
+# trusted-CA certificate.
+consumer_expose_route_validate_certs: false

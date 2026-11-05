@@ -126,6 +126,42 @@ To stand the MariaDB alternative up instead, add `-e db_engine=mariadb`.
   ansible/playbooks/svc01-health.yml -e project_slug=dronefleet -e vlan_id=100
 ```
 
+### A.2b — TLS posture + app-role TCP connectivity check
+
+The `postgres-server` role derives BOTH the server `ssl` setting and the
+`pg_hba.conf` connection-type from the single `postgres_ssl_enabled` flag
+(`fix-pg-hba-hostssl-vs-ssl-off`), so they can never contradict each other:
+
+| `postgres_ssl_enabled` | `postgresql.conf` | `pg_hba` app/exporter rule | app-role client posture |
+|---|---|---|---|
+| `false` (**default** today — no SVC-08/EJBCA cert) | `ssl = off` | `host … scram-sha-256` | **plaintext** TCP on the project VLAN (do NOT use `sslmode=require`) |
+| `true` (once a cert exists) | `ssl = on` + `ssl_cert_file`/`ssl_key_file` | `hostssl … scram-sha-256` | TLS (`sslmode=require`/`verify-full`) |
+
+Under the default posture the least-privilege app role connects over **plaintext**
+TCP bound to the guest's own private VLAN subnet (`10.0.<vlan>.0/24`). A
+`hostssl`-only rule while the server runs `ssl = off` would lock the app role out
+of TCP entirely — the provision-time fail-closed assert refuses that contradiction.
+
+Verify the app role can actually connect over TCP (the end-to-end proof the
+lockout is resolved) — a **plaintext** client, NOT `sslmode=require`:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+# From an on-VLAN host, as the least-privilege app role (password from OpenBao).
+# Default posture is plaintext (ssl = off); sslmode=require would fail with
+# "server does not support SSL".
+PGPASSWORD="$APP_PASSWORD" psql \
+  "host=10.0.100.11 port=5432 dbname=dronefleet user=dronefleet_app sslmode=disable" \
+  -tAc "SELECT 1"
+```
+
+**Future flip to TLS** (once SVC-08/EJBCA — or a deliberate self-signed dev
+stand-in — issues the DB a cert): set `postgres_ssl_enabled=true` and drop the
+cert/key at `postgres_ssl_cert_file` / `postgres_ssl_key_file`. The next converge
+renders `ssl = on` + `hostssl` with no hostname/role change; clients then switch
+to `sslmode=verify-full`.
+
 ### A.3 — Clean-slate reset
 
 <!-- doctest: requires-infra -->

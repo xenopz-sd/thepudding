@@ -9,10 +9,16 @@ port = {{ postgres_port }}
 max_connections = {{ postgres_max_connections }}
 shared_buffers = '{{ postgres_shared_buffers }}'
 work_mem = '{{ postgres_work_mem }}'
-# TLS for cross-VLAN connections is required by pg_hba (hostssl); the cert is
-# issued by SVC-08/EJBCA (or a local self-signed stand-in) and dropped at the
-# path below out-of-band — referenced by path, not generated here.
-# ssl = on   # enabled once a cert is present at the ssl_cert_file path
+# Server TLS is derived from the single source of truth `postgres_ssl_enabled`
+# (fix-pg-hba-hostssl-vs-ssl-off) so it can never contradict the pg_hba
+# connection-type. OFF (default) renders an explicit, honest `ssl = off`; ON
+# renders `ssl = on` + the cert/key paths (cert issued by SVC-08/EJBCA or a local
+# self-signed stand-in, dropped out-of-band — referenced by path, not generated).
+ssl = {{ 'on' if postgres_ssl_enabled | bool else 'off' }}
+{% if postgres_ssl_enabled | bool %}
+ssl_cert_file = '{{ postgres_ssl_cert_file }}'
+ssl_key_file = '{{ postgres_ssl_key_file }}'
+{% endif %}
 log_statement = '{{ postgres_log_statement }}'
 log_timezone = 'UTC'
 timezone = 'UTC'

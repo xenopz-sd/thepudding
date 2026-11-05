@@ -91,6 +91,41 @@ def token_env(monkeypatch):
     return "pat-secret-xyz"
 
 
+def _provision_e2e_script(roles=("admin", "member", "viewer")):
+    """The full scripted request sequence provision() now issues for a fresh
+    org/project with no pre-existing roles and assertion to be enabled
+    (fix-zitadel-onboarding-role-keys-assertion, §4). Order:
+      find/create org, find/create project,
+      reconcile: list roles (empty) -> create each declared -> final list,
+      set assertion: GET project -> PUT project,
+      find/create oidc app,
+      read-back gate: list roles -> GET project (assertion true).
+    """
+    role_result = {"result": [{"key": r} for r in roles]}
+    script = [
+        _FakeResp(200, {"result": []}),          # find org
+        _FakeResp(200, {"id": "org-1"}),          # create org
+        _FakeResp(200, {"result": []}),          # find project
+        _FakeResp(200, {"id": "proj-1"}),         # create project
+        _FakeResp(200, {"result": []}),          # reconcile: list roles (none)
+    ]
+    script += [_FakeResp(200, {}) for _ in roles]  # reconcile: create each declared
+    script += [
+        _FakeResp(200, role_result),             # reconcile: final list
+        _FakeResp(200, {"project": {"name": "proj-x-project", "projectRoleAssertion": False}}),  # GET
+        _FakeResp(200, {}),                       # PUT UpdateProject
+        _FakeResp(200, {"result": []}),          # find app
+        _FakeResp(200, {"clientId": "cid-1", "clientSecret": "csecret-1"}),  # create app
+        _FakeResp(200, role_result),             # read-back: list roles
+        _FakeResp(200, {"project": {"projectRoleAssertion": True}}),  # read-back: GET assertion
+        # §6: provision() then checks the instance Login-V2 feature (the
+        # deciding lever). GET returns {} => current None == desired False
+        # (login_version defaults to v1) => no PUT.
+        _FakeResp(200, {}),                       # GET /v2/features/instance
+    ]
+    return script
+
+
 # --------------------------------------------------------------------------- #
 # ensure_org idempotency.
 # --------------------------------------------------------------------------- #
@@ -149,12 +184,19 @@ def test_ensure_oidc_app_returns_client_secret_on_create():
 
 def test_ensure_oidc_app_no_secret_when_already_exists():
     transport = _Transport([
+        # _find_app_by_name -> present (clientId on oidcConfig)
         _FakeResp(200, {"result": [{"name": "dronefleet-webapp", "oidcConfig": {"clientId": "cid-old"}}]}),
+        # _reconcile_login_version -> _find_app_id_and_oidc: app present with
+        # loginVersion ALREADY {loginV1:{}}, so the reconcile is a no-op (no PUT).
+        _FakeResp(200, {"result": [{"name": "dronefleet-webapp", "id": "app-1",
+                                    "oidcConfig": {"clientId": "cid-old",
+                                                   "loginVersion": {"loginV1": {}}}}]}),
     ])
     with mock.patch("urllib.request.urlopen", transport):
         client = zp.ZitadelClient("https://auth.test", "tok", org_id="org-1")
         app = client.ensure_oidc_app("proj-1", "org-1", "dronefleet-webapp", ["https://app/cb"])
     assert app["already_existed"] is True
+    assert app["login_version_reconciled"] is False, "already-correct loginVersion must not PUT"
     assert app["client_secret"] is None, (
         "ZITADEL only returns a client secret at creation; a re-run must NOT fabricate one"
     )
@@ -190,17 +232,7 @@ def test_client_fails_closed_without_token():
 # end-to-end provision() + CLI contract.
 # --------------------------------------------------------------------------- #
 def test_provision_end_to_end_json_serializable():
-    transport = _Transport([
-        _FakeResp(200, {"result": []}),                       # find org
-        _FakeResp(200, {"id": "org-1"}),                      # create org
-        _FakeResp(200, {"result": []}),                       # find project
-        _FakeResp(200, {"id": "proj-1"}),                     # create project
-        _FakeResp(200, {}),                                   # role admin
-        _FakeResp(200, {}),                                   # role member
-        _FakeResp(200, {}),                                   # role viewer
-        _FakeResp(200, {"result": []}),                       # find app
-        _FakeResp(200, {"clientId": "cid-1", "clientSecret": "csecret-1"}),  # create app
-    ])
+    transport = _Transport(_provision_e2e_script())
     with mock.patch("urllib.request.urlopen", transport):
         result = zp.provision("https://auth.test", "proj-x", "proj-x-project",
                               "proj-x-webapp", ["https://app/cb"],
@@ -210,6 +242,9 @@ def test_provision_end_to_end_json_serializable():
     assert '"org-1"' in dumped and '"proj-1"' in dumped
     assert result["oidc_app"]["client_secret"] == "csecret-1"
     assert result["roles_created"] == ["admin", "member", "viewer"]
+    # §4: reconcile result + assertion flag are present and the read-back gate passed.
+    assert sorted(result["roles_reconciled"]["final"]) == ["admin", "member", "viewer"]
+    assert result["project_role_assertion"] is True
 
 
 def test_cli_requires_token_env(monkeypatch, capsys):
@@ -237,15 +272,8 @@ def test_cli_has_no_token_flag():
 
 
 def test_cli_emits_json_on_stdout(token_env):
-    transport = _Transport([
-        _FakeResp(200, {"result": []}),
-        _FakeResp(200, {"id": "org-1"}),
-        _FakeResp(200, {"result": []}),
-        _FakeResp(200, {"id": "proj-1"}),
-        _FakeResp(200, {}), _FakeResp(200, {}), _FakeResp(200, {}),
-        _FakeResp(200, {"result": []}),
-        _FakeResp(200, {"clientId": "cid-1", "clientSecret": "csecret-1"}),
-    ])
+    # CLI with no --role applies the documented default admin/member/viewer (§4).
+    transport = _Transport(_provision_e2e_script())
     buf = io.StringIO()
     with mock.patch("urllib.request.urlopen", transport), mock.patch.object(sys, "stdout", buf):
         rc = zp.main(["--base-url", "https://auth.test", "--org", "proj-x",
@@ -344,18 +372,11 @@ def test_property6_token_only_in_auth_header(token_suffix, app_type_auth):
     """
     token = f"pat-SENTINEL-{token_suffix}"
     app_type, auth_method = app_type_auth
-    # A full end-to-end provision() so org/project/role/app requests are all
-    # recorded: find-org, create-org, find-proj, create-proj, 3 roles, find-app,
-    # create-app.
-    transport = _Transport([
-        _FakeResp(200, {"result": []}),              # find org
-        _FakeResp(200, {"organizationId": "org-1"}),  # create org
-        _FakeResp(200, {"result": []}),              # find project
-        _FakeResp(200, {"id": "proj-1"}),            # create project
-        _FakeResp(200, {}), _FakeResp(200, {}), _FakeResp(200, {}),  # 3 roles
-        _FakeResp(200, {"result": []}),              # find app
-        _FakeResp(200, {"clientId": "cid-1", "clientSecret": "sek"}),  # create app
-    ])
+    # A full end-to-end provision() so org/project/role-reconcile/assertion/app +
+    # read-back requests are all recorded (§4 adds the reconcile + assertion +
+    # read-back calls). The app-create response shape is irrelevant to the
+    # token-leak property, so reuse the shared e2e script.
+    transport = _Transport(_provision_e2e_script())
     with mock.patch("urllib.request.urlopen", transport):
         zp.provision("https://auth.test", "proj-x", "proj-x-project",
                      "proj-x-app", ["https://app/cb"],
@@ -463,6 +484,7 @@ def test_result_keys_additive_no_retype():
     transport = _Transport([
         _FakeResp(200, {"result": []}),
         _FakeResp(200, {"clientId": "cid-1", "clientSecret": "csecret-1"}),
+        _FakeResp(200, {}),  # GET /v2/features/instance (current None == desired False => no PUT)
     ])
     with mock.patch("urllib.request.urlopen", transport):
         client = zp.ZitadelClient("https://auth.test", "tok", org_id="org-1")
@@ -525,6 +547,7 @@ def test_r8_3_default_registration_is_confidential_web_golden_body():
     transport = _Transport([
         _FakeResp(200, {"result": []}),
         _FakeResp(200, {"clientId": "cid-1", "clientSecret": "csecret-1"}),
+        _FakeResp(200, {}),  # GET /v2/features/instance (current None == desired False => no PUT)
     ])
     with mock.patch("urllib.request.urlopen", transport):
         client = zp.ZitadelClient("https://auth.test", "tok", org_id="org-1")
@@ -539,21 +562,17 @@ def test_r8_3_default_registration_is_confidential_web_golden_body():
         "appType": "OIDC_APP_TYPE_WEB",
         "authMethodType": "OIDC_AUTH_METHOD_TYPE_BASIC",
         "accessTokenType": "OIDC_TOKEN_TYPE_BEARER",
+        # Login V1 pinned on the app (default, fix-svc06-login-v1-ac3). The
+        # body was deliberately changed from the old byte-frozen shape: the
+        # frozen body encoded the BROKEN login (instance-default V2 route).
+        "loginVersion": {"loginV1": {}},
     }
 
 
 def test_r8_4_token_never_in_url_or_body(token_env):
     """R8.4 — the provisioning token is never present in any request URL or body
     (end-to-end, default web registration via the CLI)."""
-    transport = _Transport([
-        _FakeResp(200, {"result": []}),
-        _FakeResp(200, {"organizationId": "org-1"}),
-        _FakeResp(200, {"result": []}),
-        _FakeResp(200, {"id": "proj-1"}),
-        _FakeResp(200, {}), _FakeResp(200, {}), _FakeResp(200, {}),
-        _FakeResp(200, {"result": []}),
-        _FakeResp(200, {"clientId": "cid-1", "clientSecret": "csecret-1"}),
-    ])
+    transport = _Transport(_provision_e2e_script())
     with mock.patch("urllib.request.urlopen", transport):
         rc = zp.main(["--base-url", "https://auth.test", "--org", "proj-x",
                       "--project", "proj-x-project", "--app", "proj-x-webapp",
@@ -562,3 +581,104 @@ def test_r8_4_token_never_in_url_or_body(token_env):
     for call in transport.calls:
         assert token_env not in call["url"]
         assert token_env not in (call["body"] or "")
+
+
+# =========================================================================== #
+# fix-svc06-login-v1-ac3 — Login V1 is the platform hosted-login default.
+# Live verification found AC-3's interactive login never worked: ZITADEL v4
+# routes OIDC logins to the undeployed Login-V2 container by default. The
+# deciding lever is the INSTANCE loginV2 feature (per-app loginVersion alone does
+# NOT override it). These tests pin: (a) the app body carries loginVersion V1 by
+# default, (b) an existing app's loginVersion is RECONCILED via PUT on drift,
+# (c) provision() disables the instance loginV2 feature by default, idempotently.
+# =========================================================================== #
+def test_login_version_v1_on_web_body_by_default():
+    ep, body = zp.build_app_request("web", "basic", "app", ["https://app/cb"])
+    assert body["loginVersion"] == {"loginV1": {}}
+
+
+def test_login_version_v1_on_spa_body_by_default():
+    ep, body = zp.build_app_request("spa", "none", "spa", ["https://app/cb"])
+    assert body["loginVersion"] == {"loginV1": {}}
+
+
+def test_login_version_v2_selectable():
+    ep, body = zp.build_app_request("web", "basic", "app", ["https://app/cb"],
+                                    login_version="v2")
+    assert "loginV2" in body["loginVersion"]
+
+
+def test_login_version_invalid_fails_closed():
+    with pytest.raises(ValueError):
+        zp.build_app_request("web", "basic", "app", [], login_version="v3")
+
+
+def test_api_body_has_no_login_version():
+    ep, body = zp.build_app_request("api", "jwt", "api", [])
+    assert "loginVersion" not in body
+
+
+def test_existing_app_login_version_reconciled_via_put_on_drift():
+    transport = _Transport([
+        _FakeResp(200, {"result": [{"name": "webapp", "oidcConfig": {"clientId": "cid-old"}}]}),
+        _FakeResp(200, {"result": [{"name": "webapp", "id": "app-1",
+                                    "oidcConfig": {"clientId": "cid-old",
+                                                   "redirectUris": ["https://app/cb"],
+                                                   "responseTypes": ["OIDC_RESPONSE_TYPE_CODE"],
+                                                   "grantTypes": ["OIDC_GRANT_TYPE_AUTHORIZATION_CODE"],
+                                                   "appType": "OIDC_APP_TYPE_WEB",
+                                                   "authMethodType": "OIDC_AUTH_METHOD_TYPE_BASIC"}}]}),
+        _FakeResp(200, {}),
+    ])
+    with mock.patch("urllib.request.urlopen", transport):
+        client = zp.ZitadelClient("https://auth.test", "tok", org_id="org-1")
+        app = client.ensure_oidc_app("proj-1", "org-1", "webapp", ["https://app/cb"])
+    assert app["already_existed"] is True
+    assert app["login_version_reconciled"] is True
+    put_calls = [c for c in transport.calls if c["method"] == "PUT" and "oidc_config" in c["url"]]
+    assert len(put_calls) == 1
+    put_body = json.loads(put_calls[0]["body"])
+    assert put_body["loginVersion"] == {"loginV1": {}}
+    assert "name" not in put_body
+
+
+def test_set_instance_login_v2_required_idempotent_noop_when_already_off():
+    transport = _Transport([
+        _FakeResp(200, {"loginV2": {"required": False}}),
+    ])
+    with mock.patch("urllib.request.urlopen", transport):
+        client = zp.ZitadelClient("https://auth.test", "tok")
+        changed = client.set_instance_login_v2_required(False)
+    assert changed is False
+    assert all(c["method"] != "PUT" for c in transport.calls)
+
+
+def test_set_instance_login_v2_required_puts_when_currently_on():
+    transport = _Transport([
+        _FakeResp(200, {"loginV2": {"required": True}}),
+        _FakeResp(200, {}),
+    ])
+    with mock.patch("urllib.request.urlopen", transport):
+        client = zp.ZitadelClient("https://auth.test", "tok")
+        changed = client.set_instance_login_v2_required(False)
+    assert changed is True
+    put = next(c for c in transport.calls if c["method"] == "PUT")
+    assert json.loads(put["body"]) == {"loginV2": {"required": False}}
+
+
+def test_provision_disables_instance_login_v2_by_default():
+    # Reuse the full §4 e2e script (reconcile + assertion + read-back gate) for a
+    # single declared role, but swap its trailing feature-GET for a feature that
+    # is currently ON so the instance lever must PUT it OFF (login_version=v1).
+    script = _provision_e2e_script(roles=("admin",))
+    script[-1] = _FakeResp(200, {"loginV2": {"required": True}})  # GET feature (ON)
+    script.append(_FakeResp(200, {}))                             # PUT feature OFF
+    transport = _Transport(script)
+    with mock.patch("urllib.request.urlopen", transport):
+        result = zp.provision("https://auth.test", "proj-x", "proj-x-project",
+                              "app", ["https://app/cb"],
+                              ["admin"], "tok")
+    assert result["instance_login_v2_required"] is False
+    assert result["instance_login_v2_changed"] is True
+    put = next(c for c in transport.calls if c["method"] == "PUT" and "features/instance" in c["url"])
+    assert json.loads(put["body"]) == {"loginV2": {"required": False}}

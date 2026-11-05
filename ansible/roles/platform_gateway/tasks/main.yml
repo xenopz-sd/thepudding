@@ -75,9 +75,10 @@
       {{ platform_gateway_vlan_sets.decommissioned_vlan_ids | default([]) | to_json }}
 
 # INFO decision log for the served-VLAN set (Req 3.4): the always-served shared
-# VLAN 20 plus the registry-active project VLANs (the role intersects the
-# active set with the opted-in served list; here we surface the active set the
-# operator can then opt into).
+# VLAN 20 plus the registry-active project VLANs. The bring-up forwards the
+# registry-active set AS the opt-in served set (fix-sdn-gateway-project-vlan-noop),
+# so every active project VLAN is actually served (the role no longer silently
+# intersects/drops the opt-in).
 - name: "Gateway | INFO — served-VLAN set (shared VLAN 20 + registry-active project VLANs)"
   ansible.builtin.debug:
     msg: >-
@@ -116,6 +117,15 @@
       - "sdn_gateway_active_vlan_ids={{ platform_gateway_active_json }}"
       - --extra-vars
       - "sdn_gateway_decommissioned_vlan_ids={{ platform_gateway_decomm_json }}"
+      # fix-sdn-gateway-project-vlan-noop: forward the registry-active project
+      # VLANs as the OPT-IN served set. Without this the from-scratch bring-up
+      # path never served a project VLAN (the opt-in defaulted []). The served
+      # project set IS the registry-active set — projects.yaml is the VLAN
+      # authority (NET-00 §7), consistent with how active/decommissioned already
+      # flow here. The role's opt-in-vs-active validation is a tautology on this
+      # path (opt-in == active), so it never spuriously fails the bring-up.
+      - --extra-vars
+      - "sdn_gateway_served_project_vlan_ids={{ platform_gateway_active_json }}"
   args:
     chdir: "{{ platform_repo_root }}"
   register: platform_gateway_run

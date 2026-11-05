@@ -58,12 +58,18 @@ _redirect_uris_strategy = st.lists(
 # The exact legacy confidential-web body the pre-refactor ensure_oidc_app built
 # (sans the per-call name/redirectUris, which the test supplies). Used as the
 # golden reference for Property 2.
+# The default confidential-web body build_app_request produces (sans the
+# per-call name/redirectUris). fix-svc06-login-v1-ac3 ADDED the loginVersion
+# field: the previous "byte-frozen legacy body" froze the BROKEN login (an
+# app with no loginVersion inherits the instance-default Login V2 route,
+# which is undeployed -> /ui/v2/login 404). V1 is now pinned by default.
 _LEGACY_WEB_STATIC = {
     "responseTypes": ["OIDC_RESPONSE_TYPE_CODE"],
     "grantTypes": ["OIDC_GRANT_TYPE_AUTHORIZATION_CODE"],
     "appType": "OIDC_APP_TYPE_WEB",
     "authMethodType": "OIDC_AUTH_METHOD_TYPE_BASIC",
     "accessTokenType": "OIDC_TOKEN_TYPE_BEARER",
+    "loginVersion": {"loginV1": {}},
 }
 
 # Keys that would carry / imply a client secret for a public SPA. A public SPA

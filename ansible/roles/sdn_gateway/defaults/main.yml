@@ -48,6 +48,14 @@ sdn_gateway_shared_vlan_id: 20
 # `sdn_gateway_active_vlan_ids`.
 sdn_gateway_served_project_vlan_ids: []
 
+# fix-sdn-gateway-project-vlan-noop: the explicit opt-in above is AUTHORITATIVE
+# intent to serve; the registry-active set is a VALIDATION, not a silent filter.
+# When true (default), an opted-in, non-decommissioned VLAN that is NOT
+# registry-active FAILS CLOSED (an operator/registry inconsistency — projects.yaml
+# is the VLAN authority, NET-00 §7). Set false to WARN and serve anyway. Either
+# way an opted-in VLAN is NEVER silently dropped (the pre-fix `intersect` defect).
+sdn_gateway_require_active_optin: true
+
 # Caller-supplied desired-state / teardown VLAN-ID sets, derived from
 # projects.yaml by the C6 JSON emitter (active_vlan_ids / the decommissioned
 # complement). Defaults empty so the role is safe to run with only VLAN 20 served

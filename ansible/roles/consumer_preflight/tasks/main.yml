@@ -59,6 +59,83 @@
     consumer_proxmox_node_name: "{{ consumer_tfvars['TF_VAR_proxmox_node_name'] }}"
   no_log: true
 
+# === 2b. Resolve the Proxmox datastore ONCE (fix-workload-datastore-autodetect) ==
+# Single source of truth for BOTH the composed svc-01 child apply and the workload
+# apply, so they can never disagree on the datastore for the same node (the §5a
+# bug: the DB autodetected local-lvm while the workload fell back to hard-coded
+# local-zfs). Mirrors svc01_preflight exactly: an explicit PROXMOX_DATASTORE_ID
+# wins verbatim; otherwise a single read-only node-storage query feeds the shared
+# datastore_select.py helper (local-zfs preferred, else local-lvm, else fail
+# closed). Side-effect-free — fits the Phase-1 fail-closed gate contract.
+- name: "Preflight | Bind the configured datastore (sentinel when PROXMOX_DATASTORE_ID unset)"
+  ansible.builtin.set_fact:
+    consumer_configured_datastore: >-
+      {{ consumer_tfvars['TF_VAR_openbao_datastore_id']
+         | default(consumer_autodetect_sentinel) }}
+  no_log: true
+
+- name: "Preflight | Query target-node storage (only when datastore unset)"
+  ansible.builtin.uri:
+    url: >-
+      {{ (consumer_tfvars['TF_VAR_proxmox_endpoint'] | trim | regex_replace('/+$', ''))
+         ~ '/api2/json/nodes/' ~ consumer_proxmox_node_name ~ '/storage' }}
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ consumer_tfvars['TF_VAR_proxmox_api_token'] }}"
+    timeout: 30
+    validate_certs: "{{ consumer_validate_certs }}"
+    status_code: [200]
+  register: consumer_node_storage
+  changed_when: false
+  no_log: true
+  when: consumer_configured_datastore in ['', consumer_autodetect_sentinel]
+
+- name: "Preflight | Extract available storage ids on the target node (non-secret)"
+  ansible.builtin.set_fact:
+    consumer_node_storage_ids: "{{ consumer_node_storage.json.data | map(attribute='storage') | list }}"
+  when: consumer_configured_datastore in ['', consumer_autodetect_sentinel]
+
+- name: "Preflight | Select the datastore via the shared datastore_select.py helper"
+  ansible.builtin.command:
+    argv:
+      - "{{ consumer_venv_python }}"
+      - "{{ consumer_datastore_select_helper }}"
+      - "--node-storage-ids"
+      - "{{ consumer_node_storage_ids | default([]) | join(',') }}"
+      - "--configured"
+      - "{{ consumer_configured_datastore }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_datastore_resolve
+  changed_when: false
+  failed_when: false
+
+- name: "Preflight | Assert a datastore resolved (else fail closed before any mutation)"
+  ansible.builtin.assert:
+    that:
+      - "(consumer_datastore_resolve.rc | default(1)) == 0"
+      - "(consumer_datastore_resolve.stdout | default('') | trim) | length > 0"
+    fail_msg: >-
+      No datastore configured and neither 'local-zfs' nor 'local-lvm' is available
+      on node '{{ consumer_proxmox_node_name }}'. Set PROXMOX_DATASTORE_ID in
+      {{ cluster_env_file }} and re-run. Nothing was provisioned.
+    success_msg: "Datastore resolved to '{{ consumer_datastore_resolve.stdout | trim }}'."
+    quiet: true
+
+- name: "Preflight | Bind the single authoritative resolved datastore for Phase 2"
+  ansible.builtin.set_fact:
+    consumer_resolved_datastore: "{{ consumer_datastore_resolve.stdout | trim }}"
+  changed_when: false
+
+- name: "Preflight | INFO — resolved datastore (threaded to both the DB and workload applies)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: datastore resolved to '{{ consumer_resolved_datastore }}'
+      (source: {{ 'explicit PROXMOX_DATASTORE_ID override'
+                  if consumer_configured_datastore not in ['', consumer_autodetect_sentinel]
+                  else 'autodetected from node ' ~ consumer_proxmox_node_name }}).
+      Threaded identically to the SVC-01 DB apply and the workload apply.
+
 # --- Agent-live throwaway-guard consult (gated, fail-closed, before any mutation) ---
 # The consumer onboarding run drives DESTRUCTIVE live operations downstream — most
 # directly the Phase-2 consumer_provision per-project workload `terraform apply`
@@ -251,6 +328,114 @@
     msg: >-
       INFO: '{{ project_slug }}' resolved to VLAN {{ consumer_vlan_id }}
       (Registry-authoritative; not operator input).
+
+# === 5b. Onboarding-prerequisite checks (fix-consumer-onboarding-prerequisites) ==
+# BOTH checks are READ-ONLY and side-effect-free, so a failure here leaves ZERO
+# provisioning effect (the Phase-1 fail-closed gate contract). They move the two
+# prerequisites that previously fail-closed MID-Phase-2 (the svc01_preflight VNet
+# assert / the db|workload Terraform plan precondition) up front, so a third-party
+# operator is told the exact remedy BEFORE anything is provisioned. The Phase-2
+# backstops are UNCHANGED.
+
+# --- 5b.1 Project VNet p<vlan> presence (read-only SDN VNet list) ---
+- name: "Preflight | List Proxmox SDN VNets (project VNet p{{ consumer_vlan_id }} presence)"
+  ansible.builtin.uri:
+    url: >-
+      {{ (consumer_tfvars['TF_VAR_proxmox_endpoint'] | trim | regex_replace('/+$', ''))
+         ~ '/api2/json/cluster/sdn/vnets' }}
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ consumer_tfvars['TF_VAR_proxmox_api_token'] }}"
+    timeout: 30
+    validate_certs: "{{ consumer_validate_certs }}"
+    status_code: [200]
+  register: consumer_sdn_vnets
+  changed_when: false
+  no_log: true
+
+- name: "Preflight | Compute project VNet presence (non-secret)"
+  ansible.builtin.set_fact:
+    consumer_vnet_present: >-
+      {{ ('p' ~ consumer_vlan_id)
+         in (consumer_sdn_vnets.json.data | map(attribute='vnet') | list) }}
+  changed_when: false
+
+- name: "Preflight | Fail closed if the project VNet is absent AND auto-create is OFF"
+  ansible.builtin.assert:
+    that:
+      - "consumer_vnet_present | bool"
+    fail_msg: >-
+      The project VNet 'p{{ consumer_vlan_id }}' is absent and
+      consumer_autocreate_network_slice is OFF. Apply the project's own
+      network-slice root (infra/projects/{{ project_slug }}/, whose sdn.tf creates
+      VNet p{{ consumer_vlan_id }} + subnet) first, then re-run — OR leave
+      consumer_autocreate_network_slice ON (the default) to have Phase 2 create it.
+      Nothing was provisioned.
+    success_msg: "Project VNet 'p{{ consumer_vlan_id }}' is present."
+    quiet: true
+  when: not (consumer_autocreate_network_slice | bool)
+
+- name: "Preflight | INFO — project VNet decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: project VNet 'p{{ consumer_vlan_id }}':
+      {{ 'present' if (consumer_vnet_present | bool)
+         else ('ABSENT — Phase 2 will auto-create the network slice'
+               if (consumer_autocreate_network_slice | bool)
+               else 'ABSENT — halting (auto-create OFF)') }}.
+
+# --- 5b.2 Host_Index_Authority ledger rows derived from the manifest ---
+# The ledger is a COMMITTED, diff-reviewable, append-only INPUT (ADR-0015), never
+# runtime-generated state. So Phase 1 DERIVES the required rows from the manifest
+# and, if any are missing, FAILS CLOSED printing the EXACT rows to commit — it
+# NEVER auto-appends the committed ledger at runtime. (The off-by-default
+# consumer_emit_ledger_rows affordance writes the proposal to a SEPARATE file.)
+- name: "Preflight | Optionally emit the derived ledger rows to a proposal file (off by default)"
+  ansible.builtin.command:
+    argv:
+      - "{{ consumer_venv_python }}"
+      - "{{ consumer_ledger_helper }}"
+      - --manifest
+      - "{{ consumer_manifest_path }}"
+      - --vlan-id
+      - "{{ consumer_vlan_id | string }}"
+      - --ledger
+      - "{{ consumer_host_indices_path }}"
+      - --emit
+      - "{{ consumer_ledger_rows_out }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_ledger_emit
+  changed_when: true
+  when: consumer_emit_ledger_rows | bool
+
+- name: "Preflight | Check the manifest-derived Host_Index_Authority ledger rows exist"
+  ansible.builtin.command:
+    argv:
+      - "{{ consumer_venv_python }}"
+      - "{{ consumer_ledger_helper }}"
+      - --manifest
+      - "{{ consumer_manifest_path }}"
+      - --vlan-id
+      - "{{ consumer_vlan_id | string }}"
+      - --ledger
+      - "{{ consumer_host_indices_path }}"
+      - --check
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_ledger_check
+  changed_when: false
+  failed_when: false
+
+- name: "Preflight | Fail closed naming the EXACT ledger rows to commit (Req 2.2/2.4)"
+  ansible.builtin.assert:
+    that:
+      - "consumer_ledger_check.rc == 0"
+    fail_msg: >-
+      {{ consumer_ledger_check.stderr | default('see the ledger-check output above')
+         | trim }}
+    success_msg: "Host_Index_Authority ledger rows present for VLAN {{ consumer_vlan_id }}."
+    quiet: true
 
 # === 6. Bounded dependency probes for DECLARED services (Req 9.1-9.4) =======
 # Each probe is READ-ONLY diagnosis within a bounded timeout — never an

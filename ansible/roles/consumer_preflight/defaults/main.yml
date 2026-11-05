@@ -16,6 +16,15 @@ consumer_registry_helper: scripts/installer/consumer_registry.py
 # the TF_VAR_* mapping + asserts the mandatory cluster vars are present.
 consumer_cluster_env_helper: scripts/installer/cluster_env.py
 
+# Shared pure datastore selector (fix-workload-datastore-autodetect, §5a) — the
+# SAME helper svc01_preflight uses. Phase 1 resolves the datastore ONCE (from the
+# explicit PROXMOX_DATASTORE_ID override, else a single node-storage query +
+# local-zfs/local-lvm/fail-closed selection) and threads that one value to BOTH
+# the composed svc-01 child apply AND the workload apply — so the DB guest and the
+# workload guest can never land on different datastores for the same node.
+consumer_datastore_select_helper: scripts/installer/datastore_select.py
+consumer_autodetect_sentinel: "__AUTODETECT__"
+
 # --- Agent-live throwaway-cluster guard (testing-strategy.md "Agent Live-Test
 #     Authorization") -----------------------------------------------------------
 # The Phase-1 preflight carries the gated throwaway-guard consult for the WHOLE
@@ -42,8 +51,31 @@ consumer_forbidden_build_tools:
 # detect and warn if an operator passed -e vlan_id=... and then ignore it.
 consumer_operator_supplied_vlan_id: ""
 
-# Homelab Proxmox self-signed cert tolerance (governs the ZITADEL health GET).
+# Homelab Proxmox self-signed cert tolerance (governs the ZITADEL health GET
+# AND the Phase-1 Proxmox SDN-VNet reachability query).
 consumer_validate_certs: false
+
+# --- Onboarding prerequisites: Phase-1 checks (fix-consumer-onboarding-prerequisites, §2) ---
+# Both the project VNet (p<vlan>) presence check and the Host_Index_Authority
+# ledger-row check are MOVED into Phase 1 (this role) so a missing prerequisite
+# is a side-effect-free fail-closed halt BEFORE any Phase-2 mutation — instead of
+# the mid-Phase-2 stops (svc01_preflight VNet assert / db|workload Terraform plan
+# precondition) a third-party operator used to hit after partial provisioning.
+# The Phase-2 svc01_preflight VNet assert + the db/workload plan preconditions
+# remain as UNCHANGED backstops.
+consumer_ledger_helper: scripts/installer/consumer_ledger.py
+consumer_host_indices_path: infra/platform-foundation/host-indices.yaml
+# Auto-create the project network slice (its VNet p<vlan>) in Phase 2 when absent
+# (default ON — the orchestrator already knows the slug + Registry-resolved VLAN).
+# Turn OFF for an operator/CI path that applies the slice separately; then a
+# missing VNet fails closed in Phase 1 naming the exact `terraform -chdir=...`
+# remedy rather than being discovered mid-Phase-2.
+consumer_autocreate_network_slice: true
+# Off-by-default author-then-apply affordance (ADR-0012): when true, Phase 1 writes
+# the DERIVED ledger rows to a SEPARATE, gitignored proposal file for the operator
+# to review + commit — it NEVER mutates the committed ledger (ADR-0015).
+consumer_emit_ledger_rows: false
+consumer_ledger_rows_out: "/tmp/{{ project_slug }}-host-index-rows.proposed.yml"
 
 # --- Dependency-probe addressing (read-only diagnosis only, Req 9.1-9.4) -----
 # The OpenBao primary + its container, so the bounded `bao status` probe can run

@@ -289,10 +289,19 @@ starts — the fail-closed swap-gate the Part-5 walkthrough asserts explicitly.
 A workload that validates ZITADEL tokens has **two independent** issuer-
 reachability problems, and solving one does not solve the other:
 
-1. **Browser → issuer.** The end user's browser must reach the ZITADEL login
-   page and the OIDC authorize/redirect endpoints. This is the public,
-   LAN/Traefik-facing path you already get from the SPA client's `redirect_uris`
-   and the shared Traefik ingress — nothing extra is needed for it.
+1. **Browser → issuer (and the app host).** The end user's browser must reach
+   BOTH the ZITADEL login page / OIDC authorize-redirect endpoints AND the
+   project app's own published host (to land on the registered redirect URI). In
+   **production** this is the public, trusted-CA + real-DNS path and needs nothing
+   extra. In **dev**, though, the browser gets no platform DNS and the issuer is
+   behind a self-signed cert — exactly like the API container below — so the
+   operator's own machine needs the dev **browser-reachability recipe** (see
+   ["Browser-reachability recipe" below](#browser-reachability-recipe-dev-only)):
+   an `/etc/hosts` (or split-DNS) mapping of BOTH the issuer host AND the app host
+   to the Traefik ingress IP, plus accepting the self-signed cert. Without it,
+   `signinRedirect()` dead-ends and interactive login cannot complete (the §6 bug:
+   "healthy but unusable"). This is the browser-side sibling of the API-container
+   recipe — they are independent and BOTH are needed in dev.
 2. **API container → issuer (server side).** The workload's **backend/API
    container** must reach the issuer host *from inside the container* to fetch
    the OIDC discovery document and the **JWKS** (the signing keys it validates
@@ -342,7 +351,7 @@ graph LR
     Traefik["Traefik ingress<br/>10.0.20.12 (self-signed in dev)"]
     ZITADEL["ZITADEL issuer<br/>auth.platform.example.test"]
 
-    Browser -->|"1. login / redirect<br/>(public path — already works)"| Traefik
+    Browser -->|"1. login / redirect<br/>(dev: needs the browser-reachability recipe)"| Traefik
     API -->|"2. server-side JWKS fetch<br/>needs resolve + trust"| Traefik
     Traefik --> ZITADEL
 ```
@@ -392,6 +401,48 @@ The reference hello-workload (see the per-project install runbook
 [`infra/projects/<slug>/INSTALL-RUNBOOK.md`](../infra/projects/dronefleet/INSTALL-RUNBOOK.md))
 demonstrates this overlay when it includes an SSO-consuming component, so a
 consumer can copy it verbatim and substitute the real issuer host.
+
+### Browser-reachability recipe (dev-only)
+
+The API-container recipe above solves only the **server-side** (JWKS) half. In
+dev an interactive OIDC login ALSO needs the **browser** half, applied on the
+**operator's own machine** (fix-consumer-ingress-browser-reachable-oidc, §6).
+This is the half that was previously (wrongly) assumed to "need nothing extra".
+It is the same two problems the API container has — DNS resolution + self-signed
+trust — but for the browser:
+
+1. **Resolve BOTH the issuer host AND the project app host to the Traefik ingress
+   IP** on the machine running the browser. A minimal `/etc/hosts` (or split-DNS)
+   mapping — placeholders only:
+
+   ```
+   # DEV ONLY — operator's own machine. Never in acceptance/production.
+   10.0.20.12  auth.platform.example.test
+   10.0.20.12  moto-maintenance.thepudding.internal
+   ```
+
+   The app host is the one the project declared via the consumer manifest
+   `expose` block (`<expose.host>.${THEPUDDING_BASE_DOMAIN}`) and registered as
+   its OIDC redirect URI. Without the app-host mapping the registered callback is
+   unreachable; without the issuer mapping `signinRedirect()` dead-ends.
+
+2. **Accept the self-signed cert** Traefik presents in dev (SVC-09's
+   `traefik_tls_self_signed` mock) in the browser — the one-time
+   "proceed to site" / trust-this-cert step — for BOTH hosts.
+
+Offline, you can confirm the mapping resolves without a live cluster:
+
+<!-- doctest: offline -->
+```bash
+# Both hosts must resolve to the Traefik ingress IP (placeholders).
+getent hosts auth.platform.example.test || true
+curl -sS --resolve "moto-maintenance.thepudding.internal:443:10.0.20.12" \
+  -k "https://moto-maintenance.thepudding.internal/" -o /dev/null -w '%{http_code}\n' || true
+```
+
+The live interactive-login walkthrough (authorize → callback with the registered
+redirect URI) is `requires-infra` and lives in the per-project install runbook's
+provision-then-test section.
 
 ### Production posture (the non-dev path)
 

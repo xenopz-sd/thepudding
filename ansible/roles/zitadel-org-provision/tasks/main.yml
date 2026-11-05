@@ -224,7 +224,9 @@
           '--project', zop_project_name,
           '--app', item.name,
           '--app-type', item.app_type,
-          '--auth-method', item.auth_method]
+          '--auth-method', item.auth_method,
+          '--login-version', zop_login_version]
+         + zop_roles_arg + zop_assertion_arg
          + zop_redirect_arg }}
   delegate_to: "{{ zop_zitadel_guest_host if (zop_dev_guest_run | bool) else 'localhost' }}"
   vars:
@@ -236,6 +238,12 @@
     zop_redirect_arg: >-
       {{ ['--redirect-uri=' ~ (item.redirect_uris | first)]
          if ((item.redirect_uris | default([])) | length > 0) else [] }}
+    # §4: same role-vocabulary + assertion threading as the production path.
+    zop_roles_arg: >-
+      {{ zop_project_roles | map('regex_replace', '^(.*)$', '--role=\1') | list }}
+    zop_assertion_arg: >-
+      {{ ['--project-role-assertion'] if (zop_project_role_assertion | bool)
+         else ['--no-project-role-assertion'] }}
   environment:
     ZITADEL_PROVISION_TOKEN: "{{ zop_provision_token }}"
   loop: "{{ zop_normalized_registrations }}"
@@ -273,7 +281,9 @@
           '--project', zop_project_name,
           '--app', item.name,
           '--app-type', item.app_type,
-          '--auth-method', item.auth_method]
+          '--auth-method', item.auth_method,
+          '--login-version', zop_login_version]
+         + zop_roles_arg + zop_assertion_arg
          + zop_redirect_arg + zop_insecure_arg }}
   args:
     chdir: "{{ zop_repo_root }}"
@@ -281,6 +291,15 @@
     zop_redirect_arg: >-
       {{ ['--redirect-uri=' ~ (item.redirect_uris | first)]
          if ((item.redirect_uris | default([])) | length > 0) else [] }}
+    # §4: thread the declared project role vocabulary (one --role per key) and
+    # the projectRoleAssertion toggle. Non-secret flags, safe on argv (the TOKEN
+    # stays in the child ENV). Empty zop_project_roles ⇒ no --role ⇒ the helper's
+    # documented default set.
+    zop_roles_arg: >-
+      {{ zop_project_roles | map('regex_replace', '^(.*)$', '--role=\1') | list }}
+    zop_assertion_arg: >-
+      {{ ['--project-role-assertion'] if (zop_project_role_assertion | bool)
+         else ['--no-project-role-assertion'] }}
     # Production path only: tolerate Traefik's self-signed mock cert (ADR-0013)
     # when zop_base_url_tls_skip_verify is true; enforce verification when false.
     # Non-secret transport flag — safe on the argv (the TOKEN stays in ENV).

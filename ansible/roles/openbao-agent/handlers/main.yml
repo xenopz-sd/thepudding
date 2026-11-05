@@ -1,11 +1,27 @@
 ---
 # handlers/main.yml — openbao-agent
 #
-# No handler is required by Task 4: agent.hcl is rendered idempotently and the
-# Compose stack is reconciled declaratively by docker-compose-app (which
-# recreates on config/.env drift). A changed agent.hcl is picked up by the
-# docker_compose_v2 reconcile on the same run, so no restart handler is needed.
-# This file is present as part of the standard role skeleton for consistency
-# with the sibling openbao_* roles.
+# Concrete restart-on-config-change handler (fix-openbao-agent-reload-on-config-
+# change, §5b). agent.hcl is bind-mounted :ro into the sidecar, so a change to
+# its CONTENT does not change compose.yaml/.env — docker_compose_v2
+# (recreate: auto, the docker-compose-app default) sees no drift and NO-OPS,
+# leaving the running (or mid-backoff, crash-looping) sidecar on the STALE config.
+# This handler, notified ONLY when the agent.hcl render reports changed, forces a
+# recreate of the openbao-agent service so it re-reads the new config.
 #
-# (intentionally empty)
+# Mirrors the sibling openbao_install "Restart openbao" precedent (declarative
+# docker_compose_v2, PF §9 — NEVER a shell `docker compose restart` wrapper).
+# Idempotency lives in the NOTIFY GATE, not the module: the handler runs only on
+# a changed render, so a converged host (render changed=0) never queues it and
+# the run stays changed=0. `recreate: always` destroys+replaces the container, so
+# it also clears a mid-backoff sidecar. Scoped to services: [openbao-agent] so a
+# healthy co-deployed workload is NOT needlessly bounced (Req 2.3).
+
+- name: Recreate openbao-agent sidecar
+  community.docker.docker_compose_v2:
+    project_src: "{{ openbao_agent_stack_dir }}"
+    project_name: "{{ dca_app_name }}"
+    services:
+      - openbao-agent
+    state: present
+    recreate: always

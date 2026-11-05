@@ -101,7 +101,13 @@ def test_new_defaults_present_and_typed():
     assert "{app_name}" in d.get("zop_openbao_app_secret_path_tmpl", "")
     # Pre-existing vars retained unchanged.
     assert d.get("zop_app_name") == "{{ zop_project_slug }}-webapp"
-    assert "zop_roles" in d and "zop_redirect_uris" in d
+    assert "zop_redirect_uris" in d
+    # fix-zitadel-onboarding-role-keys-assertion (§4): the unwired zop_roles default
+    # is REPLACED by zop_project_roles (reconciled to exactly these) + the
+    # projectRoleAssertion toggle. zop_roles is removed to avoid confusion.
+    assert "zop_roles" not in d, "the unwired zop_roles default must be removed (§4)"
+    assert d.get("zop_project_roles") == []
+    assert d.get("zop_project_role_assertion") is True
 
 
 # --------------------------------------------------------------------------- #

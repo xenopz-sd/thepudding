@@ -23,6 +23,149 @@
 # the DB bootstrap is check-then-write), so a re-run against an already-provisioned
 # DB converges with zero changes.
 
+# === Phase-2 FIRST STEP — auto-create the project network slice (§2) =========
+# fix-consumer-onboarding-prerequisites: when Phase 1 found the project VNet
+# ABSENT and auto-create is ON, apply the project's OWN top-level network-slice
+# root (its sdn.tf creates VNet p<vlan> + subnet) BEFORE the svc-01 child / the
+# workload apply, so the previously-undocumented `terraform apply
+# infra/projects/<slug>/` pre-step is folded into the flow. Applies the project's
+# own `<slug>-infra` state only (one-state-per-service); the Proxmox token rides
+# via TF_VAR_* env (never argv; no_log). The composed svc01_preflight VNet assert
+# stays the UNCHANGED backstop (it simply always sees p<vlan> present now).
+- name: "Provisioning (network slice) | Auto-create the project VNet when absent"
+  when:
+    - consumer_autocreate_network_slice | bool
+    - not (consumer_vnet_present | default(true) | bool)
+  block:
+    - name: "Provisioning (network slice) | INFO — auto-creating VNet p{{ consumer_vlan_id }}"
+      ansible.builtin.debug:
+        msg: >-
+          INFO: project VNet 'p{{ consumer_vlan_id }}' absent — applying the
+          project network-slice root (state {{ consumer_network_slice_state_name }})
+          before provisioning guests.
+
+    # Backend swap-gate (same signal the workload block uses): GitLab HTTP state
+    # when the CI vars are present, else the local override (solo/offline default).
+    - name: "Provisioning (network slice) | Read the cluster env file for the backend signal"
+      ansible.builtin.slurp:
+        src: "{{ consumer_repo_root }}/{{ cluster_env_file }}"
+      register: consumer_slice_env_slurp
+      no_log: true
+
+    - name: "Provisioning (network slice) | Extract env keys (names only, no values)"
+      ansible.builtin.set_fact:
+        consumer_slice_env_keys: >-
+          {{ (consumer_slice_env_slurp.content | b64decode).splitlines()
+             | map('trim')
+             | reject('match', '^\s*#')
+             | select('search', '=')
+             | map('regex_replace', '^\s*([^=]+?)\s*=.*$', '\1')
+             | list }}
+
+    - name: "Provisioning (network slice) | Detect the GitLab state-backend signal"
+      ansible.builtin.set_fact:
+        consumer_slice_use_gitlab_backend: >-
+          {{ ('CI_API_V4_URL' in consumer_slice_env_keys)
+             and ('CI_PROJECT_ID' in consumer_slice_env_keys)
+             and ('CI_JOB_TOKEN' in consumer_slice_env_keys) }}
+
+    - name: "Provisioning (network slice) | Ensure local_backend_override.tf (local backend)"
+      ansible.builtin.copy:
+        dest: "{{ consumer_network_slice_tf_root }}/local_backend_override.tf"
+        mode: "0644"
+        content: |
+          # Local, gitignored state backend for a solo/offline apply — overrides the
+          # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+          terraform {
+            backend "local" {
+              path = "{{ consumer_network_slice_state_name }}.tfstate"
+            }
+          }
+      when: not (consumer_slice_use_gitlab_backend | bool)
+
+    - name: "Provisioning (network slice) | Remove local_backend_override.tf (GitLab backend)"
+      ansible.builtin.file:
+        path: "{{ consumer_network_slice_tf_root }}/local_backend_override.tf"
+        state: absent
+      when: consumer_slice_use_gitlab_backend | bool
+
+    - name: "Provisioning (network slice) | terraform init (local backend)"
+      ansible.builtin.command:
+        argv: [terraform, init, -input=false, -reconfigure]
+      args:
+        chdir: "{{ consumer_network_slice_tf_root }}"
+      environment: "{{ consumer_workload_tf_env }}"
+      register: consumer_slice_init_local
+      changed_when: true
+      when: not (consumer_slice_use_gitlab_backend | bool)
+      no_log: true
+
+    - name: "Provisioning (network slice) | Derive the per-slug GitLab state address (GitLab backend)"
+      ansible.builtin.set_fact:
+        consumer_slice_env_pairs: >-
+          {{ (consumer_slice_env_slurp.content | b64decode).splitlines()
+             | map('trim') | reject('match', '^\s*#') | select('search', '=') | list }}
+      when: consumer_slice_use_gitlab_backend | bool
+      no_log: true
+
+    - name: "Provisioning (network slice) | Bind the GitLab CI backend values (GitLab backend)"
+      ansible.builtin.set_fact:
+        consumer_slice_ci_values: >-
+          {{ dict(consumer_slice_env_keys | zip(
+               consumer_slice_env_pairs
+               | map('regex_replace', '^[^=]+=\s*(.*?)\s*$', '\1')
+               | map('regex_replace', '^"(.*)"$', '\1') | list)) }}
+      when: consumer_slice_use_gitlab_backend | bool
+      no_log: true
+
+    - name: "Provisioning (network slice) | terraform init (GitLab HTTP backend, per-slug state)"
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - init
+          - -input=false
+          - -reconfigure
+          - "-backend-config=address={{ _addr }}"
+          - "-backend-config=lock_address={{ _addr }}/lock"
+          - "-backend-config=unlock_address={{ _addr }}/lock"
+          - -backend-config=username=gitlab-ci-token
+          - "-backend-config=password={{ consumer_slice_ci_values['CI_JOB_TOKEN'] }}"
+          - -backend-config=lock_method=POST
+          - -backend-config=unlock_method=DELETE
+          - -backend-config=retry_wait_min=5
+      args:
+        chdir: "{{ consumer_network_slice_tf_root }}"
+      environment: "{{ consumer_workload_tf_env }}"
+      vars:
+        _addr: >-
+          {{ consumer_slice_ci_values['CI_API_V4_URL'] }}/projects/{{
+             consumer_slice_ci_values['CI_PROJECT_ID'] }}/terraform/state/{{
+             consumer_network_slice_state_name }}
+      register: consumer_slice_init_gitlab
+      changed_when: true
+      when: consumer_slice_use_gitlab_backend | bool
+      no_log: true
+
+    - name: "Provisioning (network slice) | terraform apply (create VNet p{{ consumer_vlan_id }})"
+      ansible.builtin.command:
+        argv:
+          - terraform
+          - apply
+          - -input=false
+          - -auto-approve
+          - "-var=project_slug={{ project_slug }}"
+      args:
+        chdir: "{{ consumer_network_slice_tf_root }}"
+      environment: "{{ consumer_workload_tf_env }}"
+      register: consumer_slice_apply
+      changed_when: "'0 added, 0 changed, 0 destroyed' not in (consumer_slice_apply.stdout | default(''))"
+      no_log: true
+
+    - name: "Provisioning (network slice) | Mark the VNet present for downstream steps"
+      ansible.builtin.set_fact:
+        consumer_vnet_present: true
+      changed_when: false
+
 - name: "Provisioning | INFO — Phase 2 start (per-project DB on VLAN {{ consumer_vlan_id }})"
   ansible.builtin.debug:
     msg: >-
@@ -66,6 +209,13 @@
       - "tier={{ consumer_manifest.database.tier | default('small') }}"
       - -e
       - "openbao_addr={{ openbao_addr | default('') }}"
+      # Thread the SINGLE Phase-1-resolved datastore (fix-workload-datastore-autodetect)
+      # as an EXPLICIT svc01_datastore_id. svc01_preflight gates its own autodetect
+      # query/assert on `svc01_datastore_id == sentinel`, so a non-sentinel pre-set
+      # value is used verbatim (no second node query) — making the DB guest's
+      # datastore provably identical to the workload guest's.
+      - -e
+      - "svc01_datastore_id={{ consumer_resolved_datastore }}"
   args:
     chdir: "{{ consumer_repo_root }}"
   register: consumer_db_bootstrap_run
@@ -233,10 +383,14 @@
       when: (consumer_workload_ssh_key_file | default('') | length) == 0
 
     # --- Resolve the generic LXC template + datastore from the cluster env ----
+    # Datastore comes from the SINGLE Phase-1 resolution (consumer_resolved_datastore,
+    # fix-workload-datastore-autodetect) — a real, node-validated value, never the
+    # AUTODETECT sentinel — so the workload apply ALWAYS passes it (no omit-on-sentinel
+    # branch) and it matches the datastore the composed svc-01 child used.
     - name: "Provisioning (workload) | Bind the resolved LXC template + datastore facts"
       ansible.builtin.set_fact:
         consumer_workload_template_file_id: "{{ consumer_tfvars['TF_VAR_openbao_template_file_id'] | default('') }}"
-        consumer_workload_resolved_datastore: "{{ consumer_tfvars['TF_VAR_openbao_datastore_id'] | default('') }}"
+        consumer_workload_resolved_datastore: "{{ consumer_resolved_datastore }}"
       no_log: true
 
     # --- Backend swap-gate selection (identical shape to svc01_provision) -----
@@ -375,9 +529,11 @@
     # The workload root resolves vlan_id from the Registry and host_index from the
     # Host_Index_Authority ledger itself (main.tf) — so we thread ONLY the opt-in
     # flags and the per-cluster plumbing, never vlan_id/host_index. The datastore
-    # is passed only when a real value resolved; the AUTODETECT sentinel (or empty)
-    # lets the root fall back to its own default (local-zfs). Booleans are lowered
-    # for terraform (Jinja renders Python True/False capitalized).
+    # is ALWAYS passed as the single Phase-1-resolved value (consumer_resolved_datastore,
+    # fix-workload-datastore-autodetect) — a real, node-validated datastore, never the
+    # AUTODETECT sentinel — so it can no longer fall back to the root's hard-coded
+    # local-zfs default on a node that lacks it. Booleans are lowered for terraform
+    # (Jinja renders Python True/False capitalized).
     - name: "Provisioning (workload) | terraform apply (non-interactive, auto-approve)"
       ansible.builtin.command:
         argv: >-
@@ -389,11 +545,8 @@
               '-var=proxmox_node_name=' ~ consumer_proxmox_node_name,
               '-var=workload_vmid=' ~ (consumer_workload_vmid | int),
               '-var=workload_template_file_id=' ~ consumer_workload_template_file_id,
-              '-var=operator_ssh_public_keys=' ~ consumer_workload_ssh_keys_json]
-             + (['-var=workload_datastore_id=' ~ consumer_workload_resolved_datastore]
-                if ((consumer_workload_resolved_datastore | default('') | trim | length > 0)
-                    and (consumer_workload_resolved_datastore != consumer_autodetect_sentinel))
-                else []) }}
+              '-var=operator_ssh_public_keys=' ~ consumer_workload_ssh_keys_json,
+              '-var=workload_datastore_id=' ~ consumer_workload_resolved_datastore] }}
       args:
         chdir: "{{ consumer_workload_tf_root }}"
       environment: "{{ consumer_workload_tf_env }}"
@@ -477,3 +630,75 @@
         marker: "# {mark} consumer onboarding workload host keys for {{ project_slug }}"
         block: "{{ consumer_workload_keyscan.stdout }}"
       when: (consumer_workload_keyscan.stdout | default('') | trim | length) > 0
+
+    # --- §6: consumer ingress for a USER-FACING workload --------------------
+    # fix-consumer-ingress-browser-reachable-oidc. When the manifest declares an
+    # `expose` block (enabled), resolve the REAL base-domain host rule + the
+    # ADR-0018 route inputs the openbao-agent deploy step feeds to the shared
+    # traefik_route path (replacing the *.example.test placeholder), so the
+    # workload is published through the shared Traefik at
+    # <expose.host>.<platform_domain> and its registered OIDC redirect URI is
+    # reachable. These facts are consumed by the workload app-deploy step
+    # (openbao-agent); here we resolve them + record for the handoff. No host
+    # port, no Docker labels — the file-provider Route_Fragment (ADR-0018) only.
+    - name: "Provisioning (workload) | §6 — resolve the expose ingress inputs (user-facing)"
+      ansible.builtin.set_fact:
+        consumer_expose_enabled: "{{ consumer_manifest.expose.enabled | default(false) | bool }}"
+        consumer_expose_host_fqdn: >-
+          {{ consumer_manifest.expose.host ~ '.' ~ consumer_platform_domain }}
+        # Feed the EXISTING openbao-agent ADR-0018 route wiring real inputs.
+        openbao_agent_workload_host_rule: >-
+          {{ consumer_manifest.expose.host ~ '.' ~ consumer_platform_domain }}
+        openbao_agent_workload_http_port: "{{ consumer_manifest.expose.port | default(8080) }}"
+        openbao_agent_traefik_route_enabled: true
+        openbao_agent_mock_edge_network: false
+      changed_when: false
+      when: (consumer_manifest.expose.enabled | default(false)) | bool
+
+    # Scoped FAIL-CLOSED cross-VLAN reachability preflight: Traefik (VLAN 20) must
+    # be able to reach the workload backend on the project VLAN via the sanctioned
+    # host L3 gateway (integration-boundaries §6, ADR-0004). This spec does NOT
+    # configure the gateway — that is owned by fix-sdn-gateway-project-vlan-noop;
+    # here we only CHECK and NAME it, so an expose route is never silently broken
+    # ("healthy infra-side but unusable"). A read-only TCP reachability probe
+    # delegated to the Traefik guest.
+    #
+    # It probes L3 reachability on consumer_expose_l3_probe_port (sshd, 22) —
+    # NOT the application port: in Phase 2 the workload guest is freshly
+    # provisioned and Docker + the workload stack only land in Phase 3, so the
+    # app port cannot be listening yet (probing it failed every fresh bring-up
+    # and mis-blamed the gateway — caught live). sshd IS up (the keyscan above
+    # just succeeded), so a failure here isolates the cross-VLAN gateway gap.
+    # The end-to-end app-route check through Traefik runs post-deploy in Phase 4
+    # (consumer_handoff).
+    - name: "Provisioning (workload) | §6 — cross-VLAN reachability preflight (Traefik -> backend)"
+      ansible.builtin.wait_for:
+        host: "{{ consumer_workload_guest_ip }}"
+        port: "{{ consumer_expose_l3_probe_port | int }}"
+        timeout: 15
+      delegate_to: "{{ consumer_traefik_guest_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ consumer_traefik_guest_ssh_user }}"
+        ansible_python_interpreter: "{{ consumer_traefik_guest_python }}"
+      register: consumer_expose_reach
+      failed_when: false
+      changed_when: false
+      when: (consumer_manifest.expose.enabled | default(false)) | bool
+
+    - name: "Provisioning (workload) | §6 — fail closed if Traefik cannot reach the backend"
+      ansible.builtin.assert:
+        that:
+          - "(consumer_expose_reach.state | default('')) == 'started'"
+        fail_msg: >-
+          expose is enabled but Traefik ({{ consumer_traefik_guest_host }}, VLAN 20)
+          cannot reach the workload guest {{ consumer_workload_guest_ip }} (L3
+          probe tcp/{{ consumer_expose_l3_probe_port }}) on project VLAN
+          {{ consumer_vlan_id }}. The project VLAN's host L3 gateway/NAT is unmet —
+          this is owned by fix-sdn-gateway-project-vlan-noop (the §3 fix): ensure
+          the gateway serves VLAN {{ consumer_vlan_id }} (10.0.{{ consumer_vlan_id }}.1
+          bound on p{{ consumer_vlan_id }}), then re-run. The published route would
+          otherwise be silently broken (healthy infra-side but unreachable).
+        success_msg: "Traefik can reach the workload backend on the project VLAN."
+        quiet: true
+      when: (consumer_manifest.expose.enabled | default(false)) | bool

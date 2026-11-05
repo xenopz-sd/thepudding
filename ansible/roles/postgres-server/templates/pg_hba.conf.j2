@@ -16,9 +16,16 @@
 local   all       all                                        trust
 host    all       all   127.0.0.1/32                         scram-sha-256
 host    all       all   ::1/128                              scram-sha-256
-# Project subnet only, TLS required (hostssl) — never the LAN/other VLANs.
-hostssl {{ postgres_db_name }}  {{ postgres_app_role }}  10.0.{{ postgres_vlan_id }}.0/24  scram-sha-256
-hostssl {{ postgres_db_name }}  {{ postgres_exporter_role }}  10.0.{{ postgres_vlan_id }}.0/24  scram-sha-256
+# Project subnet only — never the LAN/other VLANs. The connection-type is
+# derived from the single source of truth `postgres_ssl_enabled`
+# (fix-pg-hba-hostssl-vs-ssl-off) so it is ALWAYS satisfiable under the server's
+# current `ssl` state: `hostssl` (TLS-required) when ssl = on, `host` (plaintext
+# or TLS, on the private VLAN subnet) when ssl = off. A `hostssl` rule emitted
+# while the server runs `ssl = off` is unsatisfiable and locks the app role out
+# of TCP entirely — that contradiction is what this derivation prevents.
+{% set _pg_conn = 'hostssl' if postgres_ssl_enabled | bool else 'host' %}
+{{ _pg_conn }} {{ postgres_db_name }}  {{ postgres_app_role }}  10.0.{{ postgres_vlan_id }}.0/24  scram-sha-256
+{{ _pg_conn }} {{ postgres_db_name }}  {{ postgres_exporter_role }}  10.0.{{ postgres_vlan_id }}.0/24  scram-sha-256
 {% if postgres_client_nontls_subnet | default(false) | bool %}
 # OPT-IN (postgres_client_nontls_subnet, default OFF): a non-TLS subnet entry for
 # the app role covering ALL databases — including the `postgres` maintenance DB a

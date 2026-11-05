@@ -150,6 +150,19 @@ Creates org `proj-dronefleet`, default roles, and the `dronefleet-webapp` OIDC
 app; a re-run is a no-op success (already-exists). The OIDC client secret is
 written to OpenBao at `secret/proj-dronefleet/zitadel/oidc/dronefleet-webapp`.
 
+> **Project role vocabulary + assertion (fix-zitadel-onboarding-role-keys-assertion,
+> §4).** Onboarding now provisions EXACTLY the project's declared role vocabulary
+> and enables `projectRoleAssertion` so roles reach the token. Declare the roles in
+> the consumer manifest's `sso` block — `roles: [owner, collaborator, observer]`
+> (string keys or `{key, display_name?, group?}` mappings) and an optional
+> `project_role_assertion: true|false` (default `true`). The ZITADEL project's
+> role-key set is RECONCILED to exactly the declared keys — ZITADEL's auto-created
+> `admin/member/viewer` defaults are REMOVED unless declared — and a read-back
+> fail-loud gate refuses to report success unless the role set matches and
+> assertion is set. Omitting `roles` reproduces the historical `admin/member/viewer`
+> vocabulary (with assertion on). Verify after onboarding with `ListProjectRoles`
+> (role keys == declared) and `GetProjectByID` (`projectRoleAssertion == true`).
+
 **Manual / CI override.** To supply the provisioning token out-of-band instead
 of reading it from OpenBao (e.g. a locked-down deployment, or a CI job with the
 token in a masked variable), export `ZITADEL_PROVISION_TOKEN` — a non-empty env
@@ -510,6 +523,97 @@ credential shape — is in the role's
 [ROLE-CLAIM-REFERENCE.md](../../../ansible/roles/zitadel-org-provision/ROLE-CLAIM-REFERENCE.md).
 Role usage and CLI-flag reference: the
 [zitadel-org-provision README](../../../ansible/roles/zitadel-org-provision/README.md).
+
+---
+
+## A.7 — Interactive browser login (Login V1) — closes AC-3
+
+This is the provision-then-test step for **AC-3 / FR-9**: an external OIDC app
+completing an **interactive** Authorization-Code + PKCE login end-to-end. It was
+reopened after live verification found AC-3 had been accepted on OIDC-discovery-200
+alone, while a real browser login dead-ended (see
+[`fix-svc06-login-v1-ac3`](../../../.kiro/specs/svc-06-identity-provider/) and the
+project-constitution decision-log row).
+
+**The platform default hosted login UI is Login V1** — the Go-templated UI built
+into the `zitadel` container at `/ui/login`. ZITADEL v4 otherwise routes OIDC
+logins to the separate **Login V2** container (`/ui/v2/login`), which this platform
+does **not** deploy (deferred to the `svc06-login-v2` spec), so without this an
+authorize request dead-ends at `/ui/v2/login` → `{"code":5,"message":"Not Found"}`.
+
+**The deciding lever is the INSTANCE `loginV2` feature, not per-app config.** Live
+verification proved that pinning an app's `loginVersion` to V1 is **not** sufficient
+on its own — the instance feature `loginV2.required=true` (ZITADEL v4's default)
+overrides it and still routes to `/ui/v2/login`. The `zitadel_provision.py` helper
+therefore does BOTH, driven by `zop_login_version` (default `v1`):
+
+1. pins each OIDC app to `loginVersion:{loginV1:{}}` (create body + idempotent
+   PUT-reconcile of an existing app's `oidc_config`), and
+2. **disables the instance `loginV2` feature** (`PUT /v2/features/instance
+   {"loginV2":{"required":false}}`, idempotent — a no-op when already off), which
+   is what actually makes the authorize endpoint fall back to the built-in V1 UI.
+
+The `svc06-login-v2` path re-enables the instance feature (`-e zop_login_version=v2`
++ `--set-instance-login-v2`) once the `zitadel-login` container is deployed.
+
+### A.7.1 — Create a throwaway test login user (requires-infra)
+
+A fresh project org has no human user, so an interactive login has nobody to sign
+in as. Create a dedicated test user in the project org via ZITADEL's own management
+API (its FirstInstance/`IAM_OWNER` provisioning token from OpenBao). This is a
+`display-only` reference of the create call (the mgmt API `users/human/_import`
+with a pre-set password, no forced change):
+
+<!-- doctest: display-only -->
+```bash
+# THROWAWAY TEST USER — never a real credential, never in an .env / production.
+# userName:  testuser@<slug>.<platform-domain>
+# password:  Passw0rd!throwaway-test      (fixed, documented test password)
+# Created in org proj-<slug> via POST /management/v1/users/human/_import with
+# passwordChangeRequired=false, using the provision_token from
+# secret/proj-shared-zitadel/zitadel (OpenBao). OPENBAO_ADMIN_TOKEN must be in env.
+```
+
+> **⚠ THROWAWAY-ONLY test credential.** The fixed password
+> **`Passw0rd!throwaway-test`** is for the **throwaway test user on the throwaway
+> cluster ONLY**. It exists solely so the automated/manual interactive-login check
+> can complete. It is NEVER a real credential, NEVER written to any `.env` /
+> `cluster.*.env` / production path, and NEVER used on a shared/acceptance/
+> production ZITADEL. Tokens/users on the throwaway cluster are ephemeral — that
+> (and only that) is what makes a fixed, documented test password acceptable here,
+> mirroring the `openbao_dev_expose_secrets` / `AGENT_LIVE_AUTHORIZED` ephemeral-
+> throwaway carve-out in [`security-standards.md`](../../../.kiro/steering/security-standards.md).
+
+### A.7.2 — Verify the authorize endpoint serves the V1 login page (requires-infra)
+
+With ZITADEL up (A.1) and a project onboarded (A.2, which now disables the instance
+loginV2 feature by default), confirm the authorize endpoint 302s to the built-in
+**V1** login page — NOT `/ui/v2/login`. `<spa-client-id>` is the SPA app's client
+id (from the onboarding output / ZITADEL console); substitute `<platform-domain>`
+and the Traefik guest IP:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+curl -sk --resolve auth.<platform-domain>:443:<traefik-guest-ip> -o /dev/null   -w '%{http_code} %{redirect_url}
+'   "https://auth.<platform-domain>/oauth/v2/authorize?client_id=<spa-client-id>&redirect_uri=https%3A%2F%2F<slug>.<platform-domain>%2Foauth%2Fcallback&response_type=code&scope=openid%20profile%20email&state=x&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
+```
+
+A `302` whose redirect URL is `…/ui/login/login?authRequestID=…` (the built-in V1
+UI, which then returns HTTP 200 with a real username/password form) proves AC-3's
+routing is fixed. A redirect to `…/ui/v2/login…` (HTTP 404) means the instance
+`loginV2` feature is still required — re-run A.2 (the onboarding disables it) or
+disable it explicitly.
+
+### A.7.3 — Complete the browser login `[display-only]`
+
+From a workstation that can reach the Traefik ingress (the ADR-0004 per-developer
+static route to the VLAN-20 subnet), map BOTH the issuer host and the app host to
+the Traefik ingress IP and trust the self-signed dev cert, then open the authorize
+URL above in a browser, sign in as the test user, and confirm the redirect back to
+`https://<slug>.<platform-domain>/oauth/callback?code=…`. The dev browser-
+reachability recipe (the `/etc/hosts` mapping + cert trust) is in
+[`docs/CONSUMER-JOURNEY.md`](../../../docs/CONSUMER-JOURNEY.md#browser-reachability-recipe-dev-only).
 
 ---
 

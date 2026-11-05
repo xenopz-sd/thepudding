@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-11-04
+
+> Eight v0.13.0 deployment bugfixes, each on its own branch with offline +
+> live verification; plus the SVC-06 Login-V1 fix closing AC-3 (external apps
+> can now complete an interactive browser login through the IdP).
+
+
 ### Added
 - **SVC-06 provision-token re-mint — opt-in OpenBao-wipe recovery** (spec
   `svc06-provision-token-remint`, **ADR-0023**, extends ADR-0016): an additive,
@@ -57,6 +64,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absent post-wipe; spec `fix-svc06-clean-slate-provision-token-residue`), and
   `zitadel-org-provision` having no delete/reversal entry point (throwaway org/app
   left behind; needs its own spec).
+### Fixed (v0.13.0 deployment feedback)
+
+- **§1 `fix-pg-hba-hostssl-vs-ssl-off`:** `postgres_ssl_enabled` var + `pg_hba.conf.j2`
+  conditional `host`/`hostssl` so the default posture (`ssl=off`) uses `host` and the
+  app role can connect. Fail-closed assert rejects unknown combinations.
+- **§2 `fix-consumer-onboarding-prerequisites`:** Phase-1 VNet presence + manifest-derived
+  ledger-row checks (fail-closed, side-effect-free). Phase-2 network-slice auto-create
+  as the first provision step (Terraform backend swap-gate like the workload block).
+- **§3 `fix-sdn-gateway-project-vlan-noop`:** served-set computation now keeps opted-in
+  project VLANs (removed the silent `intersect(active)` that made opt-in a no-op);
+  fail-closed `p<vlan>` bridge precondition; opt-in-vs-active validation with
+  `sdn_gateway_require_active_optin` (default true, fail-closed).
+- **§4 `fix-zitadel-onboarding-role-keys-assertion`:** `zitadel_provision.py` reconciles
+  the project's role-key set to the manifest-declared vocabulary (create missing + delete
+  ZITADEL defaults), sets `projectRoleAssertion`, and a fail-loud read-back gate refuses
+  to report success unless both match. Decision-log entry (reconcile-to-exact).
+- **§5a `fix-workload-datastore-autodetect`:** shared `datastore_select.py` helper +
+  `consumer_preflight` resolution threaded identically to both the DB and workload applies.
+- **§5b `fix-openbao-agent-reload-on-config-change`:** notify handler on `agent.hcl`
+  render change forces a `docker_compose_v2 recreate: always` of the openbao-agent sidecar.
+- **§5c `fix-svc07-empty-transit-token-handoff`:** STEP-6 retry loop (`until`/`retries`/
+  `delay`) on the Transit-token mint, STEP-6b non-empty assert, STEP-7 non-empty gate
+  so the Handoff_File is never written empty.
+- **§6 `fix-consumer-ingress-browser-reachable-oidc`:** opt-in `expose` manifest block +
+  ADR-0018 Traefik Route_Fragment wiring + cross-VLAN L3 preflight (Phase 2) + end-to-end
+  route check through Traefik (Phase 4, fail-closed on -1/404/502-504) + dev browser-
+  reachability recipe. Live-caught: Phase-2 preflight was probing the not-yet-deployed app
+  port; fixed to probe L3 (sshd) in Phase 2, app route in Phase 4.
+- **§3 served-set test pin** corrected: the pre-existing `test_served_set_computation_
+  consumes_normalized_active_fact` asserted the old `intersect(active)` behavior that §3
+  removes; updated to assert the new contract.
+
+### Fixed (SVC-06 AC-3 — external apps can log in)
+
+- **`fix-svc06-login-v1-ac3` (reopened SVC-06 to close AC-3):** Login V1 (the built-in
+  `/ui/login` hosted UI) is the platform default. ZITADEL v4 routes OIDC logins to the
+  undeployed Login-V2 container by default; a real browser login dead-ended at
+  `/ui/v2/login` → `{"code":5}`. Root cause (live-corrected): the INSTANCE `loginV2`
+  feature (not per-app `loginVersion`) is the deciding lever. Fix: `zitadel_provision.py`
+  pins each OIDC app to V1 AND disables the instance `loginV2` feature (idempotent);
+  `zitadel-org-provision` role threads `--login-version` (default v1). FR-9 added
+  (interactive login requirement). Full scripted Auth-Code+PKCE round-trip confirmed live
+  (authorize → V1 login → password → MFA-skip → callback with auth code). Decision-log
+  row recorded (Login V1 the platform default, V2 deferred to `svc06-login-v2`).
+
+### Backlog (noted, not implemented)
+
+- **Operator-provisioned user path** for SVC-06: "how an external application adds
+  login users" is an explicit scope exclusion in the SVC-06 requirements. A supported
+  operator-provisioned path is a backlog item, not for this release.
+- **§5b handler-flush-on-abort:** the openbao-agent recreate handler cannot fire when
+  the compose reconcile fails before handler flush (play abort); a stale crash-looping
+  sidecar survives re-runs.
+- **Openbao-agent dev-TLS default wiring:** the consumer workload-deploy path doesn't
+  wire `openbao_primary_tls_skip_verify` from the dev self-signed posture by default.
 
 ## [0.13.0] - 2026-11-03
 
@@ -1272,7 +1334,8 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
-[Unreleased]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.13.0...HEAD
+[Unreleased]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.14.0...HEAD
+[0.14.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.13.0...v0.14.0
 [0.13.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.12.0...v0.13.0
 [0.12.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.3...v0.12.0
 [0.11.3]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.2...v0.11.3

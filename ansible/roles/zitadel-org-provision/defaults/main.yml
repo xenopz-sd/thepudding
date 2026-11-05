@@ -24,10 +24,17 @@ zop_project_name: "{{ zop_project_slug }}"
 zop_app_name: "{{ zop_project_slug }}-webapp"
 zop_redirect_uris:
   - "https://{{ zop_project_slug }}.{{ zop_platform_domain }}/oauth/callback"
-zop_roles:
-  - admin
-  - member
-  - viewer
+# fix-zitadel-onboarding-role-keys-assertion (§4): the project role vocabulary to
+# provision and whether to assert roles into the token. zop_project_roles drives
+# the helper's `--role` flags (the role-key set is RECONCILED to EXACTLY these —
+# non-declared ZITADEL admin/member/viewer defaults are removed). Empty (default)
+# ⇒ the helper applies its documented default set (admin/member/viewer), so a
+# caller that declares no roles is backward compatible. zop_project_role_assertion
+# defaults true so provisioned roles actually reach the issued token.
+# (The former unwired `zop_roles` default was never passed to the helper — it is
+# removed to avoid confusion; zop_project_roles is the single source.)
+zop_project_roles: []
+zop_project_role_assertion: true
 
 # --- Two-client onboarding: the list of apps to register this run -----------
 # (spec: zitadel-spa-pkce-onboarding, design Component 5 + Variables table.)
@@ -128,3 +135,12 @@ zop_zitadel_host_header: "auth.{{ zop_platform_domain }}"
 zop_guest_helper_path: "/tmp/zitadel_provision.py"
 zop_guest_python: "/usr/bin/python3"
 zop_zitadel_guest_ssh_user: "root"
+
+# Hosted-login UI version pinned on each provisioned OIDC app, and the lever
+# that drives disabling the INSTANCE loginV2 feature (fix-svc06-login-v1-ac3).
+# Default v1 = the built-in /ui/login UI (platform default, project-constitution
+# decision-log). The helper disables the instance loginV2 feature when this is
+# v1 so the built-in login actually routes (per-app pin alone does not override
+# the instance default). Set v2 only once the zitadel-login container is
+# deployed (deferred svc06-login-v2).
+zop_login_version: "v1"

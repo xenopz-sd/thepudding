@@ -43,10 +43,13 @@ from __future__ import annotations
 #: it with a longer timeout (it is fine in CI, which has no per-command budget).
 SLICES: dict[str, list[str]] = {
     "svc07a": [
+        "test_openbao_agent_reload_on_config_change.py",
         "test_openbao_unsealer_bootstrap.py",
         "test_sdn_gateway_openbao_unsealer_scoping.py",
+        "test_sdn_gateway_project_vlan_served.py",
         "test_svc07_clean_slate_preservation.py",
         "test_svc07_clean_slate_state_residue.py",
+        "test_svc07_empty_transit_token_handoff.py",
         "test_svc07_openbao_admin_token_mint.py",
         "test_svc07_openbao_alerting.py",
         "test_svc07_openbao_auth_audit.py",
@@ -101,6 +104,7 @@ SLICES: dict[str, list[str]] = {
         "test_svc01_terraform_shape.py",
         "test_svc09_terraform_shape.py",
         "test_svc09_traefik_config_render.py",
+        "test_workload_datastore_autodetect.py",
     ],
     "core": [
         "test_accessible_root_readme_links.py",
@@ -116,6 +120,7 @@ SLICES: dict[str, list[str]] = {
     ],
     "tfplan-b": [
         "test_consumer_db_offline_plan.py",
+        "test_consumer_onboarding_prerequisites.py",
         "test_consumer_workload_offline_plan.py",
         "test_degraded_modes.py",
         "test_degraded_sdn_use.py",

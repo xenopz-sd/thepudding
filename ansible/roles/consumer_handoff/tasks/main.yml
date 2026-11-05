@@ -198,6 +198,54 @@
   changed_when: false
   when: consumer_manifest.sso is defined
 
+# --- §6: post-deploy end-to-end route check THROUGH Traefik -----------------
+# fix-consumer-ingress-browser-reachable-oidc. Only now (Phase 4, after the
+# Phase-3 workload deploy delegated its Route_Fragment) can the published route
+# be proven: send the exposed FQDN as the Host header to the Traefik ingress.
+# 404 = Traefik has no router for the host (Route_Fragment missing); 502-504 =
+# the router exists but the backend is down/unreachable; -1 = the ingress itself
+# is unreachable. Any of those fails CLOSED — an exposed workload is never
+# reported "deployed" while its route is silently broken. Read-only, carries no
+# credential. (The Phase-2 preflight only proves cross-VLAN L3 reachability.)
+- name: "Handoff | §6 — probe the exposed route end-to-end via the Traefik ingress (bounded)"
+  ansible.builtin.uri:
+    url: "https://{{ consumer_traefik_ingress_host }}/"
+    method: GET
+    headers:
+      Host: "{{ consumer_manifest.expose.host ~ '.' ~ consumer_platform_domain }}"
+    validate_certs: "{{ consumer_expose_route_validate_certs | bool }}"
+    follow_redirects: none
+    status_code: [-1, 100, 101, 200, 201, 202, 204, 301, 302, 303, 304, 307, 308,
+                  400, 401, 403, 404, 405, 500, 502, 503, 504]
+    timeout: 10
+  register: consumer_expose_route
+  until: (consumer_expose_route.status | default(-1) | int) not in [-1, 404, 502, 503, 504]
+  retries: "{{ consumer_health_retries }}"
+  delay: "{{ consumer_health_delay }}"
+  failed_when: false
+  changed_when: false
+  when: (consumer_manifest.expose.enabled | default(false)) | bool
+
+- name: "Handoff | §6 — fail closed if the exposed route is not served end-to-end"
+  ansible.builtin.assert:
+    that:
+      - "(consumer_expose_route.status | default(-1) | int) != -1"
+      - "(consumer_expose_route.status | default(-1) | int) != 404"
+      - "(consumer_expose_route.status | default(-1) | int) not in [502, 503, 504]"
+    fail_msg: >-
+      The exposed route https://{{ consumer_manifest.expose.host ~ '.' ~
+      consumer_platform_domain }} is not served end-to-end through Traefik
+      ({{ consumer_traefik_ingress_host }}): HTTP {{ consumer_expose_route.status
+      | default(-1) }}. -1 = the Traefik ingress is unreachable from this machine;
+      404 = Traefik has no router for that host (the workload's Route_Fragment was
+      not delivered to the Traefik file provider); 502-504 = the route exists but
+      the workload backend (port {{ consumer_manifest.expose.port | default(8080) }})
+      is not answering. Fix the named cause and re-run (idempotent).
+    success_msg: >-
+      Exposed route served end-to-end through Traefik (HTTP {{
+      consumer_expose_route.status | default(-1) }}).
+  when: (consumer_manifest.expose.enabled | default(false)) | bool
+
 # --- Completion summary banner (secrets by name only, Req 5.4) ---------------
 - name: "Handoff | Resolve the absolute Cluster_Env_File path + banner fields"
   ansible.builtin.set_fact:
@@ -234,12 +282,37 @@
         Secrets policy:     {{ 'policy-' ~ project_slug ~ ' ; workload AppRole ' ~ consumer_workload_approle_ref
         if (consumer_manifest.secrets is defined)
         else ('policy-' ~ project_slug if (consumer_manifest.database is defined) else 'not consumed') }}
+      # §6 (fix-consumer-ingress-browser-reachable-oidc): for a USER-FACING
+      # workload the published Traefik host, so the operator sees the app is NOT
+      # "done" on a green health check alone — a human still needs browser
+      # reachability to the app host AND the issuer host to complete OIDC login.
+      - >-
+        Ingress (expose):   {{ (consumer_manifest.expose.host ~ '.' ~ consumer_platform_domain
+        ~ '  (published via Traefik)')
+        if (consumer_manifest.expose.enabled | default(false) | bool)
+        else 'not exposed (headless — no browser ingress)' }}
       - "Config:             {{ consumer_cluster_env_abspath }}"
       - ""
       - "Next Steps for Project Developers:"
       - "  The application's workload fetches its DB credential and OIDC client"
       - "  secret from OpenBao via its own Agent/AppRole at container start —"
       - "  never a plaintext secret in a repo."
+      - >-
+        {{ '  USER-FACING: this workload is NOT usable by a human until browser'
+        if (consumer_manifest.expose.enabled | default(false) | bool) else '' }}
+      - >-
+        {{ '  reachability is established — map BOTH ' ~ consumer_manifest.expose.host
+        ~ '.' ~ consumer_platform_domain ~ ' AND the ZITADEL issuer host to the'
+        if (consumer_manifest.expose.enabled | default(false) | bool) else '' }}
+      - >-
+        {{ '  Traefik ingress IP + accept the self-signed cert (see the dev'
+        if (consumer_manifest.expose.enabled | default(false) | bool) else '' }}
+      - >-
+        {{ '  browser-reachability recipe in docs/CONSUMER-JOURNEY.md §D), then'
+        if (consumer_manifest.expose.enabled | default(false) | bool) else '' }}
+      - >-
+        {{ '  complete an interactive OIDC login to confirm.'
+        if (consumer_manifest.expose.enabled | default(false) | bool) else '' }}
       - "============================================================"
 
 - name: "Handoff | INFO — Phase 4 complete"

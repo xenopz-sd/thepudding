@@ -49,13 +49,35 @@ path — never raw `ssh`/`docker`/`pct` surgery.
    [`infra/platform-foundation/projects.yaml`](../../platform-foundation/projects.yaml)
    (`dronefleet -> vlan_id 100`), assigned by the onboarding script + MR flow.
 2. The project's **network slice** (`<slug>-infra` root — the `_TEMPLATE` copy at
-   `infra/projects/<slug>/`) has been applied, so the project VNet `p<vlan>`
-   exists. The SVC-01 preflight fails closed naming the missing `p<vlan>` if not.
-3. The project's **host-index ledger row** is present in
+   `infra/projects/<slug>/`) creates the project VNet `p<vlan>`.
+   **Auto-created by onboarding** (`fix-consumer-onboarding-prerequisites`, §2):
+   Phase-1 preflight checks for `p<vlan>` and, when absent with
+   `consumer_autocreate_network_slice` ON (the default), Phase 2 applies the
+   project's own network-slice root as its FIRST step — so you no longer need a
+   manual `terraform apply infra/projects/<slug>/` pre-step. To apply it yourself
+   instead, set `consumer_autocreate_network_slice=false` and run that apply first;
+   Phase 1 then fails closed naming the exact remedy if `p<vlan>` is still absent.
+   The SVC-01 preflight VNet-presence assert remains the unchanged backstop.
+3. The project's **host-index ledger rows** are present in
    [`infra/platform-foundation/host-indices.yaml`](../../platform-foundation/host-indices.yaml)
-   (`VLAN 100: svc01 host_index 0`). A missing row fails the plan at the
-   `proxmox-compute` Guard 4 precondition (Req 3.7) rather than defaulting.
+   (`VLAN 100`: `svc01 host_index 0`, and `workload host_index 1` when the
+   `workload` block is enabled). **Onboarding Phase-1 derives the required rows
+   from the manifest** (`database` ⇒ svc01 idx 0; `workload.enabled` ⇒ workload
+   idx 1) and, if any are missing, **fails closed printing the EXACT YAML block to
+   append** under the `<vlan_id>:` key — commit that block as a reviewable MR, then
+   re-run. The ledger stays a committed, diff-reviewable input (ADR-0015); Phase 1
+   never auto-appends it at runtime. A missing row also fails the plan at the
+   `proxmox-compute` Guard 4 precondition — the unchanged backstop.
 4. The project venv exists: `~/venv/devinfra/bin/python` (dev-workflow.md).
+
+> **Datastore (`PROXMOX_DATASTORE_ID`).** Leave it **unset** and onboarding
+> auto-detects the Proxmox datastore ONCE in Phase 1 — `local-zfs` preferred,
+> else `local-lvm`, else fail-closed — and threads that single value **identically**
+> to BOTH the per-project DB guest AND the workload guest
+> (`fix-workload-datastore-autodetect`). So on a `local-lvm`-only node both guests
+> land on `local-lvm` in one run; you no longer need to set
+> `PROXMOX_DATASTORE_ID=local-lvm` by hand. An explicit `PROXMOX_DATASTORE_ID`
+> still wins verbatim for both.
 
 ---
 

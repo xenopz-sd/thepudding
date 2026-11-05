@@ -82,6 +82,27 @@ postgres_enable_timescaledb: false
 # --- Logging (composition-wiring.md: INFO to stdout) ---
 postgres_log_statement: "ddl"                           # SVC-01 §13 — avoid excessive volume
 
+# --- Server TLS / pg_hba connection-type (single source of truth) -----------
+# `postgres_ssl_enabled` is the ONE variable both templates consume so the
+# pg_hba connection-type (host vs hostssl) can never contradict the server's
+# `ssl` on/off state (bugfix: fix-pg-hba-hostssl-vs-ssl-off). It is a default-OFF
+# future-flip seam, like `postgres_client_nontls_subnet` / `openbao_dev_expose_secrets`:
+#   - false (default, today's reality — no SVC-08/EJBCA cert exists, self-signed
+#     TLS is the documented dev stand-in): postgresql.conf renders an explicit
+#     `ssl = off` and pg_hba emits `host` for the app/exporter project-subnet
+#     rules — internally consistent, the least-privilege app role can connect
+#     over plaintext TCP on its own private VLAN subnet.
+#   - true (once a cert exists at the paths below, or a deliberate self-signed
+#     stand-in is dropped): postgresql.conf renders `ssl = on` + the cert/key
+#     paths and pg_hba emits `hostssl` — the TLS-required posture SVC-01 §12
+#     targets. Flipping this flag + dropping a cert is the only remaining step.
+postgres_ssl_enabled: false
+# In-container paths a server cert/key are expected at when ssl = on. Non-secret
+# PATH references (not key material) — consumed by postgresql.conf.j2 only when
+# postgres_ssl_enabled is true; the cert itself is dropped out-of-band.
+postgres_ssl_cert_file: "/etc/postgresql/tls/server.crt"
+postgres_ssl_key_file: "/etc/postgresql/tls/server.key"
+
 # =============================================================================
 # SECRETS — generated at provision, written to OpenBao, NEVER committed.
 # -----------------------------------------------------------------------------

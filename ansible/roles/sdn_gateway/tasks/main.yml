@@ -122,15 +122,64 @@
 # an ACTIVE VLAN is byte-for-byte preserved.
 - name: Compute the served-VLAN set (shared VLAN 20 UNION opted-in active project VLANs, minus decommissioned)
   ansible.builtin.set_fact:
+    # fix-sdn-gateway-project-vlan-noop: the explicit opt-in is AUTHORITATIVE
+    # intent to serve — the served set is the shared VLAN UNION the opted-in
+    # project VLANs, minus the decommissioned set. The previous silent
+    # `intersect(active)` DROPPED an opted-in VLAN that was not also in the
+    # registry-active set with no warn/fail — a `failed=0, changed=0` no-op that
+    # left the project VLAN's .1 unbound and no MASQUERADE. The decommissioned
+    # set is still subtracted explicitly (its own teardown-ordering guard), which
+    # is the only guard the intersect ever legitimately provided (and it was
+    # redundant). The opt-in-vs-active consistency is now an EXPLICIT validation
+    # (next task), never a silent filter.
     sdn_gateway_served_vlan_ids: >-
       {{
         (
           [sdn_gateway_shared_vlan_id]
-          + (sdn_gateway_served_project_vlan_ids | map('int')
-             | intersect(sdn_gateway_active_vlan_ids_norm))
+          + (sdn_gateway_served_project_vlan_ids | map('int') | list)
         ) | map('int') | difference(sdn_gateway_decommissioned_vlan_ids_norm)
           | unique | sort
       }}
+
+# EXPLICIT opt-in-vs-active validation (fix-sdn-gateway-project-vlan-noop) —
+# replaces the silent intersect filter. An opted-in, non-decommissioned VLAN
+# that is NOT registry-active is an operator/registry inconsistency: the registry
+# (projects.yaml) is the VLAN authority (NET-00 §7), so surface it rather than
+# swallow it. Default sdn_gateway_require_active_optin=true FAILS CLOSED naming
+# each such VLAN; set false to WARN and still serve. Either way the VLAN is NEVER
+# silently dropped (the defect). On the from-scratch bring-up path the forwarded
+# opt-in IS the active set, so this is a tautology there and never spuriously fails.
+- name: Validate every opted-in project VLAN is registry-active (never silently drop)
+  vars:
+    _sdn_gateway_opted_in_not_active: >-
+      {{ (sdn_gateway_served_project_vlan_ids | map('int') | unique | list)
+         | difference(sdn_gateway_active_vlan_ids_norm)
+         | difference(sdn_gateway_decommissioned_vlan_ids_norm) }}
+  block:
+    - name: WARN that opted-in VLAN(s) are not registry-active (require_active_optin off)
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: opted-in project VLAN(s) {{ _sdn_gateway_opted_in_not_active }}
+          are NOT in the registry-active set ({{ sdn_gateway_active_vlan_ids_norm }}).
+          Serving them anyway because sdn_gateway_require_active_optin is false.
+      when:
+        - (_sdn_gateway_opted_in_not_active | length) > 0
+        - not (sdn_gateway_require_active_optin | bool)
+
+    - name: Fail closed if an opted-in VLAN is not registry-active (require_active_optin on)
+      ansible.builtin.assert:
+        that:
+          - (_sdn_gateway_opted_in_not_active | length) == 0
+        fail_msg: >-
+          Opted-in project VLAN(s) {{ _sdn_gateway_opted_in_not_active }} are NOT
+          in the registry-active set ({{ sdn_gateway_active_vlan_ids_norm }}) and are
+          not decommissioned. The registry (projects.yaml) is the VLAN authority
+          (NET-00 §7) — either activate the VLAN(s) there, or set
+          sdn_gateway_require_active_optin=false to serve them anyway. (They are
+          NOT silently dropped as before.)
+        success_msg: "All opted-in project VLANs are registry-active (or none opted in)."
+        quiet: true
+      when: sdn_gateway_require_active_optin | bool
 
 # No served VLAN may be the management VLAN (10) — that would route the very
 # segment the isolation model requires to stay unreachable (Req 2.2,

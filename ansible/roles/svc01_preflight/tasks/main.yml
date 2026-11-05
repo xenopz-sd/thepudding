@@ -197,18 +197,41 @@
       {{ svc01_node_storage.json.data | map(attribute='storage') | list }}
   when: svc01_datastore_id == svc01_autodetect_sentinel
 
-- name: "Preflight | Auto-select datastore (local-zfs preferred, else local-lvm)"
-  ansible.builtin.set_fact:
-    svc01_datastore_id: >-
-      {{ 'local-zfs' if 'local-zfs' in svc01_node_storage_ids
-         else ('local-lvm' if 'local-lvm' in svc01_node_storage_ids
-         else svc01_autodetect_sentinel) }}
+# Datastore selection is SINGLE-SOURCED via scripts/installer/datastore_select.py
+# (fix-workload-datastore-autodetect) — the SAME pure helper the consumer-onboarding
+# preflight uses — so the SVC-01 DB guest and a per-project workload guest can never
+# disagree on datastore selection for the same node. The node-storage QUERY (above)
+# stays in Ansible; only the selection over the returned ids is delegated to the
+# helper. Behaviour is identical to the previous inline rule (local-zfs preferred,
+# else local-lvm, else fail closed). rc 3 = unresolved (neither candidate present).
+- name: "Preflight | Auto-select datastore via datastore_select.py (local-zfs preferred, else local-lvm)"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc01_venv_python }}"
+      - "{{ svc01_datastore_select_helper }}"
+      - "--node-storage-ids"
+      - "{{ svc01_node_storage_ids | join(',') }}"
+      - "--configured"
+      - "{{ svc01_autodetect_sentinel }}"
+  args:
+    chdir: "{{ svc01_repo_root }}"
+  register: svc01_datastore_autodetect
+  failed_when: false
+  changed_when: false
   when: svc01_datastore_id == svc01_autodetect_sentinel
+
+- name: "Preflight | Bind the auto-detected datastore"
+  ansible.builtin.set_fact:
+    svc01_datastore_id: "{{ svc01_datastore_autodetect.stdout | trim }}"
+  when:
+    - svc01_datastore_id == svc01_autodetect_sentinel
+    - (svc01_datastore_autodetect.rc | default(1)) == 0
 
 - name: "Preflight | Assert a datastore was resolved or auto-detected"
   ansible.builtin.assert:
     that:
       - "svc01_datastore_id != svc01_autodetect_sentinel"
+      - "(svc01_datastore_id | default('') | trim) | length > 0"
     fail_msg: >-
       No datastore configured and neither 'local-zfs' nor 'local-lvm' is available
       on node '{{ svc01_proxmox_node_name }}'. Set PROXMOX_DATASTORE_ID in

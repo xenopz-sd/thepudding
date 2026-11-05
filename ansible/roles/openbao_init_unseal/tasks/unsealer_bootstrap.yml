@@ -424,6 +424,23 @@
          + ['-orphan', '-policy=' ~ openbao_seal_policy_name,
             '-period=' ~ openbao_seal_token_period, '-field=token'] }}
   register: openbao_seal_token_raw
+  # READINESS-RETRY (fix-svc07-empty-transit-token-handoff, §5c). On a fresh
+  # single-node Raft unsealer the token-create API can return rc==0 with an EMPTY
+  # / not-yet-readable `-field=token` in the beat after sealed:false but before
+  # the token endpoint is fully serving. Retry (re-issuing `token create` — it is
+  # the producer, each -orphan attempt mints a NEW, independent, scoped/periodic
+  # token; bounded accumulation of ≤ retries-1 unused orphans on the throwaway
+  # unsealer is accepted) until a NON-EMPTY token + rc==0, within the role's
+  # EXISTING readiness budget (openbao_readiness_retries × openbao_readiness_delay
+  # = 12 × 5s) — the same budget STEP-1/STEP-3/STEP-3b use. failed_when:false so an
+  # interim empty read is a RETRY, not a hard failure; the non-empty OUTCOME is
+  # enforced by the STEP-6b assert below, not the task rc.
+  until: >-
+    openbao_seal_token_raw.rc == 0
+    and (openbao_seal_token_raw.stdout | default('') | trim | length) > 0
+  retries: "{{ openbao_readiness_retries | int }}"
+  delay: "{{ openbao_readiness_delay | int }}"
+  failed_when: false
   changed_when: openbao_seal_token_raw.rc == 0
   no_log: "{{ openbao_no_log }}"
 
@@ -432,6 +449,33 @@
     openbao_seal_token: "{{ openbao_seal_token_raw.stdout | trim }}"
   no_log: "{{ openbao_no_log }}"
   changed_when: false
+
+# STEP-6b — fail-closed non-empty guard (fix-svc07-empty-transit-token-handoff).
+# The retried mint is failed_when:false, so THIS assert — not the task rc — is
+# what converts an exhausted retry budget into a halt: it refuses to capture or
+# hand off an empty token. The error names the unsealer container + the empty-mint
+# condition (DISTINCT from the downstream primary "No Bootstrap_Transit_Token is
+# available" assert and from the sibling fix-svc07-unsealer-raft-leadership-
+# readiness unseal-survival timeout) and points at the deterministic remedy
+# (clean_slate + re-run; the bootstrap is idempotent). no_log — references the
+# token fact.
+- name: "Unsealer bootstrap — assert the minted Bootstrap_Transit_Token is non-empty (fail closed, no_log)"
+  ansible.builtin.assert:
+    that:
+      - openbao_seal_token is defined
+      - (openbao_seal_token | length) > 0
+    fail_msg: >-
+      The Bootstrap_Transit_Token mint on the unsealer container
+      '{{ openbao_unsealer_container_name }}' returned an EMPTY token for all
+      {{ openbao_readiness_retries }} retries × {{ openbao_readiness_delay }}s
+      (the token endpoint never became readable within the readiness budget). The
+      primary cannot Transit-auto-unseal without it. This is the UNSEALER mint
+      failing — distinct from the downstream primary "No Bootstrap_Transit_Token
+      is available" assert and from the unseal-survival timeout. Remedy: re-run the
+      from-scratch bring-up with `-e clean_slate=true -e clean_slate_confirm=force`
+      (the bootstrap is idempotent). Nothing was handed off.
+    success_msg: "Bootstrap_Transit_Token minted and non-empty."
+  no_log: "{{ openbao_no_log }}"
 
 # ----------------------------------------------------------------------------
 # STEP-7 — HANDOFF: write the minted token to the 0600 Handoff_File.
@@ -456,6 +500,9 @@
     - openbao_mint_seal_token | bool
     - openbao_dev_expose_secrets | bool
     - openbao_seal_token_handoff_path | length > 0
+    # Belt-and-suspenders (fix-svc07-empty-transit-token-handoff): never write an
+    # empty token to the Handoff_File even if the STEP-6b assert were ever bypassed.
+    - (openbao_seal_token | default('') | length) > 0
 
 # ----------------------------------------------------------------------------
 # STEP-8 — Revoke the unsealer Root_Token, then scrub secret facts.

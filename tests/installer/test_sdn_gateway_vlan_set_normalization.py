@@ -152,7 +152,15 @@ def test_teardown_loop_iterates_normalized_decommissioned_fact():
 
 
 def test_served_set_computation_consumes_normalized_active_fact():
-    """The served-VLAN-set computation must consume the NORMALIZED active fact."""
+    """The served-VLAN-set computation must NOT silently intersect with active.
+
+    fix-sdn-gateway-project-vlan-noop (s3) removed the silent
+    `intersect(active)` that made a project-VLAN opt-in a no-op. The served set
+    is now [shared] + the opt-in list (int-coerced), minus decommissioned. The
+    NORMALIZED active fact is consumed instead by the opt-in-vs-active
+    VALIDATION (fail-closed), never by the served-set arithmetic, and the raw
+    string-coercible var must never be used.
+    """
     tasks = _load_tasks(_ROLE_MAIN)
     served_tasks = [
         t for t in tasks if _set_fact_body(t, "sdn_gateway_served_vlan_ids") is not None
@@ -161,13 +169,23 @@ def test_served_set_computation_consumes_normalized_active_fact():
         "DRIFT: no `set_fact` computing `sdn_gateway_served_vlan_ids` found."
     )
     body = _set_fact_body(served_tasks[0], "sdn_gateway_served_vlan_ids") or ""
-    assert _ACTIVE_NORM in body, (
-        "DRIFT: the served-VLAN-set computation must intersect against the "
-        f"NORMALIZED active fact `{_ACTIVE_NORM}`, not the raw string-coercible "
-        f"`{_ACTIVE_RAW}`; body={body!r}."
+    assert "intersect" not in body, (
+        "DRIFT: the served-VLAN-set must not intersect with the active set "
+        f"(silent project-VLAN no-op, s3); body={body!r}."
     )
-
-
+    assert "sdn_gateway_served_project_vlan_ids" in body, (
+        f"DRIFT: the served set must include the opt-in list; body={body!r}."
+    )
+    assert f"{_ACTIVE_RAW} " not in f"{body} ", (
+        "DRIFT: the served-set computation must never use the RAW "
+        f"string-coercible `{_ACTIVE_RAW}`; body={body!r}."
+    )
+    # The normalized active fact is still consumed - by the fail-closed
+    # opt-in-vs-active validation in the same role task file.
+    assert _ACTIVE_NORM in _ROLE_MAIN.read_text(), (
+        f"DRIFT: the normalized active fact `{_ACTIVE_NORM}` must still be "
+        "consumed by the opt-in-vs-active validation."
+    )
 def test_served_set_subtracts_decommissioned_vlans():
     """The served (configure) set must SUBTRACT the decommissioned set.
 

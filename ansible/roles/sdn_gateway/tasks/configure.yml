@@ -63,11 +63,29 @@
   register: sdn_gateway_bridge_addrs
   changed_when: false
   check_mode: false
-  # If the bridge is genuinely missing, `ip` exits non-zero — surface it as a
-  # clear failure (the SDN applier must have created p<vlan> first).
-  failed_when:
-    - sdn_gateway_bridge_addrs.rc != 0
-    - "'does not exist' in (sdn_gateway_bridge_addrs.stderr | default(''))"
+  failed_when: false
+
+# FAIL-CLOSED p<vlan> bridge precondition (fix-sdn-gateway-project-vlan-noop).
+# An explicit, always-reached assert — naming the VLAN and the fabric-apply
+# remedy — so an opted-in VLAN whose SDN VNet bridge p<vlan> does not exist yet
+# (the applier / the project's own `terraform apply` has not run) HALTS with a
+# clear diagnostic rather than binding a gateway on a nonexistent bridge or being
+# silently skipped. Converts the previous path-dependent `failed_when` on the
+# read into an explicit precondition.
+- name: Assert the SDN VNet bridge p{{ sdn_gateway_vlan_id }} exists before binding its gateway
+  ansible.builtin.assert:
+    that:
+      - sdn_gateway_bridge_addrs.rc == 0
+      - "'does not exist' not in (sdn_gateway_bridge_addrs.stderr | default(''))"
+    fail_msg: >-
+      The SDN VNet bridge 'p{{ sdn_gateway_vlan_id }}' does not exist on the host,
+      so VLAN {{ sdn_gateway_vlan_id }}'s gateway cannot be bound. Its SDN fabric
+      must be created first — apply the SDN root that owns this VLAN (the
+      platform-foundation root for VLAN 20, or the project's own network-slice
+      root for a project VLAN 100+). Then re-run. (No gateway/NAT was bound for
+      this VLAN.)
+    success_msg: "SDN VNet bridge 'p{{ sdn_gateway_vlan_id }}' is present."
+    quiet: true
 
 # noqa: no-handler — deliberately NOT a handler. It runs once per served VLAN
 # inside the configure.yml loop and MUST attach the address immediately (mid-run)

@@ -427,8 +427,9 @@ def test_preservation_consumer_manifest_allowlist_unchanged():
     # Import the validator from scripts/installer (conftest puts it on sys.path).
     import consumer_manifest as cm
 
-    assert cm.CONSUMABLE_SERVICE_KEYS == ("database", "sso", "secrets", "workload"), (
-        "The consumable service keys must be (database, sso, secrets, workload)."
+    assert cm.CONSUMABLE_SERVICE_KEYS == ("database", "sso", "secrets", "workload", "expose"), (
+        "The consumable service keys must be (database, sso, secrets, workload, expose) "
+        "— `expose` added by fix-consumer-ingress-browser-reachable-oidc (§6)."
     )
     assert cm._ALLOWED_TOP_LEVEL_KEYS == (
         "slug",
@@ -436,7 +437,8 @@ def test_preservation_consumer_manifest_allowlist_unchanged():
         "sso",
         "secrets",
         "workload",
-    ), "The top-level allowlist must be {slug, database, sso, secrets, workload}."
+        "expose",
+    ), "The top-level allowlist must be {slug, database, sso, secrets, workload, expose}."
     # An unknown top-level key is still rejected naming the offender.
     with pytest.raises(cm.ManifestValidationError):
         cm.validate_manifest({"slug": "demo", "bridge": {"subpath": "db"}})

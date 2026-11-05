@@ -220,6 +220,45 @@
     - { src: "pg_hba.conf.j2", dest: "/etc/postgresql/pg_hba.conf" }
   notify: Restart postgres
 
+# FAIL-CLOSED provision-time invariant (fix-pg-hba-hostssl-vs-ssl-off, Req 2.4):
+# the pg_hba connection-type MUST be internally consistent with the server `ssl`
+# state. Both templates derive from the single `postgres_ssl_enabled` var, so a
+# consistent render is guaranteed — but this assert fails closed on any future
+# drift or hand-set override that would reintroduce a `hostssl` rule while the
+# server runs `ssl = off` (an unsatisfiable rule that locks the app role out of
+# TCP). It cross-checks the ACTUALLY-RENDERED files: if pg_hba carries any
+# `^hostssl` line while postgresql.conf has `ssl = off`, provisioning halts here
+# rather than deferring the failure to the first app-role client query.
+# no_log-safe: references only connection-type / ssl state, never a credential.
+- name: "Postgres | Read back the rendered pg_hba + postgresql.conf (invariant cross-check)"
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop:
+    - "/etc/postgresql/pg_hba.conf"
+    - "/etc/postgresql/postgresql.conf"
+  register: postgres_rendered_config
+  changed_when: false
+
+- name: "Postgres | Assert pg_hba connection-type is consistent with server ssl state (fail closed)"
+  ansible.builtin.assert:
+    that:
+      - not (_pg_hba_has_hostssl and _pg_server_ssl_off)
+    fail_msg: >-
+      pg_hba/ssl contradiction for proj-{{ postgres_project_slug }}: pg_hba.conf
+      contains a `hostssl` rule while postgresql.conf has `ssl = off`. A hostssl
+      rule can never be satisfied with the server's TLS off, so the app/exporter
+      roles cannot connect over TCP. Remedy: set `postgres_ssl_enabled: true` and
+      drop a cert/key at `postgres_ssl_cert_file`/`postgres_ssl_key_file`, OR keep
+      `postgres_ssl_enabled: false` (the plaintext `host` posture). Do not hand-edit
+      the rendered pg_hba to `hostssl` while ssl is off.
+    success_msg: "pg_hba connection-type is consistent with the server ssl state."
+  vars:
+    _pg_hba_text: "{{ (postgres_rendered_config.results[0].content | b64decode) }}"
+    _pg_conf_text: "{{ (postgres_rendered_config.results[1].content | b64decode) }}"
+    _pg_hba_has_hostssl: "{{ _pg_hba_text is search('(?m)^hostssl\\s') }}"
+    _pg_server_ssl_off: "{{ _pg_conf_text is search('(?m)^\\s*ssl\\s*=\\s*off\\s*$')
+                            or not (_pg_conf_text is search('(?m)^\\s*ssl\\s*=\\s*on\\b')) }}"
+
 # The 0600 runtime env the container reads POSTGRES_PASSWORD from. This is a
 # SECRET-bearing file written to the guest at 0600 (NOT the repo, NOT the
 # docker-compose-app non-secret .env). no_log — it carries the superuser password.

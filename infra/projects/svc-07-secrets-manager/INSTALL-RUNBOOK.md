@@ -293,6 +293,19 @@ On success it writes `OPENBAO_ADMIN_TOKEN` into the
 and mutates real infrastructure**, so it is `requires-infra` and runs **only against
 a throwaway cluster**:
 
+> **From-scratch first-attempt mint (fix-svc07-empty-transit-token-handoff, §5c).**
+> The unsealer's `Bootstrap_Transit_Token` mint now **retries within the readiness
+> budget** (`openbao_readiness_retries` × `openbao_readiness_delay` = 12 × 5s) until
+> `bao token create -field=token` returns a NON-EMPTY, readable token — absorbing the
+> transient first-attempt empty read a fresh single-node Raft unsealer can return in
+> the beat after `sealed:false`. So a genuine fresh single-command bring-up is
+> first-attempt green with **NO** repo-root `.env` placeholder for
+> `OPENBAO_BOOTSTRAP_TRANSIT_TOKEN` and **no** clean-slate dance (the previously-needed
+> workaround is retired). If the bounded budget is ever exhausted the run **fails
+> closed** with a named empty-mint error on the unsealer container (distinct from the
+> downstream primary "No Bootstrap_Transit_Token is available" assert), whose
+> deterministic remedy is a `-e clean_slate=true -e clean_slate_confirm=force` re-run.
+
 <!-- doctest: requires-infra -->
 <!-- cwd: . -->
 ```bash

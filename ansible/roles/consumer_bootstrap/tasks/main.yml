@@ -407,6 +407,26 @@
   changed_when: false
   when: consumer_manifest.sso is defined
 
+# §4: resolve each sso.roles entry (a role-key string OR a {key: ...} mapping) to
+# its flat role key. Empty/omitted sso.roles ⇒ empty list ⇒ the role/helper applies
+# the documented default vocabulary. The manifest validator already guarantees each
+# entry is a non-empty string or a mapping with a non-empty 'key'.
+- name: "Bootstrap | STEP 4 — Reset the resolved role-key accumulator"
+  ansible.builtin.set_fact:
+    consumer_sso_role_keys: []
+  when: consumer_manifest.sso is defined
+  changed_when: false
+
+- name: "Bootstrap | STEP 4 — Resolve each declared project role key from sso.roles"
+  ansible.builtin.set_fact:
+    consumer_sso_role_keys: >-
+      {{ consumer_sso_role_keys + [item.key if (item is mapping) else item] }}
+  loop: "{{ consumer_manifest.sso.roles | default([]) }}"
+  loop_control:
+    label: "{{ item.key if (item is mapping) else item }}"
+  when: consumer_manifest.sso is defined
+  changed_when: false
+
 - name: "Bootstrap | STEP 4 — Compose zitadel-org-provision (two-client SPA+API)"
   ansible.builtin.command:
     argv:
@@ -422,6 +442,17 @@
       - "zop_openbao_addr={{ openbao_addr | default('') }}"
       - -e
       - "{{ {'zop_org_name': consumer_manifest.sso.org_name} | to_json }}"
+      # §4 (fix-zitadel-onboarding-role-keys-assertion): thread the manifest's
+      # declared project role vocabulary + the assertion toggle so onboarding
+      # provisions EXACTLY the project's roles (not ZITADEL's admin/member/viewer
+      # defaults) and enables projectRoleAssertion. consumer_sso_role_keys (derived
+      # below from each sso.roles entry — a string or a {key: ...} mapping) is
+      # bridged as a JSON -e so the list survives the child-process boundary (like
+      # zop_app_registrations). project_role_assertion defaults true when omitted.
+      - -e
+      - "{{ {'zop_project_roles': consumer_sso_role_keys} | to_json }}"
+      - -e
+      - "zop_project_role_assertion={{ consumer_manifest.sso.project_role_assertion | default(true) }}"
   args:
     chdir: "{{ consumer_repo_root }}"
   register: consumer_sso_run

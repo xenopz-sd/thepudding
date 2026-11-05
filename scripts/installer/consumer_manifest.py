@@ -72,6 +72,10 @@ __all__ = [
     "APP_TYPES",
     "AUTH_METHODS",
     "SLUG_RE",
+    "SSO_ROLE_KEY_RE",
+    "DEFAULT_PROJECT_ROLE_ASSERTION",
+    "EXPOSE_TLS_MODES",
+    "EXPOSE_HOST_LABEL_RE",
     "validate_manifest",
     "main",
 ]
@@ -101,7 +105,12 @@ SLUG_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$")
 #: key and is tracked separately. ``workload`` is the optional workload-guest
 #: block added by the consumer-last-mile-hello-workload feature (design
 #: Component 1; Requirements 2.1, 5.4).
-CONSUMABLE_SERVICE_KEYS = ("database", "sso", "secrets", "workload")
+#: ``expose`` is the opt-in, default-absent block (fix-consumer-ingress-browser-
+#: reachable-oidc, §6) declaring that a workload is USER-FACING and should be
+#: published through the shared Traefik under a hostname in the platform base
+#: domain (so an interactive OIDC login can complete from a browser). Sibling to
+#: ``workload``; additive and backward compatible.
+CONSUMABLE_SERVICE_KEYS = ("database", "sso", "secrets", "workload", "expose")
 
 #: The full set of permitted top-level keys: the mandatory ``slug`` plus the
 #: optional consumable service blocks.
@@ -118,6 +127,17 @@ DATABASE_TIERS = ("small", "medium")
 #: (small | medium); ``small`` is the default.
 WORKLOAD_TIERS = ("small", "medium")
 
+#: ``expose.tls`` enum (fix-consumer-ingress-browser-reachable-oidc, §6).
+#: ``terminate`` = Traefik terminates TLS at the edge (default); ``passthrough``
+#: leaves TLS to the backend.
+EXPOSE_TLS_MODES = ("terminate", "passthrough")
+
+#: ``expose.host`` is a BARE DNS subdomain LABEL (a single left-most label, no
+#: dots) under ``${THEPUDDING_BASE_DOMAIN}`` — the deploy layer appends the base
+#: domain, so the base domain is never written into the manifest (single source
+#: of truth). A FQDN (containing a dot) is rejected.
+EXPOSE_HOST_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
 #: ``sso.app_registrations[].app_type`` enum (Requirement 1.3). These are the
 #: manifest's own DESCRIPTIVE forms; they are NOT reused verbatim by the sibling
 #: zitadel-spa-pkce-onboarding role, which accepts the short forms
@@ -132,6 +152,18 @@ APP_TYPES = ("public-spa", "confidential-web", "api")
 #: consumer_bootstrap STEP 4 boundary (none->none, basic->basic, jwt-profile->jwt),
 #: not reused verbatim.
 AUTH_METHODS = ("none", "basic", "jwt-profile")
+
+#: ``sso.roles[]`` project role-key pattern (fix-zitadel-onboarding-role-keys-
+#: assertion, §4). A conservative DNS/role-key-safe form aligned to ZITADEL's
+#: role-key constraints. The manifest declares the project's OWN role vocabulary
+#: (e.g. owner/collaborator/observer) so onboarding provisions exactly those
+#: instead of ZITADEL's admin/member/viewer defaults.
+SSO_ROLE_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
+
+#: Default for ``sso.project_role_assertion`` when omitted — role assertion ON,
+#: so the provisioned roles actually reach the issued token. The honest safe
+#: default (the pre-fix reality left it false, which is the bug).
+DEFAULT_PROJECT_ROLE_ASSERTION = True
 
 
 def _require_non_empty_str(value: object, field: str) -> None:
@@ -222,6 +254,60 @@ def _validate_sso(block: object) -> None:
             entry.get("auth_method"), AUTH_METHODS, f"{base}.auth_method"
         )
 
+    # --- OPTIONAL project role vocabulary + assertion toggle (§4) ------------
+    # Validated AFTER app_registrations, in fixed order (roles -> assertion), so
+    # the first offender stays well-defined. Both are optional and backward
+    # compatible: an `sso` block omitting them validates identically.
+    if "roles" in block:
+        _validate_sso_roles(block["roles"])
+    if "project_role_assertion" in block and not isinstance(
+        block["project_role_assertion"], bool
+    ):
+        raise ManifestValidationError(
+            "field 'sso.project_role_assertion' must be a bool, got "
+            f"{block['project_role_assertion']!r}"
+        )
+
+
+def _validate_sso_roles(roles: object) -> None:
+    """Validate the optional ``sso.roles`` project-role vocabulary (§4).
+
+    Each entry is either a non-empty role-key string, or a mapping with a
+    required ``key`` (plus optional ``display_name`` / ``group``). Keys must be
+    unique and match :data:`SSO_ROLE_KEY_RE`. Rejects naming the first offending
+    entry/index, in list order.
+    """
+    if not isinstance(roles, list) or not roles:
+        raise ManifestValidationError(
+            f"field 'sso.roles' must be a non-empty list when present, got {roles!r}"
+        )
+    seen: set[str] = set()
+    for i, entry in enumerate(roles):
+        base = f"sso.roles[{i}]"
+        if isinstance(entry, str):
+            key = entry
+        elif isinstance(entry, dict):
+            key = entry.get("key")
+            _require_non_empty_str(key, f"{base}.key")
+            if "display_name" in entry:
+                _require_non_empty_str(entry["display_name"], f"{base}.display_name")
+            if "group" in entry:
+                _require_non_empty_str(entry["group"], f"{base}.group")
+        else:
+            raise ManifestValidationError(
+                f"field {base!r} must be a role-key string or a mapping with a "
+                f"'key', got {entry!r}"
+            )
+        if not isinstance(key, str) or not SSO_ROLE_KEY_RE.match(key):
+            raise ManifestValidationError(
+                f"field {base!r} role key {key!r} must match {SSO_ROLE_KEY_RE.pattern!r}"
+            )
+        if key in seen:
+            raise ManifestValidationError(
+                f"field {base!r} duplicates role key {key!r}; keys must be unique"
+            )
+        seen.add(key)
+
 
 def _validate_secrets(block: object) -> None:
     """Validate the optional ``secrets`` block (Requirement 1.4)."""
@@ -280,6 +366,48 @@ def _validate_workload(block: object) -> None:
         _require_enum(block["tier"], WORKLOAD_TIERS, "workload.tier")
     if "count" in block:
         _require_positive_int(block["count"], "workload.count")
+
+
+def _validate_expose(block: object) -> None:
+    """Validate the optional ``expose`` block (§6).
+
+    Opt-in, default-absent — a manifest with no ``expose`` block is unaffected.
+    Fields are validated in fixed order (``enabled`` → ``host`` → ``port`` →
+    ``tls``) so the first offender is well-defined. ``host`` is REQUIRED when
+    ``enabled`` is true and must be a bare DNS subdomain LABEL (the base domain is
+    appended by the deploy layer); a FQDN is rejected.
+    """
+    if not isinstance(block, dict):
+        raise ManifestValidationError(
+            f"service entry 'expose' must be a mapping, got {block!r}"
+        )
+    enabled = block.get("enabled", False)
+    if "enabled" in block and not isinstance(enabled, bool):
+        raise ManifestValidationError(
+            f"field 'expose.enabled' must be a bool, got {enabled!r}"
+        )
+    if "host" in block or enabled:
+        host = block.get("host")
+        _require_non_empty_str(host, "expose.host")
+        if "." in host:
+            raise ManifestValidationError(
+                f"field 'expose.host' {host!r} must be a bare DNS subdomain label "
+                "(no dots) — the platform base domain is appended by the deploy "
+                "layer, not written in the manifest"
+            )
+        if not EXPOSE_HOST_LABEL_RE.match(host):
+            raise ManifestValidationError(
+                f"field 'expose.host' {host!r} must match {EXPOSE_HOST_LABEL_RE.pattern!r}"
+            )
+    if "port" in block:
+        port = block["port"]
+        _require_positive_int(port, "expose.port")
+        if port > 65535:
+            raise ManifestValidationError(
+                f"field 'expose.port' must be <= 65535, got {port}"
+            )
+    if "tls" in block:
+        _require_enum(block["tls"], EXPOSE_TLS_MODES, "expose.tls")
 
 
 def validate_manifest(manifest: object) -> dict[str, Any]:
@@ -359,6 +487,8 @@ def validate_manifest(manifest: object) -> dict[str, Any]:
         _validate_secrets(manifest["secrets"])
     if "workload" in manifest:
         _validate_workload(manifest["workload"])
+    if "expose" in manifest:
+        _validate_expose(manifest["expose"])
 
     return manifest
 

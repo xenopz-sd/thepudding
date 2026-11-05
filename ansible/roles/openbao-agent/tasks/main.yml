@@ -111,6 +111,13 @@
 # shared pure renderer). A re-run against unchanged config produces a
 # byte-identical file and reports changed=0 (Req 4.6). No secret value is
 # templated (Req 4.8).
+# notify (fix-openbao-agent-reload-on-config-change, §5b): a CHANGED agent.hcl is
+# bind-mounted :ro and invisible to docker_compose_v2's config-drift detection, so
+# the reconcile below would NO-OP and leave the running/mid-backoff sidecar on the
+# stale config. The handler forces a recreate: always of the openbao-agent service
+# so it re-reads the new config. Built-in template change detection drives the
+# `changed` signal (no custom changed_when), so an unchanged render does NOT notify
+# and the converge stays changed=0 (idempotent).
 - name: "4 — Render agent.hcl onto the workload host (idempotent, Req 4.1/4.2/4.6)"
   ansible.builtin.template:
     src: "agent.hcl.j2"
@@ -119,6 +126,7 @@
     group: root
     mode: "0640"
   register: openbao_agent_config_render
+  notify: Recreate openbao-agent sidecar
 
 # ============================================================================
 # STEP 3 (Task 4.5) — Build the docker-compose-app var set with the SWAP-GATE

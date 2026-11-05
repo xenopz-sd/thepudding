@@ -569,6 +569,13 @@
       - "sdn_gateway_active_vlan_ids={{ [] | to_json }}"
       - --extra-vars
       - "sdn_gateway_decommissioned_vlan_ids={{ [platform_clean_slate_shared_vlan_id] | to_json }}"
+      # fix-sdn-gateway-project-vlan-noop: pass the opt-in served set EXPLICITLY
+      # as [] so the teardown contract is visible (this is a VLAN-20-decommission
+      # teardown — it serves no project VLAN). No behaviour change (it was already
+      # effectively []); making it explicit prevents a future reader re-introducing
+      # the ambiguity.
+      - --extra-vars
+      - "sdn_gateway_served_project_vlan_ids={{ [] | to_json }}"
   args:
     chdir: "{{ platform_repo_root }}"
   register: platform_cs_gateway_teardown

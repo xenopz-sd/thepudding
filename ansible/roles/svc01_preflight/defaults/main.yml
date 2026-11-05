@@ -6,6 +6,10 @@
 # vars on svc-01-bootstrap.yml. NO secret here.
 
 svc01_cluster_env_helper: scripts/installer/cluster_env.py
+# Shared pure datastore selector (fix-workload-datastore-autodetect) — the SINGLE
+# implementation of the local-zfs-preferred / local-lvm-fallback / fail-closed rule,
+# also used by consumer_preflight so the DB and workload guests agree on the same node.
+svc01_datastore_select_helper: scripts/installer/datastore_select.py
 svc01_autodetect_sentinel: "__AUTODETECT__"
 
 # Homelab Proxmox self-signed cert tolerance (governs both preflight uri + the

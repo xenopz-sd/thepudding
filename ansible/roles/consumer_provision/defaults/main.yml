@@ -11,6 +11,37 @@
 # never re-declares the DB container or re-derives addressing.
 consumer_db_tf_root: "infra/projects/{{ project_slug }}/db"
 
+# --- Network-slice auto-create (fix-consumer-onboarding-prerequisites, §2) -----
+# The project's own top-level network-slice root (its sdn.tf creates the project
+# VNet p<vlan> + subnet). It is a DISTINCT per-project Terraform state
+# `<slug>-infra` (one-state-per-service, integration-boundaries §5) that the
+# project already owns — applying it here (as the FIRST Phase-2 step, gated on the
+# Phase-1 decision that the VNet is absent + auto-create ON) folds the previously
+# undocumented `terraform apply infra/projects/<slug>/` pre-step into the flow.
+# The composed svc01_preflight VNet-presence assert stays the UNCHANGED backstop.
+consumer_network_slice_tf_root: "{{ consumer_repo_root }}/infra/projects/{{ project_slug }}"
+consumer_network_slice_state_name: "{{ project_slug }}-infra"
+# --- Consumer ingress / browser-reachable OIDC (fix-consumer-ingress-browser-
+#     reachable-oidc, §6) -----------------------------------------------------
+# When the manifest declares an `expose` block (enabled: true), the workload is
+# USER-FACING and is published through the shared Traefik under
+# <expose.host>.<consumer_platform_domain> via the EXISTING ADR-0018 traefik_route
+# path (the openbao-agent role already carries that wiring; the deploy step feeds
+# it the real base-domain host rule these facts resolve). consumer_platform_domain
+# is the base domain the subdomain label is appended to (single source of truth;
+# placeholder default).
+consumer_platform_domain: "platform.example.test"
+# The Traefik guest the backend must be reachable from (ADR-0015 host_index 2 →
+# 10.0.20.12); the cross-VLAN reachability preflight probes from here.
+consumer_traefik_guest_host: "10.0.20.12"
+# The Phase-2 cross-VLAN preflight probes L3 reachability on this port (sshd),
+# NOT the application port — the workload is only deployed in Phase 3, so the
+# app port cannot be listening yet. The app route itself is verified end-to-end
+# through Traefik post-deploy in Phase 4 (consumer_handoff).
+consumer_expose_l3_probe_port: 22
+consumer_traefik_guest_ssh_user: "root"
+consumer_traefik_guest_python: "/usr/bin/python3"
+
 # The sanctioned SVC-01 orchestrator the consumer provision COMPOSES (Req 4.4).
 # Running it stands up the per-project DB guest (Terraform apply) AND configures
 # it (common + postgres.yml) in one idempotent child run — never reimplemented.
