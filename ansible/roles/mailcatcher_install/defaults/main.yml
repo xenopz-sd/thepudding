@@ -1,0 +1,52 @@
+---
+# defaults/main.yml — mailcatcher_install (shared dev mail catcher, Mailpit)
+#
+# Spec: .kiro/specs/dev-mail-catcher, ADR-0025. NO secret value lives here: the
+# UI password is read at run time from the process ENVIRONMENT
+# (MAILCATCHER_UI_PASSWORD) and written only to a 0600 file on the guest.
+
+# --- Image pin (security-standards: exact version, never `latest`) ------------
+# Verified against Docker Hub on 2026-11-07: tag v1.33.0 is the latest stable
+# release; the multi-arch index digest below is what the tag resolved to. The
+# digest pins the content even if the tag were re-pushed. Refresh deliberately.
+mailcatcher_image_repo: "axllent/mailpit"
+mailcatcher_image_tag: "v1.33.0"
+mailcatcher_image_digest: "sha256:9b3a463be15354c0f0eba91697d80e3e0d8a5623ef0e627cacc836bc17fd5231"
+mailcatcher_image: "{{ mailcatcher_image_repo }}:{{ mailcatcher_image_tag }}@{{ mailcatcher_image_digest }}"
+
+mailcatcher_stack_name: "mailcatcher"
+# docker-compose-app names the container <stack>-<service>-1.
+mailcatcher_container_name: "mailcatcher-mailpit-1"
+
+# --- Ports: published ONLY on the guest's own VLAN-20 IP (never 0.0.0.0) ------
+# cidrhost("10.0.20.0/24", 10 + 11) per the Host_Index_Authority ledger.
+mailcatcher_bind_ip: "10.0.20.21"
+mailcatcher_smtp_port: 1025   # Mailpit's default SMTP port (container and host side)
+mailcatcher_ui_port: 8025     # Mailpit's default UI/API port (container and host side)
+
+# --- Retention (disposable dev mail) -----------------------------------------
+mailcatcher_max_messages: 500
+mailcatcher_max_age: "7d"
+
+# --- Web UI ingress (P1: delegated Traefik file-provider Route_Fragment) -------
+mailcatcher_platform_domain: "platform.example.test"
+mailcatcher_ui_host: "mail.{{ mailcatcher_platform_domain }}"
+mailcatcher_traefik_route_enabled: true
+mailcatcher_traefik_guest_host: "10.0.20.12"
+mailcatcher_traefik_guest_user: "root"
+mailcatcher_traefik_guest_python: "/usr/bin/python3"
+mailcatcher_traefik_dynamic_config_dir: "/etc/traefik/dynamic"
+
+# --- UI access control (R9) — FAILS CLOSED -----------------------------------
+# Captured mail holds verification codes and reset links, so the install refuses
+# to run unless ONE of these holds:
+#   1. MAILCATCHER_UI_PASSWORD is set in the environment (native basic auth), or
+#   2. mailcatcher_ui_auth_disabled=true is passed explicitly (named dev ack).
+# (A Traefik forward-auth option is deliberately absent: traefik_route cannot attach
+# a middleware, so such an option would have been accepted but never enforced.)
+mailcatcher_ui_user: "mailcatcher"
+mailcatcher_ui_auth_disabled: false
+
+# --- Paths on the guest --------------------------------------------------------
+mailcatcher_data_dir: "/opt/compose/mailcatcher/data"
+mailcatcher_auth_file: "{{ mailcatcher_data_dir }}/authfile"

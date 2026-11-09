@@ -1,0 +1,98 @@
+{
+  "shape": "mailpit-published-security-advisories",
+  "recorded_on": "2026-11-07",
+  "source": "GitHub advisory database, GET https://api.github.com/advisories?affects=github.com/axllent/mailpit&ecosystem=go&per_page=50",
+  "note": "first_patched is the GitHub advisory's first_patched_version. No secret, host or account data. Refresh by re-running the source query and adding any new row; a row never changes meaning. v1.33.1 (2026-11-07) carries one unadvised hardening fix (limits on remote stylesheets fetched by HTML check).",
+  "advisories": [
+    {
+      "cve": "CVE-2026-21859",
+      "ghsa": "GHSA-8v65-47jx-7mfr",
+      "summary": "SSRF in the /proxy endpoint",
+      "first_patched": "1.28.1"
+    },
+    {
+      "cve": "CVE-2026-22689",
+      "ghsa": "GHSA-524m-q5m7-79mm",
+      "summary": "Cross-site WebSocket hijacking",
+      "first_patched": "1.28.2"
+    },
+    {
+      "cve": "CVE-2026-23845",
+      "ghsa": "GHSA-6jxm-fv7w-rw5j",
+      "summary": "SSRF via the HTML Check API",
+      "first_patched": "1.28.3"
+    },
+    {
+      "cve": "CVE-2026-23829",
+      "ghsa": "GHSA-54wq-72mp-cq7c",
+      "summary": "SMTP header injection via regex bypass",
+      "first_patched": "1.28.3"
+    },
+    {
+      "cve": "CVE-2026-27808",
+      "ghsa": "GHSA-mpf7-p9x7-96r3",
+      "summary": "SSRF via the Link Check API",
+      "first_patched": "1.29.2"
+    },
+    {
+      "cve": "CVE-2026-55187",
+      "ghsa": "GHSA-w4mc-hhc6-xp28",
+      "summary": "Incomplete SSRF protection (IPv6 transition forms)",
+      "first_patched": "1.30.2"
+    },
+    {
+      "cve": "CVE-2026-45709",
+      "ghsa": "GHSA-j3fj-qppj-fmmc",
+      "summary": "HTML check SSRF, missing IP-filter dialer",
+      "first_patched": "1.30.0"
+    },
+    {
+      "cve": "CVE-2026-45713",
+      "ghsa": "GHSA-fpxj-m5q8-fphw",
+      "summary": "Memory exhaustion via unlimited SMTP DATA and /api/v1/send",
+      "first_patched": "1.30.0"
+    },
+    {
+      "cve": "CVE-2026-45712",
+      "ghsa": "GHSA-w4vj-r5pg-3722",
+      "summary": "Concurrent map access crash in the proxy CSS rewriter",
+      "first_patched": "1.30.0"
+    },
+    {
+      "cve": "CVE-2026-45711",
+      "ghsa": "GHSA-qx5x-85p8-vg4j",
+      "summary": "Path traversal in mailpit dump --http",
+      "first_patched": "1.30.0"
+    },
+    {
+      "cve": "CVE-2026-48824",
+      "ghsa": "GHSA-28pq-6qxg-wg5r",
+      "summary": "Unbounded JSON body on sibling API endpoints",
+      "first_patched": "1.30.1"
+    },
+    {
+      "cve": "CVE-2026-67445",
+      "ghsa": "GHSA-w878-pj84-3j5v",
+      "summary": "Unbounded SMTP command line buffering",
+      "first_patched": "1.30.4"
+    },
+    {
+      "cve": "CVE-2026-67446",
+      "ghsa": "GHSA-75mr-qw9x-3r39",
+      "summary": "Thumbnail generation decodes unbounded image dimensions",
+      "first_patched": "1.30.4"
+    },
+    {
+      "cve": "CVE-2026-67447",
+      "ghsa": "GHSA-r553-m4fv-5v97",
+      "summary": "SMTP DATA line buffered before size enforcement",
+      "first_patched": "1.30.5"
+    },
+    {
+      "cve": "CVE-2026-67448",
+      "ghsa": "GHSA-8r62-w5wh-fc5m",
+      "summary": "WebSocket origin check bypass via percent-encoded path",
+      "first_patched": "1.30.6"
+    }
+  ]
+}

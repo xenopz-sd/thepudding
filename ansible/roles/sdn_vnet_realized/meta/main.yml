@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  role_name: sdn_vnet_realized
+  author: Developer Services Platform
+  description: >-
+    Read-only preflight check that a committed SDN VNet is REALIZED (status available) as
+    a live bridge on the target node, with a bounded poll and a fail-closed remedy (WS-C10).
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+dependencies: []

@@ -149,6 +149,10 @@ The four phases:
    unsealed, ZITADEL reachable). A failure here provisions nothing.
 2. **Provision** — apply the per-project SVC01_Consumer_Root (`db/` root) on the
    project VLAN and configure PostgreSQL via the `postgres-server` role.
+   A project VLAN and its network slice (VNet) are only created when the manifest
+   declares a guest to place (`database` or an enabled `workload`). An **SSO-only
+   or secrets-only manifest needs no VLAN**: the slug is still resolved from the
+   Registry, but no VNet is required or created, and the preflight says so.
 3. **Bootstrap** — compose the onboarders: the DB + least-priv app role (password
    → OpenBao), the OpenBao isolation triple + `<slug>-workload` AppRole, and the
    ZITADEL org + SPA/API clients (OIDC client secret → OpenBao).
@@ -461,6 +465,50 @@ off) in any non-dev deployment. Treating the self-signed/skip-verify path as
 dev-only is the same discipline the rest of the platform applies to its mocks
 and secret-exposure opt-ins: a reviewable knob whose default keeps the
 production posture intact.
+
+---
+
+
+## SSO consumption: which org does a new user land in?
+ZITADEL scopes every user to an **organization**. Onboarding creates your project's own org (`sso.org_name`, for example
+`proj-<slug>`) and puts your project and its roles inside it. A user only sees those roles if they belong to **that** org.
+
+**The rule (verified live on ZITADEL `v4.18.0`, Login V1).** A user who signs in or self-registers through the hosted login
+lands in the org named by the **authorization request's scope**:
+
+- request the scope `urn:zitadel:iam:org:id:<your org id>` and the user is created in, and signs in to, your project's org;
+- leave it out and the user lands in the **instance default org**, where they hold none of your project's roles. Login
+  succeeds, but your role claim is missing, so authorization fails later and the cause is not obvious.
+
+So an app that offers self-registration must add that scope to its authorize request, next to `openid` and the project
+audience/role scopes it already sends:
+
+<!-- doctest: display-only -->
+```text
+scope=openid profile email urn:zitadel:iam:org:id:<your org id>
+```
+
+**Getting your org id.** Onboarding does not print it (it runs with output suppressed to protect secrets), so ask the
+platform operator who ran your onboarding. They can read it from the ZITADEL console (organization details; this path is from
+ZITADEL's documentation and was not re-checked here) or from the admin API (`POST /admin/v1/orgs/_search` by org name, which
+was confirmed live). It is stable for the life of the org, so it is safe to put in your app's configuration. Surfacing it in
+the onboarding handoff is tracked as a follow-up in `PLANNING.md` (WS-C27).
+
+**Self-registration also needs two switches.**
+1. The org's login policy must allow it. Set `sso.login_policy.allow_register: true` in your manifest (see the
+   [manifest reference](CONSUMER-MANIFEST-REFERENCE.md#schema-field-table)); omitted means the policy is left untouched.
+2. New users must be able to receive their verification mail. In **dev** the platform provides a shared mail catcher that
+   captures it (operator runbook: [`infra/projects/mailcatcher/INSTALL-RUNBOOK.md`](../infra/projects/mailcatcher/INSTALL-RUNBOOK.md));
+   in production a real SMTP provider is required.
+
+**Landing in the org does not grant a role by itself.** ZITADEL has no built-in default role, so a self-registered user has
+no project role until something grants one. Declare `sso.default_role: <role key>` in your manifest (a key from `sso.roles`,
+or `admin`/`member`/`viewer` when you declare none). Onboarding then creates one platform-owned ZITADEL action
+(`platformDefaultRole`, Internal Authentication flow, Post Creation trigger) that grants that role on your project to every
+user created in your org. It is verified live on ZITADEL `v4.18.0` for hosted self-registration. Set `default_role: false`
+to remove it; omit the key to leave things untouched. Pick a **least-privilege** role: anyone who can register gets it, so
+never use an administrative role. Users created some other way (for example by an admin in the console) were not tested
+and may not receive it.
 
 ---
 

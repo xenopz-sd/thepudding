@@ -26,9 +26,21 @@
 #     --extra-vars "@/tmp/vlan-status.json" \
 #     --extra-vars "sdn_gateway_admin_source_cidr=<dev-net-cidr>"
 #
+# Unrealized project VLANs (WS-C26): this explicit entry point FAILS CLOSED when an
+# opted-in project VLAN's SDN bridge p<vlan> does not exist (nothing is written for
+# it). platform-bootstrap.yml, which serves every registry-active VLAN by default,
+# runs this play with sdn_gateway_skip_unrealized_project_vlans=true instead: such
+# VLANs are skipped with a loud WARNING and the shared VLAN 20 is still configured.
+#
 # To serve a project VLAN (100+) off-host, add it explicitly (opt-in, never a
 # blanket route — Requirement 6.6):
 #   --extra-vars "sdn_gateway_served_project_vlan_ids=[100]"
+#
+# The list may be given as a JSON array (--extra-vars '{"sdn_gateway_served_project_vlan_ids":[100,101]}'),
+# a bracketed key=value string ("...=[100,101]", no spaces), or a comma string
+# ("...=100,101"); the role normalizes all three. The run prints
+# "INFO sdn_gateway serving VLANs: [...]" with the parsed set before acting, so
+# verify that line matches what you intended.
 - name: Configure Proxmox host as L3 gateway + firewall for served SDN VLANs
   hosts: proxmox
   become: true

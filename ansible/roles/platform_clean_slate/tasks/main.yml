@@ -53,6 +53,11 @@
       - "{{ cluster_env_file }}"
       - --allowlist
       - "{{ platform_throwaway_allowlist }}"
+      # WS-C11: the catalog services whose own clean-slates this orchestrator composes (plus the
+      # SVC-01 child that svc06 composes) must all be inside a narrow scope, checked up front.
+      - >-
+        --also-service={{ (platform_clean_slate_services | map(attribute='service') | list
+        + platform_guard_extra_composed_services) | unique | join(',') }}
   args:
     chdir: "{{ platform_repo_root }}"
   register: platform_cs_throwaway_decision
@@ -275,6 +280,13 @@
     # `pct` on the node and fail-closes without it — receives it. A row that
     # omits proxmox_host_var is threaded without the host arg (only services
     # whose child needs it set it).
+    # The per-row `extra_vars` map (WS-C2) is threaded as a single JSON
+    # `--extra-vars` argument (`-e '{"k": v}'`) AFTER the base args + the
+    # proxmox_host_var — the same JSON-extra-vars form svc01_clean_slate uses to
+    # pass clean_slate_targets. A row with no extra_vars (`{}`, e.g. svc07/svc09)
+    # appends nothing — byte-for-byte the prior behaviour. SVC-06's row supplies
+    # `svc06_zitadel_vmid`, which its child clean-slate requires (play default
+    # 0 -> its VMID-resolved gate would fail without it).
     argv: >-
       {{ [platform_venv_python | dirname ~ '/ansible-playbook',
           '-i', platform_localhost_inventory,
@@ -285,6 +297,9 @@
          + (['-e', item.proxmox_host_var ~ '=' ~ platform_clean_slate_proxmox_host]
             if (item.proxmox_host_var is defined
                 and (item.proxmox_host_var | trim | length) > 0)
+            else [])
+         + (['-e', item.extra_vars | to_json]
+            if ((item.extra_vars | default({})) | length) > 0
             else []) }}
   args:
     chdir: "{{ platform_repo_root }}"
@@ -502,6 +517,10 @@
   changed_when: true
   no_log: true
 
+# WS-C12: the zone cannot be destroyed while a VNet the foundation state does not own still references
+# it. Gate/remove those occupants (fail closed unless explicitly opted in) BEFORE the destroy.
+- name: "Clean-Slate | ZONE — Handle SDN zone occupants the foundation state does not own (WS-C12)"
+  ansible.builtin.include_tasks: zone_occupants.yml
 # (2) Scoped `terraform destroy` of the platform-foundation SDN objects. no_log —
 # the child env carries TF_VAR_proxmox_api_token. Idempotent: an already-empty
 # state destroys nothing and reports changed=false. failed_when is left DEFAULT
@@ -554,6 +573,51 @@
     success_msg: "Proxmox host SSH address supplied for the gateway teardown."
   when: (clean_slate_scope | default('all')) == 'fabric-only'
 
+# WS-C12 (found live): the platform fabric teardown decommissioned ONLY VLAN 20's host gateway, so the
+# `/etc/network/interfaces.d/sdn-gw-<vlan>.cfg` stanzas written for project VLANs (opted-in gateways such as
+# sdn-gw-100.cfg) survived the clean-slate and `auto p<vlan>` would try to bring a bridge that no longer
+# exists back on the next boot. The platform clean-slate owns the whole fabric, so decommission VLAN 20 PLUS every
+# project VLAN in the registry. sdn_gateway's per-VLAN teardown is idempotent and tolerates a missing bridge, so
+# VLANs that never had a gateway are a no-op.
+# Also discover the gateway stanzas ACTUALLY on the host, so a VLAN the registry no longer (or never) knew about
+# (e.g. an orphan p103) is cleaned too. Read-only; an unreachable host yields no extra VLANs here (the host-scoped
+# steps that follow assert reachability themselves).
+- name: "Clean-Slate | Discover the host gateway stanzas present (sdn-gw-<vlan>.cfg, read-only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "ls /etc/network/interfaces.d"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_gateway_stanzas
+  changed_when: false
+  failed_when: false
+- name: "Clean-Slate | Compute the VLANs whose host gateway to decommission (shared VLAN + every registry VLAN)"
+  ansible.builtin.set_fact:
+    platform_cs_gateway_decommission_vlans: "{{ platform_cs_gateway_vlans_calc }}"
+    # COMPACT json (no space after the comma): this is rendered into a `key=value` --extra-vars token and Ansible
+    # splits those on whitespace, so "[20, 100]" was silently truncated to "[20," and only VLAN 20 was decommissioned.
+    platform_cs_gateway_decommission_json: "{{ platform_cs_gateway_vlans_calc | to_json(separators=(',', ':')) }}"
+  vars:
+    platform_cs_gateway_registry_file: "{{ platform_repo_root }}/{{ platform_clean_slate_registry_path }}"
+    platform_cs_gateway_registry: "{{ lookup('ansible.builtin.file', platform_cs_gateway_registry_file) | from_yaml }}"
+    platform_cs_gateway_host_vlans: >-
+      {{ (platform_cs_gateway_stanzas.stdout | default('')) | regex_findall('sdn-gw-([0-9]+)[.]cfg')
+         | map('int') | reject('equalto', 10) | list }}
+    platform_cs_gateway_vlans_calc: >-
+      {{ ([platform_clean_slate_shared_vlan_id | int]
+          + (platform_cs_gateway_registry.projects | default([]) | map(attribute='vlan_id') | map('int') | list)
+          + platform_cs_gateway_host_vlans)
+         | unique | sort }}
+  changed_when: false
 - name: "Clean-Slate | Tear down the host L3 gateway (sdn-gateway.yml child play, VLAN 20 decommissioned)"
   ansible.builtin.command:
     argv:
@@ -568,7 +632,7 @@
       - --extra-vars
       - "sdn_gateway_active_vlan_ids={{ [] | to_json }}"
       - --extra-vars
-      - "sdn_gateway_decommissioned_vlan_ids={{ [platform_clean_slate_shared_vlan_id] | to_json }}"
+      - "sdn_gateway_decommissioned_vlan_ids={{ platform_cs_gateway_decommission_json }}"
       # fix-sdn-gateway-project-vlan-noop: pass the opt-in served set EXPLICITLY
       # as [] so the teardown contract is visible (this is a VLAN-20-decommission
       # teardown — it serves no project VLAN). No behaviour change (it was already
@@ -695,6 +759,118 @@
          or (('UNREACHABLE' in platform_cs_iplink_out or 'Failed to connect' in platform_cs_iplink_out)
              and ('UNREACHABLE' in platform_cs_pvesh_out or 'Failed to connect' in platform_cs_pvesh_out)) }}
 
+# (1b) WS-C25 — present -> FIRST try the least disruptive recovery: apply the (now
+# empty) SDN config on the host (`pvesh set /cluster/sdn`, the same operation the
+# Terraform SDN applier performs). Seen live twice (WS-C19, WS-C20): after
+# `terraform destroy` the Proxmox SDN config was already empty but the kernel
+# bridge stayed UP; applying the config removed it in seconds without a reboot and
+# without touching vmbr0. Only if the bridge STILL survives the re-probe do we fall
+# through to the reboot opt-in / halt below (those read the recomputed fact).
+# CAUTION (shared host): an SDN apply applies the WHOLE cluster SDN config, so any
+# other pending SDN change on the cluster is applied too. It is on by default
+# because it is far less disruptive than the reboot it replaces; set
+# platform_clean_slate_sdn_apply=false to skip it. On an agent run the step-(a)
+# throwaway guard already restricted this to a throwaway cluster.
+- name: "Clean-Slate | WARN — applying the (now empty) SDN config on the host to clear the surviving bridge"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: the SDN zone/bridge {{ platform_clean_slate_sdn_vnet_id }} survived `terraform destroy`;
+      applying the cluster SDN config (`pvesh set /cluster/sdn`) before considering a host reboot.
+      This applies ANY pending SDN change on the cluster, not only ours.
+  when:
+    - platform_cs_sdn_present | bool
+    - platform_clean_slate_sdn_apply | default(true) | bool
+- name: "Clean-Slate | Apply the (now empty) SDN config on the host (non-reboot recovery)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -b
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pvesh set /cluster/sdn"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_sdn_apply_run
+  changed_when: platform_cs_sdn_apply_run.rc == 0
+  failed_when: false
+  when:
+    - platform_cs_sdn_present | bool
+    - platform_clean_slate_sdn_apply | default(true) | bool
+# Re-probe with a bounded poll on the real signal (runtime pattern P3): the reload is
+# asynchronous, so wait for the bridge to disappear rather than sleeping.
+- name: "Clean-Slate | Re-probe — is the p20 bridge gone after the SDN apply? (ip link, polled)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "ip link show {{ platform_clean_slate_sdn_vnet_id }}"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_iplink2
+  changed_when: false
+  failed_when: false
+  retries: "{{ platform_clean_slate_sdn_apply_poll_retries | default(6) | int }}"
+  delay: "{{ platform_clean_slate_sdn_apply_poll_delay | default(5) | int }}"
+  until: "'does not exist' in (platform_cs_iplink2.stdout | default(''))"
+  when:
+    - platform_cs_sdn_present | bool
+    - platform_clean_slate_sdn_apply | default(true) | bool
+- name: "Clean-Slate | Re-probe — does pvesh still show the p20 VNet after the SDN apply?"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pvesh get /cluster/sdn/vnets"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_pvesh_vnets2
+  changed_when: false
+  failed_when: false
+  when:
+    - platform_cs_sdn_present | bool
+    - platform_clean_slate_sdn_apply | default(true) | bool
+- name: "Clean-Slate | Bind the re-probe stdouts"
+  ansible.builtin.set_fact:
+    platform_cs_iplink_out2: "{{ (platform_cs_iplink2 | default({})).stdout | default('') }}"
+    platform_cs_pvesh_out2: "{{ (platform_cs_pvesh_vnets2 | default({})).stdout | default('') }}"
+  when:
+    - platform_cs_sdn_present | bool
+    - platform_clean_slate_sdn_apply | default(true) | bool
+# SAME presence logic as the first probe (the not-exist text must not count as a
+# survivor; an unreachable host reads as present), applied to the re-probe output.
+# Re-binds the fact the reboot and halt tasks below already read.
+- name: "Clean-Slate | Re-compute whether the SDN zone/bridge is still present (after the SDN apply)"
+  ansible.builtin.set_fact:
+    platform_cs_sdn_present: >-
+      {{ (platform_cs_iplink_out2 is search('(^|: )' ~ platform_clean_slate_sdn_vnet_id ~ ':')
+          and 'does not exist' not in platform_cs_iplink_out2)
+         or (platform_clean_slate_sdn_vnet_id in platform_cs_pvesh_out2
+             and 'does not exist' not in platform_cs_pvesh_out2)
+         or (('UNREACHABLE' in platform_cs_iplink_out2 or 'Failed to connect' in platform_cs_iplink_out2)
+             and ('UNREACHABLE' in platform_cs_pvesh_out2 or 'Failed to connect' in platform_cs_pvesh_out2)) }}
+  when:
+    - platform_cs_sdn_present | bool
+    - platform_clean_slate_sdn_apply | default(true) | bool
 # (2) present + reboot opt-in -> WARN + reboot + wait-for-return. The child
 # ad-hoc `ansible.builtin.reboot` handles the disconnect + wait-for-return.
 - name: "Clean-Slate | WARN — a reboot to clear the stuck SDN zone disrupts a SHARED host"
@@ -732,13 +908,19 @@
 
 # (3) present + NO opt-in -> fail naming the survivor (NO false-clean, Req 4.3).
 - name: "Clean-Slate | Halt on a surviving SDN zone without the reboot opt-in (no false-clean, Req 4.3)"
+  vars:
+    platform_cs_apply_note: >-
+      {{ 'An automatic SDN apply (pvesh set /cluster/sdn) already ran and the bridge STILL survived it.'
+         if (platform_clean_slate_sdn_apply | default(true) | bool)
+         else 'The automatic SDN apply was disabled (platform_clean_slate_sdn_apply=false).' }}
   ansible.builtin.fail:
     msg: >-
       The SDN zone/bridge {{ platform_clean_slate_sdn_vnet_id }} SURVIVED
       `terraform destroy` and the reboot opt-in was NOT supplied, so the baseline
       is NOT clean and will NOT be reported clean. `terraform destroy` alone can
       leave the SDN zone/bridge in an ERROR state until the host re-reads
-      interfaces.d. Re-run with -e platform_clean_slate_reboot=true to let the
+      interfaces.d. {{ platform_cs_apply_note }}
+      Re-run with -e platform_clean_slate_reboot=true to let the
       clean-slate reboot the host (WARNING: disrupts a shared host), or reboot /
       reload the host networking manually, then re-run the clean-slate.
   when:

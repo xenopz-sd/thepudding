@@ -82,6 +82,51 @@
     success_msg: "AppRole credential file paths set (host + in-container)."
     quiet: true
 
+# ----------------------------------------------------------------------------
+# STEP 1b (fix-openbao-agent-dev-tls-default-wiring, WS-C6, part A) — fail-CLOSED
+# Primary-TLS-trust preflight, BEFORE anything is rendered or reconciled.
+# ----------------------------------------------------------------------------
+# With skip-verify OFF (the production default, platform-runtime-patterns P4) an
+# untrusted Primary cert (the dev self-signed mock) makes the Agent crash-loop on
+# certificate verification with no useful message. Probe the Primary's health
+# endpoint FROM THE WORKLOAD HOST with verification ON; a certificate-verification
+# failure stops the run with the exact remedy instead. This NEVER weakens
+# verification: it only reports. An unreachable / sealed / not-yet-up Primary is NOT
+# a failure here (fail-closed-by-design; the swap-gate handles it) — only a TLS
+# trust failure is. Skipped when skip-verify is already on (nothing to verify) or
+# `openbao_agent_tls_preflight` is false.
+- name: "4 — Probe the Primary TLS trust with verification ON (read-only, WS-C6)"
+  ansible.builtin.uri:
+    url: "{{ openbao_primary_addr }}/v1/sys/health"
+    method: GET
+    validate_certs: true
+    status_code: [200, 429, 472, 473, 501, 503]
+    timeout: 10
+  register: openbao_agent_tls_probe
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  when:
+    - openbao_agent_tls_preflight | bool
+    - not (openbao_primary_tls_skip_verify | bool)
+- name: "4 — Fail closed if the Primary cert is untrusted and skip-verify is off (WS-C6)"
+  ansible.builtin.assert:
+    that:
+      - >-
+        openbao_agent_tls_probe is skipped
+        or not ((openbao_agent_tls_probe.msg | default('') | string)
+        is search('(?i)certificate verify failed|self.signed|unable to get local issuer'))
+    fail_msg: >-
+      The OpenBao Primary at {{ openbao_primary_addr }} presents a TLS certificate
+      this host does not trust, and skip-verify is OFF (the production default).
+      The Agent would crash-loop on certificate verification. REMEDY: for a
+      DEVELOPMENT cluster serving the self-signed mock cert, opt in once by setting
+      OPENBAO_TLS_SELF_SIGNED=true in the dev cluster env file (or pass
+      -e openbao_tls_self_signed=true for this run). For acceptance/production,
+      install a certificate chaining to a trusted CA on the Primary instead — never
+      skip verification there.
+    success_msg: "Primary TLS trust OK (or not applicable / Primary not reachable yet)."
+    quiet: true
 # The Compose stack dir this role and docker-compose-app share
 # (openbao_agent_stack_dir, reproducing docker-compose-app's default expression
 # EXACTLY — see defaults/main.yml); created here so the rendered agent.hcl and
@@ -127,6 +172,86 @@
     mode: "0640"
   register: openbao_agent_config_render
   notify: Recreate openbao-agent sidecar
+
+# ----------------------------------------------------------------------------
+# STEP 2b (fix-openbao-agent-handler-flush-on-abort, WS-C5) — drift-gated
+# RECOVERY recreate, BEFORE the fragile reconcile.
+# ----------------------------------------------------------------------------
+# The notify above is a ONE-SHOT signal: it is queued only on the run whose
+# render CHANGED, and Ansible flushes handlers only at end-of-play. If the
+# reconcile in STEP 3 then aborts (the workload `depends_on` the agent being
+# service_healthy, so a stale/crash-looping sidecar makes `up` itself fail), the
+# queued handler is DISCARDED; the recovery run re-renders byte-identical
+# (changed=0) and never re-notifies, so the stale sidecar survives every re-run.
+#
+# This block re-derives the need from ACTUAL STATE on every converge instead of
+# trusting the discarded one-shot signal: the sidecar is recreated when it is
+#   (a) crash-looping (State.Restarting / Status == restarting), OR
+#   (b) running on STALE config — agent.hcl (bind-mounted :ro, invisible to
+#       docker_compose_v2's drift detection) is NEWER than the container's
+#       StartedAt, i.e. the container never re-read it.
+# PLACEMENT: BEFORE the docker-compose-app reconcile on purpose. The reconcile
+# is what fails against a crash-looping sidecar, so a recreate placed after it
+# would never be reached on the recovery run. The recreate needs the compose
+# project to exist; "the container exists" implies it does, so the gate is
+# `probe.exists`, NOT ordering — on a first run (no container) this is skipped
+# and the reconcile below creates the stack.
+# SCOPE / IDEMPOTENCY: acts ONLY when THIS run's render is unchanged — the
+# changed-render case stays with the notify handler (no double bounce). After a
+# recreate StartedAt > mtime and the container is not restarting, so the next
+# converge is changed=0. A sidecar that is merely UNHEALTHY because the Primary
+# is sealed (fail-closed, by design) is deliberately NOT a trigger: recreating
+# it would not help and would churn every run.
+- name: "4 — Inspect the openbao-agent sidecar (read-only, check-safe, WS-C5)"
+  community.docker.docker_container_info:
+    name: "{{ dca_app_name }}-openbao-agent-1"
+  register: openbao_agent_sidecar_probe
+  check_mode: false          # run under --check too so the drift fact can evaluate
+  changed_when: false        # a read never reports a change
+  failed_when: false         # no daemon / no container yet == "first run", not an error
+
+- name: "4 — Stat agent.hcl for the staleness comparison (read-only, WS-C5)"
+  ansible.builtin.stat:
+    path: "{{ openbao_agent_config_host_path }}"
+  register: openbao_agent_config_stat
+  check_mode: false
+  changed_when: false
+
+- name: "4 — Compute the sidecar StartedAt epoch (UTC, WS-C5)"
+  ansible.builtin.set_fact:
+    # StartedAt is RFC3339 with nanoseconds (2026-11-05T14:30:14.548385123Z);
+    # [:19] drops the fraction + Z (strptime %f cannot take 9 digits). Absent
+    # container => 0 (the needs-recovery fact is gated on `exists` anyway).
+    openbao_agent_sidecar_started_epoch: >-
+      {{ (((openbao_agent_sidecar_probe.container.State.StartedAt | default('1970-01-01T00:00:00'))[:19]
+           | to_datetime('%Y-%m-%dT%H:%M:%S'))
+          - ('1970-01-01' | to_datetime('%Y-%m-%d'))).total_seconds()
+         if (openbao_agent_sidecar_probe.exists | default(false) | bool) else 0 }}
+  changed_when: false
+
+- name: "4 — Decide whether the sidecar needs a recovery recreate (drift, WS-C5)"
+  ansible.builtin.set_fact:
+    openbao_agent_sidecar_needs_recovery: >-
+      {{ (not (openbao_agent_config_render.changed | default(false) | bool))
+         and (openbao_agent_sidecar_probe.exists | default(false) | bool)
+         and (
+              (openbao_agent_sidecar_probe.container.State.Restarting | default(false) | bool)
+              or ((openbao_agent_sidecar_probe.container.State.Status | default('')) == 'restarting')
+              or ((openbao_agent_config_stat.stat.exists | default(false) | bool)
+                  and ((openbao_agent_config_stat.stat.mtime | default(0) | float)
+                       > (openbao_agent_sidecar_started_epoch | float)))
+             ) }}
+  changed_when: false
+
+- name: "4 — Recreate the stale/crash-looping openbao-agent sidecar (drift-gated, WS-C5)"
+  community.docker.docker_compose_v2:
+    project_src: "{{ openbao_agent_stack_dir }}"
+    project_name: "{{ dca_app_name }}"
+    services:
+      - openbao-agent
+    state: present
+    recreate: always
+  when: openbao_agent_sidecar_needs_recovery | bool
 
 # ============================================================================
 # STEP 3 (Task 4.5) — Build the docker-compose-app var set with the SWAP-GATE

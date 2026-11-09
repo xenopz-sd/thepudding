@@ -1,0 +1,35 @@
+{
+  "shape": "zitadel-actions-v1-default-role-on-registration",
+  "base_path": "/management/v1",
+  "header": "x-zitadel-orgid",
+  "actions": {
+    "search": {"method": "POST", "path": "/management/v1/actions/_search", "body": {}, "response_list": "result",
+               "empty_response": "no 'result' key at all (details only)",
+               "item_fields": ["id", "name", "script", "timeout", "allowedToFail", "state"], "active_state": "ACTION_STATE_ACTIVE"},
+    "create": {"method": "POST", "path": "/management/v1/actions", "body_fields": ["name", "script", "timeout", "allowedToFail"],
+               "response": {"id": "<action id>"}},
+    "update": {"method": "PUT", "path": "/management/v1/actions/{action_id}", "body_fields": ["name", "script", "timeout", "allowedToFail"]},
+    "delete": {"method": "DELETE", "path": "/management/v1/actions/{action_id}"}
+  },
+  "flow": {
+    "get": {"method": "GET", "path": "/management/v1/flows/3", "response_object": "flow",
+            "trigger_list": "triggerActions", "trigger_item": {"triggerType": {"id": "3"}, "actions": "[ {id, name, script, ...} ]"},
+            "no_triggers": "the 'triggerActions' key is absent"},
+    "set_trigger": {"method": "POST", "path": "/management/v1/flows/3/trigger/3", "body": {"actionIds": ["<id>"]},
+                    "semantics": "REPLACES the trigger's action list; merge to preserve others",
+                    "wrong_path_that_404s": "/management/v1/flows/3/trigger/3/_set"},
+    "flow_type_id": "3",
+    "flow_type_name": "Internal Authentication",
+    "trigger_type_id": "3",
+    "trigger_type_name": "Post Creation"
+  },
+  "action_function_name_must_equal_action_name": true,
+  "script_api": "api.userGrants.push({ projectID, roles: [...] })",
+  "observed_effect": "a user who self-registers through the hosted login in the org gets a grant with the listed role keys",
+  "_provenance": {
+    "live_confirmed": true,
+    "live_confirmed_on": "ZITADEL v4.18.0, Login V1, 2026-11-08 (throwaway cluster)",
+    "how": "created the action, set the Post Creation trigger, self-registered a user through /ui/login, read the user's grants back from the management API",
+    "contains_no_secret": true
+  }
+}

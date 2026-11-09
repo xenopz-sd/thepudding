@@ -223,8 +223,11 @@ consumer layer lives alongside this root, not inside it:
   this root's `<slug>-infra` state). See
   [`../dronefleet/db/README.md`](../dronefleet/db/README.md) for the root and
   [`../dronefleet/INSTALL-RUNBOOK.md`](../dronefleet/INSTALL-RUNBOOK.md) for the
-  provision-then-test walkthrough (`dronefleet` is the scaffold example — copy
-  its `db/` directory to `infra/projects/<slug>/db/`).
+  provision-then-test walkthrough. **Scaffold it once** (WS-C9): copy this
+  template's [`db/`](db/) to `infra/projects/<slug>/db/` (`cp -r
+  infra/projects/_TEMPLATE/db infra/projects/<slug>/db`); the consumer installer
+  drives that root (state `<slug>-db`) and fails closed with this command if it is
+  missing. `dronefleet/db` is the scaffolded test instance.
 
 - **Declare the manifest:** create `infra/projects/<slug>/consumer-manifest.yml`
   per the [manifest-format reference](../../../docs/CONSUMER-MANIFEST-REFERENCE.md).

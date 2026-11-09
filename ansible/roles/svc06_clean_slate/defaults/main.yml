@@ -77,3 +77,7 @@ svc06_openbao_cli_bao_addr: "https://127.0.0.1:8200"   # BAO_ADDR inside the con
 svc06_openbao_secret_path: "secret/proj-shared-zitadel/zitadel"
 svc06_openbao_provision_token_field: "provision_token"
 svc06_openbao_tls_skip_verify: true
+# WS-C11: services whose child installers this orchestrator composes; each consults the
+# throwaway guard under its OWN --service, so a narrow AGENT_LIVE_AUTHORIZED_SERVICES scope
+# must grant them all. Composes svc-01-bootstrap.yml clean-slate.
+svc06_guard_composed_services: [svc01]

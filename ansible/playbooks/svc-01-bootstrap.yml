@@ -46,6 +46,14 @@
     # DB. Both are the documented `-e ...=` override contract into svc01_provision.
     host_index: 0
     ledger_component: ""
+    # WS-C9 (ADR-0019 consumer-wrapper mode). FALSE (default) drives the reusable
+    # svc-01-sql-database root directly with state `<slug>-svc01-postgres` — the
+    # path the SHARED SVC-06 backing DB (and any standalone SVC-01 run) uses,
+    # unchanged. TRUE drives the per-project SVC01_Consumer_Root
+    # infra/projects/<slug>/db/ (state `<slug>-db`; vlan_id + host_index resolved
+    # from the registry/ledger by the wrapper). The consumer orchestrator passes
+    # `-e svc01_consumer_wrapper=true`; it is an explicit opt-in, never inferred.
+    svc01_consumer_wrapper: false
     tier: small
     db_engine: postgres
     enable_pgvector: false

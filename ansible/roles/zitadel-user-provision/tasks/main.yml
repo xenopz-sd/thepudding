@@ -1,0 +1,30 @@
+---
+# tasks/main.yml — zitadel-user-provision (WS-C4, ADR-0023). Dispatches on zup_action.
+- name: "ZITADEL-user | Assert the action is known and a project slug was supplied"
+  ansible.builtin.assert:
+    that:
+      - zup_action in ['create', 'teardown']
+      - zup_project_slug | trim | length > 0
+    fail_msg: >-
+      zup_action must be 'create' or 'teardown' (got '{{ zup_action }}') and zup_project_slug is
+      required (the project whose org is acted on).
+    success_msg: "ZITADEL-user action '{{ zup_action }}' for project '{{ zup_project_slug }}' (org {{ zup_org_name }})."
+    quiet: true
+- name: "ZITADEL-user | Bind the OpenBao admin token from the environment (no_log)"
+  ansible.builtin.set_fact:
+    zup_bao_token: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+  no_log: true
+  changed_when: false
+- name: "ZITADEL-user | Assert OpenBao is wired and an admin token is present (the PAT lives only in OpenBao)"
+  ansible.builtin.assert:
+    that:
+      - zup_openbao_addr | length > 0
+      - zup_bao_token | length > 0
+    fail_msg: >-
+      This action reads/removes the org's user-manager secret in OpenBao
+      ({{ zup_openbao_usermgr_secret_path }}), so it needs zup_openbao_addr set (e.g. -e
+      zup_openbao_addr=10.0.20.10) and OPENBAO_ADMIN_TOKEN in the environment. No secret is shown.
+    quiet: true
+  no_log: true
+- name: "ZITADEL-user | Run the '{{ zup_action }}' action"
+  ansible.builtin.include_tasks: "{{ zup_action }}.yml"

@@ -1,0 +1,98 @@
+---
+# tasks/main.yml — mailcatcher_bootstrap (Mail catcher installer — Phase 3: Bootstrap)
+#
+# Phase-3 "Host hardening & service bootstrap". A single guest, a single Compose
+# stack:
+#   1. Ensure the UI credential (R9): generate a random password if the Cluster_Env_File
+#      has none, persist it to that gitignored file at 0600 (never echoed), and hand it
+#      to the child run through the process ENVIRONMENT (never argv).
+#   2. common baseline child run (Docker CE + Compose + hardening) on the guest.
+#   3. mailcatcher.yml configurator child run (auth file, Compose stack, Traefik route).
+# Both runs are child ansible-playbook invocations (orchestrator/configurator seam,
+# integration-boundaries.md §4). A non-zero child exit -> this phase's rescue.
+
+# --- 1. UI credential (native basic auth) -----------------------------------------
+# Skipped when the operator explicitly acknowledged an open UI; otherwise a password
+# must exist so the install can fail closed on its own.
+- name: "Bootstrap | Is native UI auth in use?"
+  ansible.builtin.set_fact:
+    mailcatcher_native_auth: >-
+      {{ not (mailcatcher_ui_auth_disabled | default(false) | bool) }}
+  changed_when: false
+
+- name: "Bootstrap | Look up MAILCATCHER_UI_PASSWORD in the Cluster_Env_File (no_log)"
+  ansible.builtin.set_fact:
+    mailcatcher_ui_password: >-
+      {{ (lookup('ansible.builtin.file',
+                 mailcatcher_repo_root ~ '/' ~ cluster_env_file, errors='ignore') | default('', true))
+         | regex_findall('(?m)^\s*MAILCATCHER_UI_PASSWORD\s*=\s*(\S+)\s*$') | first | default('') }}
+  no_log: true
+  changed_when: false
+  when: mailcatcher_native_auth | bool
+
+- name: "Bootstrap | Generate a random UI password when none exists (no_log)"
+  ansible.builtin.set_fact:
+    mailcatcher_ui_password: >-
+      {{ lookup('ansible.builtin.password', '/dev/null length=24 chars=ascii_letters,digits') }}
+    mailcatcher_ui_password_generated: true
+  no_log: true
+  changed_when: false
+  when:
+    - mailcatcher_native_auth | bool
+    - (mailcatcher_ui_password | default('')) | length == 0
+
+# Persist at 0600 so a re-run reuses (not rotates) the credential. lineinfile with
+# create+regexp reconciles rather than duplicates. The file is gitignored (cluster*.env).
+- name: "Bootstrap | Persist MAILCATCHER_UI_PASSWORD to the Cluster_Env_File at 0600 (no_log)"
+  ansible.builtin.lineinfile:
+    path: "{{ mailcatcher_repo_root }}/{{ cluster_env_file }}"
+    regexp: "^\\s*MAILCATCHER_UI_PASSWORD\\s*="
+    line: "MAILCATCHER_UI_PASSWORD={{ mailcatcher_ui_password }}"
+    create: true
+    mode: "0600"
+  no_log: true
+  when:
+    - mailcatcher_native_auth | bool
+    - mailcatcher_ui_password_generated | default(false) | bool
+
+# --- 2. Common baseline child run -------------------------------------------------
+- name: "Bootstrap | common baseline (Docker + Compose) on the mailcatcher guest"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ mailcatcher_generated_inventory }}"
+      - ansible/playbooks/common.yml
+  args:
+    chdir: "{{ mailcatcher_repo_root }}"
+  register: mailcatcher_common_run
+  changed_when: "'changed=0' not in (mailcatcher_common_run.stdout | default(''))"
+
+# --- 3. Mailpit configurator child run ---------------------------------------------
+# The UI password travels in the child ENVIRONMENT (the play reads it with
+# lookup('env')), never on argv. no_log keeps it out of any registered output.
+- name: "Bootstrap | Mailpit install (mailcatcher.yml child run against the generated inventory, no_log)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ mailcatcher_generated_inventory }}"
+      - ansible/playbooks/mailcatcher.yml
+      - -e
+      - "mailcatcher_platform_domain={{ mailcatcher_platform_domain | default('platform.example.test') }}"
+      - -e
+      - "mailcatcher_ui_auth_disabled={{ mailcatcher_ui_auth_disabled | default(false) }}"
+  args:
+    chdir: "{{ mailcatcher_repo_root }}"
+  environment:
+    MAILCATCHER_UI_PASSWORD: "{{ mailcatcher_ui_password | default('') }}"
+  register: mailcatcher_run
+  changed_when: "'changed=0' not in (mailcatcher_run.stdout | default(''))"
+  no_log: true
+
+# Scrub the credential fact from memory now it is persisted.
+- name: "Bootstrap | Scrub the UI credential fact from memory (no_log)"
+  ansible.builtin.set_fact:
+    mailcatcher_ui_password: ""
+  no_log: true
+  changed_when: false

@@ -23,3 +23,7 @@ svc06_required_venv_binaries:
   - "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
   - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
   - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-galaxy"
+# WS-C11: services whose child installers this orchestrator composes; each consults the
+# throwaway guard under its OWN --service, so a narrow AGENT_LIVE_AUTHORIZED_SERVICES scope
+# must grant them all. Composes svc-01-bootstrap.yml (the shared-zitadel backing DB).
+svc06_guard_composed_services: [svc01]

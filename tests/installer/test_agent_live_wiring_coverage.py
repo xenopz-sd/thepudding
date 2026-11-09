@@ -127,6 +127,11 @@ _LEAF_EXEMPT = {
     # cluster-identity/guard context distinct from preflight, so it is exempt here
     # (mirrors svc07_provision).
     "ansible/roles/svc09_provision/tasks/main.yml",
+    # mailcatcher_provision is the mail-catcher Phase-2 APPLY mechanism, guarded
+    # UPSTREAM exactly like svc09_provision: mailcatcher_preflight (Phase 1) runs
+    # BEFORE it in the SAME play and carries the gated guard consult (spec
+    # dev-mail-catcher, ADR-0025).
+    "ansible/roles/mailcatcher_provision/tasks/main.yml",
     # svc01_provision is the SVC-01 Phase-2 APPLY mechanism (`terraform apply`),
     # guarded UPSTREAM exactly like svc07_provision: svc01_preflight (Phase 1)
     # carries the gated throwaway-guard consult before svc01_provision (Phase 2)
@@ -199,6 +204,11 @@ _PLAYBOOK_LEAF_EXEMPT = {
     # which the role scan already flags/checks. Exempt for the same reason as
     # svc-07-bootstrap.yml.
     "ansible/playbooks/svc-09-bootstrap.yml",
+    # mailcatcher-bootstrap.yml drives its mutations via import_role
+    # (mailcatcher_provision's `terraform apply`, mailcatcher_clean_slate's child
+    # clean-slate.yml). Its guard consult is carried by mailcatcher_preflight
+    # (Phase 1) and mailcatcher_clean_slate (reset branch), both role-scanned.
+    "ansible/playbooks/mailcatcher-bootstrap.yml",
     # svc-01-bootstrap.yml drives its mutations via import_role (svc01_provision's
     # `terraform apply`, svc01_clean_slate's child clean-slate.yml); its guard
     # consult is carried upstream by svc01_preflight + svc01_clean_slate (both

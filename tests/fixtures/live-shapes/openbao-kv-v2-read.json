@@ -1,0 +1,14 @@
+{
+  "shape": "openbao-kv-v2-read",
+  "read_api_path_template": "secret/data/{slug}/{subpath}",
+  "cli_logical_path_template": "secret/{slug}/{subpath}",
+  "response_field_accessor": ".Data.data.{field}",
+  "policy_grant_template": "secret/data/{slug}/*",
+  "_provenance": {
+    "seeded_from": ".kiro/specs/fix-consumer-db-bridge-kv-v2-path/ and .kiro/specs/fix-consumer-db-secret-workload-path-mismatch/ (shape also pinned by ansible/roles/openbao-agent/templates/agent.hcl.j2 + the committed golden tests/installer/fixtures/openbao_workload_auth/agent.hcl.golden)",
+    "hand_seeded": true,
+    "refresh": "WS-M4 Increment 2 (read-only OpenBao MCP) — ADR-gated, not yet built",
+    "sanitized": "no secrets or real hostnames; {slug}/{subpath}/{field} are substitution placeholders only",
+    "notes": "OpenBao KV v2 invariants. The read/API path carries the data/ infix (secret/data/<slug>/<sub>) for consul-template / `bao read` / the HTTP API, and the v2 response nests the payload under .Data.data.<field> (double data). The `bao kv` CLI takes the BARE logical path (secret/<slug>/<sub>) and injects data/ itself — passing the data/ form to `bao kv` doubles it (secret/data/data/...), which was the fix-consumer-db-bridge-kv-v2-path defect. policy-<slug> grants secret/data/<slug>/*."
+  }
+}

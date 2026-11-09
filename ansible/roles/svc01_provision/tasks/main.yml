@@ -15,6 +15,35 @@
   ansible.builtin.set_fact:
     svc01_state_name: "{{ project_slug }}-svc01-postgres"
   changed_when: false
+  when: not (svc01_consumer_wrapper | bool)
+# WS-C9 (ADR-0019): consumer-wrapper mode uses the wrapper root's own `<slug>-db`
+# state (distinct from `<slug>-infra` and every service state, Req 3.5).
+- name: "Provisioning | Derive the consumer-wrapper state name (<slug>-db, ADR-0019)"
+  ansible.builtin.set_fact:
+    svc01_state_name: "{{ project_slug }}-db"
+  changed_when: false
+  when: svc01_consumer_wrapper | bool
+# Fail CLOSED (before any terraform) if the per-project wrapper root was never
+# scaffolded: the operator copies infra/projects/_TEMPLATE/db to
+# infra/projects/<slug>/db (the same convention as the <slug>/ network-slice root).
+- name: "Provisioning | Stat the per-project consumer wrapper root (wrapper mode)"
+  ansible.builtin.stat:
+    path: "{{ svc01_tf_root }}/main.tf"
+  register: svc01_wrapper_root_stat
+  when: svc01_consumer_wrapper | bool
+- name: "Provisioning | Fail closed if the per-project db/ wrapper root is missing (wrapper mode)"
+  ansible.builtin.assert:
+    that:
+      - svc01_wrapper_root_stat.stat.exists
+    fail_msg: >-
+      The per-project consumer DB root {{ svc01_tf_root_rel }}/ does not exist.
+      REMEDY: scaffold it once, then re-run:
+      cp -r infra/projects/_TEMPLATE/db infra/projects/{{ project_slug }}/db
+      and set var.project_slug's default in its variables.tf to '{{ project_slug }}'
+      (or rely on the -var the installer passes). Nothing was provisioned.
+    success_msg: "Per-project consumer wrapper root present: {{ svc01_tf_root_rel }}."
+    quiet: true
+  when: svc01_consumer_wrapper | bool
 
 # --- Backend swap-gate selection --------------------------------------------
 - name: "Provisioning | Read the cluster env file to detect the state-backend signal"
@@ -155,6 +184,7 @@
     success_msg: "All required guest variables present; proceeding to terraform apply."
 
 - name: "Provisioning | terraform apply (non-interactive, auto-approve)"
+  when: not (svc01_consumer_wrapper | bool)
   ansible.builtin.command:
     argv:
       - terraform
@@ -199,6 +229,48 @@
   changed_when: "'0 added, 0 changed, 0 destroyed' not in svc01_tf_apply.stdout"
   no_log: true
 
+# WS-C9 (ADR-0019): wrapper-mode apply. The wrapper resolves vlan_id from the
+# registry and host_index from the ledger itself, so it declares NEITHER (an
+# undeclared -var would error). Only the per-project + per-cluster plumbing it
+# declares is passed.
+- name: "Provisioning | terraform apply the per-project consumer wrapper root (ADR-0019)"
+  when: svc01_consumer_wrapper | bool
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - apply
+      - -input=false
+      - -auto-approve
+      - "-var=project_slug={{ project_slug }}"
+      - "-var=db_engine={{ db_engine | default('postgres') }}"
+      - "-var=tier={{ tier | default('small') }}"
+      - "-var=proxmox_node_name={{ svc01_proxmox_node_name }}"
+      - "-var=svc01_vmid={{ svc01_vmid }}"
+      - "-var=svc01_template_file_id={{ svc01_template_file_id }}"
+      - "-var=svc01_datastore_id={{ svc01_datastore_id }}"
+  args:
+    chdir: "{{ svc01_tf_root }}"
+  environment: "{{ svc01_tf_env }}"
+  register: svc01_tf_apply_wrapper
+  changed_when: "'0 added, 0 changed, 0 destroyed' not in svc01_tf_apply_wrapper.stdout"
+  no_log: true
+# The ledger-assigned host_index is the wrapper's own output; adopt it so every
+# downstream role (known_hosts, bootstrap, handoff) uses the TRUE guest IP.
+- name: "Provisioning | Read the wrapper's ledger-resolved host_index (wrapper mode)"
+  ansible.builtin.command:
+    argv: [terraform, output, -raw, host_index]
+  args:
+    chdir: "{{ svc01_tf_root }}"
+  environment: "{{ svc01_tf_env }}"
+  register: svc01_wrapper_host_index
+  changed_when: false
+  when: svc01_consumer_wrapper | bool
+  no_log: true
+- name: "Provisioning | Adopt the ledger-resolved host_index for downstream roles (wrapper mode)"
+  ansible.builtin.set_fact:
+    host_index: "{{ svc01_wrapper_host_index.stdout | trim | int }}"
+  changed_when: false
+  when: svc01_consumer_wrapper | bool
 # --- inventory generation + known_hosts -------------------------------------
 - name: "Provisioning | Generate the Ansible inventory from Terraform outputs"
   ansible.builtin.command:
@@ -206,7 +278,7 @@
       - "{{ svc01_venv_python }}"
       - ansible/inventory/generate_inventory.py
       - --root
-      - infra/projects/svc-01-sql-database
+      - "{{ svc01_tf_root_rel }}"
       - --out
       - "{{ svc01_generated_inventory }}"
   args:

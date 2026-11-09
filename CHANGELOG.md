@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-11-08
+
+> A shared dev mail catcher, five operator-feedback fixes from v0.14.0, five backlog streams closed
+> (each test-first and live-verified on a throwaway cluster where it touches the cluster), and a
+> set of methodology guards that now run in the offline gate. All additions are default-off or
+> default-inert; no breaking changes.
+
+### Added
+- **Shared dev mail catcher (Mailpit) + ZITADEL SMTP switch** (spec `dev-mail-catcher`, **ADR-0025**, Mock 7): a
+  non-catalog guest (`role_code: mailcatcher`, VLAN 20, `10.0.20.21`) installed by `mailcatcher-bootstrap.yml` (4-phase,
+  clean-slate, platform teardown catalog row), with the UI behind native basic auth (generated credential) or an explicit
+  acknowledgement; `zitadel-smtp.yml` points ZITADEL's instance SMTP at it (opt-in, refuses to overwrite a real
+  provider, read-back gate). Image pinned by tag and digest. Live-validated, including real hosted self-registration with
+  the code read from the catcher.
+- **Manifest `sso.login_policy.allow_register`** and **`sso.app_registrations[].dev_mode`** (optional, reconciled).
+- **Manifest `sso.default_role`** (WS-C18, spec `fix-zitadel-default-role-on-registration`): a role key (or `false`) granted
+  to every user created in the project org, via one platform-owned ZITADEL Actions v1 action on the Post Creation trigger;
+  preserves other actions, read-back gate. Live: real registrations got the role; re-runs `changed=0`.
+- **`traefik_route` forwardAuth** (WS-C23, ADR-0018 addendum): optional, default-inert `route_forward_auth_address` /
+  `route_forward_auth_response_headers`. Unset renders byte-identically for all five consumers (golden-hash guard); malformed
+  values are refused. Live: 401 / 200 / 500 with the auth server down. No service adopts it yet (WS-C29).
+- **Platform clean-slate SDN apply before reboot** (WS-C25, ADR-0011 addendum): applies the cluster SDN config
+  (`pvesh set /cluster/sdn`) and re-probes before offering a host reboot; `platform_clean_slate_sdn_apply=false` skips it.
+- **Mailpit advisory guard** (WS-C22): a dated table of all 15 published Mailpit advisories and a test that fails if the pin
+  falls below the highest fix; the pinned `v1.33.0` is not affected by any. Bump routine in the runbook.
+- **Consumer docs**: which ZITADEL org a new user lands in (the `urn:zitadel:iam:org:id:<id>` scope) and the self-registration
+  prerequisites (WS-C21).
+- **Methodology guards** (now in the offline gate): runtime-wiring contract tests (WS-M1), teardown-parity contract
+  (WS-M2), live-acceptance lifecycle gate (WS-M3), design-time live-shape fixtures and capture ADR-0024 (WS-M4),
+  platform runtime-patterns catalogue (WS-M5), spec-completeness guard (WS-M6), bugfix skill and spec hook.
+- **SVC-06 interactive-login MFA live proof** (WS-A2) and the user-provisioning grant model (WS-C4).
+
+### Changed
+- **Consumer onboarding**: a manifest needs a project network slice only if it declares a guest (`database` or an enabled
+  `workload`); an SSO-only or secrets-only manifest no longer fails on, or creates, a VNet (WS-C24). The Registry slug is
+  still resolved.
+- **Platform bring-up** (`platform-bootstrap.yml`): project VLANs whose SDN bridge is not realized are skipped with a visible
+  warning instead of ending the run in a fail-closed stop after VLAN 20 is configured; an explicit `sdn-gateway.yml` run stays
+  fail-closed and VLAN 20 is never skipped (WS-C26).
+- **OIDC apps are reconciled on re-run** (`redirectUris`, `devMode`, `loginVersion`, all redirect URIs passed) with a read-back gate.
+- `sdn_gateway` logs the parsed served-VLAN set (INFO).
+
+### Fixed
+- `sdn_gateway` wrote the persistent `sdn-gw-<vlan>.cfg` before asserting the bridge exists, leaving a dangling stanza when the
+  run then failed closed (WS-C20).
+- The mail catcher no longer accepts a forward-auth setting that nothing enforced (fail-open dressed as a control); a real
+  mechanism now exists (WS-C23).
+- A real-provider refusal in `zitadel-smtp.yml` was shown as a censored templating error; it now shows the helper's message.
+- A login-policy-only change in `zitadel-org-provision` was reported as `changed=0`.
+- Platform clean-slate now discovers SVC-06 and SVC-09 (WS-C2) and destroys the consumer workload guest (WS-C3); fabric destroy
+  handles SDN zone occupants the state does not own; composed services are pre-checked against a narrow live-authorized scope
+  (WS-C11); a bounded retry for the consumer preflight ZITADEL probe (WS-C8); the consumer DB flow goes through the `db/`
+  wrapper (WS-C9); openbao-agent dev-TLS default wiring (WS-C6) and drift-gated recovery after an aborted run (WS-C5); the
+  VNet-realized assertion moved into preflight (WS-C10).
+
+### Known limitations
+- The default-role grant covers hosted self-registration; users created in the console or API were not tested. Anyone who can
+  register receives the role, so use a least-privilege one.
+- The platform clean-slate reboot fallback (after a failed SDN apply) is covered offline only.
+- Database/workload manifests were not re-run live for the network-slice change (logic unchanged, covered by tests).
+- Backlog: WS-C27 (print the org id in the onboarding handoff), WS-C28 (bump Mailpit to v1.33.1 after soak), WS-C29 (an
+  authorization endpoint so a service can adopt forward-auth).
+
 ## [0.14.0] — 2026-11-04
 
 > Eight v0.13.0 deployment bugfixes, each on its own branch with offline +
@@ -1334,7 +1397,8 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
-[Unreleased]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.14.0...HEAD
+[Unreleased]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.15.0...HEAD
+[0.15.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.14.0...v0.15.0
 [0.14.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.13.0...v0.14.0
 [0.13.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.12.0...v0.13.0
 [0.12.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.11.3...v0.12.0

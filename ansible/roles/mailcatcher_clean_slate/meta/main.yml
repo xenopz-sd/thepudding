@@ -1,0 +1,13 @@
+---
+# meta/main.yml — mailcatcher_clean_slate (Mail catcher installer — clean-slate branch)
+galaxy_info:
+  role_name: mailcatcher_clean_slate
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Mail catcher installer clean-slate reset: agent-live throwaway-guard
+    consult, confirmation gate, delegated terraform_clean_slate destroy of the
+    mailcatcher LXC, two-way empty-baseline verification.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

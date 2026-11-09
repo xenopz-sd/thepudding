@@ -1,0 +1,12 @@
+---
+# meta/main.yml — mailcatcher_handoff (Mail catcher installer — Phase 4)
+galaxy_info:
+  role_name: mailcatcher_handoff
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Mail catcher installer Phase 4 — health sanity & Developer B handoff:
+    invokes the mailcatcher-health.yml child gate and prints the completion banner.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

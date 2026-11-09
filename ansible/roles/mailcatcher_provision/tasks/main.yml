@@ -1,0 +1,258 @@
+---
+# tasks/main.yml — mailcatcher_provision (Mail catcher installer — Phase 2: Provision)
+#
+# Clone of svc07_provision adapted for the mailcatcher single-guest root:
+#   - backend swap-gate (GitLab HTTP when all three CI keys present, else
+#     local_backend_override.tf) with its single INFO decision log,
+#   - terraform init / apply (Proxmox creds via TF_VAR_* env, no_log),
+#   - generate_inventory.py + existence assert,
+#   - add_host of the single mailcatcher guest,
+#   - ssh-keygen -R + ssh-keyscan known_hosts reconciliation.
+#
+# NOTE (agent-live meta-guard): this role runs `terraform apply` (a destructive
+# marker) but is LEAF-EXEMPT in test_agent_live_wiring_coverage.py exactly like
+# svc07_provision — the throwaway-guard consult is carried UPSTREAM by
+# mailcatcher_preflight (Phase 1 runs before Phase 2 in the same play).
+
+# --- Backend swap-gate selection --------------------------------------------
+- name: "Provisioning | Read the cluster env file to detect the state-backend signal"
+  ansible.builtin.slurp:
+    src: "{{ mailcatcher_repo_root }}/{{ cluster_env_file }}"
+  register: mailcatcher_env_slurp
+  no_log: true
+
+- name: "Provisioning | Reduce the env file to KEY=VALUE lines"
+  ansible.builtin.set_fact:
+    mailcatcher_env_pairs: >-
+      {{ (mailcatcher_env_slurp.content | b64decode).splitlines()
+         | map('trim')
+         | reject('match', '^\s*#')
+         | select('search', '=')
+         | list }}
+  no_log: true
+
+- name: "Provisioning | Extract the set of env keys (names only, no values)"
+  ansible.builtin.set_fact:
+    mailcatcher_env_keys: >-
+      {{ mailcatcher_env_pairs
+         | map('regex_replace', '^\s*([^=]+?)\s*=.*$', '\1')
+         | list }}
+
+- name: "Provisioning | Decide the Terraform backend (swap gate)"
+  ansible.builtin.set_fact:
+    mailcatcher_use_gitlab_backend: >-
+      {{ ('CI_API_V4_URL' in mailcatcher_env_keys)
+         and ('CI_PROJECT_ID' in mailcatcher_env_keys)
+         and ('CI_JOB_TOKEN' in mailcatcher_env_keys) }}
+
+- name: "Provisioning | Extract GitLab CI state-backend values (GitLab backend only)"
+  ansible.builtin.set_fact:
+    mailcatcher_env_ci_values: >-
+      {{ dict(mailcatcher_env_keys | zip(
+           mailcatcher_env_pairs
+           | map('regex_replace', '^[^=]+=\s*(.*?)\s*$', '\1')
+           | map('regex_replace', '^"(.*)"$', '\1')
+           | list
+         )) }}
+  when: mailcatcher_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Derive the GitLab state address + job token (GitLab backend only)"
+  ansible.builtin.set_fact:
+    mailcatcher_env_gitlab_state_address: >-
+      {{ mailcatcher_env_ci_values['CI_API_V4_URL'] }}/projects/{{
+         mailcatcher_env_ci_values['CI_PROJECT_ID'] }}/terraform/state/mailcatcher
+    mailcatcher_env_ci_job_token: "{{ mailcatcher_env_ci_values['CI_JOB_TOKEN'] }}"
+  when: mailcatcher_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Log the Terraform backend selection (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Terraform backend:
+      {{ 'GitLab HTTP state (mailcatcher) — the Cluster_Env_File '
+         ~ 'configures the GitLab CI state-backend variables'
+         if (mailcatcher_use_gitlab_backend | bool)
+         else 'LOCAL (local_backend_override.tf) — the Cluster_Env_File does not '
+              ~ 'configure the GitLab HTTP backend (solo/offline Developer-B default)' }}
+
+- name: "Provisioning | Ensure local_backend_override.tf is present (local backend)"
+  ansible.builtin.copy:
+    dest: "{{ mailcatcher_tf_root }}/local_backend_override.tf"
+    mode: "0644"
+    content: |
+      # Local, gitignored state backend for a solo/offline apply — overrides the
+      # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+      terraform {
+        backend "local" {}
+      }
+  when: not (mailcatcher_use_gitlab_backend | bool)
+
+- name: "Provisioning | Remove any local_backend_override.tf (GitLab HTTP backend)"
+  ansible.builtin.file:
+    path: "{{ mailcatcher_tf_root }}/local_backend_override.tf"
+    state: absent
+  when: mailcatcher_use_gitlab_backend | bool
+
+- name: "Provisioning | terraform init (local backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+  args:
+    chdir: "{{ mailcatcher_tf_root }}"
+  environment: "{{ mailcatcher_tf_env }}"
+  register: mailcatcher_tf_init_local
+  changed_when: true
+  when: not (mailcatcher_use_gitlab_backend | bool)
+  no_log: true
+
+- name: "Provisioning | terraform init (GitLab HTTP backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+      - "-backend-config=address={{ mailcatcher_env_gitlab_state_address }}"
+      - "-backend-config=lock_address={{ mailcatcher_env_gitlab_state_address }}/lock"
+      - "-backend-config=unlock_address={{ mailcatcher_env_gitlab_state_address }}/lock"
+      - -backend-config=username=gitlab-ci-token
+      - "-backend-config=password={{ mailcatcher_env_ci_job_token }}"
+      - -backend-config=lock_method=POST
+      - -backend-config=unlock_method=DELETE
+      - -backend-config=retry_wait_min=5
+  args:
+    chdir: "{{ mailcatcher_tf_root }}"
+  environment: "{{ mailcatcher_tf_env }}"
+  register: mailcatcher_tf_init_gitlab
+  changed_when: true
+  when: mailcatcher_use_gitlab_backend | bool
+  no_log: true
+
+# --- guest-variable assembly + non-interactive apply ------------------------
+- name: "Provisioning | Assert all required guest variables are present (before apply)"
+  ansible.builtin.assert:
+    that:
+      - "mailcatcher_proxmox_node_name is defined and (mailcatcher_proxmox_node_name | trim | length > 0)"
+      - "mailcatcher_template_file_id is defined and (mailcatcher_template_file_id | trim | length > 0)"
+      - "mailcatcher_datastore_id is defined and (mailcatcher_datastore_id | trim | length > 0)"
+      - "mailcatcher_datastore_id != mailcatcher_autodetect_sentinel"
+      - "mailcatcher_vmid is defined"
+    fail_msg: >-
+      A required guest variable is absent or empty; refusing to run
+      `terraform apply` so no Proxmox resource is created. Required:
+      proxmox_node_name, mailcatcher_template_file_id, a resolved
+      mailcatcher_datastore_id (not the auto-detect sentinel), mailcatcher_vmid.
+    success_msg: "All required guest variables are present; proceeding to terraform apply."
+
+- name: "Provisioning | terraform apply (non-interactive, auto-approve)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - apply
+      - -input=false
+      - -auto-approve
+      - "-var=proxmox_node_name={{ mailcatcher_proxmox_node_name }}"
+      - "-var=mailcatcher_vmid={{ mailcatcher_vmid }}"
+      - "-var=mailcatcher_template_file_id={{ mailcatcher_template_file_id }}"
+      - "-var=mailcatcher_datastore_id={{ mailcatcher_datastore_id }}"
+  args:
+    chdir: "{{ mailcatcher_tf_root }}"
+  environment: "{{ mailcatcher_tf_env }}"
+  register: mailcatcher_tf_apply
+  changed_when: "'0 added, 0 changed, 0 destroyed' not in mailcatcher_tf_apply.stdout"
+  no_log: true
+
+# --- inventory generation + refresh handoff ---------------------------------
+- name: "Provisioning | Generate the Ansible inventory from Terraform outputs"
+  ansible.builtin.command:
+    argv:
+      - "{{ mailcatcher_venv_python }}"
+      - ansible/inventory/generate_inventory.py
+      - --root
+      - infra/projects/mailcatcher
+      - --out
+      - "{{ mailcatcher_generated_inventory }}"
+  args:
+    chdir: "{{ mailcatcher_repo_root }}"
+  register: mailcatcher_gen_inventory
+  changed_when: true
+
+- name: "Provisioning | Confirm the generated inventory file was written"
+  ansible.builtin.stat:
+    path: "{{ mailcatcher_repo_root }}/{{ mailcatcher_generated_inventory }}"
+  register: mailcatcher_generated_inventory_stat
+
+- name: "Provisioning | Assert the generated inventory exists (else halt before Bootstrap)"
+  ansible.builtin.assert:
+    that:
+      - "mailcatcher_generated_inventory_stat.stat.exists"
+    fail_msg: >-
+      generate_inventory.py did not produce {{ mailcatcher_generated_inventory }};
+      halting before the Bootstrap phase and leaving the provisioned guest in
+      place.
+    success_msg: "Generated inventory present: {{ mailcatcher_generated_inventory }}."
+
+- name: "Provisioning | add_host the mailcatcher guest into the in-memory inventory"
+  ansible.builtin.add_host:
+    name: mailcatcher-20-01
+    groups:
+      - mailcatcher
+    # cidrhost("10.0.20.0/24", 10 + 11) = 10.0.20.21 — host_index 2 per the
+    # ADR-0015 host-index ledger (infra/platform-foundation/host-indices.yaml).
+    # MOVED off the colliding host_index 0 / 10.0.20.10, which the SVC-07 OpenBao
+    # primary owns. Carried as a literal here, matching the sibling svc07/svc06
+    # bootstraps (the Terraform root derives it; the Ansible layer carries the
+    # computed IP as a constant).
+    ansible_host: "10.0.20.21"
+    ansible_user: root
+    ansible_connection: ssh
+  changed_when: false
+
+# --- SSH known_hosts reconciliation -----------------------------------------
+- name: "Provisioning | Ensure ~/.ssh exists (0700)"
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+
+- name: "Provisioning | Remove stale known_hosts fingerprints for the guest IP"
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -R
+      - "{{ item }}"
+      - -f
+      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
+  loop: "{{ mailcatcher_guest_ips }}"
+  register: mailcatcher_knownhosts_purge
+  changed_when: "'updated' in (mailcatcher_knownhosts_purge.stderr | default(''))"
+  failed_when: false
+
+- name: "Provisioning | ssh-keyscan the guest IP (per-address 30s timeout)"
+  ansible.builtin.command:
+    argv:
+      - ssh-keyscan
+      - -T
+      - "30"
+      - "{{ item }}"
+  loop: "{{ mailcatcher_guest_ips }}"
+  register: mailcatcher_keyscan
+  changed_when: false
+  failed_when: >-
+    mailcatcher_keyscan.rc != 0
+    or (mailcatcher_keyscan.stdout | default('') | trim | length == 0)
+
+- name: "Provisioning | Append current host keys to known_hosts"
+  ansible.builtin.blockinfile:
+    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+    create: true
+    mode: "0600"
+    marker: "# {mark} Mail catcher installer host keys for {{ item.item }}"
+    block: "{{ item.stdout }}"
+  loop: "{{ mailcatcher_keyscan.results }}"
+  loop_control:
+    label: "{{ item.item }}"

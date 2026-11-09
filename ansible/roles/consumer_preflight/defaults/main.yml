@@ -92,3 +92,11 @@ consumer_openbao_cli_python: "/usr/bin/python3"
 # domain is supplied per-env.
 consumer_platform_domain: "platform.example.test"
 consumer_zitadel_health_url: "https://auth.{{ consumer_platform_domain }}/debug/healthz"
+# Bounded retry for the ZITADEL health probe (WS-C8, P3). Total attempts and the pause
+# between them; worst case = attempts x (dependency_probe_timeout + delay).
+consumer_probe_retries: 5
+consumer_probe_retry_delay: 3
+# WS-C11: services whose child installers this orchestrator composes; each consults the
+# throwaway guard under its OWN --service, so a narrow AGENT_LIVE_AUTHORIZED_SERVICES scope
+# must grant them all. Composes svc-01-bootstrap.yml (the per-project DB).
+consumer_guard_composed_services: [svc01]

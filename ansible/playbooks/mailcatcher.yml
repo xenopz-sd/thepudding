@@ -1,0 +1,21 @@
+---
+# Mail catcher provisioning playbook (spec: dev-mail-catcher, ADR-0025).
+#
+# CONFIGURATOR play (integration-boundaries.md §4): runs `hosts: mailcatcher`
+# NATIVELY on the catcher LXC, reached via the generated inventory the installer
+# wrote (ansible/inventory/mailcatcher.generated.yml). Invoked by the
+# mailcatcher_bootstrap role as a child ansible-playbook run; also runnable
+# standalone. Bind-only: NO task logic here (it lives in mailcatcher_install).
+# The UI password, if any, is read from the ENVIRONMENT (MAILCATCHER_UI_PASSWORD),
+# never from -e (argv would expose it).
+- name: Provision the shared dev mail catcher (Mailpit)
+  hosts: mailcatcher
+  become: true
+  tasks:
+    - name: Install + configure Mailpit (auth, Compose stack, Traefik route)
+      ansible.builtin.import_role:
+        name: mailcatcher_install
+      tags: ["install"]
+
+    - name: Flush handlers so Mailpit restarts with its final config
+      ansible.builtin.meta: flush_handlers

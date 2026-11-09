@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  role_name: zitadel_user_provision
+  author: Developer Services Platform
+  description: >-
+    SVC-06 org-scoped human-user provisioning (WS-C4, ADR-0023): create a login user with the
+    project org's ORG_USER_MANAGER PAT, or tear the user-manager identity down.
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+dependencies: []

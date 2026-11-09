@@ -144,3 +144,21 @@ zop_zitadel_guest_ssh_user: "root"
 # the instance default). Set v2 only once the zitadel-login container is
 # deployed (deferred svc06-login-v2).
 zop_login_version: "v1"
+# --- Per-org user-manager identity (WS-C4, ADR-0023) -------------------------------------
+# A dedicated non-human machine user per project org holding ORG_USER_MANAGER on that org ONLY,
+# with a bounded-lifetime PAT stored only in the project's OpenBao path. Minted at onboarding
+# when OpenBao is wired. Rotate by deleting the OpenBao field and re-running onboarding (quarterly
+# cadence, security-standards).
+zop_usermgr_enabled: true
+zop_usermgr_name: "usermgr-sa"
+zop_usermgr_pat_days: 90
+zop_usermgr_helper: "scripts/installer/zitadel_user_provision.py"
+zop_openbao_usermgr_secret_path: "{{ zop_openbao_kv_mount }}/proj-{{ zop_project_slug }}/zitadel/usermgr"
+zop_openbao_usermgr_token_field: "pat"
+
+# dev-mail-catcher R7: org login-policy `allowRegister` toggle. null (default) = leave the org
+# login policy UNTOUCHED; true/false = reconcile it (read-modify-write with a read-back gate).
+zop_allow_register: null
+# WS-C18: default project role granted to every user created in the org (self-registration). null =
+# untouched; a role key = reconcile the platform-owned Actions v1 Post Creation grant; false = remove it.
+zop_default_role: null

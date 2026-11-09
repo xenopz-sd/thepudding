@@ -1,0 +1,91 @@
+---
+# tasks/main.yml — mailcatcher_handoff (Mail catcher installer — Phase 4: Handoff)
+#
+# Phase 4 = health sanity + Developer B completion handoff. Invoked from the thin
+# orchestrator play as `import_role: mailcatcher_handoff` inside the Phase-4
+# block/rescue.
+#
+# The health gate runs as the CHILD configurator play mailcatcher-health.yml
+# (hosts: mailcatcher, NATIVELY on the guest). The health knobs are THIS role's
+# defaults, bridged across the child-process boundary via -e. The UI credential (if
+# native auth is in use) is read by the child from the ENVIRONMENT, never argv.
+- name: "Handoff | Is native UI auth expected?"
+  ansible.builtin.set_fact:
+    mailcatcher_ui_auth_expected: >-
+      {{ not (mailcatcher_ui_auth_disabled | default(false) | bool) }}
+  changed_when: false
+
+- name: "Handoff | Read the UI credential for the authenticated probe (no_log)"
+  ansible.builtin.set_fact:
+    mailcatcher_handoff_ui_password: >-
+      {{ (lookup('ansible.builtin.file',
+                 mailcatcher_repo_root ~ '/' ~ cluster_env_file, errors='ignore') | default('', true))
+         | regex_findall('(?m)^\s*MAILCATCHER_UI_PASSWORD\s*=\s*(\S+)\s*$') | first | default('') }}
+  no_log: true
+  changed_when: false
+  when: mailcatcher_ui_auth_expected | bool
+
+- name: "Handoff | Run the guest health gate as a child configurator play (mailcatcher-health.yml, no_log)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ mailcatcher_generated_inventory }}"
+      - ansible/playbooks/mailcatcher-health.yml
+      - -e
+      - "mailcatcher_container_name={{ mailcatcher_container_name }}"
+      - -e
+      - "mailcatcher_bind_ip={{ mailcatcher_bind_ip }}"
+      - -e
+      - "mailcatcher_smtp_port={{ mailcatcher_smtp_port }}"
+      - -e
+      - "mailcatcher_ui_port={{ mailcatcher_ui_port }}"
+      - -e
+      - "mailcatcher_ui_user={{ mailcatcher_ui_user }}"
+      - -e
+      - "mailcatcher_ui_auth_expected={{ mailcatcher_ui_auth_expected }}"
+      - -e
+      - "mailcatcher_health_retries={{ mailcatcher_health_retries }}"
+      - -e
+      - "mailcatcher_health_delay={{ mailcatcher_health_delay }}"
+  args:
+    chdir: "{{ mailcatcher_repo_root }}"
+  environment:
+    MAILCATCHER_UI_PASSWORD: "{{ mailcatcher_handoff_ui_password | default('') }}"
+  register: mailcatcher_health_run
+  changed_when: false
+  no_log: true
+
+# --- Completion summary banner ----------------------------------------------------
+- name: "Handoff | Resolve the absolute Cluster_Env_File path"
+  ansible.builtin.set_fact:
+    mailcatcher_cluster_env_abspath: >-
+      {{ (mailcatcher_repo_root ~ '/' ~ cluster_env_file) | ansible.builtin.realpath }}
+
+- name: "Handoff | Compose banner fields (UI URL, access-control mode)"
+  ansible.builtin.set_fact:
+    mailcatcher_banner_ui_url: "https://mail.{{ mailcatcher_platform_domain | default('platform.example.test') }}/"
+    mailcatcher_banner_auth: >-
+      {{ 'basic auth, user ' ~ mailcatcher_ui_user ~ ', password in MAILCATCHER_UI_PASSWORD'
+         if (mailcatcher_ui_auth_expected | bool)
+         else 'NONE (mailcatcher_ui_auth_disabled=true — dev acknowledgement)' }}
+  changed_when: false
+
+- name: "Handoff | Print the Developer B completion summary banner"
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Shared dev mail catcher (Mailpit) Deployed Successfully!"
+      - "============================================================"
+      - "Status:             healthy"
+      - "SMTP (VLAN-20):     {{ mailcatcher_bind_ip }}:{{ mailcatcher_smtp_port }} (no auth, no TLS — dev only)"
+      - "Web UI via Traefik: {{ mailcatcher_banner_ui_url }}"
+      - "UI access:          {{ mailcatcher_banner_auth }}"
+      - "Credentials saved:  {{ mailcatcher_cluster_env_abspath }}"
+      - "(value never printed)"
+      - ""
+      - "DEV-ONLY mock. ZITADEL is NOT pointed at it yet. To enable (explicit opt-in):"
+      - "  ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \\"
+      - "    ansible/playbooks/zitadel-smtp.yml -e zitadel_smtp_dev_catcher=true"
+      - "Read a verification code at the Web UI above after a user self-registers."
+      - "============================================================"

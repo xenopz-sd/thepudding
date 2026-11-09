@@ -1,0 +1,72 @@
+---
+# tasks/main.yml — sdn_vnet_realized (WS-C10; platform-runtime-patterns P3)
+#
+# COMMITTED != REALIZED. A preflight that only checks the VNet exists in the SDN CONFIG
+# (/cluster/sdn/vnets) passes even when the host never realized it as a live bridge
+# (the applier did not run, or it reloaded without the VNet). The guest then fails at
+# container start with "bridge 'p100' does not exist" — after Terraform already created
+# resources. This role closes that gap with the REALIZED signal: the per-node SDN zone
+# content (/nodes/<node>/sdn/zones/<zone>/content) lists each VNet with a status; only
+# `available` means the bridge is live on that node.
+#
+# READ-ONLY and check-safe. Bounded poll (never an unbounded wait; realization can lag an
+# apply by seconds). FAIL-CLOSED with the remedy. Called by the guest-placing preflights
+# right after their "VNet exists in config" assert. NO secret is shown (no_log on the GET).
+#
+# Inputs (all via include_role vars): sdn_vnet_realized_endpoint, _token, _validate_certs,
+# _node, _vnet (e.g. p20 or p100), _vnets (the `.json.data` list from /cluster/sdn/vnets).
+- name: "SDN realized | Resolve the zone that owns the VNet (from the config list)"
+  ansible.builtin.set_fact:
+    sdn_vnet_realized_zone: >-
+      {{ (sdn_vnet_realized_vnets
+          | selectattr('vnet', 'equalto', sdn_vnet_realized_vnet)
+          | map(attribute='zone') | list | first) | default(sdn_vnet_realized_default_zone, true) }}
+  changed_when: false
+- name: "SDN realized | Read the per-node realized zone content (bounded poll, read-only)"
+  ansible.builtin.uri:
+    url: >-
+      {{ sdn_vnet_realized_endpoint }}/api2/json/nodes/{{ sdn_vnet_realized_node }}/sdn/zones/{{
+      sdn_vnet_realized_zone }}/content
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ sdn_vnet_realized_token }}"
+    timeout: 30
+    validate_certs: "{{ sdn_vnet_realized_validate_certs }}"
+    status_code: [200]
+  register: sdn_vnet_realized_content
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  until: >-
+    (sdn_vnet_realized_content.status | default(0)) == 200
+    and ('available' in (sdn_vnet_realized_content.json.data | default([])
+         | selectattr('vnet', 'equalto', sdn_vnet_realized_vnet)
+         | map(attribute='status') | list))
+  retries: "{{ sdn_vnet_realized_retries | int }}"
+  delay: "{{ sdn_vnet_realized_delay | int }}"
+  no_log: true
+- name: "SDN realized | Compute the realized status of the VNet on this node"
+  ansible.builtin.set_fact:
+    sdn_vnet_realized_statuses: >-
+      {{ (sdn_vnet_realized_content.json.data | default([])
+          | selectattr('vnet', 'equalto', sdn_vnet_realized_vnet)
+          | map(attribute='status') | list)
+         if (sdn_vnet_realized_content.status | default(0)) == 200 else [] }}
+    sdn_vnet_realized_http: "{{ sdn_vnet_realized_content.status | default('none') }}"
+  changed_when: false
+- name: "SDN realized | Fail closed unless the VNet is REALIZED on the node"
+  ansible.builtin.assert:
+    that:
+      - "'available' in sdn_vnet_realized_statuses"
+    fail_msg: >-
+      VNet '{{ sdn_vnet_realized_vnet }}' is in the SDN config but is NOT realized as a live
+      bridge on node '{{ sdn_vnet_realized_node }}' (zone '{{ sdn_vnet_realized_zone }}'; realized
+      status: {{ sdn_vnet_realized_statuses if sdn_vnet_realized_statuses
+      else 'absent from the node zone content (HTTP ' ~ sdn_vnet_realized_http ~ ')' }}).
+      A guest placed now would fail at container start with "bridge '{{ sdn_vnet_realized_vnet }}'
+      does not exist". REMEDY: re-run the SDN applier of the Terraform root that owns this VNet
+      (platform-foundation for p20, the project's own root otherwise) with
+      `terraform apply -replace=<that root's proxmox_sdn_applier resource>`, or use Datacenter >
+      SDN > Apply in the Proxmox UI, then re-run this installer. Nothing was provisioned.
+    success_msg: "VNet '{{ sdn_vnet_realized_vnet }}' is realized on node '{{ sdn_vnet_realized_node }}'."
+    quiet: true

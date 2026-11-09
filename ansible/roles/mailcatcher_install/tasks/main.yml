@@ -1,0 +1,120 @@
+---
+# tasks/main.yml — mailcatcher_install (shared dev mail catcher, Mailpit)
+#
+# DEV-ONLY PERMANENT MOCK STAND-IN for a real SMTP relay (mock-stand-ins.md,
+# Mock 7). It is never selected by default and is never turned on by merge.
+#
+# Order: (1) decide + assert UI access control (FAIL CLOSED, R9), (2) guest dirs,
+# (3) password file, (4) Compose stack, (5) delegated Traefik Route_Fragment.
+# Captured mail is NEVER relayed or forwarded outward (R13): no MP_SMTP_RELAY_* /
+# MP_SMTP_FORWARD_* option is ever set here.
+
+# --- 1. UI access control decision (never prints the password) ----------------
+- name: "Mailcatcher | Resolve the UI access-control mode (no_log)"
+  ansible.builtin.set_fact:
+    mailcatcher_has_ui_password: >-
+      {{ (lookup('ansible.builtin.env', 'MAILCATCHER_UI_PASSWORD', default='') | length) > 0 }}
+  no_log: true
+  changed_when: false
+
+- name: "Mailcatcher | INFO — UI access-control mode"
+  ansible.builtin.debug:
+    msg: >-
+      INFO mailcatcher UI access control:
+      {{ 'native basic auth (MP_UI_AUTH_FILE)' if (mailcatcher_has_ui_password | bool)
+         else ('NONE — mailcatcher_ui_auth_disabled=true (explicit dev acknowledgement)'
+               if (mailcatcher_ui_auth_disabled | bool) else 'UNSET (will fail closed)') }}
+  changed_when: false
+
+- name: "Mailcatcher | Fail closed unless the UI is access-controlled or explicitly acknowledged (R9)"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (mailcatcher_has_ui_password | bool) or (mailcatcher_ui_auth_disabled | bool)
+    fail_msg: >-
+      Refusing to expose the mail catcher UI: captured mail contains verification
+      codes and reset links. Provide ONE of: MAILCATCHER_UI_PASSWORD in the
+      environment (native basic auth — the bootstrap generates and persists it),
+      or the explicit dev acknowledgement -e mailcatcher_ui_auth_disabled=true.
+      (No proxy-side auth layer is offered: the shared traefik_route role cannot
+      attach a middleware yet, so it could not be enforced — see WS-C23.)
+    success_msg: "UI access control satisfied."
+    quiet: true
+
+# --- 2. Guest directories ------------------------------------------------------
+- name: "Mailcatcher | Ensure the data directory exists"
+  ansible.builtin.file:
+    path: "{{ mailcatcher_data_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+# --- 3. Password file (native basic auth) ---------------------------------------
+# SHA-512 crypt with a DETERMINISTIC salt (derived from non-secret names) so the
+# file is byte-stable across runs: no spurious change, no restart churn. The
+# cleartext never touches the guest or any log (no_log).
+- name: "Mailcatcher | Write the UI password file at 0600 (no_log)"
+  ansible.builtin.copy:
+    dest: "{{ mailcatcher_auth_file }}"
+    content: >-
+      {{ mailcatcher_ui_user }}:{{ lookup('ansible.builtin.env', 'MAILCATCHER_UI_PASSWORD')
+      | password_hash('sha512',
+                       (mailcatcher_ui_user ~ mailcatcher_stack_name) | hash('sha1') | truncate(16, true, '')) }}
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: mailcatcher_has_ui_password | bool
+  notify: Restart mailcatcher
+
+- name: "Mailcatcher | Remove a stale password file when native auth is not in use"
+  ansible.builtin.file:
+    path: "{{ mailcatcher_auth_file }}"
+    state: absent
+  when: not (mailcatcher_has_ui_password | bool)
+  notify: Restart mailcatcher
+
+# --- 4. Compose stack ------------------------------------------------------------
+# Both ports are published on the guest's OWN VLAN-20 IP only (R2): SMTP for
+# ZITADEL (another guest), the UI for Traefik only. The documented VLAN-bound
+# private port exception (not LAN ingress; Traefik stays the only ingress).
+- name: "Mailcatcher | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ mailcatcher_stack_name }}"
+    dca_services:
+      - name: mailpit
+        image: "{{ mailcatcher_image }}"
+        restart: "unless-stopped"
+        env_file: false
+        ports:
+          - "{{ mailcatcher_bind_ip }}:{{ mailcatcher_smtp_port }}:1025"
+          - "{{ mailcatcher_bind_ip }}:{{ mailcatcher_ui_port }}:8025"
+        volumes: >-
+          {{ [mailcatcher_auth_file ~ ':/data/authfile:ro']
+             if (mailcatcher_has_ui_password | bool) else [] }}
+        environment: >-
+          {{ {
+               'MP_MAX_MESSAGES': (mailcatcher_max_messages | string),
+               'MP_MAX_AGE': mailcatcher_max_age,
+               'MP_DISABLE_VERSION_CHECK': 'true',
+               'MP_LABEL': 'dev-mail-catcher'
+             } | combine({'MP_UI_AUTH_FILE': '/data/authfile'} if (mailcatcher_has_ui_password | bool) else {}) }}
+
+# --- 5. Delegated Route_Fragment for the web UI (P1, ADR-0018) ------------------
+- name: "Mailcatcher | Render + delegate the web-UI Route_Fragment onto the Traefik guest"
+  ansible.builtin.include_role:
+    name: traefik_route
+  vars:
+    traefik_route_enabled: "{{ mailcatcher_traefik_route_enabled | bool }}"
+    route_name: "mailcatcher"
+    route_host_rule: "{{ mailcatcher_ui_host }}"
+    route_backend_url: "http://{{ mailcatcher_bind_ip }}:{{ mailcatcher_ui_port }}"
+    route_entrypoint: "websecure"
+    route_tls: true
+    traefik_guest_host: "{{ mailcatcher_traefik_guest_host }}"
+    traefik_guest_user: "{{ mailcatcher_traefik_guest_user }}"
+    traefik_guest_python: "{{ mailcatcher_traefik_guest_python }}"
+    traefik_dynamic_config_dir: "{{ mailcatcher_traefik_dynamic_config_dir }}"

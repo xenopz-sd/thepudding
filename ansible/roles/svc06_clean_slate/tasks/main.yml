@@ -21,6 +21,9 @@
       - "{{ cluster_env_file }}"
       - --allowlist
       - "{{ svc06_throwaway_allowlist }}"
+      # WS-C11: pre-check the services this orchestrator COMPOSES against a narrow
+      # AGENT_LIVE_AUTHORIZED_SERVICES scope up front (a child would otherwise REFUSE mid-run).
+      - "--also-service={{ svc06_guard_composed_services | join(',') }}"
   args:
     chdir: "{{ svc06_repo_root }}"
   register: svc06_throwaway_decision

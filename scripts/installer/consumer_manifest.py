@@ -253,6 +253,11 @@ def _validate_sso(block: object) -> None:
         _require_enum(
             entry.get("auth_method"), AUTH_METHODS, f"{base}.auth_method"
         )
+        # OPTIONAL devMode toggle (v0.14.0 feedback #3), reconciled on re-run.
+        if "dev_mode" in entry and not isinstance(entry["dev_mode"], bool):
+            raise ManifestValidationError(
+                f"field '{base}.dev_mode' must be a bool, got {entry['dev_mode']!r}"
+            )
 
     # --- OPTIONAL project role vocabulary + assertion toggle (§4) ------------
     # Validated AFTER app_registrations, in fixed order (roles -> assertion), so
@@ -260,6 +265,10 @@ def _validate_sso(block: object) -> None:
     # compatible: an `sso` block omitting them validates identically.
     if "roles" in block:
         _validate_sso_roles(block["roles"])
+    if "login_policy" in block:
+        _validate_sso_login_policy(block["login_policy"])
+    if "default_role" in block:
+        _validate_sso_default_role(block["default_role"], block.get("roles"))
     if "project_role_assertion" in block and not isinstance(
         block["project_role_assertion"], bool
     ):
@@ -269,6 +278,43 @@ def _validate_sso(block: object) -> None:
         )
 
 
+def _validate_sso_login_policy(policy: object) -> None:
+    """Validate the optional ``sso.login_policy`` block (dev-mail-catcher R7).
+
+    A mapping whose only recognised key is ``allow_register`` (bool); omitting the block or
+    the key leaves the org login policy untouched (backward compatible)."""
+    if not isinstance(policy, dict):
+        raise ManifestValidationError(f"field 'sso.login_policy' must be a mapping, got {policy!r}")
+    unknown = sorted(set(policy) - {"allow_register"})
+    if unknown:
+        raise ManifestValidationError(f"field 'sso.login_policy' has unknown key(s) {unknown}")
+    if "allow_register" in policy and not isinstance(policy["allow_register"], bool):
+        raise ManifestValidationError(
+            f"field 'sso.login_policy.allow_register' must be a bool, got {policy['allow_register']!r}"
+        )
+
+
+#: ZITADEL's auto-created project roles, which onboarding keeps when ``sso.roles`` is omitted.
+_SSO_DEFAULT_ROLE_VOCABULARY = ("admin", "member", "viewer")
+def _validate_sso_default_role(value: object, roles: object) -> None:
+    """Validate the optional ``sso.default_role`` (WS-C18).
+    A role key granted to every user created in the project org (self-registration), or ``false``
+    to remove the platform-owned grant action. Omitting it leaves ZITADEL untouched. The key must
+    be one of the project's roles: ``sso.roles`` when declared, else ZITADEL's default vocabulary."""
+    if value is False:
+        return
+    if not isinstance(value, str) or not value or not SSO_ROLE_KEY_RE.match(value):
+        raise ManifestValidationError(
+            f"field 'sso.default_role' must be a role-key string or false, got {value!r}"
+        )
+    if isinstance(roles, list) and roles:
+        vocabulary = [r if isinstance(r, str) else (r.get("key") if isinstance(r, dict) else None) for r in roles]
+    else:
+        vocabulary = list(_SSO_DEFAULT_ROLE_VOCABULARY)
+    if value not in vocabulary:
+        raise ManifestValidationError(
+            f"field 'sso.default_role' {value!r} is not among the project's roles {sorted(map(str, vocabulary))}"
+        )
 def _validate_sso_roles(roles: object) -> None:
     """Validate the optional ``sso.roles`` project-role vocabulary (§4).
 

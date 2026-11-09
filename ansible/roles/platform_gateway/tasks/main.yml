@@ -69,10 +69,12 @@
 # argv lines stay within the 120-col limit and the encoding happens once.
 - name: "Gateway | Encode the served-VLAN sets for the gateway child run"
   ansible.builtin.set_fact:
+    # Compact JSON on purpose: these are rendered into `key=value` --extra-vars tokens, which Ansible splits on
+    # whitespace; "[100, 101]" would be truncated to "[100,". (WS-C12 live finding.)
     platform_gateway_active_json: >-
-      {{ platform_gateway_vlan_sets.active_vlan_ids | default([]) | to_json }}
+      {{ platform_gateway_vlan_sets.active_vlan_ids | default([]) | to_json(separators=(',', ':')) }}
     platform_gateway_decomm_json: >-
-      {{ platform_gateway_vlan_sets.decommissioned_vlan_ids | default([]) | to_json }}
+      {{ platform_gateway_vlan_sets.decommissioned_vlan_ids | default([]) | to_json(separators=(',', ':')) }}
 
 # INFO decision log for the served-VLAN set (Req 3.4): the always-served shared
 # VLAN 20 plus the registry-active project VLANs. The bring-up forwards the
@@ -126,7 +128,20 @@
       # path (opt-in == active), so it never spuriously fails the bring-up.
       - --extra-vars
       - "sdn_gateway_served_project_vlan_ids={{ platform_gateway_active_json }}"
+      # WS-C26: the line above serves EVERY registry-active project VLAN as a default, not a per-VLAN
+      # request, so a project VLAN whose network slice is not applied yet is skipped with a loud
+      # warning instead of failing the bring-up after VLAN 20 is already configured.
+      - --extra-vars
+      - "sdn_gateway_skip_unrealized_project_vlans=true"
   args:
     chdir: "{{ platform_repo_root }}"
   register: platform_gateway_run
   changed_when: "'changed=0' not in (platform_gateway_run.stdout | default(''))"
+
+# WS-C26: the child run's stdout is captured (shown only on failure), so its WARNING that project
+# VLANs were skipped because their network slice is not applied would be invisible on a successful
+# bring-up. Surface just that warning here so a skipped VLAN is never silent to the operator.
+- name: "Gateway | Surface the skipped-VLAN warning from the child run"
+  ansible.builtin.debug:
+    msg: "{{ platform_gateway_run.stdout | regex_search('WARNING: served project VLAN[^\"]*') }}"
+  when: "'WARNING: served project VLAN' in (platform_gateway_run.stdout | default(''))"

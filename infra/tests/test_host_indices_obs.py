@@ -94,7 +94,7 @@ def _obs_rows(ledger: dict) -> dict[tuple[str, str], dict]:
     return {
         (entry["svc_code"], entry["component"]): entry
         for entry in ledger[20]
-        if entry["svc_code"] in ("svc17", "svc18")
+        if entry.get("svc_code") in ("svc17", "svc18")  # role_code rows have no svc_code (ADR-0021)
     }
 
 

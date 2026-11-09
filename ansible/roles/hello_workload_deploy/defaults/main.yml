@@ -132,3 +132,21 @@ hello_workload_secret_id_dest_path: "/etc/openbao-workload/{{ project_slug }}/{{
 # `-e openbao_dev_expose_secrets=true` — never committed, never in CI/acc/prod.
 openbao_dev_expose_secrets: false
 openbao_no_log: "{{ not (openbao_dev_expose_secrets | bool) }}"
+# =============================================================================
+# DEV TLS posture for the Agent -> OpenBao Primary hop (WS-C6, part B)
+# =============================================================================
+# platform-runtime-patterns P4: production VERIFIES the Primary cert; a development
+# cluster serving the self-signed mock cert needs a conscious, default-OFF opt-in.
+# That opt-in is recorded ONCE per environment as OPENBAO_TLS_SELF_SIGNED=true in the
+# dev cluster env file (the single source of truth), instead of re-passing a flag on
+# every run. Resolution order: an explicit `-e openbao_tls_self_signed=` wins, else
+# the env-file key, else FALSE (verify). A prod env file simply omits the key.
+# The env file is the one the playbook already names (`cluster_env_file`).
+hello_workload_cluster_env_path: >-
+  {{ cluster_env_file
+     if (cluster_env_file | default('cluster.env')).startswith('/')
+     else (playbook_dir | dirname | dirname) ~ '/' ~ (cluster_env_file | default('cluster.env')) }}
+# Matches an explicit dev opt-in line (true/1/yes); false, unset and commented
+# lines do not match. Only a literal \n inside a class (Jinja/YAML escape-safe).
+hello_workload_tls_optin_regex: >-
+  (?im)^[ ]*(export[ ]+)?OPENBAO_TLS_SELF_SIGNED[ ]*=[^a-z0-9#\n]*(true|1|yes)[^a-z0-9#\n]*(#.*)?$

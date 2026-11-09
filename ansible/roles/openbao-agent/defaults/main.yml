@@ -52,6 +52,10 @@ openbao_primary_addr: "https://10.0.20.10:8200"
 # roles (all derive from openbao_tls_self_signed); with a real SVC-08/EJBCA cert
 # chaining to a trusted CA this is false and the Agent verifies normally.
 openbao_primary_tls_skip_verify: "{{ openbao_tls_self_signed | default(false) | bool }}"
+# Fail-closed Primary-TLS-trust preflight (WS-C6): with skip-verify OFF, probe the
+# Primary with verification ON and stop with the remedy on an untrusted cert,
+# instead of letting the Agent crash-loop. Reports only; never weakens verification.
+openbao_agent_tls_preflight: true
 
 # =============================================================================
 # The `bao agent` sidecar image

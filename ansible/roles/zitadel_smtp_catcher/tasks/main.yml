@@ -1,0 +1,157 @@
+---
+# tasks/main.yml — zitadel_smtp_catcher (Mock 7, default OFF)
+#
+# DEV-ONLY PERMANENT MOCK STAND-IN for a real SMTP relay (mock-stand-ins.md).
+# Swap-gate (composition-wiring.md): flag OFF => nothing below the INFO line runs and
+# ZITADEL's SMTP is untouched. Flag ON => the catcher MUST exist or we FAIL CLOSED
+# (never silently leave SMTP unconfigured, never point at a dead host, R5).
+
+- name: "ZITADEL-SMTP | INFO — swap-gate decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO zitadel_smtp_dev_catcher={{ zitadel_smtp_dev_catcher }} remove={{ zitadel_smtp_remove }}:
+      {{ 'ZITADEL instance email provider will be pointed at the dev mail catcher '
+         ~ zitadel_smtp_catcher_host ~ ':' ~ (zitadel_smtp_catcher_port | string) ~ ' (dev-only mock)'
+         if (zitadel_smtp_dev_catcher | bool) and not (zitadel_smtp_remove | bool)
+         else ('the catcher provider will be REMOVED if present' if (zitadel_smtp_remove | bool)
+               else 'flag OFF: ZITADEL SMTP configuration left UNTOUCHED') }}
+  changed_when: false
+
+- name: "ZITADEL-SMTP | Configure or remove the catcher provider (only when opted in)"
+  when: (zitadel_smtp_dev_catcher | bool) or (zitadel_smtp_remove | bool)
+  block:
+    # --- Fail closed: the catcher must be provisioned and answering (P3: polled signal). ---
+    - name: "ZITADEL-SMTP | Is the catcher's generated inventory present?"
+      ansible.builtin.stat:
+        path: "{{ zitadel_smtp_repo_root }}/{{ zitadel_smtp_catcher_inventory }}"
+      register: zitadel_smtp_inventory_stat
+      when: not (zitadel_smtp_remove | bool)
+
+    - name: "ZITADEL-SMTP | Fail closed unless the catcher is provisioned"
+      ansible.builtin.assert:
+        that:
+          - zitadel_smtp_inventory_stat.stat.exists | default(false)
+        fail_msg: >-
+          The dev mail catcher is not provisioned ({{ zitadel_smtp_catcher_inventory }} is absent).
+          Refusing to point ZITADEL at a dead SMTP host. Provision it first:
+          ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml
+          ansible/playbooks/mailcatcher-bootstrap.yml -e cluster_env_file=<env-file>
+        quiet: true
+      when: not (zitadel_smtp_remove | bool)
+
+    - name: "ZITADEL-SMTP | Poll the catcher SMTP banner (real signal, not a sleep)"
+      ansible.builtin.wait_for:
+        host: "{{ zitadel_smtp_catcher_host }}"
+        port: "{{ zitadel_smtp_catcher_port | int }}"
+        search_regex: "^220"
+        timeout: "{{ zitadel_smtp_catcher_probe_timeout | int }}"
+      delegate_to: localhost
+      changed_when: false
+      when: not (zitadel_smtp_remove | bool)
+
+    # --- Token: env override else OpenBao (same sources as zitadel-org-provision). ---
+    - name: "ZITADEL-SMTP | Bind the token env override and OpenBao admin token (no_log)"
+      ansible.builtin.set_fact:
+        zitadel_smtp_env_token: "{{ lookup('ansible.builtin.env', 'ZITADEL_PROVISION_TOKEN') | default('', true) }}"
+        zitadel_smtp_bao_token: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+      no_log: true
+      changed_when: false
+
+    - name: "ZITADEL-SMTP | Read provision_token from OpenBao when the env override is empty (no_log)"
+      ansible.builtin.command:
+        argv: >-
+          {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zitadel_smtp_openbao_bao_addr,
+              '-e', 'BAO_TOKEN=' ~ zitadel_smtp_bao_token, zitadel_smtp_openbao_container,
+              zitadel_smtp_openbao_bao_bin, 'kv', 'get']
+             + (['-tls-skip-verify'] if (zitadel_smtp_openbao_tls_skip_verify | bool) else [])
+             + ['-field=' ~ zitadel_smtp_openbao_provision_token_field,
+                zitadel_smtp_openbao_provision_secret_path] }}
+      delegate_to: "{{ zitadel_smtp_openbao_cli_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ zitadel_smtp_openbao_cli_user }}"
+        ansible_python_interpreter: "{{ zitadel_smtp_openbao_cli_python }}"
+      register: zitadel_smtp_bao_token_read
+      failed_when: false
+      changed_when: false
+      no_log: true
+      when: (zitadel_smtp_env_token | trim | length) == 0
+
+    - name: "ZITADEL-SMTP | Resolve the access token (no_log)"
+      ansible.builtin.set_fact:
+        zitadel_smtp_token: >-
+          {{ zitadel_smtp_env_token if ((zitadel_smtp_env_token | trim | length) > 0)
+             else (zitadel_smtp_bao_token_read.stdout | default('') | trim) }}
+      no_log: true
+      changed_when: false
+
+    - name: "ZITADEL-SMTP | Assert a token resolved (names both sources, shows no value)"
+      ansible.builtin.assert:
+        that:
+          - zitadel_smtp_token | length > 0
+        fail_msg: >-
+          No ZITADEL access token could be resolved. Checked the ZITADEL_PROVISION_TOKEN
+          environment variable (empty) and OpenBao field
+          {{ zitadel_smtp_openbao_provision_token_field }} at
+          {{ zitadel_smtp_openbao_provision_secret_path }} (needs OPENBAO_ADMIN_TOKEN).
+        quiet: true
+      no_log: true
+
+    # --- Reconcile (idempotent; the helper refuses to clobber a real provider). ---
+    - name: "ZITADEL-SMTP | Run the helper (token in ENV only, no_log)"
+      ansible.builtin.command:
+        argv: >-
+          {{ [zitadel_smtp_venv_python, zitadel_smtp_helper,
+              '--base-url', zitadel_smtp_base_url,
+              '--smtp-host', zitadel_smtp_catcher_host,
+              '--smtp-port', (zitadel_smtp_catcher_port | string),
+              '--sender-address', zitadel_smtp_sender_address,
+              '--sender-name', zitadel_smtp_sender_name]
+             + (['--remove'] if (zitadel_smtp_remove | bool) else [])
+             + (['--replace-existing'] if (zitadel_smtp_replace_existing | bool) else [])
+             + (['--insecure'] if (zitadel_smtp_base_url_tls_skip_verify | bool) else []) }}
+      args:
+        chdir: "{{ zitadel_smtp_repo_root }}"
+      environment:
+        ZITADEL_PROVISION_TOKEN: "{{ zitadel_smtp_token }}"
+      register: zitadel_smtp_run
+      # The helper prints its JSON result on stdout ONLY on success; a refusal/error prints
+      # to stderr with an empty stdout. Guard the parse so a failure is never replaced by a
+      # templating error, and raise the failure from the readable task below instead.
+      changed_when: >-
+        zitadel_smtp_run.rc | default(1) == 0
+        and ((zitadel_smtp_run.stdout | default('{}', true) | from_json).changed | default(false) | bool)
+      failed_when: false
+      no_log: true
+
+    # The run task above is no_log (its environment carries the token), which would also
+    # censor the helper's refusal text. The helper never prints the token, so surface ONLY
+    # its stderr here (exit 4 = refused to replace a real provider, 3 = ZITADEL API error,
+    # 2 = bad arguments/token) and fail closed.
+    - name: "ZITADEL-SMTP | Surface the helper's failure (stderr only, never the token)"
+      ansible.builtin.fail:
+        msg: >-
+          zitadel_smtp helper exited {{ zitadel_smtp_run.rc }}
+          ({{ {2: 'bad arguments or no token', 3: 'ZITADEL API error', 4: 'REFUSED: a real email provider is active'}
+              .get(zitadel_smtp_run.rc, 'unexpected failure') }}).
+          {{ (zitadel_smtp_run.stderr | default('', true) | trim) }}
+          ZITADEL's email configuration was not changed by this run.
+      when: zitadel_smtp_run.rc | default(1) != 0
+
+    - name: "ZITADEL-SMTP | INFO — outcome"
+      ansible.builtin.debug:
+        msg: >-
+          INFO ZITADEL instance email provider: action={{ (zitadel_smtp_run.stdout | from_json).action }}
+          (catcher {{ zitadel_smtp_catcher_host }}:{{ zitadel_smtp_catcher_port }}).
+          {{ 'Read verification codes in the catcher web UI.'
+             if ((zitadel_smtp_run.stdout | from_json).action in ['added', 'updated', 'unchanged'])
+             else 'The catcher is no longer the ZITADEL email provider.' }}
+      changed_when: false
+
+    - name: "ZITADEL-SMTP | Scrub the token facts from memory (no_log)"
+      ansible.builtin.set_fact:
+        zitadel_smtp_token: ""
+        zitadel_smtp_env_token: ""
+        zitadel_smtp_bao_token: ""
+      no_log: true
+      changed_when: false

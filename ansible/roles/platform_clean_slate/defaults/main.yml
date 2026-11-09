@@ -59,6 +59,11 @@
 # §5 boundary intact — the platform still NEVER `state rm`s a service's state;
 # it only refines what "the service's real resources are gone" means to match
 # the child's actual destroy contract.
+# `extra_vars` (WS-C2): an optional per-row map of additional `-e key=value`
+# arguments the child clean-slate needs BEYOND the host address. The child-run
+# threads these after the base args + the proxmox_host_var. Most rows need none
+# (`{}`); SVC-06's child (`svc-06-bootstrap.yml`) requires `svc06_zitadel_vmid`
+# (its play default is 0 = "REQUIRED via -e"), so the svc06 row supplies it here.
 platform_clean_slate_services:
   - service: svc07
     bootstrap_playbook: ansible/playbooks/svc-07-bootstrap.yml
@@ -66,12 +71,76 @@ platform_clean_slate_services:
     verify_vmids: [1070, 1071]
     verify_tf_root: infra/projects/svc-07-secrets-manager
     proxmox_host_var: svc07_proxmox_host
+    extra_vars: {}
     # Inert proxmox-compute anchors (one per module instance: module.primary /
     # module.unsealer) with no real Proxmox object — tolerated, not survivors.
     # The real destroyable resources are the two
     # `proxmox_virtual_environment_container.*` addresses under those module
     # paths, which the child clean-slate removes.
     state_ignore_patterns:
+      - terraform_data.input_guards
+  # --- SVC-09 (Traefik) — WS-C2. Single Traefik LXC; its own svc09_clean_slate
+  # tears it down + residue-sweeps the SVC-09 state. svc09_traefik_vmid defaults
+  # to 1090 at play level, so no extra_vars are needed. Inert anchors: the root
+  # ledger-drift guard + the proxmox-compute module anchor.
+  - service: svc09
+    bootstrap_playbook: ansible/playbooks/svc-09-bootstrap.yml
+    generated_inventory: ansible/inventory/svc-09-reverse-proxy.generated.yml
+    verify_vmids: [1090]
+    verify_tf_root: infra/projects/svc-09-reverse-proxy
+    proxmox_host_var: svc09_proxmox_host
+    extra_vars: {}
+    state_ignore_patterns:
+      - terraform_data.ledger_index_assert
+      - terraform_data.input_guards
+  # --- SVC-06 (ZITADEL) — WS-C2. svc06_clean_slate tears down BOTH the ZITADEL
+  # guest (1103) AND the backing SVC-01 DB (1102, via a composed svc-01-bootstrap
+  # clean-slate), so verify_vmids covers both. The child requires
+  # svc06_zitadel_vmid (play default 0), supplied via extra_vars. Inert anchor:
+  # the proxmox-compute module anchor on the ZITADEL guest.
+  - service: svc06
+    bootstrap_playbook: ansible/playbooks/svc-06-bootstrap.yml
+    generated_inventory: ansible/inventory/svc-06-identity-provider.generated.yml
+    verify_vmids: [1103, 1102]
+    verify_tf_root: infra/projects/svc-06-identity-provider
+    proxmox_host_var: svc06_proxmox_host
+    extra_vars:
+      svc06_zitadel_vmid: 1103
+    state_ignore_patterns:
+      - terraform_data.input_guards
+  # --- SVC-17/18 (observability) — WS-M2. The teardown-parity guard
+  # (tests/installer/test_teardown_parity.py) caught that this shared+implemented
+  # service shipped a full obs_clean_slate contract but was never catalogued
+  # (missed even by WS-C2). obs_clean_slate tears down THREE guests
+  # (Prometheus 1170 / Grafana 1171 / Loki 1180) from ONE shared TF root; their
+  # VMIDs default at play level (svc-17-18-bootstrap.yml), so no extra_vars. Inert
+  # anchors: the root ledger-drift guard + one proxmox-compute module anchor per
+  # guest. `service: svc17` is a label only (the catalog keys functionally on
+  # bootstrap_playbook).
+  - service: svc17
+    bootstrap_playbook: ansible/playbooks/svc-17-18-bootstrap.yml
+    generated_inventory: ansible/inventory/svc-17-18-observability.generated.yml
+    verify_vmids: [1170, 1171, 1180]
+    verify_tf_root: infra/projects/svc-17-18-observability
+    proxmox_host_var: obs_proxmox_host
+    extra_vars: {}
+    state_ignore_patterns:
+      - terraform_data.ledger_index_assert
+      - terraform_data.input_guards
+  # --- Shared dev mail catcher (Mailpit) — spec dev-mail-catcher, ADR-0025. A
+  # shared VLAN-20 dev-only mock service: mailcatcher_clean_slate tears down the
+  # single guest (VMID 20011 = 20 * 1000 + host_index 11, ADR-0022) and the
+  # Traefik-side Route_Fragment, and residue-sweeps its state. Inert anchors: the
+  # root ledger-drift guard + the proxmox-compute module anchor.
+  - service: mailcatcher
+    bootstrap_playbook: ansible/playbooks/mailcatcher-bootstrap.yml
+    generated_inventory: ansible/inventory/mailcatcher.generated.yml
+    verify_vmids: [20011]
+    verify_tf_root: infra/projects/mailcatcher
+    proxmox_host_var: mailcatcher_proxmox_host
+    extra_vars: {}
+    state_ignore_patterns:
+      - terraform_data.ledger_index_assert
       - terraform_data.input_guards
 
 # --- Fabric_Teardown target (design "Data Models", step (e)) ----------------- #
@@ -164,3 +233,24 @@ platform_clean_slate_admin_source_cidr: >-
   {{ platform_admin_source_cidr
      | default(lookup('ansible.builtin.env', 'ADMIN_SOURCE_CIDR', default=''))
      | default('127.0.0.1/32', true) }}
+# WS-C11: composed children NOT listed in the catalog above (svc06 composes the SVC-01 backing-DB clean-slate).
+platform_guard_extra_composed_services: [svc01]
+# --- Zone occupants (WS-C12) ---------------------------------------------------------------------------
+# The SDN zone the foundation root creates, and the registry used to name an occupant VNet's owning project.
+platform_clean_slate_sdn_zone_id: vlanzone
+platform_clean_slate_registry_path: infra/platform-foundation/projects.yaml
+# FAIL-CLOSED default: VNets in the zone that the foundation state does not own HALT the teardown. Set true
+# (-e platform_clean_slate_remove_zone_occupants=true) to remove them through the Proxmox SDN API, only for VNets
+# with no guest attached.
+platform_clean_slate_remove_zone_occupants: false
+platform_clean_slate_validate_certs: false
+platform_clean_slate_zone_poll_retries: 6
+platform_clean_slate_zone_poll_delay: 5
+
+# WS-C25: before escalating to a host reboot, apply the (now empty) cluster SDN config
+# on the host (`pvesh set /cluster/sdn`) and re-probe. Far less disruptive than a reboot;
+# it applies the WHOLE cluster SDN config, so set false to skip it on a host with other
+# pending SDN changes. The reboot (platform_clean_slate_reboot, default OFF) stays the fallback.
+platform_clean_slate_sdn_apply: true
+platform_clean_slate_sdn_apply_poll_retries: 6
+platform_clean_slate_sdn_apply_poll_delay: 5

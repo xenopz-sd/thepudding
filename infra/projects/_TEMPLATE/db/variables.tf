@@ -1,0 +1,105 @@
+# infra/projects/<slug>/db/variables.tf  —  SVC01_Consumer_Root inputs.
+#
+# The ONLY project-identifying input is project_slug. CRUCIALLY, this root does
+# NOT accept vlan_id or host_index as free operator inputs — vlan_id is RESOLVED
+# from the registry (main.tf, Req 2.3) and host_index is READ from the
+# Host_Index_Authority ledger (main.tf, Req 3.8). Everything else is per-cluster
+# plumbing (node, template, vmid, storage) threaded into the reused SVC-01
+# module, mirroring the SVC-01 root's own input surface.
+
+variable "project_slug" {
+  description = <<-EOT
+    The Consumer_Project's slug. Must exactly match a `slug` entry already
+    recorded in infra/platform-foundation/projects.yaml, assigned once by the
+    onboarding script + CI MR flow (NET-00 §7). Lowercase, hyphenated, <=20
+    chars (PF §4). This root reads the project's vlan_id from the registry and
+    its DB host_index from host-indices.yaml using this slug; if either is
+    absent the plan fails (Req 2.2, 3.7) rather than provisioning with a guessed
+    VLAN or a colliding default index.
+
+    Defaulted to the placeholder slug `example-project` so this template `db/` root
+    is self-contained; the real per-project copy sets its slug here (the installer
+    also passes `-var project_slug=<slug>` explicitly).
+  EOT
+  type        = string
+  default     = "example-project"
+
+  validation {
+    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$", var.project_slug))
+    error_message = "project_slug must be lowercase alphanumeric with internal hyphens and at most 20 characters (PF §4)."
+  }
+}
+
+variable "db_engine" {
+  description = "Relational engine threaded into the SVC-01 module: `postgres` (default) or `mariadb` (strict-EU, domain-rules §4). Drives the tag (proj-<slug>-postgres|-mariadb) and the wire port (5432|3306)."
+  type        = string
+  default     = "postgres"
+
+  validation {
+    condition     = contains(["postgres", "mariadb"], var.db_engine)
+    error_message = "db_engine must be 'postgres' (default) or 'mariadb'."
+  }
+}
+
+variable "tier" {
+  description = "Sizing tier threaded into the SVC-01 module: `small` (1 vCPU/2 GB/20 GB) or `medium` (4/8192/100)."
+  type        = string
+  default     = "small"
+
+  validation {
+    condition     = contains(["small", "medium"], var.tier)
+    error_message = "tier must be 'small' or 'medium'."
+  }
+}
+
+variable "proxmox_node_name" {
+  description = "Proxmox VE node the DB LXC is created on. Supplied per-cluster at apply time."
+  type        = string
+}
+
+variable "svc01_vmid" {
+  description = <<-EOT
+    OPERATOR OVERRIDE for the DB LXC's Proxmox VMID, threaded into the reused
+    SVC-01 module (ADR-0022 grandfather posture). Non-zero wins verbatim
+    (grandfathers an already-provisioned consumer DB — e.g. dronefleet's live
+    1101 — so the stateful prevent_destroy guest is never force-replaced); 0 (the
+    "use computed" sentinel default) lets the module compute the deterministic
+    VMID (vlan_id * 1000 + host_index). The consumer orchestrator passes the live
+    value via -e consumer_svc01_vmid, so a standing DB is untouched.
+  EOT
+  type        = number
+  default     = 0
+}
+
+variable "svc01_template_file_id" {
+  description = "Proxmox volume ID of the STOCK LXC template (Docker + Compose installed per host by the `common` role, ADR-0003). Form `<datastore>:vztmpl/<file>`."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[^:]+:vztmpl/.+", var.svc01_template_file_id))
+    error_message = "svc01_template_file_id must be '<datastore>:vztmpl/<file_name>'."
+  }
+}
+
+variable "svc01_template_os_type" {
+  description = "operating_system.type for the template — `debian` (default) or `ubuntu`."
+  type        = string
+  default     = "debian"
+
+  validation {
+    condition     = contains(["debian", "ubuntu"], var.svc01_template_os_type)
+    error_message = "svc01_template_os_type must be 'debian' or 'ubuntu'."
+  }
+}
+
+variable "svc01_datastore_id" {
+  description = "Proxmox storage pool for the LXC rootfs + DB data (default local-zfs per PF §6/§7)."
+  type        = string
+  default     = "local-zfs"
+}
+
+variable "operator_ssh_public_keys" {
+  description = "Operator SSH PUBLIC key(s) injected into the DB LXC root account so Ansible can reach it. PUBLIC keys only; sourced from TF_VAR_operator_ssh_public_keys / gitignored .env, never committed. Default [] = SSH-unreachable until supplied."
+  type        = list(string)
+  default     = []
+}

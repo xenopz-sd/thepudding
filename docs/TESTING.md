@@ -695,8 +695,13 @@ Two known teardown gotchas:
 - If a root was left after an offline `terraform init -backend=false`, a live state
   op will refuse until you re-initialise the real backend with
   `terraform init -reconfigure`.
-- The SDN zone/bridge can survive `terraform destroy` until the host re-reads
-  `interfaces.d` — an `ifreload -a` or a host reboot clears it (ADR-0011). The
+- The SDN zone/bridge can survive `terraform destroy` until the host re-reads its
+  SDN config. The platform clean-slate now applies the (empty) cluster SDN config
+  itself (`pvesh set /cluster/sdn`, WS-C25) and re-checks; only if the bridge still
+  survives does it halt and offer the host reboot (`-e platform_clean_slate_reboot=true`,
+  default OFF, ADR-0011). Set `-e platform_clean_slate_sdn_apply=false` to skip the
+  automatic apply on a host with other pending SDN changes (it applies the whole
+  cluster SDN config). The
   gateway-side teardown and its reboot-persistence behaviour are covered in
   [Gateway operator walkthrough → decommission-teardown](#gateway-operator-walkthrough--configure--reach--decommission-teardown--reboot-persistence).
 
@@ -1002,6 +1007,12 @@ it in an environment without the `shrimp` node and its credentials. The
 `requires-infra` doctest tier is deselected by default and **skips cleanly when the
 infra/creds are absent** (the same clean-skip contract as the rest of this file's
 live tier); the offline preflight below is the only part that runs everywhere.
+
+> **Project VLANs whose network slice is not applied yet (WS-C26).** `platform-bootstrap.yml` serves every
+> registry-active project VLAN by default. For a VLAN whose bridge `p<vlan>` does not exist yet it now **skips it with a
+> warning** (printed in the run output, naming the VLAN and the remedy: apply the project's network-slice root, then re-run)
+> and still configures the shared VLAN 20. Running `sdn-gateway.yml` yourself for a project VLAN keeps the strict behavior:
+> it **fails closed** and writes nothing for that VLAN. Set `sdn_gateway_skip_unrealized_project_vlans=true|false` to choose.
 
 > **Off-VLAN control host assumed.** This whole walkthrough is for the case ADR-0004
 > calls Option B — an off-VLAN control host (a developer workstation). If you run

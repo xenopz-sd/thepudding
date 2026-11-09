@@ -1,0 +1,101 @@
+---
+# mailcatcher-health.yml — mail catcher installer Phase-4 health gate (CHILD configurator play)
+#
+# The child play the mailcatcher_handoff role invokes via
+# `ansible-playbook -i {{ mailcatcher_generated_inventory }} mailcatcher-health.yml`
+# (integration-boundaries.md §4). Runs `hosts: mailcatcher` NATIVELY on the catcher
+# LXC (no delegate_to). The generated inventory entry carries ansible_host
+# 10.0.20.21 (cidrhost("10.0.20.0/24", 10 + 11), ledger index 11).
+#
+# Three-stage recreate-robust gate:
+#   Stage 1 — `docker inspect`: the Mailpit container exists and is RUNNING.
+#   Stage 2 — SMTP: the VLAN-20-bound SMTP port answers with a 220 banner.
+#   Stage 3 — UI: with auth expected, an UNAUTHENTICATED request is refused (401)
+#             — this live-verifies the fail-closed access control (R9) — and an
+#             AUTHENTICATED request succeeds (200); with auth not expected the
+#             plain request returns 200.
+#
+# Each `until` is EMPTY-SAFE. The UI password is read from the ENVIRONMENT
+# (MAILCATCHER_UI_PASSWORD) and used only inside no_log tasks.
+- name: Mail catcher health gate
+  hosts: mailcatcher
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: "Health | Stage 1 — wait for the Mailpit container to exist and be running"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ mailcatcher_container_name }}"
+      register: mailcatcher_container_running
+      failed_when: false
+      changed_when: false
+      until: >-
+        (mailcatcher_container_running.rc | default(1)) == 0
+        and (mailcatcher_container_running.stdout | default('') | trim | length > 0)
+        and ((mailcatcher_container_running.stdout | trim)[0] == '[')
+        and ((mailcatcher_container_running.stdout | from_json)[0].State.Running | default(false) | bool)
+      retries: "{{ mailcatcher_health_retries | default(24) | int }}"
+      delay: "{{ mailcatcher_health_delay | default(5) | int }}"
+
+    - name: "Health | Assert Stage 1 — the Mailpit container became running within the deadline"
+      ansible.builtin.assert:
+        that: >-
+          (mailcatcher_container_running.rc | default(1)) == 0
+          and (mailcatcher_container_running.stdout | default('') | trim | length > 0)
+          and ((mailcatcher_container_running.stdout | trim)[0] == '[')
+          and ((mailcatcher_container_running.stdout | from_json)[0].State.Running | default(false) | bool)
+        fail_msg: >-
+          The Mailpit container ({{ mailcatcher_container_name }}) never became running
+          within {{ (mailcatcher_health_retries | default(24) | int) * (mailcatcher_health_delay | default(5) | int) }}
+          seconds. Inspect `docker logs {{ mailcatcher_container_name }}` on the guest.
+        success_msg: "Mailpit container is running (Stage 1 gate passed)."
+
+    - name: "Health | Stage 2 — wait for the SMTP banner on the VLAN-20-bound port"
+      ansible.builtin.wait_for:
+        host: "{{ mailcatcher_bind_ip }}"
+        port: "{{ mailcatcher_smtp_port | int }}"
+        search_regex: "^220"
+        timeout: >-
+          {{ (mailcatcher_health_retries | default(24) | int) * (mailcatcher_health_delay | default(5) | int) }}
+      changed_when: false
+
+    - name: "Health | Stage 3a — the UI answers an unauthenticated request"
+      ansible.builtin.uri:
+        url: "http://{{ mailcatcher_bind_ip }}:{{ mailcatcher_ui_port }}/"
+        method: GET
+        follow_redirects: none
+        status_code: [200, 401]
+      register: mailcatcher_ui_anon
+      failed_when: false
+      changed_when: false
+      until: (mailcatcher_ui_anon.status | default(0)) in [200, 401]
+      retries: "{{ mailcatcher_health_retries | default(24) | int }}"
+      delay: "{{ mailcatcher_health_delay | default(5) | int }}"
+
+    - name: "Health | Assert Stage 3a — the unauthenticated UI response matches the access-control mode (R9)"
+      ansible.builtin.assert:
+        that:
+          - >-
+            (mailcatcher_ui_anon.status | default(0))
+            == (401 if (mailcatcher_ui_auth_expected | default(true) | bool) else 200)
+        fail_msg: >-
+          UI access-control mismatch: an unauthenticated GET returned
+          HTTP {{ mailcatcher_ui_anon.status | default('no response') }}, expected
+          {{ 401 if (mailcatcher_ui_auth_expected | default(true) | bool) else 200 }}.
+          {{ 'Native basic auth is expected but the UI is OPEN — fail closed (R9): inspect MP_UI_AUTH_FILE.'
+             if (mailcatcher_ui_auth_expected | default(true) | bool) else '' }}
+        success_msg: "UI access-control posture verified (Stage 3a gate passed)."
+
+    - name: "Health | Stage 3b — the UI accepts the generated credential (no_log)"
+      ansible.builtin.uri:
+        url: "http://{{ mailcatcher_bind_ip }}:{{ mailcatcher_ui_port }}/"
+        method: GET
+        url_username: "{{ mailcatcher_ui_user }}"
+        url_password: "{{ lookup('ansible.builtin.env', 'MAILCATCHER_UI_PASSWORD') }}"
+        force_basic_auth: true
+        status_code: [200]
+      no_log: true
+      changed_when: false
+      when: mailcatcher_ui_auth_expected | default(true) | bool

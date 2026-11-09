@@ -1,0 +1,22 @@
+---
+# meta/main.yml — zitadel_smtp_catcher
+galaxy_info:
+  role_name: zitadel_smtp_catcher
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Opt-in, default-OFF permanent mock (Mock 7): points ZITADEL's instance email
+    provider at the shared dev mail catcher so the verification-code flow completes
+    on a dev cluster with no SMTP. Fails closed when the catcher is absent; never
+    replaces a real provider. Spec dev-mail-catcher, ADR-0025.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+  galaxy_tags:
+    - zitadel
+    - smtp
+    - dev
+dependencies: []

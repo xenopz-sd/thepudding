@@ -9,6 +9,8 @@
 # The SVC01_Consumer_Root per-project `db/` Terraform root (ADR-0019). The
 # apply is COMPOSED via a child svc-01-bootstrap.yml run (Req 4.4) — this role
 # never re-declares the DB container or re-derives addressing.
+# Now CONSUMED (WS-C9): the live flow routes through this root via
+# `-e svc01_consumer_wrapper=true` on the svc-01-bootstrap child run.
 consumer_db_tf_root: "infra/projects/{{ project_slug }}/db"
 
 # --- Network-slice auto-create (fix-consumer-onboarding-prerequisites, §2) -----

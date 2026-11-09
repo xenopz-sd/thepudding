@@ -1,0 +1,27 @@
+---
+# meta/main.yml — mailcatcher_install
+galaxy_info:
+  role_name: mailcatcher_install
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Installs the shared dev mail catcher (Mailpit) on a Proxmox LXC as a Docker
+    Compose stack: pinned image, ports bound to the guest's own VLAN-20 IP, UI
+    basic auth (fail closed), and a delegated Traefik Route_Fragment for the web
+    UI. Dev-only permanent mock (ADR-0025).
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - mailpit
+    - mail
+    - dev
+# No hard cross-role dependencies; docker-compose-app and traefik_route are
+# consumed via include_role.
+dependencies: []

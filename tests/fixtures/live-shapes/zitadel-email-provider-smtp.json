@@ -1,0 +1,128 @@
+{
+  "shape": "zitadel-email-provider-smtp",
+  "base_path": "/admin/v1",
+  "get_active": {
+    "method": "GET",
+    "path": "/email",
+    "response_object": "config",
+    "state_field": "state",
+    "active_state": "EMAIL_PROVIDER_ACTIVE",
+    "absent": "HTTP 404 (message 'SMTP configuration not found', code QUERY-fwofw)",
+    "live_response_keys": {
+      "top": [
+        "config"
+      ],
+      "config": [
+        "description",
+        "details",
+        "id",
+        "smtp",
+        "state"
+      ],
+      "smtp": [
+        "host",
+        "none",
+        "senderAddress",
+        "senderName"
+      ]
+    }
+  },
+  "add_smtp": {
+    "method": "POST",
+    "path": "/email/smtp",
+    "returns": "id",
+    "note": "adds only if nothing is set yet; must then be activated"
+  },
+  "update_smtp": {
+    "method": "PUT",
+    "path": "/email/smtp/{id}",
+    "note": "activates as soon as it is saved; body repeats id"
+  },
+  "activate": {
+    "method": "POST",
+    "path": "/email/{id}/_activate",
+    "body": {}
+  },
+  "remove": {
+    "method": "DELETE",
+    "path": "/email/{id}"
+  },
+  "smtp_body_fields": [
+    "senderAddress",
+    "senderName",
+    "tls",
+    "host",
+    "description",
+    "none"
+  ],
+  "host_includes_port": true,
+  "auth_oneof": {
+    "none_member": "none",
+    "plain_member": "plain",
+    "xoauth2_member": "xoauth2"
+  },
+  "no_auth_body_member": {
+    "none": {}
+  },
+  "_provenance": {
+    "seeded_from": "upstream proto/zitadel/admin.proto and management.proto on main, then CONFIRMED against a live instance",
+    "hand_seeded": false,
+    "live_confirmed": true,
+    "live_confirmed_on": "ZITADEL ghcr.io/zitadel/zitadel:v4.18.0 on the shrimp throwaway cluster (spec dev-mail-catcher live run, WS-C16)",
+    "live_findings": "1) responses omit tls when false; 2) absent provider is HTTP 404 not an empty object; 3) an untagged provider with identical host/sender must be re-tagged by a PUT (helper bug found and fixed); 4) add + activate + read-back, PUT update, DELETE, and the org login-policy POST/PUT/DELETE all work as recorded",
+    "refresh": "WS-M4 Increment 2 (read-only live capture) - ADR-0024, not yet built",
+    "sanitized": "no secrets or real hostnames; placeholders only"
+  },
+  "tls_false_is_omitted_from_responses": true,
+  "ownership_marker_field": "description",
+  "login_policy": {
+    "get": {
+      "method": "GET",
+      "path": "/management/v1/policies/login",
+      "header": "x-zitadel-orgid",
+      "response_object": "policy",
+      "effective_flag": "isDefault"
+    },
+    "create_custom": {
+      "method": "POST",
+      "path": "/management/v1/policies/login",
+      "use_when": "isDefault is true"
+    },
+    "update_custom": {
+      "method": "PUT",
+      "path": "/management/v1/policies/login",
+      "use_when": "isDefault is false",
+      "note": "FULL REPLACE: carry every other field"
+    },
+    "reset": {
+      "method": "DELETE",
+      "path": "/management/v1/policies/login"
+    },
+    "request_fields_echoed": [
+      "allowUsernamePassword",
+      "allowRegister",
+      "allowExternalIdp",
+      "forceMfa",
+      "passwordlessType",
+      "hidePasswordReset",
+      "ignoreUnknownUsernames",
+      "defaultRedirectUri",
+      "passwordCheckLifetime",
+      "externalLoginCheckLifetime",
+      "mfaInitSkipLifetime",
+      "secondFactorCheckLifetime",
+      "multiFactorCheckLifetime",
+      "allowDomainDiscovery",
+      "disableLoginWithEmail",
+      "disableLoginWithPhone"
+    ],
+    "read_only_response_fields_never_echoed": [
+      "details",
+      "isDefault",
+      "secondFactors",
+      "multiFactors",
+      "idps"
+    ],
+    "live_observed": "response keys were a subset of the echoed fields plus the read-only ones; POST (inherited default), idempotent repeat, PUT (restore) all accepted; a full round trip changed no other field"
+  }
+}

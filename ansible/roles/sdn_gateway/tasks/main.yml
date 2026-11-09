@@ -101,6 +101,18 @@
          else (sdn_gateway_decommissioned_vlan_ids | regex_findall('[0-9]+')))
         | map('int') | unique | sort
       }}
+    # WS-C12 (found live in the platform teardown): the opted-in served set is a caller-supplied set too,
+    # and both child-run callers pass it as `--extra-vars "sdn_gateway_served_project_vlan_ids=[...]"`,
+    # i.e. the STRING "[]" / "[100]". Used raw, `map('int')` iterated its characters ('[', ']') and
+    # produced the phantom VLAN [0], which the opt-in validation then rejected, aborting the gateway
+    # teardown. Same footgun, same cure as the sets above.
+    sdn_gateway_served_project_vlan_ids_norm: >-
+      {{
+        (sdn_gateway_served_project_vlan_ids
+         if (sdn_gateway_served_project_vlan_ids is not string)
+         else (sdn_gateway_served_project_vlan_ids | regex_findall('[0-9]+')))
+        | map('int') | unique | sort
+      }}
 
 # Compute the served-VLAN set once: the always-served shared VLAN (20) plus the
 # opted-in project VLANs that are also in the active set. `unique` dedupes if the
@@ -136,10 +148,20 @@
       {{
         (
           [sdn_gateway_shared_vlan_id]
-          + (sdn_gateway_served_project_vlan_ids | map('int') | list)
+          + (sdn_gateway_served_project_vlan_ids_norm | map('int') | list)
         ) | map('int') | difference(sdn_gateway_decommissioned_vlan_ids_norm)
           | unique | sort
       }}
+
+# fix-sdn-gateway-vlan-list-parse: echo what the role actually PARSED, next to
+# the raw caller-supplied value, so a mis-parse is visible BEFORE the role acts
+# (v0.14.0 operator feedback #2). Non-secret topology values only.
+- name: INFO — echo the parsed served-VLAN set (and the raw opt-in it came from)
+  ansible.builtin.debug:
+    msg: >-
+      INFO sdn_gateway serving VLANs: {{ sdn_gateway_served_vlan_ids }}
+      (opted-in project VLANs parsed as {{ sdn_gateway_served_project_vlan_ids_norm }}
+      from raw value {{ sdn_gateway_served_project_vlan_ids | to_json }}).
 
 # EXPLICIT opt-in-vs-active validation (fix-sdn-gateway-project-vlan-noop) —
 # replaces the silent intersect filter. An opted-in, non-decommissioned VLAN
@@ -152,7 +174,7 @@
 - name: Validate every opted-in project VLAN is registry-active (never silently drop)
   vars:
     _sdn_gateway_opted_in_not_active: >-
-      {{ (sdn_gateway_served_project_vlan_ids | map('int') | unique | list)
+      {{ (sdn_gateway_served_project_vlan_ids_norm | map('int') | unique | list)
          | difference(sdn_gateway_active_vlan_ids_norm)
          | difference(sdn_gateway_decommissioned_vlan_ids_norm) }}
   block:
@@ -231,6 +253,51 @@
     quiet: true
 
 # =============================================================================
+# WS-C26 — optionally skip project VLANs whose SDN bridge is not realized yet
+# -----------------------------------------------------------------------------
+# The platform bring-up serves EVERY registry-active project VLAN by default (it is
+# not a per-VLAN request), so on a cluster with active registry rows but no applied
+# project network slices it used to end in a fail-closed stop at the first project
+# VLAN even though the shared VLAN 20 was fine. For that caller (and only when
+# sdn_gateway_skip_unrealized_project_vlans is true) a project VLAN whose bridge
+# p<vlan> does not exist is SKIPPED with a WARNING naming it and the remedy. An
+# explicit sdn-gateway.yml run keeps the flag false, so an opted-in VLAN is still
+# never silently dropped (fix-sdn-gateway-project-vlan-noop). The shared VLAN is
+# never probed or skipped: its bridge was just created by the fabric apply, so its
+# absence is a real error that configure.yml must fail closed on. The probe is
+# read-only; configure.yml keeps its own bridge assertion.
+# =============================================================================
+- name: Probe the SDN bridge of each served project VLAN (read-only, only when the skip is on)
+  ansible.builtin.command:
+    cmd: "ip -o link show dev p{{ item }}"
+  loop: "{{ sdn_gateway_served_vlan_ids | difference([sdn_gateway_shared_vlan_id | int]) }}"
+  register: sdn_gateway_bridge_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: sdn_gateway_skip_unrealized_project_vlans | bool
+- name: Compute which served project VLANs have a realized bridge
+  vars:
+    _sdn_gateway_probed_absent: >-
+      {{ ((sdn_gateway_bridge_probe.results | default([])
+           | rejectattr('rc', 'equalto', 0) | map(attribute='item') | map('int') | list)
+          if (sdn_gateway_skip_unrealized_project_vlans | bool) else [])
+         | difference([sdn_gateway_shared_vlan_id | int]) | unique | sort }}
+  ansible.builtin.set_fact:
+    sdn_gateway_unrealized_project_vlan_ids: "{{ _sdn_gateway_probed_absent }}"
+    sdn_gateway_configure_vlan_ids: >-
+      {{ sdn_gateway_served_vlan_ids | map('int') | list
+         | difference(_sdn_gateway_probed_absent) | unique | sort }}
+- name: WARN — served project VLAN(s) skipped because their SDN bridge does not exist yet
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: served project VLAN(s) {{ sdn_gateway_unrealized_project_vlan_ids }} were NOT configured:
+      their SDN bridge (p<vlan>) does not exist on this host yet, so no gateway address, NAT or firewall
+      rule was bound for them. Apply each project's own network-slice root (infra/projects/<slug>/, whose
+      sdn.tf creates the VNet) and re-run to bring them up. Configuring only {{ sdn_gateway_configure_vlan_ids }}.
+      Set sdn_gateway_skip_unrealized_project_vlans=false to fail closed instead.
+  when: (sdn_gateway_unrealized_project_vlan_ids | length) > 0
+# =============================================================================
 # Configure the served VLANs (create/configure direction — Req 6.2)
 # -----------------------------------------------------------------------------
 # Per served VLAN: ensure the host sub-interface + gateway address exist and a
@@ -240,7 +307,7 @@
 # =============================================================================
 - name: Configure each served VLAN's host gateway + scoped ALLOW rule
   ansible.builtin.include_tasks: configure.yml
-  loop: "{{ sdn_gateway_served_vlan_ids }}"
+  loop: "{{ sdn_gateway_configure_vlan_ids }}"
   loop_control:
     loop_var: sdn_gateway_vlan_id
 

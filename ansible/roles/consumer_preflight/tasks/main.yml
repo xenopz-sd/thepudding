@@ -157,6 +157,9 @@
       - "{{ cluster_env_file }}"
       - --allowlist
       - "{{ consumer_throwaway_allowlist }}"
+      # WS-C11: pre-check the services this orchestrator COMPOSES against a narrow
+      # AGENT_LIVE_AUTHORIZED_SERVICES scope up front (a child would otherwise REFUSE mid-run).
+      - "--also-service={{ consumer_guard_composed_services | join(',') }}"
   args:
     chdir: "{{ consumer_repo_root }}"
   register: consumer_throwaway_decision
@@ -360,6 +363,16 @@
          in (consumer_sdn_vnets.json.data | map(attribute='vnet') | list) }}
   changed_when: false
 
+# WS-C24: a VLAN/VNet is only needed to PLACE a guest. A manifest with no database and no
+# enabled workload (for example SSO-only: just an org and OIDC apps) declares no guest, so
+# it needs no project network slice. The registry slug -> vlan_id resolution above still
+# happens (the slug is allocated and never reused); only the slice requirement is dropped.
+- name: "Preflight | Decide whether the manifest needs a project network slice (a guest to place)"
+  ansible.builtin.set_fact:
+    consumer_network_slice_required: >-
+      {{ (consumer_manifest.database is defined)
+         or ((consumer_manifest.workload | default({})).enabled | default(false) | bool) }}
+  changed_when: false
 - name: "Preflight | Fail closed if the project VNet is absent AND auto-create is OFF"
   ansible.builtin.assert:
     that:
@@ -373,16 +386,20 @@
       Nothing was provisioned.
     success_msg: "Project VNet 'p{{ consumer_vlan_id }}' is present."
     quiet: true
-  when: not (consumer_autocreate_network_slice | bool)
+  when:
+    - consumer_network_slice_required | bool
+    - not (consumer_autocreate_network_slice | bool)
 
 - name: "Preflight | INFO — project VNet decision"
   ansible.builtin.debug:
     msg: >-
       INFO: project VNet 'p{{ consumer_vlan_id }}':
-      {{ 'present' if (consumer_vnet_present | bool)
-         else ('ABSENT — Phase 2 will auto-create the network slice'
-               if (consumer_autocreate_network_slice | bool)
-               else 'ABSENT — halting (auto-create OFF)') }}.
+      {{ 'not needed — the manifest declares no database or workload, so there is no guest to place'
+         if not (consumer_network_slice_required | bool)
+         else ('present' if (consumer_vnet_present | bool)
+               else ('ABSENT — Phase 2 will auto-create the network slice'
+                     if (consumer_autocreate_network_slice | bool)
+                     else 'ABSENT — halting (auto-create OFF)')) }}.
 
 # --- 5b.2 Host_Index_Authority ledger rows derived from the manifest ---
 # The ledger is a COMMITTED, diff-reviewable, append-only INPUT (ADR-0015), never
@@ -498,6 +515,14 @@
   register: consumer_zitadel_probe
   changed_when: false
   failed_when: false
+  # WS-C8 / platform-runtime-patterns P3: poll a real readiness signal with a BOUNDED
+  # retry instead of one shot. A single transient connect/TLS reset through Traefik
+  # used to fail the whole preflight while the provider was healthy (a standalone
+  # probe returned 200 20/20). Worst case = retries x (timeout + delay); never an
+  # unbounded wait, no unconditional delay on success. Still read-only.
+  until: (consumer_zitadel_probe.status | default(0)) == 200
+  retries: "{{ consumer_probe_retries | int }}"
+  delay: "{{ consumer_probe_retry_delay | int }}"
   when: consumer_manifest.sso is defined
 
 - name: "Preflight | Halt fail-closed if ZITADEL is unreachable (Req 9.3)"
@@ -506,7 +531,10 @@
       - "(consumer_zitadel_probe.status | default(0)) == 200"
     fail_msg: >-
       The SSO provider (ZITADEL) is unreachable within the bounded probe timeout
-      ({{ dependency_probe_timeout }}s) at {{ consumer_zitadel_health_url }}. The
+      ({{ dependency_probe_timeout }}s x {{ consumer_probe_retries }} attempts) at
+      {{ consumer_zitadel_health_url }} (last status
+      {{ consumer_zitadel_probe.status | default('none') }}:
+      {{ consumer_zitadel_probe.msg | default('no response') }}). The
       SSO org/app onboarding depends on it. Bring ZITADEL up ONLY via its own
       `ansible/playbooks/svc-06-bootstrap.yml` automated path (never raw
       ssh/docker/pct), then re-run. Nothing was provisioned (Req 9.3, 9.5, 9.6).

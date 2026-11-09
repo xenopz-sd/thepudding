@@ -322,6 +322,18 @@
 # datastore is the AUTODETECT sentinel. When the operator set the var
 # explicitly, cluster_env.py resolved a concrete value and we skip the
 # node-storage query entirely.
+# WS-C10 (P3, committed != realized): the assert above only proves the VNet is in the SDN CONFIG.
+# Verify it is REALIZED as a live bridge on the target node before any guest is placed on it.
+- name: "Preflight | Verify the VNet is REALIZED as a live bridge on the node (WS-C10)"
+  ansible.builtin.include_role:
+    name: sdn_vnet_realized
+  vars:
+    sdn_vnet_realized_endpoint: "{{ svc07_proxmox_endpoint_base }}"
+    sdn_vnet_realized_token: "{{ svc07_proxmox_api_token }}"
+    sdn_vnet_realized_validate_certs: "{{ svc07_proxmox_validate_certs }}"
+    sdn_vnet_realized_node: "{{ svc07_proxmox_node_name }}"
+    sdn_vnet_realized_vnet: "p20"
+    sdn_vnet_realized_vnets: "{{ svc07_sdn_vnets.json.data }}"
 - name: "Preflight | Query target-node storage (only when datastore unset)"
   ansible.builtin.uri:
     url: >-

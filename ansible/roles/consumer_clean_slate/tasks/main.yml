@@ -15,6 +15,60 @@
 # resource halts WITHOUT reporting a clean baseline (Req 7.5, 7.6). NEVER removes
 # the Registry entry or the <slug>-infra network slice (Req 7.7).
 
+# === Agent-live throwaway-cluster guard consult (FIRST — before any destroy) ==
+# consumer_clean_slate is a destructive-live orchestrator (workload teardown via
+# clean-slate.yml, DB teardown via svc-01-bootstrap.yml). On an agent-live run
+# (AGENT_LIVE_AUTHORIZED armed -> agent_live_run truthy), consult the throwaway
+# guard FIRST and REFUSE unless it AUTHORIZED — so a destructive reset can never
+# touch a shared/acceptance/production cluster. All three tasks are gated
+# `when: agent_live_run`, so an ordinary operator run (interlock unset) SKIPS
+# them and is byte-for-byte unchanged. Fail-closed: the consult never fails the
+# task (failed_when:false) — the rc is the signal and the assert HALTS unless
+# rc==0. Mirrors svc01_clean_slate / svc07_clean_slate (testing-strategy.md
+# "Agent Live-Test Authorization").
+- name: "Clean-Slate | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ consumer_venv_python }}"
+      - "{{ consumer_throwaway_guard }}"
+      - --service
+      - consumer
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ consumer_throwaway_allowlist }}"
+      # WS-C11: pre-check the services this orchestrator COMPOSES against a narrow
+      # AGENT_LIVE_AUTHORIZED_SERVICES scope up front (a child would otherwise REFUSE mid-run).
+      - "--also-service={{ consumer_guard_composed_services | join(',') }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_cs_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (consumer_cs_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | Refuse the reset unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "consumer_cs_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live consumer clean-slate REFUSED by the throwaway-cluster guard:
+      {{ (consumer_cs_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      Nothing was destroyed — no workload teardown, no DB clean-slate, and no
+      Terraform state was modified. Arm the run only against a throwaway cluster
+      listed in throwaway-clusters.yml with AGENT_LIVE_AUTHORIZED set.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live consumer clean-slate."
+  when: agent_live_run | default(false) | bool
+
 # === Resolve the manifest + vlan_id (clean-slate runs without a prior preflight) ==
 - name: "Clean-Slate | Assert project_slug is supplied"
   ansible.builtin.assert:
@@ -106,6 +160,50 @@
       deletes (Req 9.6).
   when: consumer_manifest.sso is defined
 
+# === WS-C4 (ADR-0023): remove the per-org user-manager identity (teardown parity) =========
+# The onboarding mints a per-org ORG_USER_MANAGER machine user + a PAT in OpenBao. Its OWN
+# reversal path is the zitadel-user-provision.yml playbook (zup_action=teardown): it deletes the
+# machine user and the OpenBao secret and gates on no residue. Composed as a child run (never raw
+# ZITADEL/bao surgery from this role). The instance token + OpenBao admin token travel in the
+# inherited process ENV. Strict by default; consumer_cs_usermgr_teardown_strict=false downgrades a
+# failure (e.g. ZITADEL already torn down) to a loud WARN so it cannot block the rest of the reset.
+- name: "Clean-Slate | Compose the user-manager identity teardown (zitadel-user-provision, ADR-0023)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - ansible/inventory/localhost.yml
+      - ansible/playbooks/zitadel-user-provision.yml
+      - -e
+      - zup_action=teardown
+      - -e
+      - "zup_project_slug={{ project_slug }}"
+      - -e
+      - "zup_openbao_addr={{ openbao_addr }}"
+      - -e
+      - "zup_platform_domain={{ consumer_platform_domain | default('platform.example.test') }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  register: consumer_cs_usermgr_run
+  changed_when: "'changed=0' not in (consumer_cs_usermgr_run.stdout | default(''))"
+  failed_when:
+    - consumer_cs_usermgr_run.rc != 0
+    - consumer_cs_usermgr_teardown_strict | bool
+  when:
+    - consumer_manifest.sso is defined
+    - (openbao_addr | default('') | trim) | length > 0
+- name: "Clean-Slate | WARN — user-manager identity teardown did not complete (non-strict mode)"
+  ansible.builtin.debug:
+    msg: >-
+      WARN: the user-manager identity teardown for '{{ project_slug }}' exited
+      {{ consumer_cs_usermgr_run.rc | default('?') }}. The ZITADEL machine user and/or the OpenBao secret
+      secret/proj-{{ project_slug }}/zitadel/usermgr may remain. Re-run
+      ansible/playbooks/zitadel-user-provision.yml -e zup_action=teardown -e zup_project_slug={{ project_slug }}
+      when ZITADEL and OpenBao are reachable.
+  when:
+    - consumer_cs_usermgr_run is defined
+    - not (consumer_cs_usermgr_run.skipped | default(false))
+    - (consumer_cs_usermgr_run.rc | default(0)) != 0
 # === Reverse the OpenBao onboarding (compose the onboarder's own reversal) ====
 # OpenBao project objects (policy-<slug>, <slug>-ci, <slug>-workload, KV path)
 # are removed via the onboarders' own reversal paths. Where an onboarder exposes
@@ -123,6 +221,201 @@
   when:
     - (consumer_manifest.secrets is defined) or (consumer_manifest.database is defined)
     - (openbao_addr | default('') | trim) | length > 0
+
+# === Tear down the WORKLOAD guest FIRST (reverse of bring-up, WS-C3) =========
+# The workload guest is the leaf consumer (it consumes the DB + OpenBao), so it
+# comes down BEFORE the DB — the reverse of consumer_provision, which applies the
+# workload LAST. Unlike the DB (a separate service composed via its own
+# svc-01-bootstrap.yml clean-slate), the workload root is OWNED by this consumer
+# flow, so the teardown composes the shared terraform_clean_slate mechanism
+# DIRECTLY through ansible/playbooks/clean-slate.yml — exactly as svc01_clean_slate
+# assembles a single clean_slate_target. This is an OWNED teardown, never raw
+# surgery (integration-boundaries §5). STRICT NO-OP when the manifest declared no
+# workload (symmetry with consumer_provision's Req 2.3 gate).
+- name: "Clean-Slate | Evaluate the workload gate (strict no-op when absent/false)"
+  ansible.builtin.set_fact:
+    consumer_workload_enabled: "{{ consumer_manifest.workload.enabled | default(false) | bool }}"
+  changed_when: false
+
+- name: "Clean-Slate | INFO — workload teardown skipped (manifest declares no enabled workload)"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: no workload guest to tear down for '{{ project_slug }}'
+      (manifest workload.enabled is absent/false). No-op (WS-C3, Req 2.3 symmetry).
+  when: not (consumer_workload_enabled | bool)
+
+- name: "Clean-Slate | Workload teardown (compose terraform_clean_slate via clean-slate.yml)"
+  when: consumer_workload_enabled | bool
+  block:
+    # Fail-closed: the reset delegates to clean-slate.yml against the Proxmox-host
+    # inventory (runs `pct` on the node). Assert the host address BEFORE any
+    # destroy so a reset requested without it halts having destroyed nothing.
+    - name: "Clean-Slate | Assert the Proxmox host SSH address was supplied (workload)"
+      ansible.builtin.assert:
+        that:
+          - "consumer_proxmox_host is defined"
+          - "(consumer_proxmox_host | trim | length) > 0"
+        fail_msg: >-
+          The workload reset delegates to clean-slate.yml against the Proxmox-host
+          inventory (runs `pct` on the node). Supply
+          -e consumer_proxmox_host=<real-proxmox-lan-ip>. Nothing was destroyed.
+        success_msg: "Proxmox host SSH address supplied for the workload reset."
+
+    # The anti-footgun confirm token is the target VMID; 0 (the derived sentinel)
+    # is not a valid live destroy target — a live reset pins the real VMID with
+    # -e consumer_workload_vmid=<id>.
+    - name: "Clean-Slate | Assert a concrete workload VMID was supplied (anti-footgun)"
+      ansible.builtin.assert:
+        that:
+          - "consumer_workload_vmid is defined"
+          - "(consumer_workload_vmid | int) > 0"
+        fail_msg: >-
+          A concrete workload VMID is required to destroy the workload guest
+          (the clean_slate_confirm token must match it). Supply
+          -e consumer_workload_vmid=<id> (the value used at provision, or the
+          module-computed vlan_id*1000+host_index). Nothing was destroyed.
+        success_msg: "Workload VMID supplied; proceeding to the workload teardown."
+
+    - name: "Clean-Slate | Resolve cluster env for the Proxmox node name (workload, no_log)"
+      ansible.builtin.command:
+        argv:
+          - "{{ consumer_venv_python }}"
+          - scripts/installer/cluster_env.py
+          - --env-file
+          - "{{ cluster_env_file }}"
+      args:
+        chdir: "{{ consumer_repo_root }}"
+      register: consumer_cs_workload_env_resolve
+      changed_when: false
+      no_log: true
+
+    - name: "Clean-Slate | Bind the resolved Proxmox node name (workload, no_log)"
+      ansible.builtin.set_fact:
+        consumer_cs_workload_node: >-
+          {{ (consumer_cs_workload_env_resolve.stdout | from_json)['TF_VAR_proxmox_node_name'] }}
+      no_log: true
+
+    - name: "Clean-Slate | Assemble the single workload clean_slate_target"
+      ansible.builtin.set_fact:
+        consumer_workload_clean_slate_targets:
+          - name: "workload-{{ consumer_vlan_id }}-01"
+            terraform_root: "{{ consumer_workload_tf_root }}"
+            resource_address: "{{ consumer_workload_resource_address }}"
+            node: "{{ consumer_cs_workload_node }}"
+            vmid: "{{ consumer_workload_vmid }}"
+
+    # Delegate the destroy to clean-slate.yml (composes terraform_clean_slate:
+    # pct destroy --purge on the node -> terraform state rm on the control node,
+    # both idempotent + fail-closed). clean_slate_confirm MUST equal the target
+    # VMID (the mechanism's mandatory anti-footgun guard).
+    - name: "Clean-Slate | Delegate the workload reset to clean-slate.yml (owned terraform_clean_slate)"
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+          - -i
+          - "{{ consumer_workload_proxmox_host_inventory }}"
+          - ansible/playbooks/clean-slate.yml
+          - --extra-vars
+          - "ansible_host={{ consumer_proxmox_host }}"
+          - -e
+          - clean_slate_enabled=true
+          - -e
+          - "clean_slate_confirm={{ item.vmid }}"
+          - -e
+          - "{{ {'clean_slate_targets': [item]} | to_json }}"
+      args:
+        chdir: "{{ consumer_repo_root }}"
+      loop: "{{ consumer_workload_clean_slate_targets }}"
+      loop_control:
+        label: "{{ item.name }} (vmid {{ item.vmid }})"
+      register: consumer_workload_cs_runs
+      changed_when: "'changed=0' not in (consumer_workload_cs_runs.stdout | default(''))"
+
+    # Residue sweep: the container-only state rm above leaves the non-guest
+    # module/anchor addresses (module.workload[0], terraform_data.assert_resolvable)
+    # in the <slug>-workload state. A correct clean-slate leaves `terraform state
+    # list` EMPTY, so enumerate every remaining address and `terraform state rm`
+    # it PROVIDER-FREE on the control node (mirrors svc01_clean_slate).
+    - name: "Clean-Slate | List ALL remaining addresses in the workload state (residue sweep)"
+      ansible.builtin.command:
+        argv: [terraform, state, list]
+      args:
+        chdir: "{{ consumer_repo_root }}/{{ consumer_workload_tf_root }}"
+      register: consumer_workload_residual_list
+      changed_when: false
+      failed_when: false
+
+    - name: "Clean-Slate | Compute the residual workload state addresses to remove"
+      ansible.builtin.set_fact:
+        consumer_workload_residual_addrs: >-
+          {{ (consumer_workload_residual_list.stdout | default('')).splitlines()
+             | map('trim') | select('ne', '') | list }}
+
+    - name: "Clean-Slate | Remove ALL remaining workload state addresses provider-free"
+      ansible.builtin.command:
+        argv: [terraform, state, rm, "{{ item }}"]
+      args:
+        chdir: "{{ consumer_repo_root }}/{{ consumer_workload_tf_root }}"
+      loop: "{{ consumer_workload_residual_addrs }}"
+      loop_control:
+        label: "{{ item }}"
+      register: consumer_workload_residual_rm
+      changed_when: "'Removed' in (consumer_workload_residual_rm.stdout | default(''))"
+      failed_when:
+        - (consumer_workload_residual_rm.rc | default(1)) != 0
+        - "'No matching objects' not in (consumer_workload_residual_rm.stdout | default(''))"
+        - "'No matching objects' not in (consumer_workload_residual_rm.stderr | default(''))"
+
+    # GATE (FR-3): zero surviving workload container on the host + EMPTY workload
+    # state. A surviving guest/state halts non-zero WITHOUT a clean report.
+    - name: "Clean-Slate | VERIFY — list any surviving workload container on the host (pct list)"
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible"
+          - proxmox
+          - -i
+          - "{{ consumer_workload_proxmox_host_inventory }}"
+          - --extra-vars
+          - "ansible_host={{ consumer_proxmox_host }}"
+          - -m
+          - ansible.builtin.command
+          - -a
+          - "pct list"
+      args:
+        chdir: "{{ consumer_repo_root }}"
+      register: consumer_workload_pct_list
+      changed_when: false
+      failed_when: false
+
+    - name: "Clean-Slate | VERIFY — list the FULL workload Terraform state after the sweep"
+      ansible.builtin.command:
+        argv: [terraform, state, list]
+      args:
+        chdir: "{{ consumer_repo_root }}/{{ consumer_workload_tf_root }}"
+      register: consumer_workload_state_list
+      changed_when: false
+      failed_when: false
+
+    - name: "Clean-Slate | Compute the surviving workload container + state addresses"
+      ansible.builtin.set_fact:
+        consumer_workload_vmid_survives: >-
+          {{ (consumer_workload_vmid | string) in (consumer_workload_pct_list.stdout | default('')) }}
+        consumer_workload_surviving_state: >-
+          {{ (consumer_workload_state_list.stdout | default('')).splitlines()
+             | map('trim') | select('ne', '') | list }}
+
+    - name: "Clean-Slate | GATE — assert the workload baseline is empty (0 container, 0 state)"
+      ansible.builtin.assert:
+        that:
+          - "not (consumer_workload_vmid_survives | bool)"
+          - "(consumer_workload_surviving_state | length) == 0"
+        fail_msg: >-
+          Workload clean-slate did NOT reach an empty baseline. Surviving
+          container VMID {{ consumer_workload_vmid }} present:
+          {{ consumer_workload_vmid_survives }}; surviving workload state
+          address(es):
+          {{ consumer_workload_surviving_state | join(', ') | default('none', true) }}.
+        success_msg: "Workload teardown complete — zero workload container + EMPTY <slug>-workload state."
 
 # === Tear down the DB via its OWN clean-slate contract (ADR-0011, Req 9.5) ====
 # Compose svc-01-bootstrap.yml -e clean_slate=true for the per-project DB. That
@@ -148,6 +441,10 @@
       - "vlan_id={{ consumer_vlan_id | default(0) }}"
       - -e
       - "svc01_vmid={{ consumer_svc01_vmid }}"
+      # WS-C9 (ADR-0019): the DB was provisioned through the per-project wrapper
+      # root (state <slug>-db), so its clean-slate must target that same root.
+      - -e
+      - "svc01_consumer_wrapper=true"
       - -e
       - "svc01_proxmox_host={{ consumer_proxmox_host }}"
   args:
@@ -179,12 +476,21 @@
       are preserved (clean-slate removed only CONSUMER resources, Req 7.7).
     quiet: true
 
+- name: "Clean-Slate | Compose the workload line for the baseline report"
+  ansible.builtin.set_fact:
+    consumer_workload_report: >-
+      {{ 'destroyed (terraform_clean_slate)'
+         if (consumer_workload_enabled | default(false) | bool)
+         else 'n/a (no workload declared)' }}
+  changed_when: false
+
 - name: "Clean-Slate | Report an empty consumer baseline"
   ansible.builtin.debug:
     msg:
       - "============================================================"
       - "Consumer clean-slate complete for project '{{ project_slug }}'."
       - "============================================================"
+      - "  Workload guest + <slug>-workload state: {{ consumer_workload_report }}"
       - "  DB guest + <slug>-db state:  destroyed (via the DB's own clean-slate)"
       - "  OpenBao/ZITADEL objects:     reversed via the onboarders' own paths"
       - "  Registry entry:              PRESERVED (never removed, Req 7.7)"

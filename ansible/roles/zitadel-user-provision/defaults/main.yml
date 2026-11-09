@@ -1,0 +1,42 @@
+---
+# defaults/main.yml — zitadel-user-provision (WS-C4, ADR-0023). NO secret here: the per-org PAT,
+# the instance token, the OpenBao admin token and the new user's password come from the
+# environment / OpenBao at run time, never from a default.
+#
+# zup_action selects what the role does:
+#   create   — path (a), the operator-provisioned human login user, authenticated by the project
+#              org's ORG_USER_MANAGER PAT read from OpenBao. NEVER uses the instance IAM_OWNER token.
+#   teardown — teardown parity: delete the org's user-manager machine user and its OpenBao secret.
+zup_action: create
+zup_project_slug: ""
+zup_org_name: "proj-{{ zup_project_slug }}"
+# --- the human user to create (action=create) ---
+zup_username: ""
+zup_first_name: ""
+zup_last_name: ""
+zup_email: ""
+# Throwaway test users only (the AC-4 style probe user); real users must change their password.
+zup_password_change_required: true
+# --- ZITADEL endpoint (production path: control node -> Traefik) ---
+zup_platform_domain: "platform.example.test"
+zup_base_url: "https://auth.{{ zup_platform_domain }}"
+zup_base_url_tls_skip_verify: true
+# --- helper ---
+zup_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+zup_helper: "scripts/installer/zitadel_user_provision.py"
+zup_repo_root: "{{ playbook_dir | dirname | dirname }}"
+zup_usermgr_name: "usermgr-sa"
+# --- OpenBao (mirrors zitadel-org-provision; same delegated bao docker-exec pattern) ---
+zup_openbao_addr: ""
+zup_openbao_primary_container_name: "openbao-openbao-1"
+zup_openbao_bao_bin: "bao"
+zup_openbao_tls_skip_verify: true
+zup_openbao_kv_mount: "secret"
+zup_openbao_usermgr_secret_path: "{{ zup_openbao_kv_mount }}/proj-{{ zup_project_slug }}/zitadel/usermgr"
+zup_openbao_usermgr_token_field: "pat"
+zup_openbao_provision_secret_path: "{{ zup_openbao_kv_mount }}/proj-shared-zitadel/zitadel"
+zup_openbao_provision_token_field: "provision_token"
+zup_openbao_cli_host: "10.0.20.10"
+zup_openbao_cli_bao_addr: "https://127.0.0.1:8200"
+zup_openbao_cli_user: "root"
+zup_openbao_cli_python: "/usr/bin/python3"

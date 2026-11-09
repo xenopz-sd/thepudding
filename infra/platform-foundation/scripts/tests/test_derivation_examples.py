@@ -223,8 +223,8 @@ def _load_ledger():
 def _vlan20_index_by_key(ledger):
     """Build a {(svc_code, component): host_index} map for VLAN 20's entries."""
     return {
-        (entry["svc_code"], entry.get("component")): entry["host_index"]
-        for entry in ledger[20]
+        (entry.get("svc_code") or entry["role_code"], entry.get("component")): entry["host_index"]
+        for entry in ledger[20]  # identity is svc_code XOR role_code (ADR-0021)
     }
 
 
@@ -261,11 +261,11 @@ def test_vlan20_allocated_indices_all_distinct():
     """Every allocated guest on VLAN 20 holds a distinct host index (no .10 clash)."""
     ledger = _load_ledger()
     # svc07 primary=0, unsealer=1, svc09=2, svc01=4, svc06=5 are all distinct.
-    primary = next(e for e in ledger[20] if e["svc_code"] == "svc07" and "component" not in e)
+    primary = next(e for e in ledger[20] if e.get("svc_code") == "svc07" and "component" not in e)
     unsealer = next(e for e in ledger[20] if e.get("component") == "unsealer")
-    traefik = next(e for e in ledger[20] if e["svc_code"] == "svc09")
+    traefik = next(e for e in ledger[20] if e.get("svc_code") == "svc09")
     db = next(e for e in ledger[20] if e.get("component") == "shared-zitadel")
-    zitadel = next(e for e in ledger[20] if e["svc_code"] == "svc06")
+    zitadel = next(e for e in ledger[20] if e.get("svc_code") == "svc06")
 
     indices = [
         primary["host_index"],

@@ -12,11 +12,22 @@ SVC-06 provides the platform's single sign-on and identity backbone: one place w
 - Tenancy model: one shared ZITADEL instance with a separate ZITADEL "project"/organization per platform project for realm-like isolation.
 - OIDC integration patterns for Grafana, Harbor, GitLab, and generic project web apps.
 - Baseline MFA and password policy expectations.
+- **Human-user provisioning into an existing organization (WS-C4, ADR-0023):** both
+  an **operator-provisioned** path (a platform operator creates a login user in an
+  org via the ZITADEL management API, driven by an Ansible task) and an
+  **external/consumer-app programmatic** path (a consuming application creates a human
+  user **in its own organization**). Both act through a dedicated **per-org machine
+  user holding `ORG_USER_MANAGER` on that single organization** — the narrowest
+  ZITADEL grant that manages human users in one org, never the instance-level
+  `IAM_OWNER` provisioning token (ADR-0016). The machine user is minted at
+  `zitadel-org-provision` onboarding with a bounded-lifetime PAT stored in the
+  project's OpenBao path. See ADR-0023 #[[file:.kiro/decisions/0023-svc06-user-provisioning-path.md]]
+  and `.kiro/specs/svc06-user-provisioning/`.
 
 **Out of scope:**
 - Directory synchronization with an external HR/identity source (no such source exists yet in this homelab/office context).
 - Fine-grained per-application RBAC policy design beyond basic role/group mapping (each consuming service's own requirements doc covers its specific authorization model).
-- Public user self-registration flows (this IdP serves internal operators/developers and project-facing tools, not an external customer base).
+- Public user **self-registration** flows — an anonymous external person signing *themselves* up (this IdP serves internal operators/developers and project-facing tools, not an external customer base). This is distinct from, and unaffected by, the **provisioned** human-user creation now in scope above (an operator or an app creating a user in an org it controls, per ADR-0023): self-service signup stays out; provisioned user-create is in.
 
 ## 3. Technology selection
 

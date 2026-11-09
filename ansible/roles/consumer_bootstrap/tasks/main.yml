@@ -400,6 +400,7 @@
            'app_type': consumer_app_type_map[item.app_type],
            'auth_method': consumer_auth_method_map[item.auth_method],
            'redirect_uris': (item.redirect_uris | default([])),
+           'dev_mode': (item.dev_mode | default(none)),
          }] }}
   loop: "{{ consumer_manifest.sso.app_registrations }}"
   loop_control:
@@ -453,6 +454,15 @@
       - "{{ {'zop_project_roles': consumer_sso_role_keys} | to_json }}"
       - -e
       - "zop_project_role_assertion={{ consumer_manifest.sso.project_role_assertion | default(true) }}"
+      # dev-mail-catcher R7: optional org login-policy allowRegister (null = untouched).
+      - -e
+      - >-
+        {{ {'zop_allow_register':
+            ((consumer_manifest.sso.login_policy | default({})).allow_register | default(none))} | to_json }}
+      # WS-C18: optional default project role for self-registered users (null = untouched, false = remove).
+      - -e
+      - >-
+        {{ {'zop_default_role': (consumer_manifest.sso.default_role | default(none))} | to_json }}
   args:
     chdir: "{{ consumer_repo_root }}"
   register: consumer_sso_run

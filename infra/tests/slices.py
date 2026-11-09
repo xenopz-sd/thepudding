@@ -43,6 +43,8 @@ from __future__ import annotations
 #: it with a longer timeout (it is fine in CI, which has no per-command budget).
 SLICES: dict[str, list[str]] = {
     "svc07a": [
+        "test_openbao_agent_dev_tls_default_wiring.py",
+        "test_openbao_agent_handler_flush_on_abort.py",
         "test_openbao_agent_reload_on_config_change.py",
         "test_openbao_unsealer_bootstrap.py",
         "test_sdn_gateway_openbao_unsealer_scoping.py",
@@ -97,6 +99,7 @@ SLICES: dict[str, list[str]] = {
         "test_obs_terraform_shape.py",
     ],
     "svc01-09": [
+        "test_mailcatcher_terraform_shape.py",
         "test_proxmox_compute_identity.py",
         "test_svc01_destroy_isolation.py",
         "test_svc01_openbao_token_failfast.py",

@@ -103,3 +103,7 @@ route_tls: true
 #                                 e.g. "/etc/traefik/dynamic/ca/openbao-mock-ca.crt"
 route_servers_transport_name: ""
 route_backend_root_cas: ""
+# WS-C23: optional forwardAuth middleware in front of the route (default-inert: empty => byte-identical render).
+# An http(s) URL Traefik asks to authorize each request; names of response headers to pass to the backend.
+route_forward_auth_address: ""
+route_forward_auth_response_headers: []

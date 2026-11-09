@@ -1,0 +1,8 @@
+---
+# defaults/main.yml — sdn_vnet_realized (WS-C10). NO secret here; the token is passed in
+# by the calling preflight via include_role vars.
+# Bounded poll: attempts x delay seconds of grace for realization to catch up after an apply.
+sdn_vnet_realized_retries: 6
+sdn_vnet_realized_delay: 5
+# Only used if the VNet's zone cannot be read from the config list (never expected).
+sdn_vnet_realized_default_zone: vlanzone

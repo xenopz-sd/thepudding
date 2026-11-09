@@ -1,0 +1,98 @@
+---
+# tasks/teardown.yml — teardown parity (WS-C4 FR-5, WS-M2): remove the org's user-manager machine
+# user from ZITADEL (via the helper, with the instance token) AND its OpenBao secret, then verify
+# the secret is gone. Idempotent: an absent org/user/secret is a no-op, not an error.
+# The instance IAM_OWNER token is needed ONLY here (deleting a machine user the org-scoped
+# credential must not be able to delete itself); it is read env-first, else from OpenBao.
+- name: "ZITADEL-user | Bind the instance provisioning token env override (no_log)"
+  ansible.builtin.set_fact:
+    zup_env_token: "{{ lookup('ansible.builtin.env', 'ZITADEL_PROVISION_TOKEN') | default('', true) }}"
+  no_log: true
+  changed_when: false
+- name: "ZITADEL-user | Read provision_token from OpenBao when the env override is empty (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zup_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zup_bao_token,
+          zup_openbao_primary_container_name, zup_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (zup_openbao_tls_skip_verify | bool) else [])
+         + ['-field=' ~ zup_openbao_provision_token_field, zup_openbao_provision_secret_path] }}
+  delegate_to: "{{ zup_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zup_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zup_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zup_iam_read
+  failed_when: false
+  changed_when: false
+  no_log: true
+  when: (zup_env_token | trim | length) == 0
+- name: "ZITADEL-user | Resolve the instance token (env override else OpenBao, no_log)"
+  ansible.builtin.set_fact:
+    zup_iam_token: >-
+      {{ zup_env_token if ((zup_env_token | trim | length) > 0) else (zup_iam_read.stdout | default('') | trim) }}
+  no_log: true
+  changed_when: false
+- name: "ZITADEL-user | Assert an instance token resolved (teardown cannot delete the machine user without it)"
+  ansible.builtin.assert:
+    that:
+      - zup_iam_token | length > 0
+    fail_msg: >-
+      No ZITADEL instance provisioning token could be resolved (ZITADEL_PROVISION_TOKEN env empty and
+      no provision_token at {{ zup_openbao_provision_secret_path }}). Nothing was removed.
+    quiet: true
+  no_log: true
+- name: "ZITADEL-user | Delete the org's user-manager machine user (idempotent, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ [zup_venv_python, zup_helper, '--base-url', zup_base_url]
+         + (['--insecure'] if (zup_base_url_tls_skip_verify | bool) else [])
+         + ['remove-usermgr', '--org', zup_org_name, '--user', zup_usermgr_name] }}
+  args:
+    chdir: "{{ zup_repo_root }}"
+  environment:
+    ZITADEL_PROVISION_TOKEN: "{{ zup_iam_token }}"
+  register: zup_remove_run
+  changed_when: (zup_remove_run.stdout | default('{}') | from_json).removed | default(false)
+  no_log: true
+- name: "ZITADEL-user | Delete the user-manager secret from OpenBao (all versions, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zup_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zup_bao_token,
+          zup_openbao_primary_container_name, zup_openbao_bao_bin, 'kv', 'metadata', 'delete']
+         + (['-tls-skip-verify'] if (zup_openbao_tls_skip_verify | bool) else [])
+         + [zup_openbao_usermgr_secret_path] }}
+  delegate_to: "{{ zup_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zup_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zup_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zup_secret_delete
+  changed_when: >-
+    'Success' in (zup_secret_delete.stdout | default('')) or 'Success' in (zup_secret_delete.stderr | default(''))
+  failed_when: false
+  no_log: true
+- name: "ZITADEL-user | VERIFY — the user-manager secret is gone from OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zup_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zup_bao_token,
+          zup_openbao_primary_container_name, zup_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (zup_openbao_tls_skip_verify | bool) else [])
+         + ['-field=' ~ zup_openbao_usermgr_token_field, zup_openbao_usermgr_secret_path] }}
+  delegate_to: "{{ zup_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zup_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zup_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zup_secret_verify
+  failed_when: false
+  changed_when: false
+  no_log: true
+- name: "ZITADEL-user | GATE — no residue: the machine user and its OpenBao secret are both absent"
+  ansible.builtin.assert:
+    that:
+      - (zup_secret_verify.rc | default(0)) != 0
+    fail_msg: >-
+      Teardown left residue: the user-manager PAT is still readable at {{ zup_openbao_usermgr_secret_path }}.
+      The ZITADEL machine user removal result: {{ (zup_remove_run.stdout | default('{}') | from_json) }}.
+    success_msg: "User-manager identity for {{ zup_org_name }} removed (machine user + OpenBao secret); no residue."
+    quiet: true

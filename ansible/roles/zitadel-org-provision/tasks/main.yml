@@ -147,6 +147,7 @@
              if (item.auth_method is defined and (item.auth_method | string | trim | length) > 0)
              else zop_app_type_default_auth_method[item.app_type]),
            'redirect_uris': (item.redirect_uris | default([])),
+           'dev_mode': (item.dev_mode | default(none)),
          }] }}
   loop: "{{ zop_effective_registrations }}"
   loop_control:
@@ -227,7 +228,7 @@
           '--auth-method', item.auth_method,
           '--login-version', zop_login_version]
          + zop_roles_arg + zop_assertion_arg
-         + zop_redirect_arg }}
+         + zop_redirect_arg + zop_dev_mode_arg + zop_allow_register_arg + zop_default_role_arg }}
   delegate_to: "{{ zop_zitadel_guest_host if (zop_dev_guest_run | bool) else 'localhost' }}"
   vars:
     ansible_connection: ssh
@@ -236,8 +237,20 @@
     zop_dev_container_ip: "{{ (zop_zitadel_cip.stdout | default('') | trim).split() | first }}"
     zop_dev_base_url: "http://{{ zop_dev_container_ip }}:{{ zop_zitadel_http_port }}"
     zop_redirect_arg: >-
-      {{ ['--redirect-uri=' ~ (item.redirect_uris | first)]
-         if ((item.redirect_uris | default([])) | length > 0) else [] }}
+      {{ (item.redirect_uris | default([])) | map('regex_replace', '^(.*)$', '--redirect-uri=\1') | list }}
+    # v0.14.0 feedback #3: ALL declared redirect URIs are passed (not just the
+    # first) so the helper can RECONCILE the live app's set to the manifest.
+    # Tri-state devMode: omitted = leave the live value alone.
+    zop_allow_register_arg: >-
+      {{ ['--allow-register'] if (zop_allow_register | default(none)) is sameas true
+         else (['--no-allow-register'] if (zop_allow_register | default(none)) is sameas false else []) }}
+    zop_default_role_arg: >-
+      {{ ['--no-default-role'] if (zop_default_role | default(none)) is sameas false
+         else (['--default-role=' ~ zop_default_role]
+               if ((zop_default_role | default(none)) is string and (zop_default_role | length) > 0) else []) }}
+    zop_dev_mode_arg: >-
+      {{ ['--dev-mode'] if (item.dev_mode | default(none)) is sameas true
+         else (['--no-dev-mode'] if (item.dev_mode | default(none)) is sameas false else []) }}
     # §4: same role-vocabulary + assertion threading as the production path.
     zop_roles_arg: >-
       {{ zop_project_roles | map('regex_replace', '^(.*)$', '--role=\1') | list }}
@@ -251,7 +264,10 @@
     label: "{{ item.name }}"
   register: zop_provision_run_guest
   changed_when: >-
-    (zop_provision_run_guest.stdout | default('{}') | from_json).oidc_app.already_existed | default(true) == false
+    ((zop_provision_run_guest.stdout | default('{}') | from_json).oidc_app.already_existed | default(true) == false)
+    or ((zop_provision_run_guest.stdout | default('{}') | from_json).oidc_app.config_reconciled | default(false) | bool)
+    or ((zop_provision_run_guest.stdout | default('{}') | from_json).login_policy.changed | default(false) | bool)
+    or ((zop_provision_run_guest.stdout | default('{}') | from_json).default_role.changed | default(false) | bool)
   no_log: true
   when: zop_dev_guest_run | bool
 
@@ -284,13 +300,25 @@
           '--auth-method', item.auth_method,
           '--login-version', zop_login_version]
          + zop_roles_arg + zop_assertion_arg
-         + zop_redirect_arg + zop_insecure_arg }}
+         + zop_redirect_arg + zop_dev_mode_arg + zop_allow_register_arg + zop_default_role_arg + zop_insecure_arg }}
   args:
     chdir: "{{ zop_repo_root }}"
   vars:
     zop_redirect_arg: >-
-      {{ ['--redirect-uri=' ~ (item.redirect_uris | first)]
-         if ((item.redirect_uris | default([])) | length > 0) else [] }}
+      {{ (item.redirect_uris | default([])) | map('regex_replace', '^(.*)$', '--redirect-uri=\1') | list }}
+    # v0.14.0 feedback #3: ALL declared redirect URIs are passed (not just the
+    # first) so the helper can RECONCILE the live app's set to the manifest.
+    # Tri-state devMode: omitted = leave the live value alone.
+    zop_allow_register_arg: >-
+      {{ ['--allow-register'] if (zop_allow_register | default(none)) is sameas true
+         else (['--no-allow-register'] if (zop_allow_register | default(none)) is sameas false else []) }}
+    zop_default_role_arg: >-
+      {{ ['--no-default-role'] if (zop_default_role | default(none)) is sameas false
+         else (['--default-role=' ~ zop_default_role]
+               if ((zop_default_role | default(none)) is string and (zop_default_role | length) > 0) else []) }}
+    zop_dev_mode_arg: >-
+      {{ ['--dev-mode'] if (item.dev_mode | default(none)) is sameas true
+         else (['--no-dev-mode'] if (item.dev_mode | default(none)) is sameas false else []) }}
     # §4: thread the declared project role vocabulary (one --role per key) and
     # the projectRoleAssertion toggle. Non-secret flags, safe on argv (the TOKEN
     # stays in the child ENV). Empty zop_project_roles ⇒ no --role ⇒ the helper's
@@ -314,7 +342,10 @@
     label: "{{ item.name }}"
   register: zop_provision_run_prod
   changed_when: >-
-    (zop_provision_run_prod.stdout | default('{}') | from_json).oidc_app.already_existed | default(true) == false
+    ((zop_provision_run_prod.stdout | default('{}') | from_json).oidc_app.already_existed | default(true) == false)
+    or ((zop_provision_run_prod.stdout | default('{}') | from_json).oidc_app.config_reconciled | default(false) | bool)
+    or ((zop_provision_run_prod.stdout | default('{}') | from_json).login_policy.changed | default(false) | bool)
+    or ((zop_provision_run_prod.stdout | default('{}') | from_json).default_role.changed | default(false) | bool)
   no_log: true
   when: not (zop_dev_guest_run | bool)
 
@@ -450,3 +481,21 @@
   when:
     - zop_openbao_addr | length > 0
     - not (item.skipped | default(false))
+# === WS-C4 (ADR-0023): per-org ORG_USER_MANAGER machine user + PAT -> OpenBao ==============
+# Minted AFTER the org/app onboarding so the org exists. Only when OpenBao is wired (a minted PAT
+# must be stored; ZITADEL shows it once) and on the production control-node path.
+- name: "ZITADEL-org | USERMGR — Mint the per-org ORG_USER_MANAGER identity (ADR-0023)"
+  ansible.builtin.include_tasks: usermgr_mint.yml
+  when:
+    - zop_usermgr_enabled | bool
+    - zop_openbao_addr | length > 0
+    - not (zop_dev_guest_run | bool)
+- name: "ZITADEL-org | WARN — user-manager identity NOT minted (OpenBao unwired or dev guest-run path)"
+  ansible.builtin.debug:
+    msg: >-
+      WARN: the per-org ORG_USER_MANAGER user-manager identity was NOT minted for {{ zop_org_name }}:
+      it needs OpenBao wired (zop_openbao_addr) to store the PAT and the production control-node path
+      (no zop_zitadel_guest_host). Re-run onboarding with OpenBao wired to create it.
+  when:
+    - zop_usermgr_enabled | bool
+    - (zop_openbao_addr | length == 0) or (zop_dev_guest_run | bool)

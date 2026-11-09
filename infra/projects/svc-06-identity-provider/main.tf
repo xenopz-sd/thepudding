@@ -46,7 +46,7 @@ locals {
   # var.zitadel_host_index default only if the ledger has no svc06 row.
   zitadel_ledger_index = one([
     for e in local.host_index_ledger[local.zitadel_vlan_id] :
-    e.host_index if e.svc_code == "svc06" && !can(e.component)
+    e.host_index if lookup(e, "svc_code", null) == "svc06" && !can(e.component)
   ])
   zitadel_host_index = local.zitadel_ledger_index != null ? local.zitadel_ledger_index : var.zitadel_host_index
 

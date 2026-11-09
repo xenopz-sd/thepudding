@@ -1,0 +1,22 @@
+---
+# zitadel-user-provision.yml — SVC-06 org-scoped human-user provisioning (WS-C4, ADR-0023).
+#
+# Path (a), the operator-provisioned user: create a human login user in a project's ZITADEL org.
+# It authenticates with that org's ORG_USER_MANAGER PAT read from OpenBao (minted at SSO
+# onboarding), NEVER the instance IAM_OWNER token. Idempotent: re-running for an existing
+# username changes nothing. The same playbook tears the user-manager identity down
+# (-e zup_action=teardown), which the consumer clean-slate composes.
+#
+#   ZITADEL_NEW_USER_PASSWORD='<initial-password>' OPENBAO_ADMIN_TOKEN=<token> \
+#   ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/zitadel-user-provision.yml \
+#     -e zup_project_slug=<slug> -e zup_openbao_addr=10.0.20.10 \
+#     -e zup_username=<login> -e zup_first_name=<first> -e zup_last_name=<last> -e zup_email=<email>
+#
+# The password and tokens are read from the environment only, never a variable or argv.
+- name: ZITADEL org-scoped user provisioning (create a login user, or tear the identity down)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  roles:
+    - zitadel-user-provision

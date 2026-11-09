@@ -1,0 +1,286 @@
+---
+# tasks/zone_occupants.yml — platform_clean_slate (WS-C12)
+#
+# The SDN zone cannot be deleted while any VNet still references it. The foundation root's
+# `terraform destroy` only removes what ITS state tracks, so a VNet it does not track blocks the
+# zone and the fabric teardown halts. Live example: the foundation state tracked only the zone,
+# while the zone held p20 (shared VNet, untracked), p100 (a project slice, tracked by the PROJECT's
+# own state) and p103 (an orphan with no state at all).
+#
+# This step runs after `terraform init` and before the destroy:
+#   1. List the zone's VNets from the SDN config (read-only) and the foundation state's tracked VNet.
+#   2. Occupants = zone VNets the FOUNDATION state does not own.
+#   3. FAIL CLOSED: occupants present and the explicit opt-in off -> HALT naming each one, its owner
+#      (project slug from the registry, or "untracked") and both remedies. Nothing is changed.
+#   4. With the opt-in: refuse if any guest is still attached to an occupant bridge; otherwise delete
+#      each occupant's subnets then the VNet through the Proxmox SDN API, apply the SDN, poll until
+#      they are gone, then `terraform state rm` (provider-free) the project slice's now-dangling
+#      addresses so no stale state is left behind.
+# Idempotent: with no occupants every mutating task is skipped (changed=false).
+# The PVE API token is in request headers, so every task carrying it is no_log.
+- name: "Clean-Slate | ZONE — Normalize the Proxmox API base"
+  ansible.builtin.set_fact:
+    platform_cs_pve_base: >-
+      {{ platform_cs_proxmox_endpoint | regex_replace('/api2/json/?$', '') | regex_replace('/+$', '') }}
+  changed_when: false
+- name: "Clean-Slate | ZONE — List the SDN VNets (config, read-only)"
+  ansible.builtin.uri:
+    url: "{{ platform_cs_pve_base }}/api2/json/cluster/sdn/vnets"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  register: platform_cs_zone_vnets_raw
+  check_mode: false
+  changed_when: false
+  no_log: true
+- name: "Clean-Slate | ZONE — List the foundation root's tracked resources (read-only)"
+  ansible.builtin.command:
+    argv: [terraform, state, list]
+  args:
+    chdir: "{{ platform_repo_root }}/{{ platform_clean_slate_foundation_root }}"
+  environment: "{{ platform_clean_slate_tf_env }}"
+  register: platform_cs_zone_foundation_state
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  no_log: true
+- name: "Clean-Slate | ZONE — Compute the zone's VNets and the VNet the foundation state owns"
+  ansible.builtin.set_fact:
+    platform_cs_zone_vnet_ids: >-
+      {{ platform_cs_zone_vnets_raw.json.data | default([])
+         | selectattr('zone', 'equalto', platform_clean_slate_sdn_zone_id)
+         | map(attribute='vnet') | list }}
+    platform_cs_zone_foundation_owned: >-
+      {{ [platform_clean_slate_sdn_vnet_id]
+         if ('proxmox_sdn_vnet.shared_services'
+             in (platform_cs_zone_foundation_state.stdout | default('')).split())
+         else [] }}
+  changed_when: false
+- name: "Clean-Slate | ZONE — Compute the occupants the foundation does not own"
+  ansible.builtin.set_fact:
+    platform_cs_zone_occupants: >-
+      {{ platform_cs_zone_vnet_ids | difference(platform_cs_zone_foundation_owned) | sort }}
+  changed_when: false
+- name: "Clean-Slate | ZONE — Map each occupant VNet to its owning project (registry), else 'untracked'"
+  ansible.builtin.set_fact:
+    platform_cs_zone_occupant_owners: |-
+      {%- set out = {} -%}
+      {%- for v in platform_cs_zone_occupants -%}
+      {%- set _ = out.update({v: platform_cs_zone_slug_by_vnet.get(v, 'untracked')}) -%}
+      {%- endfor -%}
+      {{ out }}
+  vars:
+    platform_cs_zone_registry_file: "{{ platform_repo_root }}/{{ platform_clean_slate_registry_path }}"
+    platform_cs_zone_registry: "{{ lookup('ansible.builtin.file', platform_cs_zone_registry_file) | from_yaml }}"
+    platform_cs_zone_slug_by_vnet: |-
+      {%- set out = {} -%}
+      {%- for p in platform_cs_zone_registry.projects | default([]) -%}
+      {%- set _ = out.update({'p' ~ p.vlan_id: p.slug}) -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+- name: "Clean-Slate | ZONE — GATE: halt (fail closed) on zone occupants unless explicitly opted in"
+  ansible.builtin.assert:
+    that:
+      - (platform_cs_zone_occupants | length) == 0 or (platform_clean_slate_remove_zone_occupants | bool)
+    fail_msg: >-
+      The SDN zone '{{ platform_clean_slate_sdn_zone_id }}' still holds VNet(s) the platform-foundation
+      state does not own, so the zone cannot be destroyed: {{ platform_cs_zone_occupant_owners }}
+      (VNet: owner; 'untracked' = no registry project). Nothing in the fabric was changed. REMEDY, either:
+      (a) tear each project's network slice down with that project's OWN root (terraform destroy in
+      infra/projects/<slug>/) and re-run; or (b) re-run with -e platform_clean_slate_remove_zone_occupants=true
+      to remove them through the Proxmox SDN API (only VNets with NO guest attached; a project slice's
+      now-dangling local state is cleaned afterwards).
+    success_msg: "No unowned VNets in the zone, or removal of the occupants is explicitly authorized."
+    quiet: true
+# --- from here on: only when there ARE occupants AND the operator opted in -----------------------------
+- name: "Clean-Slate | ZONE — List the node's guests (lxc and qemu) to find attached NICs"
+  ansible.builtin.uri:
+    url: "{{ platform_cs_pve_base }}/api2/json/nodes/{{ platform_cs_proxmox_node_name }}/{{ item }}"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  loop: [lxc, qemu]
+  register: platform_cs_zone_guest_lists
+  check_mode: false
+  changed_when: false
+  no_log: true
+  when: &zone_remove
+    - (platform_cs_zone_occupants | length) > 0
+    - platform_clean_slate_remove_zone_occupants | bool
+- name: "Clean-Slate | ZONE — Flatten the guests to [{kind, vmid}]"
+  ansible.builtin.set_fact:
+    platform_cs_zone_guests: |-
+      {%- set out = [] -%}
+      {%- for r in platform_cs_zone_guest_lists.results | default([]) -%}
+      {%- for g in (r.json.data | default([])) -%}
+      {%- set _ = out.append({'kind': r.item, 'vmid': g.vmid}) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+  when: *zone_remove
+- name: "Clean-Slate | ZONE — Read each guest's NIC config (read-only)"
+  ansible.builtin.uri:
+    url: >-
+      {{ platform_cs_pve_base }}/api2/json/nodes/{{ platform_cs_proxmox_node_name }}/{{
+      item.kind }}/{{ item.vmid }}/config
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  loop: "{{ platform_cs_zone_guests | default([]) }}"
+  loop_control:
+    label: "{{ item.kind }}/{{ item.vmid }}"
+  register: platform_cs_zone_guest_configs
+  check_mode: false
+  changed_when: false
+  no_log: true
+  when: *zone_remove
+- name: "Clean-Slate | ZONE — Compute the guests still attached to an occupant bridge"
+  ansible.builtin.set_fact:
+    platform_cs_zone_attached: |-
+      {%- set out = [] -%}
+      {%- for r in platform_cs_zone_guest_configs.results | default([]) -%}
+      {%- for k, v in (r.json.data | default({})).items() -%}
+      {%- if k is match('^net[0-9]+$') -%}
+      {%- for b in (v | string | regex_findall('bridge=([^,]+)')) -%}
+      {%- if b in platform_cs_zone_occupants -%}
+      {%- set _ = out.append(r.item.kind ~ '/' ~ r.item.vmid ~ ' on ' ~ b) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+  when: *zone_remove
+- name: "Clean-Slate | ZONE — GATE: refuse to remove a VNet that still has a guest attached"
+  ansible.builtin.assert:
+    that:
+      - (platform_cs_zone_attached | length) == 0
+    fail_msg: >-
+      Refusing to remove zone occupant VNet(s): guest(s) are still attached: {{ platform_cs_zone_attached }}.
+      Tear those guests down with their OWN clean-slate (service installer or the consumer clean-slate)
+      first. Nothing was removed.
+    success_msg: "No guest is attached to any occupant VNet; safe to remove."
+    quiet: true
+  when: *zone_remove
+- name: "Clean-Slate | ZONE — List each occupant VNet's subnets (read-only)"
+  ansible.builtin.uri:
+    url: "{{ platform_cs_pve_base }}/api2/json/cluster/sdn/vnets/{{ item }}/subnets"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  loop: "{{ platform_cs_zone_occupants }}"
+  register: platform_cs_zone_subnet_lists
+  check_mode: false
+  changed_when: false
+  no_log: true
+  when: *zone_remove
+- name: "Clean-Slate | ZONE — Flatten the subnets to [{vnet, subnet}]"
+  ansible.builtin.set_fact:
+    platform_cs_zone_subnets: |-
+      {%- set out = [] -%}
+      {%- for r in platform_cs_zone_subnet_lists.results | default([]) -%}
+      {%- for sn in (r.json.data | default([])) -%}
+      {%- set _ = out.append({'vnet': r.item, 'subnet': sn.subnet}) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+  when: *zone_remove
+# Subnets first, then the VNet (Proxmox rejects deleting a VNet that still has subnets).
+- name: "Clean-Slate | ZONE — Delete the occupants' subnets (Proxmox SDN API)"
+  ansible.builtin.uri:
+    url: "{{ platform_cs_pve_base }}/api2/json/cluster/sdn/vnets/{{ item.vnet }}/subnets/{{ item.subnet }}"
+    method: DELETE
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  loop: "{{ platform_cs_zone_subnets | default([]) }}"
+  loop_control:
+    label: "{{ item.vnet }}/{{ item.subnet }}"
+  changed_when: true
+  no_log: true
+  when: *zone_remove
+- name: "Clean-Slate | ZONE — Delete the occupant VNets (Proxmox SDN API)"
+  ansible.builtin.uri:
+    url: "{{ platform_cs_pve_base }}/api2/json/cluster/sdn/vnets/{{ item }}"
+    method: DELETE
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  loop: "{{ platform_cs_zone_occupants }}"
+  changed_when: true
+  no_log: true
+  when: *zone_remove
+- name: "Clean-Slate | ZONE — Apply the SDN so the removals are realized"
+  ansible.builtin.uri:
+    url: "{{ platform_cs_pve_base }}/api2/json/cluster/sdn"
+    method: PUT
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 60
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  changed_when: true
+  no_log: true
+  when: *zone_remove
+- name: "Clean-Slate | ZONE — Poll until the occupants are gone from the SDN config (bounded)"
+  ansible.builtin.uri:
+    url: "{{ platform_cs_pve_base }}/api2/json/cluster/sdn/vnets"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  register: platform_cs_zone_vnets_after
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  until: >-
+    (platform_cs_zone_vnets_after.status | default(0)) == 200
+    and (platform_cs_zone_vnets_after.json.data | default([]) | map(attribute='vnet') | list
+         | intersect(platform_cs_zone_occupants) | length) == 0
+  retries: "{{ platform_clean_slate_zone_poll_retries | int }}"
+  delay: "{{ platform_clean_slate_zone_poll_delay | int }}"
+  no_log: true
+  when: *zone_remove
+- name: "Clean-Slate | ZONE — GATE: the occupants are gone before the foundation destroy"
+  ansible.builtin.assert:
+    that:
+      - (platform_cs_zone_vnets_after.json.data | default([]) | map(attribute='vnet') | list
+         | intersect(platform_cs_zone_occupants) | length) == 0
+    fail_msg: >-
+      Zone occupant VNet(s) {{ platform_cs_zone_occupants }} are still present in the SDN config after removal
+      and apply. The foundation destroy would fail. Check the Proxmox SDN state (Datacenter > SDN) and re-run.
+    success_msg: "Zone occupants {{ platform_cs_zone_occupants }} removed; the zone can now be destroyed."
+    quiet: true
+  when: *zone_remove
+# Project slices whose VNet was removed out-of-band keep dangling addresses in their LOCAL state.
+# Remove them provider-free so no stale state survives (the same out-of-band-destroy-then-state-rm
+# idiom the per-guest clean-slate uses). Only for registry-known slugs with a local state file.
+- name: "Clean-Slate | ZONE — Clean the dangling local slice state of each removed project VNet"
+  ansible.builtin.include_tasks: zone_slice_state.yml
+  loop: "{{ platform_cs_zone_occupant_owners | dict2items | rejectattr('value', 'equalto', 'untracked') | list }}"
+  loop_control:
+    loop_var: platform_cs_zone_owner
+    label: "{{ platform_cs_zone_owner.key }} ({{ platform_cs_zone_owner.value }})"
+  when: *zone_remove

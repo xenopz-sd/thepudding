@@ -1,0 +1,12 @@
+---
+# handlers/main.yml — mailcatcher_install
+#
+# Mailpit reads its password file only at start ("if you modify your password
+# file while Mailpit is running, you will need to restart"), so a changed auth
+# file recreates the container.
+- name: Restart mailcatcher
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ mailcatcher_stack_name }}"
+    project_name: "{{ mailcatcher_stack_name }}"
+    state: present
+    recreate: always

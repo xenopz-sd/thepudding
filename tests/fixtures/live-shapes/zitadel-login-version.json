@@ -1,0 +1,19 @@
+{
+  "shape": "zitadel-login-version",
+  "app_oidc_login_version_field": "loginVersion",
+  "login_version_oneof": {
+    "v1": {"loginV1": {}},
+    "v2": {"loginV2": {"baseUri": ""}}
+  },
+  "instance_feature_endpoint": "/v2/features/instance",
+  "instance_feature_body": {"loginV2": {"required": true}},
+  "instance_feature_readback_accessor": ".loginV2.required",
+  "deciding_lever": "instance",
+  "_provenance": {
+    "seeded_from": ".kiro/specs/fix-svc06-login-v1-ac3/ (reopened SVC-06 AC-3); shape pinned by scripts/installer/zitadel_provision.py (LOGIN_VERSION_BODY, EP_FEATURES_INSTANCE, set_instance_login_v2_required) and infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md",
+    "hand_seeded": true,
+    "refresh": "WS-M4 Increment 2 (read-only ZITADEL MCP) — ADR-gated, not yet built",
+    "sanitized": "no secrets or real hostnames; empty baseUri placeholder only",
+    "notes": "ZITADEL v4.18.0 live-confirmed. The per-app loginVersion is a camelCase oneof: {loginV1:{}} (built-in V1 UI, /ui/login, platform default) or {loginV2:{baseUri}} (separate zitadel-login container, /ui/v2/login). The DECIDING lever for which hosted-login UI the authorize endpoint routes to is the INSTANCE feature loginV2.required (bool) at PUT /v2/features/instance — NOT the per-app field; pinning the app alone does not override the instance default. This is the SVC-06 AC-3 dead-end: with the instance default loginV2.required=true and no V2 container deployed, authorize dead-ended at /ui/v2/login -> {\"code\":5}."
+  }
+}

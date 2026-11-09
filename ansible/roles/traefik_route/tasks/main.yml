@@ -90,6 +90,26 @@
 # --- Ensure the file-provider dir exists on the Traefik_Guest (delegate) ----
 # 0755 so Traefik (file provider, :ro mount) can traverse + read the fragments;
 # this is SVC-09's already-watched dynamic dir — ensure-only, never re-own.
+- name: "Traefik_route | Fail closed on a malformed forward-auth address or response header (WS-C23)"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (route_forward_auth_address | default('') | trim | length) == 0
+        or (route_forward_auth_address | trim) is match('^https?://[!#-Z^-~]+$')
+      - route_forward_auth_response_headers | default([]) is sequence
+      - route_forward_auth_response_headers | default([]) is not string
+      - >-
+        (route_forward_auth_response_headers | default([]) | map('string')
+         | reject('match', '^[A-Za-z0-9-]+$') | list | length) == 0
+    fail_msg: >-
+      route_forward_auth_address must be empty or an http:// or https:// URL of printable ASCII without spaces, quotes,
+      backslashes or square brackets (got '{{ route_forward_auth_address | default('') }}'), and
+      route_forward_auth_response_headers must be a list of plain header names (letters, digits, hyphen).
+      Refusing to render a forwardAuth middleware from an unvalidated value (it would otherwise be spliced
+      into the Traefik dynamic config). Remedy: fix the value, or leave route_forward_auth_address empty.
+    success_msg: "forward-auth settings are well formed (or unset)."
+    quiet: true
+  when: traefik_route_enabled | bool
 - name: "Traefik_route | Ensure the Traefik file-provider dir exists on the Traefik_Guest"
   ansible.builtin.file:
     path: "{{ traefik_dynamic_config_dir }}"

@@ -51,6 +51,9 @@ top-level keys are `slug`, `database`, `sso`, `secrets`, and `workload`.
 | `sso.app_registrations[].app_type` | enum `public-spa` \| `confidential-web` \| `api` | 1.3 | reuses the `zitadel-spa-pkce-onboarding` app_type values |
 | `sso.app_registrations[].auth_method` | enum `none` \| `basic` \| `jwt-profile` | 1.3 | valid combo per the sibling spec |
 | `sso.app_registrations[].redirect_uris` | list of strings | 1.3 | required for `public-spa` / `confidential-web` |
+| `sso.app_registrations[].dev_mode` | bool, optional | v0.14.0 #3 | declares OIDC `devMode` (needed for non-https redirect URIs, dev only); reconciled on re-run; omitted = live value untouched |
+| `sso.login_policy.allow_register` | bool, optional | dev-mail-catcher R7 | reconciles the project org's login-policy `allowRegister` (self-registration) with a read-back gate; omitted = untouched; unknown keys under `login_policy` are rejected Self-registered users only land in your org if the app requests the org-id scope: see [which org does a new user land in?](CONSUMER-JOURNEY.md#sso-consumption-which-org-does-a-new-user-land-in) |
+| `sso.default_role` | string role key, or `false`, optional | WS-C18 | grants that project role to every user created in the project org (a ZITADEL Post Creation action, reconciled with a read-back gate); must be one of `sso.roles` (or `admin`/`member`/`viewer` when none declared); `false` removes it; omitted = untouched. Use a least-privilege role: see [the journey note](CONSUMER-JOURNEY.md#sso-consumption-which-org-does-a-new-user-land-in) |
 | `secrets.policy` | string, non-empty | 1.4 | OpenBao ACL policy name |
 | `secrets.path` | string, `secret/...` | 1.4 | OpenBao KV path prefix |
 | `secrets.workload_token_ttl` | integer > 0 | 1.4 | ≤ `workload_token_max_ttl` |

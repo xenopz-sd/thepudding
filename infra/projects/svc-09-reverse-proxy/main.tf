@@ -40,7 +40,7 @@ locals {
   # and the ledger is caught, not silently papered over.
   _traefik_ledger_index = one([
     for e in local._vlan20_entries : e.host_index
-    if e.svc_code == "svc09" && lookup(e, "component", null) == null
+    if lookup(e, "svc_code", null) == "svc09" && lookup(e, "component", null) == null
   ])
 
   # This root's EXPLICIT assigned index. Kept as a literal (2) for readability

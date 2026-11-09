@@ -1,0 +1,130 @@
+---
+# tasks/usermgr_mint.yml — zitadel-org-provision (WS-C4, ADR-0023)
+#
+# Mint the per-org USER-MANAGER identity at onboarding: a dedicated NON-HUMAN machine user in
+# THIS project's org holding ORG_USER_MANAGER on that org only (never IAM_OWNER, never
+# ORG_OWNER), with a bounded-lifetime PAT stored ONLY in the project's OpenBao path. Mirrors
+# ADR-0016's machine-user -> bounded PAT -> OpenBao-only -> no_log pattern, org-scoped.
+#
+# Included from the end of tasks/main.yml, so the provisioning token (zop_provision_token) and
+# the OpenBao admin token (zop_bao_token) are already resolved. Idempotent:
+#   * the machine user + membership are converged on every run;
+#   * a PAT is minted ONLY when the user is new or the stored secret is missing (ZITADEL returns
+#     a PAT value once), so a converged re-run changes nothing.
+# A PAT is never minted when OpenBao is unwired (it could not be stored) or on the dev guest-run
+# path (which has no control-node route to the mgmt API).
+# Every task carrying a token or the PAT is no_log; the PAT travels in the child ENV / bao argv
+# of a delegated docker exec exactly like the OIDC client secret writes above (no new exposure).
+- name: "ZITADEL-org | USERMGR — Read the stored user-manager PAT presence from OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zop_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zop_bao_token,
+          zop_openbao_primary_container_name, zop_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (zop_openbao_tls_skip_verify | bool) else [])
+         + ['-field=' ~ zop_openbao_usermgr_token_field, zop_openbao_usermgr_secret_path] }}
+  delegate_to: "{{ zop_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zop_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zop_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zop_usermgr_stored
+  failed_when: false
+  changed_when: false
+  no_log: true
+- name: "ZITADEL-org | USERMGR — Mint/converge the per-org ORG_USER_MANAGER machine user (idempotent, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ [zop_venv_python, zop_usermgr_helper,
+          '--base-url', zop_base_url]
+         + zop_usermgr_insecure_arg
+         + ['mint-usermgr',
+            '--org', zop_org_name,
+            '--user', zop_usermgr_name,
+            '--pat-days', (zop_usermgr_pat_days | string)]
+         + zop_usermgr_have_secret_arg }}
+  args:
+    chdir: "{{ zop_repo_root }}"
+  vars:
+    zop_usermgr_insecure_arg: "{{ ['--insecure'] if (zop_base_url_tls_skip_verify | bool) else [] }}"
+    # The stored PAT exists iff the read succeeded with a non-empty value; then do not re-mint.
+    zop_usermgr_have_secret_arg: >-
+      {{ ['--have-secret']
+         if ((zop_usermgr_stored.rc | default(1)) == 0
+             and (zop_usermgr_stored.stdout | default('') | trim | length) > 0)
+         else [] }}
+  environment:
+    ZITADEL_PROVISION_TOKEN: "{{ zop_provision_token }}"
+  register: zop_usermgr_run
+  changed_when: >-
+    (zop_usermgr_run.stdout | default('{}') | from_json).created | default(false)
+    or (zop_usermgr_run.stdout | default('{}') | from_json).pat_minted | default(false)
+  no_log: true
+- name: "ZITADEL-org | USERMGR — Bind the (non-secret) mint outcome"
+  ansible.builtin.set_fact:
+    zop_usermgr_minted: >-
+      {{ (zop_usermgr_run.stdout | default('{}') | from_json).pat_minted | default(false) | bool }}
+    zop_usermgr_user_id: >-
+      {{ (zop_usermgr_run.stdout | default('{}') | from_json).user_id | default('') }}
+    zop_usermgr_expires: >-
+      {{ (zop_usermgr_run.stdout | default('{}') | from_json).pat_expires | default('') }}
+  no_log: true
+  changed_when: false
+- name: "ZITADEL-org | USERMGR — Persist the PAT to the project's OpenBao path (only when newly minted, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zop_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zop_bao_token,
+          zop_openbao_primary_container_name, zop_openbao_bao_bin, 'kv', 'put']
+         + (['-tls-skip-verify'] if (zop_openbao_tls_skip_verify | bool) else [])
+         + [zop_openbao_usermgr_secret_path,
+            zop_openbao_usermgr_token_field ~ '='
+              ~ ((zop_usermgr_run.stdout | default('{}') | from_json).pat | default('')),
+            'user_id=' ~ zop_usermgr_user_id,
+            'user_name=' ~ zop_usermgr_name,
+            'role=ORG_USER_MANAGER',
+            'expires=' ~ zop_usermgr_expires] }}
+  delegate_to: "{{ zop_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zop_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zop_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zop_usermgr_write
+  changed_when: true
+  no_log: true
+  when: zop_usermgr_minted | bool
+- name: "ZITADEL-org | USERMGR — Read back the stored PAT (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ zop_openbao_cli_bao_addr, '-e', 'BAO_TOKEN=' ~ zop_bao_token,
+          zop_openbao_primary_container_name, zop_openbao_bao_bin, 'kv', 'get']
+         + (['-tls-skip-verify'] if (zop_openbao_tls_skip_verify | bool) else [])
+         + ['-field=' ~ zop_openbao_usermgr_token_field, zop_openbao_usermgr_secret_path] }}
+  delegate_to: "{{ zop_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ zop_openbao_cli_user | default('root') }}"
+    ansible_python_interpreter: "{{ zop_openbao_cli_python | default('/usr/bin/python3') }}"
+  register: zop_usermgr_readback
+  changed_when: false
+  no_log: true
+  when: zop_usermgr_minted | bool
+- name: "ZITADEL-org | USERMGR — Verify the read-back equals the minted PAT (fail names the path, no value echoed)"
+  ansible.builtin.assert:
+    that:
+      - (zop_usermgr_readback.stdout | default('') | trim)
+        == ((zop_usermgr_run.stdout | default('{}') | from_json).pat | default(''))
+    fail_msg: >-
+      OpenBao read-back MISMATCH for the user-manager PAT at {{ zop_openbao_usermgr_secret_path }} —
+      the stored value does not equal the minted value. (No secret value is shown.)
+    success_msg: "User-manager PAT stored and verified at {{ zop_openbao_usermgr_secret_path }} (value not logged)."
+    quiet: true
+  no_log: true
+  when: zop_usermgr_minted | bool
+- name: "ZITADEL-org | INFO — user-manager identity for org {{ zop_org_name }} (non-secret)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: org {{ zop_org_name }} has the ORG_USER_MANAGER machine user '{{ zop_usermgr_name }}'
+      (user_id={{ zop_usermgr_user_id }}); PAT {{ 'MINTED and stored' if (zop_usermgr_minted | bool)
+      else 'already stored (not re-minted)' }} at {{ zop_openbao_usermgr_secret_path }}
+      field '{{ zop_openbao_usermgr_token_field }}'{{ (' (expires ' ~ zop_usermgr_expires ~ ')')
+      if (zop_usermgr_expires | length > 0) else '' }}.
+      Create login users with zitadel-user-provision.yml (operator) or from the app using that PAT.

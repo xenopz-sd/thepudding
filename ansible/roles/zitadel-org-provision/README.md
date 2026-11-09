@@ -144,6 +144,18 @@ zop_app_registrations:
     redirect_uris: []               # resource servers have no redirect URIs
 ```
 
+Optional per-entry `dev_mode` (bool): declares OIDC `devMode`, which ZITADEL needs
+for non-https redirect URIs (dev only). Omit it to leave the live value untouched.
+
+**Re-run reconcile (v0.14.0 feedback #3).** An app that already exists is converged
+to the manifest, not just newly-created ones: `redirect_uris` (set-equal, order is
+not drift), `loginVersion`, and `dev_mode` (when declared) are fixed via one
+full-config PUT, followed by a read-back gate that fails the run (exit 3) if the
+live app did not converge. All declared redirect URIs are passed (previously only
+the first). An unchanged app makes no PUT and the task reports `changed=0`. Result
+JSON gains `config_reconciled`, `reconciled_fields`, `redirect_uris_reconciled`
+and `dev_mode_reconciled`. The client secret is still emitted only at creation.
+
 ---
 
 ## Usage

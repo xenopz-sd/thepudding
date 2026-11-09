@@ -526,6 +526,20 @@ Role usage and CLI-flag reference: the
 
 ---
 
+## A.6.5 — Dev clusters have no SMTP: completing self-registration
+
+ZITADEL's hosted login offers **self-registration**, and a dev cluster has **no SMTP**. A user who registers
+stays in `USER_STATE_INITIAL` waiting for an email verification code that can never be delivered, and ZITADEL
+deliberately refuses admin `SetEmail`/`SetPassword` on such a user. Two supported ways out, both off by default:
+
+- **Catch the mail.** Install the shared dev mail catcher and point ZITADEL at it, then read the code in its web
+  UI: [mail catcher runbook](../mailcatcher/INSTALL-RUNBOOK.md) (Mock 7, `zitadel_smtp_dev_catcher`).
+- **Do not offer self-registration.** Set `sso.login_policy.allow_register: false` in the consumer manifest and seed
+  users administratively ([manifest reference](../../../docs/CONSUMER-MANIFEST-REFERENCE.md)).
+
+Org placement of a self-registered user and an automatic default role are **not** solved by either; see WS-C18 in
+[`PLANNING.md`](../../../PLANNING.md).
+
 ## A.7 — Interactive browser login (Login V1) — closes AC-3
 
 This is the provision-then-test step for **AC-3 / FR-9**: an external OIDC app
@@ -614,6 +628,94 @@ URL above in a browser, sign in as the test user, and confirm the redirect back 
 `https://<slug>.<platform-domain>/oauth/callback?code=…`. The dev browser-
 reachability recipe (the `/etc/hosts` mapping + cert trust) is in
 [`docs/CONSUMER-JOURNEY.md`](../../../docs/CONSUMER-JOURNEY.md#browser-reachability-recipe-dev-only).
+
+---
+## A.8 — Prove MFA is enforceable and blocks a login (AC-4) `[requires-infra]`
+
+AC-4 ("MFA enforceable via org login policy") is accepted only when MFA **actually
+blocks** a login that has correct primary credentials but no valid second factor.
+`scripts/installer/zitadel_login_probe.py` drives the built-in Login V1 UI and reports
+whether an authorization code was issued. Run it against the **throwaway** cluster with
+the throwaway test user from A.7.1 only. The IAM_OWNER token comes from OpenBao
+(`provision_token`); keep it in the environment, never on argv. Placeholders:
+`<traefik-guest-ip>`, `<platform-domain>`, `<org-id>`, `<spa-client-id>`, `<slug>`.
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+# Control: MFA not enforced -> the optional 2FA step can be skipped and a code is issued.
+ZPROBE_PASSWORD="$TEST_USER_PASSWORD" ~/venv/devinfra/bin/python scripts/installer/zitadel_login_probe.py \
+  --connect-base https://<traefik-guest-ip> --host auth.<platform-domain> --insecure \
+  login --client-id <spa-client-id> --redirect-uri https://<slug>.<platform-domain>/oauth/callback \
+  --login-name testuser@<slug>.<platform-domain>      # expect "outcome": "CODE_ISSUED"
+# Enforce MFA on the org (custom login policy forceMfa=true + second factors), read it back.
+ZITADEL_ACCESS_TOKEN="$ZITADEL_PROVISION_TOKEN" ~/venv/devinfra/bin/python scripts/installer/zitadel_login_probe.py \
+  --connect-base https://<traefik-guest-ip> --host auth.<platform-domain> --insecure \
+  policy --org-id <org-id> enforce                    # expect "forceMfa": true
+# Enforced: the same login, and a forced-skip bypass attempt, must NOT yield a code.
+ZPROBE_PASSWORD="$TEST_USER_PASSWORD" ~/venv/devinfra/bin/python scripts/installer/zitadel_login_probe.py \
+  --connect-base https://<traefik-guest-ip> --host auth.<platform-domain> --insecure \
+  login --client-id <spa-client-id> --redirect-uri https://<slug>.<platform-domain>/oauth/callback \
+  --login-name testuser@<slug>.<platform-domain> --force-skip   # expect MFA_REQUIRED or DENIED
+# Restore the baseline (drop the org custom policy -> instance default).
+ZITADEL_ACCESS_TOKEN="$ZITADEL_PROVISION_TOKEN" ~/venv/devinfra/bin/python scripts/installer/zitadel_login_probe.py \
+  --connect-base https://<traefik-guest-ip> --host auth.<platform-domain> --insecure \
+  policy --org-id <org-id> reset
+```
+
+With a TOTP registered for the test user (`POST /v2/users/{id}/totp` then `/totp/verify`),
+the probe also takes `ZPROBE_OTP=<code>` (a deliberately wrong code is **DENIED**,
+"Invalid code") and `ZPROBE_TOTP_SECRET=<base32>` (a correct code yields `CODE_ISSUED`).
+The probe makes exactly one credential attempt per call and never resubmits (lockout
+safety). It prints only the outcome, steps and code length, never the code, password or
+token.
+
+---
+
+## A.9 — Org-scoped login-user provisioning (WS-C4, ADR-0023) `[requires-infra]`
+
+Every project org gets a dedicated non-human machine user, `usermgr-sa`, that holds
+`ORG_USER_MANAGER` on **that org only** (it cannot create orgs, touch other orgs, or change the
+org's projects). It is minted when the project is onboarded to SSO (an `sso` block in the consumer
+manifest, OpenBao wired) and its bounded-lifetime PAT lives only in OpenBao at
+`secret/proj-<slug>/zitadel/usermgr` (field `pat`). The instance `IAM_OWNER` token is used for the
+mint and the teardown, never for creating users.
+
+**Path (a), the operator creates a login user.** Idempotent; the password is read from the
+environment only and a first login forces a change unless `zup_password_change_required=false`
+(throwaway test users only).
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+ZITADEL_NEW_USER_PASSWORD="$INITIAL_PASSWORD" OPENBAO_ADMIN_TOKEN="$OPENBAO_ADMIN_TOKEN" \
+~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+  ansible/playbooks/zitadel-user-provision.yml \
+  -e zup_project_slug=<slug> -e zup_openbao_addr=<openbao-primary-ip> \
+  -e zup_username=<login-name> -e zup_first_name=<first> -e zup_last_name=<last> -e zup_email=<email>
+```
+
+**Path (b), an application creates users in its own org.** The app retrieves the PAT from its
+OpenBao path (through its openbao-agent sidecar like any other secret) and calls the ZITADEL
+management API without an org header, so the call can only act on the PAT's own org:
+
+<!-- doctest: display-only -->
+```bash
+# POST https://auth.<platform-domain>/management/v1/users/human/_import
+#   Authorization: Bearer <PAT from secret/proj-<slug>/zitadel/usermgr field pat>
+#   {"userName": "...", "profile": {"firstName": "...", "lastName": "..."},
+#    "email": {"email": "...", "isEmailVerified": true}, "password": "...", "passwordChangeRequired": true}
+# 200 -> {"userId": "..."}; 409 -> the user already exists.
+# The same PAT is refused (404/403) for another org, for creating an org, and for creating a project.
+```
+
+The helper `scripts/installer/zitadel_user_provision.py` wraps these calls (`create-user`,
+`probe-refusals`); tokens and the password are environment-only.
+
+**Teardown.** The consumer clean-slate composes
+`zitadel-user-provision.yml -e zup_action=teardown`, which deletes the machine user and the OpenBao
+secret and fails on any residue. To rotate the PAT, delete the OpenBao field and re-run the SSO
+onboarding; a converged re-run never re-mints.
 
 ---
 

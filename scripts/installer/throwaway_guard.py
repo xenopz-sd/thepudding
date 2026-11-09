@@ -136,6 +136,21 @@ def parse_services_scope(raw: str | None) -> frozenset[str] | None:
     return frozenset(tokens)
 
 
+def scope_missing(services_scope_raw: str | None, services: "list[str] | tuple[str, ...]") -> list[str]:
+    """Services (from ``services``) that a PRESENT ``AGENT_LIVE_AUTHORIZED_SERVICES`` scope omits.
+
+    Pure (WS-C11). An absent/empty scope narrows nothing, so nothing is missing. Used by
+    orchestrators that COMPOSE child service installers (each child consults the guard under
+    its own ``--service``): they pre-check the whole composed set UP FRONT so a too-narrow
+    scope refuses before any mutation, instead of REFUSING mid-run inside a child after the
+    orchestrator already changed things. Never weakens the guard: it can only add refusals.
+    """
+    scope = parse_services_scope(services_scope_raw)
+    if scope is None:
+        return []
+    return [svc for svc in services if svc.strip() and svc.strip().lower() not in scope]
+
+
 def is_armed(interlock_raw: str | None) -> bool:
     """Return True iff ``AGENT_LIVE_AUTHORIZED`` is armed.
 
@@ -379,6 +394,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to the throwaway-cluster allowlist YAML "
         "(scripts/installer/throwaway-clusters.yml).",
     )
+    parser.add_argument(
+        "--also-service",
+        default="",
+        help="Comma/space-separated services this orchestrator COMPOSES (their own guard "
+        "consults run in child installers). A present AGENT_LIVE_AUTHORIZED_SERVICES scope "
+        "must grant every one, else REFUSED up front (WS-C11). Empty = none.",
+    )
     args = parser.parse_args(argv)
 
     interlock_raw = os.environ.get("AGENT_LIVE_AUTHORIZED")
@@ -395,6 +417,19 @@ def main(argv: list[str] | None = None) -> int:
         allowlist=allowlist,
     )
 
+    if decision.authorized:
+        composed = [t for t in re.split(r"[,\s]+", args.also_service) if t.strip()]
+        missing = scope_missing(services_scope_raw, composed)
+        if missing:
+            decision = Decision(
+                authorized=False,
+                reason=(
+                    f"composed service(s) {', '.join(missing)} out of "
+                    f"AGENT_LIVE_AUTHORIZED_SERVICES scope (the {args.service} orchestrator "
+                    f"composes them; add them to the scope or unset it)"
+                ),
+                identity=decision.identity,
+            )
     payload = {
         "authorized": decision.authorized,
         "reason": decision.reason,

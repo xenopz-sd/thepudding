@@ -34,6 +34,24 @@
     quiet: true
 
 # ============================================================================
+# STEP 0b (WS-C6, part B) — Resolve the dev TLS posture for the Agent -> Primary hop
+# ============================================================================
+# explicit -e openbao_tls_self_signed > OPENBAO_TLS_SELF_SIGNED in the cluster env
+# file > false (verify). Read-only; control-node lookup; a missing file is "unset".
+# The env text is never logged (no_log) and only the boolean verdict is kept.
+- name: "Hello-workload | Read the cluster env file text (control node, read-only, WS-C6)"
+  ansible.builtin.set_fact:
+    hello_workload_envfile_text: >-
+      {{ lookup('ansible.builtin.file', hello_workload_cluster_env_path, errors='ignore')
+         | default('', true) }}
+  no_log: true
+- name: "Hello-workload | Resolve the dev TLS posture (explicit -e > env file > verify, WS-C6)"
+  ansible.builtin.set_fact:
+    hello_workload_tls_self_signed: >-
+      {{ (openbao_tls_self_signed | bool) if openbao_tls_self_signed is defined
+         else (hello_workload_envfile_text | string
+               is search(hello_workload_tls_optin_regex)) }}
+# ============================================================================
 # STEP 1 — Stage the reference entrypoint onto the target host (service-owned)
 # ============================================================================
 # The reference image is STOCK (busybox); the /healthz-iff-secret behaviour is
@@ -195,6 +213,9 @@
     # The workload-layer /healthz healthcheck (Req 1.1) — distinct from, and on
     # top of, the Agent sidecar's RSF-presence healthcheck + the swap-gate.
     openbao_agent_workload_healthcheck: "{{ hello_workload_healthcheck }}"
+    # Dev TLS posture (WS-C6): the resolved explicit-opt-in verdict (default FALSE =
+    # verify). Never a committed production default (platform-runtime-patterns P4).
+    openbao_primary_tls_skip_verify: "{{ hello_workload_tls_self_signed }}"
 
 - name: "Hello-workload | INFO — reference workload stood up via openbao-agent (secret by name only)"
   ansible.builtin.debug:

@@ -1,0 +1,44 @@
+---
+# tasks/zone_slice_state.yml — platform_clean_slate (WS-C12). Included once per removed project VNet
+# (loop var platform_cs_zone_owner = {key: p<vlan>, value: <slug>}).
+# The project's network-slice root keeps its resources in a LOCAL state file
+# infra/projects/<slug>/<slug>-infra.tfstate. Once the platform removed that VNet through the API those
+# addresses dangle; `terraform state rm -state=<file>` (provider-free, no backend, no destroy) clears them.
+# Skipped when the file is absent (GitLab-backed or never applied locally): nothing local to clean.
+- name: "Clean-Slate | ZONE — Locate the local slice state of {{ platform_cs_zone_owner.value }}"
+  ansible.builtin.stat:
+    path: >-
+      {{ platform_repo_root }}/infra/projects/{{ platform_cs_zone_owner.value }}/{{
+      platform_cs_zone_owner.value }}-infra.tfstate
+  register: platform_cs_zone_slice_state
+- name: "Clean-Slate | ZONE — List the dangling slice addresses (read-only)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+      - "-state={{ platform_cs_zone_owner.value }}-infra.tfstate"
+  args:
+    chdir: "{{ platform_repo_root }}/infra/projects/{{ platform_cs_zone_owner.value }}"
+  register: platform_cs_zone_slice_addrs
+  changed_when: false
+  failed_when: false
+  when: platform_cs_zone_slice_state.stat.exists
+- name: "Clean-Slate | ZONE — Remove the dangling slice addresses (provider-free state rm)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - rm
+      - "-state={{ platform_cs_zone_owner.value }}-infra.tfstate"
+      - "{{ item }}"
+  args:
+    chdir: "{{ platform_repo_root }}/infra/projects/{{ platform_cs_zone_owner.value }}"
+  loop: "{{ (platform_cs_zone_slice_addrs.stdout | default('')).split() }}"
+  register: platform_cs_zone_slice_rm
+  changed_when: "'Removed' in (platform_cs_zone_slice_rm.stdout | default(''))"
+  failed_when:
+    - (platform_cs_zone_slice_rm.rc | default(1)) != 0
+    - "'No matching objects' not in (platform_cs_zone_slice_rm.stdout | default(''))"
+    - "'No matching objects' not in (platform_cs_zone_slice_rm.stderr | default(''))"
+  when: platform_cs_zone_slice_state.stat.exists

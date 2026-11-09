@@ -40,3 +40,8 @@ secrets:
   workload_token_max_ttl: 14400
   secret_id_ttl: 86400
   secret_id_num_uses: 0
+
+workload:
+  enabled: true     # provision the per-project workload guest (§B, VLAN 100 host_index 1 -> 10.0.100.11)
+  tier: small       # small | medium
+  count: 1          # single-guest validated path

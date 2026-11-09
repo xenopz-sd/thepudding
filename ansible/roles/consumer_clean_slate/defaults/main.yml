@@ -6,6 +6,19 @@
 # agent_live_run) are play-level vars; consumer_vlan_id / consumer_manifest are
 # Phase-1-style facts resolved below. NO secret here.
 
+# --- Agent-live throwaway-cluster guard (WS-C3) ----------------------------- #
+# consumer_clean_slate is now a first-class destructive-live orchestrator (it
+# composes clean-slate.yml -> terraform_clean_slate for the workload guest, and
+# the DB's own clean-slate), so — per testing-strategy.md "Agent Live-Test
+# Authorization" and the mechanical coverage guard
+# (test_agent_live_wiring_coverage.py) — it MUST consult the throwaway guard
+# FIRST on an agent-live run, exactly as svc01_clean_slate / svc07_clean_slate
+# do. The clean-slate branch does not run consumer_preflight (which defines these
+# for the onboard path), so the role carries its own copies. `agent_live_run` and
+# `consumer_venv_python` are play-level vars (project-consumer-bootstrap.yml).
+consumer_throwaway_guard: scripts/installer/throwaway_guard.py
+consumer_throwaway_allowlist: scripts/installer/throwaway-clusters.yml
+
 # The sanctioned SVC-01 orchestrator whose OWN clean-slate contract the consumer
 # clean-slate COMPOSES for the DB teardown (ADR-0011 pattern, Req 9.5). The
 # consumer clean-slate NEVER pct-destroys or terraform-state-rm's the DB guest
@@ -33,3 +46,46 @@ consumer_proxmox_host: ""
 # (Req 7.7). Named here only for the explicit no-touch assertions/documentation.
 consumer_registry_path: infra/platform-foundation/projects.yaml
 consumer_network_slice_root: "infra/projects/{{ project_slug }}"
+
+# --- Workload guest teardown (WS-C3) ---------------------------------------- #
+# The per-project workload guest (consumer-last-mile-hello-workload §B, ADR-0021)
+# is a stateless Terraform-provisioned LXC applied by consumer_provision from the
+# workload root below (state `<slug>-workload`). Bring-up creates it; the
+# clean-slate MUST reverse it or the guest + its state survive a reset (the WS-C3
+# teardown-parity gap). The workload root is OWNED by the consumer flow (applied
+# inline by consumer_provision, not by a separate service bootstrap), so — unlike
+# the DB, which composes its own svc-01-bootstrap.yml clean-slate — the workload
+# teardown composes the shared terraform_clean_slate mechanism DIRECTLY through
+# `ansible/playbooks/clean-slate.yml`, exactly as svc01_clean_slate assembles a
+# single clean_slate_target. This is an owned teardown, not cross-boundary
+# surgery (integration-boundaries §5: each state reversed only by its owner).
+#
+# Repo-RELATIVE; clean-slate.yml resolves it absolute on the control node (same
+# as the DB target's terraform_root).
+consumer_workload_tf_root: "infra/projects/{{ project_slug }}/workload"
+
+# The workload container resource ADDRESS in that root. The guest is count-gated
+# (count = workload_enabled ? workload_count : 0), so the address is indexed; the
+# default single-guest case is [0]. The residue sweep after the child run clears
+# any remaining module/anchor addresses (module.workload[0],
+# terraform_data.assert_resolvable), mirroring the DB residue sweep.
+consumer_workload_resource_address: "proxmox_virtual_environment_container.workload[0]"
+
+# Per-project workload guest VMID — OPERATOR OVERRIDE, default 0 = "use the
+# module-computed deterministic VMID" (ADR-0022, mirrors consumer_provision). The
+# clean_slate_confirm anti-footgun token must match this VMID, so a live reset
+# pins the real VMID with -e consumer_workload_vmid=<id> (0 is not a valid live
+# destroy target — the teardown is a strict no-op when the workload is disabled,
+# and the VMID is required when it is enabled).
+consumer_workload_vmid: 0
+
+# The Proxmox-host inventory the workload reset delegates to (pct runs on the
+# node) — the same inventory the DB reset path uses.
+consumer_workload_proxmox_host_inventory: ansible/inventory/proxmox-hosts.yml
+# WS-C11: services whose child installers this orchestrator composes; each consults the
+# throwaway guard under its OWN --service, so a narrow AGENT_LIVE_AUTHORIZED_SERVICES scope
+# must grant them all. Composes svc-01-bootstrap.yml clean-slate.
+consumer_guard_composed_services: [svc01]
+# WS-C4: strict teardown of the per-org user-manager identity (machine user + OpenBao secret).
+# false downgrades a failed teardown (e.g. ZITADEL already torn down) to a WARN.
+consumer_cs_usermgr_teardown_strict: true

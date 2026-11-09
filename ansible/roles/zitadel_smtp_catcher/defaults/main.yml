@@ -1,0 +1,47 @@
+---
+# defaults/main.yml — zitadel_smtp_catcher (Mock 7, default OFF)
+#
+# NO secret value lives here. The IAM_OWNER access token comes from the process
+# ENVIRONMENT (ZITADEL_PROVISION_TOKEN) or, when that is empty, from OpenBao exactly
+# like zitadel-org-provision (same path/field), and is passed to the helper only via
+# the child ENVIRONMENT.
+
+# --- The mock flag (mock-stand-ins.md, Mock 7): default OFF. ----------------------
+# false => SMTP is left UNTOUCHED (today's behaviour). true => point ZITADEL's
+# instance email provider at the dev catcher. Never flipped by merge or by another
+# service; a conscious per-deployment opt-in (-e zitadel_smtp_dev_catcher=true).
+zitadel_smtp_dev_catcher: false
+# true => remove the provider IF AND ONLY IF it is the catcher (reverse of the above).
+zitadel_smtp_remove: false
+# Dangerous: allow replacing a non-catcher SMTP provider. Off; the helper refuses.
+zitadel_smtp_replace_existing: false
+
+# --- Targets ------------------------------------------------------------------------
+zitadel_smtp_platform_domain: "platform.example.test"
+zitadel_smtp_base_url: "https://auth.{{ zitadel_smtp_platform_domain }}"
+# Dev self-signed Traefik cert (ADR-0013) => skip verification; set false once a real CA exists (P4).
+zitadel_smtp_base_url_tls_skip_verify: true
+# The catcher: VLAN-20 IP + SMTP port (kept in sync with mailcatcher_install/defaults).
+zitadel_smtp_catcher_host: "10.0.20.21"
+zitadel_smtp_catcher_port: 1025
+zitadel_smtp_sender_address: "noreply@{{ zitadel_smtp_platform_domain }}"
+zitadel_smtp_sender_name: "ZITADEL (dev)"
+# The generated inventory proving the catcher is provisioned (file-mediated handoff, §4).
+zitadel_smtp_catcher_inventory: "ansible/inventory/mailcatcher.generated.yml"
+zitadel_smtp_catcher_probe_timeout: 30
+
+# --- Repo plumbing ---------------------------------------------------------------------
+zitadel_smtp_repo_root: "{{ playbook_dir | dirname | dirname }}"
+zitadel_smtp_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+zitadel_smtp_helper: "scripts/installer/zitadel_smtp.py"
+
+# --- Token source 2: OpenBao (same path/field as zitadel-org-provision) -------------------
+zitadel_smtp_openbao_cli_host: "10.0.20.10"
+zitadel_smtp_openbao_container: "openbao-openbao-1"
+zitadel_smtp_openbao_bao_bin: "bao"
+zitadel_smtp_openbao_bao_addr: "https://127.0.0.1:8200"
+zitadel_smtp_openbao_tls_skip_verify: true
+zitadel_smtp_openbao_provision_secret_path: "secret/proj-shared-zitadel/zitadel"
+zitadel_smtp_openbao_provision_token_field: "provision_token"
+zitadel_smtp_openbao_cli_user: "root"
+zitadel_smtp_openbao_cli_python: "/usr/bin/python3"

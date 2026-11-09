@@ -35,6 +35,9 @@
 - name: "Provisioning (network slice) | Auto-create the project VNet when absent"
   when:
     - consumer_autocreate_network_slice | bool
+    # WS-C24: only a manifest that declares a guest (database / enabled workload) needs the slice.
+    # Defaults to true so an absent fact keeps the previous behavior (fail-safe).
+    - consumer_network_slice_required | default(true) | bool
     - not (consumer_vnet_present | default(true) | bool)
   block:
     - name: "Provisioning (network slice) | INFO — auto-creating VNet p{{ consumer_vlan_id }}"
@@ -182,12 +185,12 @@
 # throwaway-guard consult (gated on agent_live_run) in svc01_preflight, so this
 # role is LEAF-EXEMPT (no duplicate guard here).
 #
-# NOTE: svc-01-bootstrap.yml drives the REUSABLE svc-01-sql-database root
-# directly (its svc01_provision uses state name <slug>-svc01-postgres). The
-# SVC01_Consumer_Root `db/` wrapper root (state <slug>-db) is the ADR-0019
-# per-project pattern; composing svc-01-bootstrap.yml reuses the SAME underlying
-# module and threads the SAME per-project inputs, so the provisioned guest is
-# identical. A non-zero child exit propagates to the Phase-2 rescue.
+# NOTE (WS-C9, ADR-0019): the child is run with `-e svc01_consumer_wrapper=true`,
+# so svc01_provision drives the per-project SVC01_Consumer_Root
+# infra/projects/<slug>/db/ (state <slug>-db), which resolves vlan_id/host_index
+# from the registry/ledger and REUSES the svc-01-sql-database module internally.
+# Previously the live flow bypassed the wrapper (state <slug>-svc01-postgres).
+# A non-zero child exit propagates to the Phase-2 rescue.
 - name: "Provisioning | Compose svc-01-bootstrap.yml to provision + bootstrap the per-project DB"
   ansible.builtin.command:
     argv:
@@ -203,6 +206,10 @@
       - "vlan_id={{ consumer_vlan_id }}"
       - -e
       - "svc01_vmid={{ consumer_svc01_vmid }}"
+      # WS-C9 (ADR-0019): drive the per-project SVC01_Consumer_Root infra/<slug>/db/
+      # (state <slug>-db) instead of the reusable svc-01-sql-database root.
+      - -e
+      - "svc01_consumer_wrapper=true"
       - -e
       - "db_engine={{ consumer_manifest.database.engine | default('postgres') }}"
       - -e
@@ -233,7 +240,7 @@
       - "{{ consumer_venv_python }}"
       - ansible/inventory/generate_inventory.py
       - --root
-      - infra/projects/svc-01-sql-database
+      - "infra/projects/{{ project_slug }}/db"
       - --out
       - "{{ consumer_generated_inventory }}"
   args:

@@ -139,6 +139,15 @@
     host_index: 10            # -> 10.0.20.20
     status: allocated
 
+  # --- Shared dev mail catcher (Mailpit), spec dev-mail-catcher, ADR-0025. A
+  #     NON-CATALOG guest (no SVC-NN slot exists for a mail sink), so it is keyed
+  #     on role_code (ADR-0021). Index 3 (.13) stays a documented gap. NON-ANCHOR:
+  #     stateless, disposable mail. ---
+  - role_code: mailcatcher    # shared dev mail catcher (Mailpit)
+    instance: 1
+    host_index: 11            # -> 10.0.20.21
+    status: allocated
+
 # =============================================================================
 # PROJECT VLANs (100+) — per-project dedicated tenancy (NET-00 §2, domain-rules
 # §1). Populated the FIRST time a project VLAN carries more than one Terraform

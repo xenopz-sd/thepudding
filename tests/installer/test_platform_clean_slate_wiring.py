@@ -946,3 +946,118 @@ def _reboot_default():
             if isinstance(p, dict) and isinstance(p.get("vars"), dict) and key in p["vars"]:
                 return p["vars"][key]
     return None
+
+
+# =============================================================================
+# WS-C2 — discovery-completeness: the catalog covers every IMPLEMENTED shared
+# service (svc06 + svc07 + svc09), and the child-run threads per-row extra_vars.
+# Validates: WS-C2 requirements FR-1..FR-4 / AC-1..AC-3.
+# =============================================================================
+def _catalog_rows() -> list[dict]:
+    defaults = yaml.safe_load(_ROLE_DEFAULTS.read_text(encoding="utf-8")) or {}
+    return [
+        r for r in (defaults.get("platform_clean_slate_services") or [])
+        if isinstance(r, dict)
+    ]
+
+
+def _catalog_row(service: str) -> dict | None:
+    return next((r for r in _catalog_rows() if r.get("service") == service), None)
+
+
+def test_catalog_covers_all_implemented_shared_services():
+    """WS-C2 bug-condition (AC-1) — FAILS on the committed svc07-only catalog.
+
+    The platform clean-slate discovers services by iterating
+    `platform_clean_slate_services`, so an implemented shared service that ships
+    a clean-slate contract + a generated inventory but has NO catalog row is
+    structurally UNDISCOVERABLE and is silently left standing by the teardown.
+    SVC-06 (ZITADEL + backing DB) and SVC-09 (Traefik) both ship compliant
+    `*_clean_slate` roles and generated inventories, so the catalog MUST include
+    them alongside SVC-07.
+
+    On the committed svc07-only catalog this FAILS (the WS-C2 gap); after the fix
+    (svc06 + svc09 rows added) it PASSES.
+    """
+    services = {r.get("service") for r in _catalog_rows()}
+    required = {"svc06", "svc07", "svc09"}
+    missing = required - services
+    assert not missing, (
+        "WS-C2: platform_clean_slate_services must catalog every IMPLEMENTED "
+        "shared service that ships a clean-slate contract — the teardown can only "
+        "discover + tear down catalogued services. Missing row(s): "
+        f"{sorted(missing)}. Found: {sorted(services)}. An un-catalogued service "
+        "is silently left standing by the platform clean-slate."
+    )
+
+
+def test_svc06_and_svc09_rows_are_contract_complete():
+    """WS-C2 row shape (AC-2) — the new rows carry the fields discovery +
+    child-run + verification consume, with the correct values."""
+    svc09 = _catalog_row("svc09")
+    assert svc09 is not None, "WS-C2: no svc09 row in platform_clean_slate_services."
+    assert svc09.get("bootstrap_playbook") == "ansible/playbooks/svc-09-bootstrap.yml", (
+        f"WS-C2: svc09 bootstrap_playbook wrong: {svc09.get('bootstrap_playbook')!r}"
+    )
+    assert svc09.get("generated_inventory") == (
+        "ansible/inventory/svc-09-reverse-proxy.generated.yml"
+    ), f"WS-C2: svc09 generated_inventory wrong: {svc09.get('generated_inventory')!r}"
+    assert svc09.get("verify_tf_root") == "infra/projects/svc-09-reverse-proxy", (
+        f"WS-C2: svc09 verify_tf_root wrong: {svc09.get('verify_tf_root')!r}"
+    )
+    assert svc09.get("proxmox_host_var") == "svc09_proxmox_host", (
+        f"WS-C2: svc09 proxmox_host_var wrong: {svc09.get('proxmox_host_var')!r}"
+    )
+    assert 1090 in (svc09.get("verify_vmids") or []), (
+        f"WS-C2: svc09 verify_vmids must include the Traefik VMID 1090; got "
+        f"{svc09.get('verify_vmids')!r}"
+    )
+
+    svc06 = _catalog_row("svc06")
+    assert svc06 is not None, "WS-C2: no svc06 row in platform_clean_slate_services."
+    assert svc06.get("bootstrap_playbook") == "ansible/playbooks/svc-06-bootstrap.yml", (
+        f"WS-C2: svc06 bootstrap_playbook wrong: {svc06.get('bootstrap_playbook')!r}"
+    )
+    assert svc06.get("generated_inventory") == (
+        "ansible/inventory/svc-06-identity-provider.generated.yml"
+    ), f"WS-C2: svc06 generated_inventory wrong: {svc06.get('generated_inventory')!r}"
+    assert svc06.get("verify_tf_root") == "infra/projects/svc-06-identity-provider", (
+        f"WS-C2: svc06 verify_tf_root wrong: {svc06.get('verify_tf_root')!r}"
+    )
+    assert svc06.get("proxmox_host_var") == "svc06_proxmox_host", (
+        f"WS-C2: svc06 proxmox_host_var wrong: {svc06.get('proxmox_host_var')!r}"
+    )
+    # SVC-06 tears down BOTH the ZITADEL guest (1103) AND the backing DB (1102).
+    svc06_vmids = set(svc06.get("verify_vmids") or [])
+    assert {1103, 1102} <= svc06_vmids, (
+        "WS-C2: svc06 verify_vmids must cover BOTH the ZITADEL guest (1103) and "
+        f"the backing DB (1102); got {sorted(svc06_vmids)}."
+    )
+    # SVC-06's child needs svc06_zitadel_vmid (play default 0) threaded via extra_vars.
+    extra = svc06.get("extra_vars") or {}
+    assert isinstance(extra, dict) and "svc06_zitadel_vmid" in extra, (
+        "WS-C2: the svc06 row must carry `extra_vars: {svc06_zitadel_vmid: ...}` "
+        "— the child svc-06-bootstrap.yml clean-slate requires svc06_zitadel_vmid "
+        f"(its play default is 0, which fails its VMID-resolved gate). Got "
+        f"extra_vars={extra!r}."
+    )
+
+
+def test_child_run_threads_per_row_extra_vars():
+    """WS-C2 extra-vars threading (AC-3) — the child-run argv threads each row's
+    `extra_vars` as `-e k=v`, so a row (svc06) can supply what its child needs
+    beyond the host address. A row without extra_vars (svc07/svc09) threads
+    nothing extra."""
+    tasks = _load_role_tasks(_ROLE_TASKS)
+    child_idx = _first_index(tasks, _is_child_clean_slate_run)
+    assert child_idx is not None, (
+        "WS-C2: no child service clean-slate run found to inspect for extra_vars "
+        "threading."
+    )
+    child_argv = _task_argv_text(tasks[child_idx])
+    assert "extra_vars" in child_argv, (
+        "WS-C2: the child clean-slate run argv must thread each catalog row's "
+        "`extra_vars` (as `-e k=v`), so a row like svc06 can supply "
+        "svc06_zitadel_vmid. The argv does not reference `extra_vars`: "
+        f"{child_argv!r}"
+    )

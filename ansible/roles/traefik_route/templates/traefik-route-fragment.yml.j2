@@ -51,10 +51,23 @@
   permitted on the internal VLAN-20 hop; https/h2c backends are VERIFIED via the
   optional serversTransport above; the LAN-facing hop is always HTTPS).
 
+  OPTIONAL forwardAuth CAPABILITY (ADDITIVE, DEFAULT-INERT) — WS-C23:
+    route_forward_auth_address          (default "") http(s) URL Traefik asks
+                      to authorize each request BEFORE proxying (Traefik
+                      forwardAuth). Non-empty => the fragment gains
+                      `http.middlewares.<route_name>-auth.forwardAuth.address`
+                      and the router lists that middleware. Empty => the render
+                      is BYTE-IDENTICAL to the pre-extension output (golden hash
+                      guard for the shared consumers). An unreachable auth server
+                      makes Traefik answer 5xx (fail closed), never pass-through.
+    route_forward_auth_response_headers (default []) header names copied from the
+                      auth response to the backend request (authResponseHeaders).
+                      Validated by the role; names only, never values.
   NON-SECRET ONLY — carries a Host() rule, a VLAN-20 scheme://IP:port, and (when
   set) a PUBLIC CA path, never a credential or private key.
 #}
 {%- set _st = (route_servers_transport_name | default('') | trim | length > 0) and (route_backend_root_cas | default('') | trim | length > 0) %}
+{%- set _fa = (route_forward_auth_address | default('', true) | trim | length > 0) %}
 # MANAGED BY ANSIBLE ({{ route_name }} cross-guest route) — DO NOT EDIT BY HAND.
 # Traefik v3 file-provider Route_Fragment. Spec: .kiro/specs/traefik-cross-guest-ingress.
 ---
@@ -67,6 +80,9 @@ http:
 {% if route_tls | default(true) | bool %}
       tls: {}
 {% endif %}
+{% if _fa %}
+      middlewares: ["{{ route_name }}-auth"]
+{% endif %}
   services:
     {{ route_name }}:
       loadBalancer:
@@ -75,6 +91,18 @@ http:
 {% endif %}
         servers:
           - url: "{{ route_backend_url }}"
+{% if _fa %}
+  middlewares:
+    {{ route_name }}-auth:
+      forwardAuth:
+        address: "{{ route_forward_auth_address | trim }}"
+{% if route_forward_auth_response_headers | default([]) | length > 0 %}
+        authResponseHeaders:
+{% for h in route_forward_auth_response_headers %}
+          - "{{ h }}"
+{% endfor %}
+{% endif %}
+{% endif %}
 {% if _st %}
   serversTransports:
     {{ route_servers_transport_name }}:

@@ -97,8 +97,10 @@
   ansible.builtin.set_fact:
     svc01_clean_slate_targets:
       - name: "svc01-{{ vlan_id }}-01"
-        terraform_root: infra/projects/svc-01-sql-database
-        resource_address: proxmox_virtual_environment_container.db
+        terraform_root: "{{ svc01_tf_root_rel }}"
+        # In consumer-wrapper mode the container lives one module deeper (WS-C9).
+        resource_address: >-
+          {{ 'module.db.' if (svc01_consumer_wrapper | bool) else '' }}proxmox_virtual_environment_container.db
         node: "{{ proxmox_node_name }}"
         vmid: "{{ svc01_vmid }}"
 

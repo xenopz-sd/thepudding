@@ -1,0 +1,24 @@
+---
+# defaults/main.yml — mailcatcher_clean_slate (Mail catcher installer — clean-slate branch)
+#
+# Clean-slate phase-specific defaults. Cross-phase constants (clean_slate,
+# clean_slate_confirm, cluster_env_file, mailcatcher_repo_root, mailcatcher_venv_python,
+# mailcatcher_tf_root, mailcatcher_cluster_env_helper, mailcatcher_vmid) stay as play-level
+# vars. NO secret value ever lives here. Derived from the svc09_clean_slate defaults.
+
+# Proxmox host SSH address for the Clean_Slate_Reset path. The delegated
+# clean-slate.yml runs `pct` ON THE NODE, so it targets the Proxmox-host
+# inventory, whose ansible_host is a committed placeholder overridden at run
+# time. Supply the real LAN IP with `-e mailcatcher_proxmox_host=<real-proxmox-lan-ip>`.
+# Unset by default; the clean-slate branch fails fast (naming this var) if a
+# reset is requested without it. Not needed on the normal install path.
+mailcatcher_proxmox_host: ""
+# The Proxmox-host inventory clean-slate.yml expects (pct runs on the node).
+mailcatcher_proxmox_host_inventory: ansible/inventory/proxmox-hosts.yml
+
+# The Traefik guest the web-UI Route_Fragment lives on (cleanup target). Kept in sync
+# with mailcatcher_install/defaults.
+mailcatcher_traefik_guest_host: "10.0.20.12"
+mailcatcher_traefik_guest_user: "root"
+mailcatcher_traefik_guest_python: "/usr/bin/python3"
+mailcatcher_traefik_dynamic_config_dir: "/etc/traefik/dynamic"

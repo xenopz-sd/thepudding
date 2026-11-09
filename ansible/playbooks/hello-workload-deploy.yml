@@ -58,6 +58,9 @@
     # simply matches no hosts (a no-op) — the operator must point it at the
     # co-locate target (e.g. the DB guest group) for a co-located stand-up.
     hello_workload_target: "workload"
+    # The cluster env file the dev TLS opt-in (OPENBAO_TLS_SELF_SIGNED=true) is read
+    # from (WS-C6). Absent/unset => the Agent VERIFIES the Primary cert (prod default).
+    cluster_env_file: cluster.env
   roles:
     # Docker CE + Compose plugin install + baseline hardening (ADR-0003). A
     # freshly-provisioned workload guest boots the stock debian-12 template with

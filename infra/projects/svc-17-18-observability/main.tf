@@ -57,15 +57,15 @@ locals {
   # papered over.
   _prometheus_ledger_index = one([
     for e in local._vlan20_entries : e.host_index
-    if e.svc_code == "svc17" && lookup(e, "component", null) == "prometheus"
+    if lookup(e, "svc_code", null) == "svc17" && lookup(e, "component", null) == "prometheus"
   ])
   _grafana_ledger_index = one([
     for e in local._vlan20_entries : e.host_index
-    if e.svc_code == "svc17" && lookup(e, "component", null) == "grafana"
+    if lookup(e, "svc_code", null) == "svc17" && lookup(e, "component", null) == "grafana"
   ])
   _loki_ledger_index = one([
     for e in local._vlan20_entries : e.host_index
-    if e.svc_code == "svc18" && lookup(e, "component", null) == "loki"
+    if lookup(e, "svc_code", null) == "svc18" && lookup(e, "component", null) == "loki"
   ])
 
   # This root's EXPLICIT assigned indices. Kept as literals for readability at

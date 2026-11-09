@@ -1,0 +1,13 @@
+---
+# meta/main.yml — mailcatcher_bootstrap (Mail catcher installer — Phase 3)
+galaxy_info:
+  role_name: mailcatcher_bootstrap
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Mail catcher installer Phase 3 — host hardening & service bootstrap:
+    common baseline child run (Docker + Compose) then the mailcatcher.yml configurator
+    child run (UI auth file, Mailpit Compose stack, Traefik route).
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

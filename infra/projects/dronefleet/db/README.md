@@ -11,7 +11,8 @@ VLAN 20).
 - **Install runbook (provision-then-test):** [`../INSTALL-RUNBOOK.md`](../INSTALL-RUNBOOK.md)
 - **Consumer journey (end-to-end):** [`../../../../docs/CONSUMER-JOURNEY.md`](../../../../docs/CONSUMER-JOURNEY.md)
 
-> `dronefleet` is the scaffold/test slug. Copy this whole `db/` directory to
+> `dronefleet` is the scaffolded test instance of [`../../_TEMPLATE/db`](../../_TEMPLATE/db),
+> the copy source (WS-C9). For a new project copy `_TEMPLATE/db` (or this directory) to
 > `infra/projects/<your-slug>/db/` and change `var.project_slug`'s default (or
 > pass `-var project_slug=<slug>`). Everything else — `vlan_id`, `host_index`,
 > host IP — is **derived**, never hand-edited.

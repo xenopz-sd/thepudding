@@ -1,0 +1,122 @@
+---
+# Mail catcher (shared dev Mailpit) automated installer — Day-0 orchestrator.
+# Spec: .kiro/specs/dev-mail-catcher, ADR-0025. A DEV-ONLY permanent mock
+# stand-in for a real SMTP relay (mock-stand-ins.md, Mock 7). Single approved
+# entry point (service-installer.md §2): Ansible only.
+#
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/mailcatcher-bootstrap.yml \
+#     -e cluster_env_file=cluster.dev.env
+#
+# Four phases (preflight -> provision -> bootstrap -> handoff) as thin
+# block/rescue-wrapped import_role calls; no task logic here. Clean-slate reset:
+#     -e clean_slate=true -e clean_slate_confirm=force
+# Enabling ZITADEL to use this catcher is a SEPARATE, explicit step the handoff
+# banner prints (-e zitadel_smtp_dev_catcher=true); this play never does it.
+- name: Mail catcher (shared dev Mailpit) automated installer — Day-0 orchestrator
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  any_errors_fatal: true
+  vars:
+    # The gitignored KEY=VALUE .env the installer reads Proxmox/provider params from.
+    cluster_env_file: cluster.env
+    mailcatcher_repo_root: "{{ playbook_dir | dirname | dirname }}"
+    mailcatcher_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+    # Generated inventory path (repo-relative), written by provision, consumed by
+    # the bootstrap + handoff child runs as `-i`.
+    mailcatcher_generated_inventory: ansible/inventory/mailcatcher.generated.yml
+    # Deterministic VMID = vlan_id * 1000 + host_index = 20 * 1000 + 11 (ADR-0022).
+    # Passed to Terraform as the explicit override (equal to the computed value, so
+    # no drift) and used by the clean-slate. Non-secret.
+    mailcatcher_vmid: 20011
+    # The single guest IP: cidrhost("10.0.20.0/24", 10 + 11) (ledger index 11).
+    mailcatcher_guest_ips:
+      - "10.0.20.21"
+    clean_slate: false
+    clean_slate_confirm: ""
+    # Platform domain for the UI Host() rule.
+    mailcatcher_platform_domain: platform.example.test
+    # UI access control (R9): the env var MAILCATCHER_UI_PASSWORD (generated and
+    # persisted by the bootstrap role) enables native basic auth; the explicit
+    # acknowledgement below is the only alternative, default OFF -> fail closed.
+    mailcatcher_ui_auth_disabled: false
+    # Agent Live-Test Authorization: truthy ONLY when AGENT_LIVE_AUTHORIZED is set
+    # in the process environment; gates the throwaway-guard consult.
+    agent_live_run: "{{ (lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') | trim) | length > 0 }}"
+    mailcatcher_throwaway_guard: scripts/installer/throwaway_guard.py
+    mailcatcher_throwaway_allowlist: scripts/installer/throwaway-clusters.yml
+
+  tasks:
+    # === Clean-Slate branch — runs ONLY when clean_slate is truthy. ===
+    - name: Clean-Slate reset
+      when: clean_slate | default(false) | bool
+      block:
+        - name: "Clean-Slate | Run the mailcatcher_clean_slate role"
+          ansible.builtin.import_role:
+            name: mailcatcher_clean_slate
+      rescue:
+        - name: Report Clean-Slate reset failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Mail catcher installer FAILED during the Clean-Slate reset:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # === Normal install path — Phases 1→4, skipped entirely on clean_slate. ===
+    - name: "Phase 1 — Preflight & environment validation"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Preflight | Run the mailcatcher_preflight role"
+          ansible.builtin.import_role:
+            name: mailcatcher_preflight
+      rescue:
+        - name: Report Phase 1 (Preflight) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Mail catcher installer FAILED in Phase 1 (Preflight & environment validation):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 2 — Infrastructure provisioning"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Provisioning | Run the mailcatcher_provision role"
+          ansible.builtin.import_role:
+            name: mailcatcher_provision
+      rescue:
+        - name: Report Phase 2 (Provisioning) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Mail catcher installer FAILED in Phase 2 (Infrastructure provisioning):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 3 — Host hardening & service bootstrap"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Bootstrap | Run the mailcatcher_bootstrap role"
+          ansible.builtin.import_role:
+            name: mailcatcher_bootstrap
+      rescue:
+        - name: Report Phase 3 (Bootstrap) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Mail catcher installer FAILED in Phase 3 (Host hardening & service bootstrap):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 4 — Health sanity & Developer B handoff"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Handoff | Run the mailcatcher_handoff role"
+          ansible.builtin.import_role:
+            name: mailcatcher_handoff
+      rescue:
+        - name: Report Phase 4 (Handoff) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              Mail catcher installer FAILED in Phase 4 (Health sanity & handoff):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}

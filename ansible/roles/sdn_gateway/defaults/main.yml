@@ -55,6 +55,12 @@ sdn_gateway_served_project_vlan_ids: []
 # is the VLAN authority, NET-00 §7). Set false to WARN and serve anyway. Either
 # way an opted-in VLAN is NEVER silently dropped (the pre-fix `intersect` defect).
 sdn_gateway_require_active_optin: true
+# WS-C26: when true, a served PROJECT VLAN whose SDN bridge p<vlan> does not exist yet is
+# SKIPPED with a loud WARNING instead of failing the whole run. Default false (fail closed)
+# so an explicit sdn-gateway.yml run never silently drops a VLAN it was asked to serve; the
+# platform bring-up, which serves every registry-active VLAN by default, sets it true. The
+# shared VLAN is never skipped.
+sdn_gateway_skip_unrealized_project_vlans: false
 
 # Caller-supplied desired-state / teardown VLAN-ID sets, derived from
 # projects.yaml by the C6 JSON emitter (active_vlan_ids / the decommissioned

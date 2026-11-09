@@ -15,35 +15,12 @@
 #
 # Every mutating task is check-then-change / `state:`-driven so a second run is
 # changed=0 (Req 1.5, 6.5). A failed interface or rule write fails with a clear
-# error and does NOT leave a half-configured/half-open host — the interface
-# stanza is written first and validated before the firewall opening is added, and
-# each `pvesh` write is guarded (Req FD.5).
+# error and does NOT leave a half-configured/half-open host — the bridge is proven
+# to exist BEFORE anything persistent is written (WS-C20), the interface stanza is
+# written before the firewall opening is added, and each `pvesh` write is guarded
+# (Req FD.5).
 #
 # NO secret material is read, templated, or echoed here.
-
-# --- 1. Persistent host L3 sub-interface (survives reboot) -------------------
-# Write the interfaces.d stanza first. `template` is check-then-change: it only
-# reports changed (and only notifies the reload handler) when the rendered
-# content differs, so a converged host is changed=0.
-- name: Ensure persistent L3 gateway address stanza for VLAN {{ sdn_gateway_vlan_id }}
-  ansible.builtin.template:
-    src: interfaces.d-vlan-gateway.j2
-    dest: "/etc/network/interfaces.d/sdn-gw-{{ sdn_gateway_vlan_id }}.cfg"
-    owner: root
-    group: root
-    mode: "0644"
-    # NOTE: no `validate: ifup --no-act ...` guard here. `ifup --no-act` (the
-    # ifupdown2 dry-run) is broken on Proxmox's ifupdown2 (observed on
-    # 3.3.0-pmx12): it aborts with
-    #   "NetlinkListenerWithCache.link_add_vlan_dry_run() takes from 4 to 5
-    #    positional arguments but 6 were given"
-    # on ANY VLAN/bridge stanza, regardless of content, so it cannot be used as
-    # a pre-commit validator. The guarded-apply intent (FD.5 — never leave a
-    # half-open host) is preserved by the guarded `ip addr add` step below,
-    # which surfaces a genuine failure loudly instead of relying on the broken
-    # dry-run.
-  register: sdn_gateway_iface_stanza
-  notify: Reload host networking
 
 # Attach the gateway address to the SDN VNet bridge p<vlan> now (guarded), so
 # reachability works within this run without waiting for a reboot / ifreload.
@@ -86,6 +63,35 @@
       this VLAN.)
     success_msg: "SDN VNet bridge 'p{{ sdn_gateway_vlan_id }}' is present."
     quiet: true
+
+# --- 1b. Persistent host L3 sub-interface (survives reboot) ------------------
+# Written ONLY AFTER the bridge-exists assertion above (WS-C20). Previously this
+# ran first, so a VLAN whose SDN bridge p<vlan> did not exist yet (e.g. a registry-
+# active project VLAN on a clean cluster) failed closed at the assert but left a
+# PERSISTENT sdn-gw-<vlan>.cfg describing an address on a nonexistent bridge, which
+# the next ifreload / reboot trips over. A missing bridge now leaves the host
+# exactly as it was. `template` is check-then-change: it only reports changed (and
+# only notifies the reload handler) when the rendered content differs, so a
+# converged host is changed=0.
+- name: Ensure persistent L3 gateway address stanza for VLAN {{ sdn_gateway_vlan_id }}
+  ansible.builtin.template:
+    src: interfaces.d-vlan-gateway.j2
+    dest: "/etc/network/interfaces.d/sdn-gw-{{ sdn_gateway_vlan_id }}.cfg"
+    owner: root
+    group: root
+    mode: "0644"
+    # NOTE: no `validate: ifup --no-act ...` guard here. `ifup --no-act` (the
+    # ifupdown2 dry-run) is broken on Proxmox's ifupdown2 (observed on
+    # 3.3.0-pmx12): it aborts with
+    #   "NetlinkListenerWithCache.link_add_vlan_dry_run() takes from 4 to 5
+    #    positional arguments but 6 were given"
+    # on ANY VLAN/bridge stanza, regardless of content, so it cannot be used as
+    # a pre-commit validator. The guarded-apply intent (FD.5 — never leave a
+    # half-open host) is preserved by the guarded `ip addr add` step below,
+    # which surfaces a genuine failure loudly instead of relying on the broken
+    # dry-run.
+  register: sdn_gateway_iface_stanza
+  notify: Reload host networking
 
 # noqa: no-handler — deliberately NOT a handler. It runs once per served VLAN
 # inside the configure.yml loop and MUST attach the address immediately (mid-run)

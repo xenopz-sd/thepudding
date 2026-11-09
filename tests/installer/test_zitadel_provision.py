@@ -190,6 +190,7 @@ def test_ensure_oidc_app_no_secret_when_already_exists():
         # loginVersion ALREADY {loginV1:{}}, so the reconcile is a no-op (no PUT).
         _FakeResp(200, {"result": [{"name": "dronefleet-webapp", "id": "app-1",
                                     "oidcConfig": {"clientId": "cid-old",
+                                                   "redirectUris": ["https://app/cb"],
                                                    "loginVersion": {"loginV1": {}}}}]}),
     ])
     with mock.patch("urllib.request.urlopen", transport):
@@ -629,6 +630,11 @@ def test_existing_app_login_version_reconciled_via_put_on_drift():
                                                    "appType": "OIDC_APP_TYPE_WEB",
                                                    "authMethodType": "OIDC_AUTH_METHOD_TYPE_BASIC"}}]}),
         _FakeResp(200, {}),
+        # read-back gate (v0.14.0 feedback #3): the live config now has loginV1
+        _FakeResp(200, {"result": [{"name": "webapp", "id": "app-1",
+                                    "oidcConfig": {"clientId": "cid-old",
+                                                   "redirectUris": ["https://app/cb"],
+                                                   "loginVersion": {"loginV1": {}}}}]}),
     ])
     with mock.patch("urllib.request.urlopen", transport):
         client = zp.ZitadelClient("https://auth.test", "tok", org_id="org-1")

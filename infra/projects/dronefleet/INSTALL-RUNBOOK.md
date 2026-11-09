@@ -234,10 +234,21 @@ baseline while preserving the Registry entry + `<slug>-infra` slice (10.5).
 
 ## Part 4 — Clean-slate teardown (Tier-2, requires-infra)
 
-Return the consumer resources to a clean baseline. This orchestrates the DB's
-**own** clean-slate (ADR-0011) and reverses the OpenBao/ZITADEL onboarding via
-the onboarders' own paths. It **never** removes the Registry entry or the
+Return the consumer resources to a clean baseline. This tears down the per-project
+**workload guest** (when the manifest declared one) by composing the owned
+`terraform_clean_slate` mechanism, **then** orchestrates the DB's **own**
+clean-slate (ADR-0011), and reverses the OpenBao/ZITADEL onboarding via the
+onboarders' own paths. It **never** removes the Registry entry or the
 `<slug>-infra` network slice (Req 7.7).
+
+> **Workload teardown (WS-C3).** Before this fix the consumer clean-slate left the
+> workload LXC (`workload-<vlan>-01`) and its `<slug>-workload` Terraform state
+> standing — they had to be removed by hand. The clean-slate now destroys the
+> workload guest itself (reverse order: workload first, then DB). Pass the
+> workload VMID so the teardown's anti-footgun confirm token can match it, and the
+> Proxmox host LAN IP so the host-scoped `pct` runs; the VMID is the value used at
+> provision (or the module-computed `vlan_id*1000 + host_index`, e.g. VLAN 100
+> index 1 → `100001`).
 
 <!-- doctest: requires-infra -->
 <!-- cwd: . -->
@@ -247,13 +258,26 @@ the onboarders' own paths. It **never** removes the Registry entry or the
   -e clean_slate=true -e clean_slate_confirm=force \
   -e cluster_env_file=cluster.throwaway.env \
   -e project_slug=dronefleet \
-  -e svc01_vmid=1101
+  -e svc01_vmid=1101 \
+  -e consumer_proxmox_host=<real-proxmox-lan-ip> \
+  -e consumer_workload_vmid=100001
 ```
 
 The verification gate asserts zero surviving consumer compute + zero Terraform
-state before reporting a clean baseline; a failed destroy or surviving resource
-halts without reporting clean (Req 7.4–7.6). After it completes, re-install is
-safe (re-run Part 2).
+state before reporting a clean baseline: a surviving workload container / a
+non-empty `<slug>-workload` state (as well as the DB baseline) halts the run
+without reporting clean (Req 7.4–7.6, WS-C3 FR-3). After it completes, confirm the
+workload guest is gone and its state is empty, then re-install is safe (re-run
+Part 2):
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+# No workload-<vlan>-01 guest should remain on the node:
+ssh root@<real-proxmox-lan-ip> "pct list | grep -c 100001 || true"   # -> 0
+# And the workload state must be empty:
+terraform -chdir=infra/projects/dronefleet/workload state list        # -> (no output)
+```
 
 ---
 

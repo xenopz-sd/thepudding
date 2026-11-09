@@ -1,0 +1,52 @@
+{
+  "shape": "zitadel-user-management",
+  "machine_user_create": {
+    "method": "POST",
+    "endpoint": "/management/v1/users/machine",
+    "body_keys": ["userName", "name", "description", "accessTokenType"],
+    "access_token_type": "ACCESS_TOKEN_TYPE_BEARER",
+    "response_accessor": ".userId"
+  },
+  "org_member": {
+    "add": {"method": "POST", "endpoint": "/management/v1/orgs/me/members", "body_keys": ["userId", "roles"]},
+    "search": {"method": "POST", "endpoint": "/management/v1/orgs/me/members/_search", "query": {"userIdQuery": {"userId": "<id>"}}, "response_accessor": ".result[].roles"},
+    "update": {"method": "PUT", "endpoint": "/management/v1/orgs/me/members/{userId}", "body_keys": ["roles"], "benign_400": "NotChanged"},
+    "least_privilege_role": "ORG_USER_MANAGER"
+  },
+  "pat": {
+    "mint": {"method": "POST", "endpoint": "/management/v1/users/{userId}/pats", "body_keys": ["expirationDate"], "expiration_format": "%Y-%m-%dT%H:%M:%SZ", "response_accessors": [".tokenId", ".token"]},
+    "search": {"method": "POST", "endpoint": "/management/v1/users/{userId}/pats/_search", "response_accessor": ".result[].id"},
+    "delete": {"method": "DELETE", "endpoint": "/management/v1/users/{userId}/pats/{tokenId}"},
+    "value_returned": "once, at creation"
+  },
+  "human_user_import": {
+    "method": "POST",
+    "endpoint": "/management/v1/users/human/_import",
+    "body_keys": ["userName", "profile", "email", "password", "passwordChangeRequired"],
+    "profile_keys": ["firstName", "lastName"],
+    "email_keys": ["email", "isEmailVerified"],
+    "response_accessor": ".userId",
+    "duplicate_http": 409
+  },
+  "user_search": {
+    "method": "POST",
+    "endpoint": "/management/v1/users/_search",
+    "query": {"queries": [{"userNameQuery": {"userName": "<name>", "method": "TEXT_QUERY_METHOD_EQUALS"}}]},
+    "response_accessor": ".result[].userName"
+  },
+  "user_delete": {"method": "DELETE", "endpoint": "/management/v1/users/{userId}"},
+  "least_privilege_refusals": {
+    "create_user_in_other_org_http": 404,
+    "create_org_http": 403,
+    "create_project_in_own_org_http": 403
+  },
+  "org_selection_header": "x-zitadel-orgid",
+  "_provenance": {
+    "seeded_from": ".kiro/specs/svc06-user-provisioning/ (WS-C4 code atom, ADR-0023)",
+    "hand_seeded": false,
+    "recorded_live": "ZITADEL v4.18.0 on the throwaway cluster, probed with an IAM_OWNER token and then an ORG_USER_MANAGER PAT",
+    "refresh": "WS-M4 Increment 2 (read-only ZITADEL MCP) - ADR-gated, not yet built",
+    "sanitized": "no secrets, tokens, real hostnames or real user ids; placeholders only",
+    "notes": "Create-user with the PAT worked in its own org (200, userId); a duplicate userName returns 409; another org returns 404 'membership not found'; creating an org or a project returns 403 'No matching permissions'. A PAT value is returned once, at mint. Without the x-zitadel-orgid header the call acts on the token owner's own org."
+  }
+}

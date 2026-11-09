@@ -279,6 +279,12 @@ before any `pveum`/`pveam`/`terraform` mutation (Req 7.1):
    never a key in an env file). An optional `AGENT_LIVE_AUTHORIZED_SERVICES=platform`
    narrows the arm to this feature's `--service platform` scope; it only narrows,
    never broadens.
+   An orchestrator that **composes child installers** (the platform clean-slate, the
+   consumer onboarding, SVC-06) checks the whole composed set in its one up-front
+   consult, so a scope that names the orchestrator but omits a composed service
+   (for example `svc01`) is refused at preflight, before anything is provisioned.
+   List every composed service (`AGENT_LIVE_AUTHORIZED_SERVICES=consumer,svc01`) or
+   leave the scope unset.
 2. The target is a **throwaway cluster listed** in
    [`../../scripts/installer/throwaway-clusters.yml`](../../scripts/installer/throwaway-clusters.yml),
    and the run reads its cluster parameters from the isolated
@@ -564,6 +570,7 @@ scoped strictly to what the platform layer owns:
 | `-e clean_slate_confirm=force` | `""` (prompt) | skip the interactive typed-`yes` confirmation prompt (which names that this tears the WHOLE prerequisites layer down); **required for non-interactive / CI / agent runs** |
 | `-e platform_clean_slate_reboot=true` | `false` | opt in to the host reboot when the SDN zone/bridge survives the destroy; **reboots a shared host — throwaway only** |
 | `-e clean_slate_scope=all\|fabric-only` | `all` | `all` orchestrates service clean-slates then the fabric; `fabric-only` still fails closed if a service guest is attached (never orphan-destroys) |
+| `-e platform_clean_slate_remove_zone_occupants=true` | `false` (fail closed) | the SDN zone cannot be destroyed while a VNet it holds is not tracked by the platform-foundation state (a project's network slice, or an untracked / orphan VNet). By default the clean-slate **halts before changing anything**, naming each such VNet and its owning project (or `untracked`). This opt-in removes them through the Proxmox SDN API (subnets, then the VNet, then an SDN apply), refuses any VNet that still has a guest attached, and clears the project slice's dangling local state; the host gateway stanzas of every registry VLAN are decommissioned too |
 | `-e platform_clean_slate_proxmox_host=<proxmox-lan-ip>` | `""` (fail closed) | the real Proxmox LAN IP for the host-scoped `pct`/`ip link`/reboot child runs — **required**; a host-scoped step fails closed naming this var if unset |
 | `AGENT_LIVE_AUTHORIZED=1` (env) | unset | arms an **agent-driven** run; consulted by the throwaway guard at the HEAD of the role before ANY destruction (see [section 1b](#1b--agent-driven-live-runs-throwaway-guard)) |
 

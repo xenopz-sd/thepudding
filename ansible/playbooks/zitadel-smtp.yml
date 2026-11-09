@@ -1,0 +1,19 @@
+---
+# zitadel-smtp.yml — opt-in dev mail catcher wiring for ZITADEL (Mock 7, spec dev-mail-catcher).
+#
+# Orchestrator play (Ansible-as-Orchestrator, runs on the control node): calls the ZITADEL
+# admin API through the zitadel_smtp_catcher role. DEFAULT OFF — with no flag this play
+# changes nothing. Never invoked by any bootstrap; the mail-catcher handoff banner only
+# PRINTS this command. Enable explicitly:
+#
+#   ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/zitadel-smtp.yml -e zitadel_smtp_dev_catcher=true
+#
+# Reverse (remove the catcher provider, only if it is the catcher):
+#   ... -e zitadel_smtp_remove=true
+- name: Point ZITADEL's instance email provider at the dev mail catcher (opt-in)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  roles:
+    - role: zitadel_smtp_catcher

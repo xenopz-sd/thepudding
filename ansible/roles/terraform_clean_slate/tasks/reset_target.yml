@@ -118,3 +118,9 @@
     - "'No matching objects' not in (clean_slate_state_rm.stdout | default(''))"
     - "'No matching objects' not in (clean_slate_state_rm.stderr | default(''))"
     - "'No matching objects' not in (clean_slate_state_rm.msg | default(''))"
+    # WS-C9: a root that never reached its first apply (e.g. a consumer whose
+    # onboarding failed before the DB apply, or a freshly-routed wrapper root) has
+    # NO state file at all. That is the same already-absent condition, not a failure.
+    - "'No state file was found' not in (clean_slate_state_rm.stdout | default(''))"
+    - "'No state file was found' not in (clean_slate_state_rm.stderr | default(''))"
+    - "'No state file was found' not in (clean_slate_state_rm.msg | default(''))"
