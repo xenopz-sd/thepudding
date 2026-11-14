@@ -48,7 +48,7 @@
 - name: "Handoff | Bind the OpenBao admin token for the policy poll (no_log)"
   ansible.builtin.set_fact:
     consumer_handoff_bao_token: >-
-      {{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}
+      {{ consumer_openbao_admin_token }}
   no_log: true
   changed_when: false
   when:
@@ -274,6 +274,12 @@
         SSO applications:   {{ (consumer_manifest.sso.app_registrations | map(attribute='name') | list | join(', '))
         ~ '  (org ' ~ consumer_manifest.sso.org_name ~ ')'
         if (consumer_manifest.sso is defined) else 'not consumed' }}
+      - >-
+        SSO org id:         {{ (consumer_sso_org_id ~ '  (use scope urn:zitadel:iam:org:id:' ~ consumer_sso_org_id
+        ~ ' so self-registered users land in this org)')
+        if ((consumer_sso_org_id | default('')) | length > 0)
+        else ('not reported by this run — ask the platform operator, or look it up in the ZITADEL console')
+        if (consumer_manifest.sso is defined) else 'n/a' }}
       - >-
         SSO secrets:        {{ ((consumer_sso_app_lines | default([]) | join('; '))
         ~ '  (OpenBao — by path only, never shown)')

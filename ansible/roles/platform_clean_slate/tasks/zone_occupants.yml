@@ -64,6 +64,31 @@
     platform_cs_zone_occupants: >-
       {{ platform_cs_zone_vnet_ids | difference(platform_cs_zone_foundation_owned) | sort }}
   changed_when: false
+# WS-C33: a zone that exists in Proxmox but is NOT in the foundation state (and may hold no VNet at all) is
+# neither an occupant nor destroyed by `terraform destroy`; the final gate used to miss it. Detect it here.
+- name: "Clean-Slate | ZONE — List the SDN zones (config, read-only)"
+  ansible.builtin.uri:
+    url: "{{ platform_cs_pve_base }}/api2/json/cluster/sdn/zones"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  register: platform_cs_zone_list_raw
+  check_mode: false
+  changed_when: false
+  no_log: true
+- name: "Clean-Slate | ZONE — Compute the untracked zone (present in Proxmox, not in the foundation state)"
+  ansible.builtin.set_fact:
+    platform_cs_zone_untracked: >-
+      {{ [platform_clean_slate_sdn_zone_id]
+         if (platform_clean_slate_sdn_zone_id
+               in (platform_cs_zone_list_raw.json.data | default([]) | map(attribute='zone') | list)
+             and 'proxmox_sdn_zone_vlan.foundation'
+               not in (platform_cs_zone_foundation_state.stdout | default('')).split())
+         else [] }}
+  changed_when: false
 - name: "Clean-Slate | ZONE — Map each occupant VNet to its owning project (registry), else 'untracked'"
   ansible.builtin.set_fact:
     platform_cs_zone_occupant_owners: |-
@@ -284,3 +309,78 @@
     loop_var: platform_cs_zone_owner
     label: "{{ platform_cs_zone_owner.key }} ({{ platform_cs_zone_owner.value }})"
   when: *zone_remove
+
+# --- WS-C33: an untracked zone (not in the foundation state) ---------------------------------------------
+# Fail closed unless the same opt-in is given; the removal runs AFTER the occupant VNets are gone (a zone with a
+# VNet cannot be deleted), through the Proxmox SDN API, then the SDN is applied and polled until the zone is gone.
+- name: "Clean-Slate | ZONE — GATE: halt on an untracked zone unless explicitly opted in"
+  ansible.builtin.assert:
+    that:
+      - (platform_cs_zone_untracked | length) == 0 or (platform_clean_slate_remove_zone_occupants | bool)
+    fail_msg: >-
+      The SDN zone {{ platform_cs_zone_untracked }} exists in Proxmox but the platform-foundation Terraform
+      state does not track it, so `terraform destroy` would leave it behind and the baseline would not be
+      empty. Nothing in the fabric was changed. REMEDY: re-run with
+      -e platform_clean_slate_remove_zone_occupants=true to remove it through the Proxmox SDN API, or delete
+      it in Datacenter > SDN and re-run.
+    success_msg: "No untracked SDN zone, or its removal is explicitly authorized."
+    quiet: true
+- name: "Clean-Slate | ZONE — Delete the untracked zone (Proxmox SDN API)"
+  ansible.builtin.uri:
+    url: "{{ platform_cs_pve_base }}/api2/json/cluster/sdn/zones/{{ item }}"
+    method: DELETE
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  loop: "{{ platform_cs_zone_untracked }}"
+  changed_when: true
+  no_log: true
+  when: &zone_untracked_remove
+    - (platform_cs_zone_untracked | length) > 0
+    - platform_clean_slate_remove_zone_occupants | bool
+- name: "Clean-Slate | ZONE — Apply the SDN so the zone removal is realized"
+  ansible.builtin.uri:
+    url: "{{ platform_cs_pve_base }}/api2/json/cluster/sdn"
+    method: PUT
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 60
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  changed_when: true
+  no_log: true
+  when: *zone_untracked_remove
+- name: "Clean-Slate | ZONE — Poll until the untracked zone is gone from the SDN config (bounded)"
+  ansible.builtin.uri:
+    url: "{{ platform_cs_pve_base }}/api2/json/cluster/sdn/zones"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ platform_cs_proxmox_api_token }}"
+    timeout: 30
+    validate_certs: "{{ platform_clean_slate_validate_certs }}"
+    status_code: [200]
+  register: platform_cs_zone_list_after
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  until: >-
+    (platform_cs_zone_list_after.status | default(0)) == 200
+    and (platform_cs_zone_list_after.json.data | default([]) | map(attribute='zone') | list
+         | intersect(platform_cs_zone_untracked) | length) == 0
+  retries: "{{ platform_clean_slate_zone_poll_retries | int }}"
+  delay: "{{ platform_clean_slate_zone_poll_delay | int }}"
+  no_log: true
+  when: *zone_untracked_remove
+- name: "Clean-Slate | ZONE — GATE: the untracked zone is gone before the foundation destroy"
+  ansible.builtin.assert:
+    that:
+      - (platform_cs_zone_list_after.json.data | default([]) | map(attribute='zone') | list
+         | intersect(platform_cs_zone_untracked) | length) == 0
+    fail_msg: >-
+      The untracked SDN zone {{ platform_cs_zone_untracked }} is still present after removal and apply.
+      Check Datacenter > SDN on the Proxmox host and re-run.
+    success_msg: "Untracked zone {{ platform_cs_zone_untracked }} removed."
+    quiet: true
+  when: *zone_untracked_remove

@@ -1,0 +1,27 @@
+---
+# tasks/main.yml — known_hosts_refresh (WS-C39)
+#
+# The installers used to `ssh-keygen -R` every guest address and then re-append the scanned keys on EVERY run,
+# so the known_hosts step always reported changed and a re-run was never changed=0. This role scans first and
+# touches known_hosts only when the recorded keys for an address differ from what the guest presents now
+# (a re-provisioned guest on the same IP). The managed block is written sorted so it is stable across runs.
+- name: "known_hosts | Ensure ~/.ssh exists (0700)"
+  ansible.builtin.file:
+    path: "{{ khr_known_hosts | dirname }}"
+    state: directory
+    mode: "0700"
+- name: "known_hosts | Build the address list"
+  ansible.builtin.set_fact:
+    khr_entries: |-
+      {%- set out = khr_hosts | list -%}
+      {%- for ip in khr_ips -%}
+      {%- set _ = out.append({'ip': ip, 'marker': khr_marker_prefix ~ ip}) -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+- name: "known_hosts | Refresh one address"
+  ansible.builtin.include_tasks: host.yml
+  loop: "{{ khr_entries }}"
+  loop_control:
+    loop_var: khr_host
+    label: "{{ khr_host.ip }}"

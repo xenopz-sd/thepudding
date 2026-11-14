@@ -247,8 +247,10 @@ def test_bridge_put_is_no_log_and_gated_and_token_in_env():
     assert "BAO_TOKEN=" in argv and "-e" in argv, (
         "The bridge put must carry BAO_TOKEN in the -e exec environment, never argv."
     )
-    assert "OPENBAO_ADMIN_TOKEN" in argv, (
-        "The admin token must come from lookup('env','OPENBAO_ADMIN_TOKEN') like STEP 1."
+    # WS-C45: the token is the preflight-resolved `consumer_openbao_admin_token` (process env, else the
+    # cluster env file), the same source STEP 1 uses.
+    assert "consumer_openbao_admin_token" in argv, (
+        "The admin token must come from the preflight-resolved consumer_openbao_admin_token like STEP 1."
     )
 
     # Gating: database declared AND wired openbao_addr.

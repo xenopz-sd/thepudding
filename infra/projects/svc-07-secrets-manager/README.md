@@ -32,7 +32,7 @@ only these two LXCs (Requirement 9.6, 9.7; `structure.md`).
 > - `openbao_project_onboard` role: [`../../../ansible/roles/openbao_project_onboard/README.md`](../../../ansible/roles/openbao_project_onboard/README.md)
 > - `docker-compose-app` role: [`../../../ansible/roles/docker-compose-app/README.md`](../../../ansible/roles/docker-compose-app/README.md)
 > - **Restore runbook (60-min RTO):** [`../../../ansible/roles/openbao_install/RESTORE-RUNBOOK.md`](../../../ansible/roles/openbao_install/RESTORE-RUNBOOK.md)
-> - Offline-vs-cluster testing guide: [`../../../TESTING.md`](../../../TESTING.md)
+> - Offline-vs-cluster testing guide: [`../../../TESTING.md`](../../../docs/TESTING.md)
 
 ---
 

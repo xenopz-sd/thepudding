@@ -32,9 +32,10 @@ consumer_svc01_bootstrap_playbook: ansible/playbooks/svc-01-bootstrap.yml
 consumer_openbao_project_onboard_role: openbao_project_onboard
 consumer_openbao_workload_approle_role: openbao_workload_approle
 
-# Per-project DB guest VMID (mirrors consumer_provision; threaded into the child
-# svc-01-bootstrap.yml clean-slate run).
-consumer_svc01_vmid: 1101
+# Per-project DB guest VMID override (mirrors consumer_provision). 0 = use the VMID recorded in the project's
+# generated inventory; the teardown refuses to guess when neither is known (WS-C48).
+consumer_svc01_vmid: 0
+consumer_generated_inventory: "ansible/inventory/{{ project_slug }}-consumer.generated.yml"
 
 # The Proxmox host SSH address for the DB reset path (pct runs on the node).
 # Supply the real LAN IP with -e consumer_proxmox_host=<real-proxmox-lan-ip>.

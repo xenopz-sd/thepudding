@@ -204,6 +204,12 @@ here):
   -e obs_tls_self_signed=true
 ```
 
+> **OpenBao wiring (WS-C37).** The orchestrator wires OpenBao by default (`obs_openbao_addr=10.0.20.10`, the
+> SVC-07 primary), seeds `secret/observability/grafana-admin` on first run and reads it, and refuses to render an
+> empty or default Grafana admin password. `OPENBAO_ADMIN_TOKEN` is read from the environment or the cluster env
+> file. For a deliberate dev/offline run without OpenBao, pass `-e obs_openbao_addr=""` together with
+> `-e observability_grafana_admin_password_override=<password>`.
+
 The orchestrator runs **Preflight** (`cluster.env` resolve, Proxmox auth, `p20`
 gate, datastore autodetect, `promtool`/local prereq checks), **Provisioning**
 (`terraform apply` of the three LXC guests, inventory generation to

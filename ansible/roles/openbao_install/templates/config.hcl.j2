@@ -93,9 +93,12 @@ seal "transit" {
 # unauthenticated metrics ACCESS toggle is a LISTENER parameter and lives in the
 # `listener "tcp"` telemetry sub-block above — NOT here (OpenBao rejects it as an
 # unknown field in the top-level stanza).
+# metrics_prefix: OpenBao defaults to "vault", which made the live instance expose vault_core_unsealed
+# while every alert/rule/scrape assertion in this repo is keyed on openbao_* (WS-C36, found live).
 telemetry {
   prometheus_retention_time = "{{ openbao_telemetry_retention }}"
   disable_hostname          = true
+  metrics_prefix            = "{{ openbao_telemetry_metrics_prefix }}"
 }
 
 # Declarative file audit device (Req 7.1). OpenBao 2.4 REMOVED API-driven audit

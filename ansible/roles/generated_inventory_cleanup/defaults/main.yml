@@ -1,0 +1,6 @@
+---
+# defaults/main.yml — generated_inventory_cleanup (WS-C42)
+# Absolute paths of the generated inventories to remove.
+gic_paths: []
+# When set, remove a file only if it lists this VMID (for the shared SVC-01 file).
+gic_only_if_vmid: ""

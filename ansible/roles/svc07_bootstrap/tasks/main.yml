@@ -238,12 +238,43 @@
 # re-run path). Bind the child env token to
 # the in-memory value when we have one, else fall back to the ambient env
 # var so a re-run still works. no_log — carries the token.
+# WS-C41 / ADR-0027 (operator decision B): a re-run against an already-initialised SVC-07 has no seal token in
+# memory. When the operator did not supply one either, read it from the seal stanza of the primary's existing
+# config.hcl on its guest (no_log, slurp over SSH, never written to the control node). Finding it puts the run in
+# RE-RUN MODE: the config converges and the fresh-bootstrap-only steps below are skipped.
+- name: "Bootstrap | Re-run: read the primary's existing config.hcl for the seal token (no_log)"
+  ansible.builtin.slurp:
+    src: "{{ svc07_primary_config_path }}"
+  delegate_to: "{{ svc07_primary_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: root
+    ansible_python_interpreter: /usr/bin/python3
+  register: svc07_primary_config_read
+  failed_when: false
+  no_log: true
+  when:
+    - not (svc07_bootstrap_transit_token is defined and (svc07_bootstrap_transit_token | length > 0))
+    - (lookup('ansible.builtin.env', 'OPENBAO_BOOTSTRAP_TRANSIT_TOKEN', default='') | length) == 0
+- name: "Bootstrap | Re-run: bind the seal token from the primary config (no_log)"
+  ansible.builtin.set_fact:
+    svc07_guest_transit_token: >-
+      {{ (svc07_primary_config_read.content | default('') | b64decode)
+         | regex_search(svc07_seal_token_regex, '\1') | default([''], true) | first }}
+    svc07_rerun_mode: >-
+      {{ ((svc07_primary_config_read.content | default('') | b64decode)
+          | regex_search(svc07_seal_token_regex, '\1') | default([''], true) | first | length) > 0 }}
+  vars:
+    svc07_seal_token_regex: 'seal\s+"transit"\s*\{[^}]*?\btoken\s*=\s*"([^"]+)"'
+  no_log: true
+  changed_when: false
 - name: "Bootstrap | Resolve the transit token for the primary child env (no_log)"
   ansible.builtin.set_fact:
     svc07_primary_transit_token: >-
       {{ svc07_bootstrap_transit_token
          if (svc07_bootstrap_transit_token is defined and (svc07_bootstrap_transit_token | length > 0))
-         else lookup('ansible.builtin.env', 'OPENBAO_BOOTSTRAP_TRANSIT_TOKEN', default='') }}
+         else (lookup('ansible.builtin.env', 'OPENBAO_BOOTSTRAP_TRANSIT_TOKEN', default='')
+               or (svc07_guest_transit_token | default(''))) }}
   no_log: true
   changed_when: false
 
@@ -351,6 +382,8 @@
 # secret. `initialized=True` / `SKIPPING init` in the child output is the
 # same drift signal.
 - name: "Bootstrap | Drift guard — require the primary ran a fresh bootstrap (Req 5.11, no_log)"
+  when:
+    - not (svc07_rerun_mode | default(false) | bool)
   ansible.builtin.assert:
     that:
       - "'TOKEN=' in (svc07_primary_bootstrap.stdout | default(''))"
@@ -369,6 +402,8 @@
 # captured value never reaches this run's log. This is the ONLY place the
 # value is handled, and it flows straight into the 0600 write below.
 - name: "Bootstrap | Capture the revealed Admin_Token from the child output (no_log)"
+  when:
+    - not (svc07_rerun_mode | default(false) | bool)
   ansible.builtin.set_fact:
     svc07_admin_token: "{{ svc07_primary_bootstrap.stdout | regex_search('TOKEN=([^\\s\"]+)', '\\1') | first }}"
   no_log: true
@@ -377,6 +412,8 @@
 # Guard that a non-empty token was actually parsed — a reveal-marker
 # present but empty capture would otherwise write a blank credential.
 - name: "Bootstrap | Assert the Admin_Token was captured (no_log)"
+  when:
+    - not (svc07_rerun_mode | default(false) | bool)
   ansible.builtin.assert:
     that:
       - "svc07_admin_token is defined"
@@ -395,6 +432,8 @@
 # A write failure is caught here and re-raised as a "credential could not
 # be persisted" halt WITHOUT echoing the value (Req 5.9).
 - name: "Bootstrap | Persist OPENBAO_ADMIN_TOKEN to the Cluster_Env_File at 0600 (Req 5.8, no_log)"
+  when:
+    - not (svc07_rerun_mode | default(false) | bool)
   block:
     - name: "Bootstrap | Write/update OPENBAO_ADMIN_TOKEN (no_log) in {{ cluster_env_file }}"
       ansible.builtin.lineinfile:
@@ -414,6 +453,55 @@
           permissions/path and re-run the Clean_Slate_Reset + installer
           (Req 5.9).
 
+# WS-C41 / ADR-0027: in re-run mode no Admin_Token is minted (the primary is initialised), so the run must end
+# with a USABLE existing one, else it halts with the clean-slate remedy (the Req 5.11 protection, kept).
+- name: "Bootstrap | Re-run: resolve the existing platform-admin token (no_log)"
+  ansible.builtin.set_fact:
+    svc07_existing_admin_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         or (lookup('ansible.builtin.file', svc07_rerun_env_path, errors='ignore') | default('', true)
+             | regex_findall(svc07_admin_line_regex) | first | default('') | trim) }}
+  vars:
+    svc07_rerun_env_path: >-
+      {{ (svc07_repo_root ~ '/' ~ cluster_env_file) if not (cluster_env_file is match('^/')) else cluster_env_file }}
+    svc07_admin_line_regex: '(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*["'']?([^"''\r\n]*?)["'']?[ \t]*$'
+  no_log: true
+  changed_when: false
+  when: svc07_rerun_mode | default(false) | bool
+- name: "Bootstrap | Re-run: verify the existing platform-admin token is valid (lookup-self, no_log)"
+  ansible.builtin.uri:
+    url: "{{ svc07_primary_api }}/v1/auth/token/lookup-self"
+    method: GET
+    headers:
+      X-Vault-Token: "{{ svc07_existing_admin_token }}"
+    validate_certs: false
+    status_code: [200, 403]
+    timeout: 20
+  register: svc07_existing_admin_lookup
+  failed_when: false
+  no_log: true
+  when: svc07_rerun_mode | default(false) | bool
+- name: "Bootstrap | Re-run: require a valid existing platform-admin token (else clean-slate)"
+  ansible.builtin.assert:
+    that:
+      - (svc07_existing_admin_lookup.status | default(0)) == 200
+    fail_msg: >-
+      Re-run against an initialised SVC-07: the configuration was converged, but no VALID OPENBAO_ADMIN_TOKEN was
+      found (environment or {{ cluster_env_file }}), and an initialised primary cannot mint a new one. Restore the
+      token in {{ cluster_env_file }}, or run the Clean_Slate_Reset (-e clean_slate=true) and re-run for a fresh
+      bootstrap.
+    success_msg: >-
+      INFO: re-run against an initialised SVC-07: configuration converged with the primary's existing seal token;
+      the existing platform-admin token is valid and was kept (no new mint).
+    quiet: true
+  when: svc07_rerun_mode | default(false) | bool
+- name: "Bootstrap | Re-run: drop the existing admin token from memory (no_log)"
+  ansible.builtin.set_fact:
+    svc07_existing_admin_token: ""
+    svc07_guest_transit_token: ""
+  no_log: true
+  changed_when: false
+  when: svc07_rerun_mode | default(false) | bool
 # Scrub the Admin_Token fact from memory now it is persisted to the 0600
 # env file — it should not linger as a fact for Phase 4.
 - name: "Bootstrap | Scrub the Admin_Token + transit-token facts from memory (no_log)"

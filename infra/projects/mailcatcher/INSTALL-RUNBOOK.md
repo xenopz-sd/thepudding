@@ -1,9 +1,10 @@
 # Mail catcher Install Runbook — provision the shared dev mail sink from nothing, then test it
 
-> **Status: implemented and LIVE-VALIDATED on a throwaway cluster** (ZITADEL `v4.18.0`, Mailpit `v1.33.0`), including the
-> platform clean-slate discovery, the explicit-acknowledgement variant, the playbook refusal path and a second
-> from-scratch bring-up ([WS-C19](../../../PLANNING.md)). One path remains tracked: `allow_register` through the full
-> consumer orchestrator ([WS-C24](../../../PLANNING.md)).
+> **Status: implemented and LIVE-VALIDATED on a throwaway cluster** (ZITADEL `v4.18.0`, Mailpit `v1.33.0`, then `v1.33.1`), including the
+> platform clean-slate discovery, the explicit-acknowledgement variant, the playbook refusal path, a second from-scratch
+> bring-up ([WS-C19](../../../PLANNING.md)) and `allow_register` through the full consumer orchestrator
+> ([WS-C24](../../../PLANNING.md)). **The pin is now `v1.33.1`** ([WS-C28](../../../PLANNING.md)), live-probed on a
+> from-scratch install (version, digest, SMTP banner, UI 401/200, ports bound only to the VLAN-20 IP; [WS-C30](../../../PLANNING.md)).
 > Closed by [WS-C16 and WS-C17](../../../PLANNING.md).
 
 This is the **provision-then-test spine** for the shared dev mail catcher ([Mailpit](https://mailpit.axllent.org),
@@ -198,9 +199,12 @@ check and HTML check; unbounded buffering; WebSocket origin handling), so treat 
    `mailcatcher_image_digest` together, then run the live probes in A.3 (SMTP banner, UI 401 unauthenticated and 200 with the
    credential, ports bound only to the VLAN-20 IP) on a throwaway cluster.
 
-Status at 2026-11-07: pinned `v1.33.0` is above every published first-patched version (highest `1.30.6`). `v1.33.1`
-(published the same day) adds one unadvised hardening fix (limits on remote stylesheets fetched by HTML check); bumping to it
-is tracked as WS-C28.
+Status at 2026-11-08: the pin is `v1.33.1`, above every published first-patched version (highest `1.30.6`); the advisory
+query returned the same 15 advisories as on 2026-11-07. `v1.33.1` adds one unadvised hardening fix (limits on the number and size
+of remote stylesheets fetched by HTML check) and no new feature. It was bumped from `v1.33.0` with only a few days of
+field time; the A.3 probes were run on `v1.33.1` ([WS-C30](../../../PLANNING.md)) and passed. If a later problem appears, revert
+`mailcatcher_image_tag` and `mailcatcher_image_digest` together to `v1.33.0` /
+`sha256:9b3a463be15354c0f0eba91697d80e3e0d8a5623ef0e627cacc836bc17fd5231`.
 
 ## Known limitations
 

@@ -266,6 +266,26 @@ class _OpenBao:
         return self._request("PUT", "sys/seal")
 
 
+#: WS-C40: the primary and the unsealer run on DIFFERENT guests, so one ambient ``DOCKER_HOST`` cannot reach both
+#: containers. These optional per-container docker endpoints (e.g. ``ssh://root@10.0.20.10``) are applied to the
+#: matching container's commands; unset keeps the ambient docker context (previous behavior).
+_PRIMARY_DOCKER_HOST_ENV = "OPENBAO_TEST_PRIMARY_DOCKER_HOST"
+_UNSEALER_DOCKER_HOST_ENV = "OPENBAO_TEST_UNSEALER_DOCKER_HOST"
+
+
+def _docker_env_for(args: tuple[str, ...], environ=None) -> dict[str, str]:
+    """The environment for a ``docker`` call: DOCKER_HOST is set from the per-container endpoint when the call
+    targets the primary or the unsealer container and that endpoint is configured."""
+    environ = dict(os.environ if environ is None else environ)
+    for ctr_env, host_env in ((_UNSEALER_CONTAINER_ENV, _UNSEALER_DOCKER_HOST_ENV),
+                              (_PRIMARY_CONTAINER_ENV, _PRIMARY_DOCKER_HOST_ENV)):
+        ctr, host = environ.get(ctr_env, ""), environ.get(host_env, "")
+        if ctr and host and ctr in args:
+            environ["DOCKER_HOST"] = host
+            break
+    return environ
+
+
 def _docker(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
     """Run a ``docker`` subcommand, capturing output. Never carries a secret."""
     return subprocess.run(
@@ -273,7 +293,20 @@ def _docker(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=_docker_env_for(args),
     )
+
+
+#: Live shape (WS-C40, observed 2026-11-08): what OpenBao logs when its Transit seal cannot be used.
+_SEAL_FAILURE_PREFIX = "error parsing seal configuration"
+_SEAL_FAILURE_CAUSES = ("vault is sealed", "connection refused", "no route to host", "i/o timeout", "dial tcp",
+                        "context deadline exceeded")
+
+
+def _transit_seal_failure_logged(lowered_logs: str) -> bool:
+    """True when the logs carry the seal-configuration error for the Transit endpoint plus a recognised cause."""
+    return (_SEAL_FAILURE_PREFIX in lowered_logs and "/v1/transit/" in lowered_logs
+            and any(c in lowered_logs for c in _SEAL_FAILURE_CAUSES))
 
 
 def _wait_until_unsealed(bao: _OpenBao, deadline_seconds: int) -> bool:
@@ -389,16 +422,19 @@ class TestOpenBaoSwapGateSeal:
 
     @staticmethod
     def _assert_transit_seal_unreachable_error(primary_ctr: str) -> None:
-        """Assert the primary's logs carry >=1 ERROR line containing BOTH the
-        token 'transit seal' and the token 'unreachable' (Req 5.6/5.7)."""
+        """Assert the primary's logs show the failed Transit seal (Req 5.6/5.7, corrected WS-C40).
+
+        The original wording expected the literal tokens 'transit seal' and 'unreachable', which OpenBao never
+        prints. The REAL shape, observed live on 2026-11-08 (unsealer sealed), is
+        ``Error parsing Seal configuration: Error making API request. URL: PUT https://<unsealer>/v1/transit/encrypt/
+        <key> Code: 503 ... Vault is sealed``; an unreachable unsealer yields the same prefix with a connection error.
+        """
         logs = _docker("logs", "--tail", "400", primary_ctr, timeout=30)
         combined = (logs.stdout + logs.stderr).lower()
-        assert "transit seal" in combined and "unreachable" in combined, (
-            "the primary must emit an ERROR log entry containing both 'transit "
-            "seal' and 'unreachable' when the Transit unsealer is unreachable / "
-            "itself sealed (Req 5.6/5.7); neither/both tokens were found in the "
-            "primary container logs. This is the swap-gate's loud-failure "
-            "requirement — a missing real unsealer must NOT be masked."
+        assert _transit_seal_failure_logged(combined), (
+            "the primary must log the failed Transit seal ('Error parsing Seal configuration' naming the unsealer's "
+            "/v1/transit/ endpoint and the cause) when the unsealer is unreachable or itself sealed (Req 5.6/5.7); "
+            "a missing real unsealer must NOT be masked."
         )
 
     def test_real_unsealer_reachable_primary_unseals(
@@ -430,6 +466,11 @@ class TestOpenBaoSwapGateSeal:
         """Swap-gate negative arm (Req 5.6): with the unsealer STOPPED, restart
         the primary and assert it stays sealed:true and logs the 'transit seal …
         unreachable' ERROR — never a masked/fake-unsealed success."""
+        # WS-C40 (found live): a stopped unsealer comes back SEALED (Shamir seal), and the throwaway bring-up does
+        # not keep the Shamir keys, so this arm too leaves SVC-07 unrecoverable until a clean-slate.
+        if os.environ.get("OPENBAO_TEST_ALLOW_SEAL", "").strip().lower() not in ("1", "true", "yes"):
+            pytest.skip("requires-infra, skipped: OPENBAO_TEST_ALLOW_SEAL not set; stopping the Transit unsealer "
+                        "re-seals it on restart, which only a clean-slate (or the offline Shamir keys) can recover")
         primary_ctr = os.environ[_PRIMARY_CONTAINER_ENV]
         unsealer_ctr = os.environ[_UNSEALER_CONTAINER_ENV]
 
@@ -472,6 +513,12 @@ class TestOpenBaoSwapGateSeal:
         """Swap-gate negative arm (Req 5.7): with the unsealer RUNNING but itself
         ``sealed:true``, the primary must behave identically to the unreachable
         case — stay sealed and log the 'transit seal … unreachable' ERROR."""
+        # WS-C40 (found live): sealing the Shamir-sealed unsealer cannot be undone by a restart, and the throwaway
+        # bring-up does not keep the Shamir keys, so this arm leaves SVC-07 unrecoverable until a clean-slate.
+        # It therefore runs only with the explicit seal opt-in.
+        if os.environ.get("OPENBAO_TEST_ALLOW_SEAL", "").strip().lower() not in ("1", "true", "yes"):
+            pytest.skip("requires-infra, skipped: OPENBAO_TEST_ALLOW_SEAL not set; this arm seals the Transit "
+                        "unsealer, which only a clean-slate (or the offline Shamir keys) can recover")
         primary_ctr = os.environ[_PRIMARY_CONTAINER_ENV]
         unsealer_ctr = os.environ[_UNSEALER_CONTAINER_ENV]
 
@@ -515,3 +562,29 @@ class TestOpenBaoSwapGateSeal:
             _docker("restart", unsealer_ctr)
             time.sleep(_POLL_INTERVAL_SECONDS)
             _docker("restart", primary_ctr)
+
+
+
+def test_docker_endpoint_is_chosen_per_container():
+    """Offline (WS-C40): unsealer and primary calls get their own DOCKER_HOST; other calls keep the ambient one."""
+    env = {_PRIMARY_CONTAINER_ENV: "openbao-openbao-1", _UNSEALER_CONTAINER_ENV: "openbao-unsealer-1",
+           _PRIMARY_DOCKER_HOST_ENV: "ssh://root@10.0.20.10", _UNSEALER_DOCKER_HOST_ENV: "ssh://root@10.0.20.11",
+           "DOCKER_HOST": "unix:///ambient"}
+    assert _docker_env_for(("stop", "openbao-unsealer-1"), env)["DOCKER_HOST"] == "ssh://root@10.0.20.11"
+    assert _docker_env_for(("restart", "openbao-openbao-1"), env)["DOCKER_HOST"] == "ssh://root@10.0.20.10"
+    assert _docker_env_for(("ps",), env)["DOCKER_HOST"] == "unix:///ambient"
+    no_hosts = {k: v for k, v in env.items() if k not in (_PRIMARY_DOCKER_HOST_ENV, _UNSEALER_DOCKER_HOST_ENV)}
+    assert _docker_env_for(("stop", "openbao-unsealer-1"), no_hosts)["DOCKER_HOST"] == "unix:///ambient"
+
+
+
+def test_transit_seal_failure_matches_the_live_log_shape():
+    """Offline (WS-C40): the recorded real log line is recognised; unrelated output is not."""
+    sealed = ("Error parsing Seal configuration: Error making API request.\n"
+              "URL: PUT https://10.0.20.11:8200/v1/transit/encrypt/openbao-unseal\nCode: 503. Errors:\n"
+              "* Vault is sealed").lower()
+    stopped = ("Error parsing Seal configuration: Put \"https://10.0.20.11:8200/v1/transit/encrypt/openbao-unseal\": "
+               "dial tcp 10.0.20.11:8200: connect: connection refused").lower()
+    assert _transit_seal_failure_logged(sealed)
+    assert _transit_seal_failure_logged(stopped)
+    assert not _transit_seal_failure_logged("core: vault is unsealed")

@@ -1,0 +1,45 @@
+---
+# tasks/main.yml — generated_inventory_cleanup (WS-C42)
+#
+# Called by each clean-slate AFTER its empty-baseline gate passed: remove the generated inventory of what was just
+# torn down, so no later run (SVC-17's file_sd discovery, the platform clean-slate discovery, an operator) trusts a
+# file describing guests that no longer exist (integration-boundaries.md §4). Control-node files only.
+# With gic_only_if_vmid set, a file is removed only when it lists that VMID (the SVC-01 file is shared by every
+# SVC-01 instance; last writer wins).
+- name: "Inventory cleanup | Stat the generated inventories"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ gic_paths }}"
+  register: gic_stats
+- name: "Inventory cleanup | Read the existing inventories (for the VMID filter)"
+  ansible.builtin.set_fact:
+    gic_contents: |-
+      {%- set out = {} -%}
+      {%- for r in gic_stats.results if r.stat.exists -%}
+      {%- set _ = out.update({r.item: lookup('ansible.builtin.file', r.item)}) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: (gic_only_if_vmid | string | length) > 0
+- name: "Inventory cleanup | Decide which inventories to remove"
+  ansible.builtin.set_fact:
+    gic_remove: |-
+      {%- set out = [] -%}
+      {%- for r in gic_stats.results if r.stat.exists -%}
+      {%- set vmid_re = '(?m)^[ ]*vmid:[ ]*' ~ (gic_only_if_vmid | string) ~ '[ ]*$' -%}
+      {%- if (gic_only_if_vmid | string | length) == 0
+            or (gic_contents[r.item] | default('')) is search(vmid_re) -%}
+      {%- set _ = out.append(r.item) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+- name: "Inventory cleanup | Remove the generated inventories of the torn-down guests"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ gic_remove }}"
+- name: "Inventory cleanup | INFO — generated inventories"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: removed generated inventory {{ gic_remove | map('basename') | list }};
+      kept {{ (gic_stats.results | selectattr('stat.exists') | map(attribute='item') | list)
+              | difference(gic_remove) | map('basename') | list }} (describes another instance).

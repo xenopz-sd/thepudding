@@ -165,7 +165,7 @@
     chdir: "{{ svc06_tf_root }}"
   environment: "{{ svc06_tf_env }}"
   register: svc06_tf_init_local
-  changed_when: true
+  changed_when: "'Installing ' in (svc06_tf_init_local.stdout | default(''))"
   when: not (svc06_use_gitlab_backend | bool)
   no_log: true
 
@@ -188,7 +188,7 @@
     chdir: "{{ svc06_tf_root }}"
   environment: "{{ svc06_tf_env }}"
   register: svc06_tf_init_gitlab
-  changed_when: true
+  changed_when: "'Installing ' in (svc06_tf_init_gitlab.stdout | default(''))"
   when: svc06_use_gitlab_backend | bool
   no_log: true
 
@@ -243,7 +243,7 @@
   args:
     chdir: "{{ svc06_repo_root }}"
   register: svc06_gen_inventory
-  changed_when: true
+  changed_when: "'inventory unchanged' not in (svc06_gen_inventory.stderr | default(''))"
 
 - name: "Provisioning | Confirm the generated inventory file was written"
   ansible.builtin.stat:
@@ -273,30 +273,10 @@
     state: directory
     mode: "0700"
 
-- name: "Provisioning | Remove stale known_hosts fingerprints for the ZITADEL IP"
-  ansible.builtin.command:
-    argv:
-      - ssh-keygen
-      - -R
-      - "10.0.20.{{ 10 + (svc06_zitadel_host_index | int) }}"
-      - -f
-      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
-  register: svc06_knownhosts_purge
-  changed_when: "'updated' in (svc06_knownhosts_purge.stderr | default(''))"
-  failed_when: false
-
-- name: "Provisioning | ssh-keyscan the ZITADEL IP (30s timeout)"
-  ansible.builtin.command:
-    argv: [ssh-keyscan, -T, "30", "10.0.20.{{ 10 + (svc06_zitadel_host_index | int) }}"]
-  register: svc06_keyscan
-  changed_when: false
-  failed_when: >-
-    svc06_keyscan.rc != 0 or (svc06_keyscan.stdout | default('') | trim | length == 0)
-
-- name: "Provisioning | Append current host keys to known_hosts"
-  ansible.builtin.blockinfile:
-    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
-    create: true
-    mode: "0600"
-    marker: "# {mark} ANSIBLE MANAGED svc06-20-01"
-    block: "{{ svc06_keyscan.stdout }}"
+- name: "Provisioning | ssh-keyscan the guest IP and refresh known_hosts (known_hosts_refresh)"
+  ansible.builtin.include_role:
+    name: known_hosts_refresh
+  vars:
+    khr_hosts:
+      - ip: "10.0.20.{{ 10 + (svc06_zitadel_host_index | int) }}"
+        marker: "# {mark} ANSIBLE MANAGED svc06-20-01"

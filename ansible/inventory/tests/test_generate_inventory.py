@@ -350,3 +350,30 @@ def test_main_no_terraform_invoked_in_from_json_path(tmp_path, monkeypatch):
     rc = main(["--from-json", str(src), "--out", str(out)])
     assert rc == 0
     assert out.exists()
+
+
+# --- WS-C39: an unchanged inventory is not rewritten and says so ------------- #
+def test_BUG_a_second_identical_render_does_not_rewrite_and_reports_unchanged(tmp_path, capsys):
+    """Installers reported the inventory step as changed on every run (`changed_when: true`). The generator now
+    leaves an identical file untouched and prints `inventory unchanged:` so the task can report truthfully."""
+    src = tmp_path / "out.json"
+    src.write_text(json.dumps(_wrap(SVC07_HOSTS)))
+    out = tmp_path / "inv.yml"
+    assert main(["--from-json", str(src), "--out", str(out)]) == 0
+    first = capsys.readouterr().err
+    assert "wrote inventory:" in first
+    mtime = out.stat().st_mtime_ns
+    assert main(["--from-json", str(src), "--out", str(out)]) == 0
+    second = capsys.readouterr().err
+    assert "inventory unchanged:" in second and "wrote inventory:" not in second
+    assert out.stat().st_mtime_ns == mtime, "an identical inventory must not be rewritten"
+
+
+def test_a_different_render_is_still_written(tmp_path, capsys):
+    src = tmp_path / "out.json"
+    src.write_text(json.dumps(_wrap(SVC07_HOSTS)))
+    out = tmp_path / "inv.yml"
+    out.write_text("stale: true\n")
+    assert main(["--from-json", str(src), "--out", str(out)]) == 0
+    assert "wrote inventory:" in capsys.readouterr().err
+    assert "stale" not in out.read_text()

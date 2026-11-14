@@ -506,3 +506,12 @@
       surviving ZITADEL state address(es):
       {{ svc06_surviving_state_addrs | default([]) | join(', ') | default('none', true) }}.
     success_msg: "Clean-Slate reset complete — zero SVC-06 containers + EMPTY ZITADEL state."
+
+# WS-C42: the guests are gone, so their generated inventory must go too (no stale file left for
+# SVC-17 discovery or later runs). Runs only after the gate above passed.
+- name: "Clean-Slate | Remove the generated inventory of the torn-down guests (WS-C42)"
+  ansible.builtin.include_role:
+    name: generated_inventory_cleanup
+  vars:
+    gic_paths:
+      - "{{ svc06_repo_root }}/{{ svc06_generated_inventory }}"

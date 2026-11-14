@@ -99,7 +99,7 @@
         chdir: "{{ consumer_network_slice_tf_root }}"
       environment: "{{ consumer_workload_tf_env }}"
       register: consumer_slice_init_local
-      changed_when: true
+      changed_when: "'Installing ' in (consumer_slice_init_local.stdout | default(''))"
       when: not (consumer_slice_use_gitlab_backend | bool)
       no_log: true
 
@@ -145,7 +145,7 @@
              consumer_slice_ci_values['CI_PROJECT_ID'] }}/terraform/state/{{
              consumer_network_slice_state_name }}
       register: consumer_slice_init_gitlab
-      changed_when: true
+      changed_when: "'Installing ' in (consumer_slice_init_gitlab.stdout | default(''))"
       when: consumer_slice_use_gitlab_backend | bool
       no_log: true
 
@@ -169,6 +169,41 @@
         consumer_vnet_present: true
       changed_when: false
 
+# === Phase-2 SECOND STEP — converge the host L3 gateway for the project VLAN (WS-C44) ===========
+# On a from-scratch platform bring-up the gateway phase skipped this VLAN because its slice did not exist
+# yet (WS-C26), so nothing binds 10.0.<vlan>.1 and the guests below are unreachable. Re-converge the
+# platform gateway by REUSING the platform_gateway role (registry-active VLANs, unrealized ones skipped,
+# VLAN 20 unconditional). Idempotent: changed=0 when already converged. Operator decision WS-C44 option A.
+- name: "Provisioning (gateway) | Resolve the gateway inputs"
+  ansible.builtin.set_fact:
+    consumer_gateway_host: >-
+      {{ (consumer_proxmox_host | default('') | trim)
+         or (consumer_tfvars['TF_VAR_proxmox_host_lan_ip'] | default('') | trim) }}
+    consumer_gateway_admin_cidr: >-
+      {{ consumer_tfvars['TF_VAR_sdn_gateway_admin_source_cidr'] | default('') | trim }}
+  changed_when: false
+  when: consumer_network_slice_required | default(true) | bool
+- name: "Provisioning (gateway) | Assert the Proxmox host address and admin CIDR are known (fail closed)"
+  ansible.builtin.assert:
+    that:
+      - (consumer_gateway_host | trim | length) > 0
+      - (consumer_gateway_admin_cidr | trim | length) > 0
+    fail_msg: >-
+      The project VLAN {{ consumer_vlan_id }} needs its host L3 gateway, which runs on the Proxmox node. Set
+      PROXMOX_HOST_LAN_IP and ADMIN_SOURCE_CIDR in the cluster env file (or pass -e consumer_proxmox_host=<ip>).
+      Nothing on the gateway was changed; the network slice may already exist and is reused on re-run.
+    success_msg: "Gateway inputs resolved (host {{ consumer_gateway_host }})."
+    quiet: true
+  when: consumer_network_slice_required | default(true) | bool
+- name: "Provisioning (gateway) | Converge the host L3 gateway for the project VLAN (platform_gateway)"
+  ansible.builtin.include_role:
+    name: platform_gateway
+  vars:
+    platform_venv_python: "{{ consumer_venv_python }}"
+    platform_repo_root: "{{ consumer_repo_root }}"
+    platform_host_lan_ip: "{{ consumer_gateway_host }}"
+    platform_admin_source_cidr: "{{ consumer_gateway_admin_cidr }}"
+  when: consumer_network_slice_required | default(true) | bool
 - name: "Provisioning | INFO — Phase 2 start (per-project DB on VLAN {{ consumer_vlan_id }})"
   ansible.builtin.debug:
     msg: >-
@@ -191,6 +226,21 @@
 # from the registry/ledger and REUSES the svc-01-sql-database module internally.
 # Previously the live flow bypassed the wrapper (state <slug>-svc01-postgres).
 # A non-zero child exit propagates to the Phase-2 rescue.
+# WS-C48: explicit override, else the VMID the standing DB already has (read from the project's own generated
+# inventory, the file-mediated hand-off), else 0 so the module computes vlan_id * 1000 + host_index (ADR-0022).
+- name: "Provisioning | Resolve the DB VMID (explicit, else the standing DB's, else computed)"
+  ansible.builtin.set_fact:
+    consumer_svc01_vmid_effective: |-
+      {%- set inv = (consumer_db_inventory_text | default('', true) | from_yaml) or {} -%}
+      {%- set hosts = (((inv.get('all') or {}).get('children') or {}).get('postgres') or {}).get('hosts') or {} -%}
+      {%- set recorded = (hosts.values() | list | map(attribute='vmid', default=0) | select | list) -%}
+      {{ (consumer_svc01_vmid | int) if (consumer_svc01_vmid | int) != 0
+         else ((recorded | first) if recorded else 0) }}
+  vars:
+    consumer_db_inventory_text: >-
+      {{ lookup('ansible.builtin.file', consumer_repo_root ~ '/' ~ consumer_generated_inventory, errors='ignore')
+         | default('', true) }}
+  changed_when: false
 - name: "Provisioning | Compose svc-01-bootstrap.yml to provision + bootstrap the per-project DB"
   ansible.builtin.command:
     argv:
@@ -205,7 +255,7 @@
       - -e
       - "vlan_id={{ consumer_vlan_id }}"
       - -e
-      - "svc01_vmid={{ consumer_svc01_vmid }}"
+      - "svc01_vmid={{ consumer_svc01_vmid_effective }}"
       # WS-C9 (ADR-0019): drive the per-project SVC01_Consumer_Root infra/<slug>/db/
       # (state <slug>-db) instead of the reusable svc-01-sql-database root.
       - -e
@@ -246,7 +296,7 @@
   args:
     chdir: "{{ consumer_repo_root }}"
   register: consumer_gen_inventory
-  changed_when: true
+  changed_when: "'inventory unchanged' not in (consumer_gen_inventory.stderr | default(''))"
   when: consumer_manifest.database is defined
 
 - name: "Provisioning | Confirm the consumer-scoped inventory was written"
@@ -282,38 +332,15 @@
     mode: "0700"
   when: consumer_manifest.database is defined
 
-- name: "Provisioning | Remove stale known_hosts fingerprints for the DB guest IP"
-  ansible.builtin.command:
-    argv:
-      - ssh-keygen
-      - -R
-      - "{{ consumer_db_guest_ip }}"
-      - -f
-      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
-  register: consumer_knownhosts_purge
-  changed_when: "'updated' in (consumer_knownhosts_purge.stderr | default(''))"
-  failed_when: false
+- name: "Provisioning | ssh-keyscan the DB guest IP and refresh known_hosts (known_hosts_refresh)"
+  ansible.builtin.include_role:
+    name: known_hosts_refresh
+  vars:
+    khr_fail_unreachable: false
+    khr_hosts:
+      - ip: "{{ consumer_db_guest_ip }}"
+        marker: "# {mark} consumer onboarding host keys for {{ project_slug }}"
   when: consumer_manifest.database is defined
-
-- name: "Provisioning | ssh-keyscan the DB guest IP (30s timeout)"
-  ansible.builtin.command:
-    argv: [ssh-keyscan, -T, "30", "{{ consumer_db_guest_ip }}"]
-  register: consumer_keyscan
-  changed_when: false
-  failed_when: false
-  when: consumer_manifest.database is defined
-
-- name: "Provisioning | Append current host keys to known_hosts"
-  ansible.builtin.blockinfile:
-    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
-    create: true
-    mode: "0600"
-    marker: "# {mark} consumer onboarding host keys for {{ project_slug }}"
-    block: "{{ consumer_keyscan.stdout }}"
-  when:
-    - consumer_manifest.database is defined
-    - (consumer_keyscan.stdout | default('') | trim | length) > 0
-
 - name: "Provisioning | INFO — Phase 2 skipped (no database declared)"
   ansible.builtin.debug:
     msg: "INFO: Phase 2 (Provision) skipped for '{{ project_slug }}' — the Consumer_Manifest declares no database."
@@ -491,7 +518,7 @@
         chdir: "{{ consumer_workload_tf_root }}"
       environment: "{{ consumer_workload_tf_env }}"
       register: consumer_workload_tf_init_local
-      changed_when: true
+      changed_when: "'Installing ' in (consumer_workload_tf_init_local.stdout | default(''))"
       when: not (consumer_workload_use_gitlab_backend | bool)
       no_log: true
 
@@ -514,7 +541,7 @@
         chdir: "{{ consumer_workload_tf_root }}"
       environment: "{{ consumer_workload_tf_env }}"
       register: consumer_workload_tf_init_gitlab
-      changed_when: true
+      changed_when: "'Installing ' in (consumer_workload_tf_init_gitlab.stdout | default(''))"
       when: consumer_workload_use_gitlab_backend | bool
       no_log: true
 
@@ -579,7 +606,7 @@
       args:
         chdir: "{{ consumer_repo_root }}"
       register: consumer_workload_gen_inventory
-      changed_when: true
+      changed_when: "'inventory unchanged' not in (consumer_workload_gen_inventory.stderr | default(''))"
 
     - name: "Provisioning (workload) | Confirm the workload inventory file was written"
       ansible.builtin.stat:
@@ -610,34 +637,14 @@
         state: directory
         mode: "0700"
 
-    - name: "Provisioning (workload) | Remove stale known_hosts fingerprints for the workload guest IP"
-      ansible.builtin.command:
-        argv:
-          - ssh-keygen
-          - -R
-          - "{{ consumer_workload_guest_ip }}"
-          - -f
-          - "{{ ansible_env.HOME }}/.ssh/known_hosts"
-      register: consumer_workload_knownhosts_purge
-      changed_when: "'updated' in (consumer_workload_knownhosts_purge.stderr | default(''))"
-      failed_when: false
-
-    - name: "Provisioning (workload) | ssh-keyscan the workload guest IP (30s timeout)"
-      ansible.builtin.command:
-        argv: [ssh-keyscan, -T, "30", "{{ consumer_workload_guest_ip }}"]
-      register: consumer_workload_keyscan
-      changed_when: false
-      failed_when: false
-
-    - name: "Provisioning (workload) | Append current host keys to known_hosts"
-      ansible.builtin.blockinfile:
-        path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
-        create: true
-        mode: "0600"
-        marker: "# {mark} consumer onboarding workload host keys for {{ project_slug }}"
-        block: "{{ consumer_workload_keyscan.stdout }}"
-      when: (consumer_workload_keyscan.stdout | default('') | trim | length) > 0
-
+    - name: "Provisioning (workload) | ssh-keyscan the workload guest IP and refresh known_hosts (known_hosts_refresh)"
+      ansible.builtin.include_role:
+        name: known_hosts_refresh
+      vars:
+        khr_fail_unreachable: false
+        khr_hosts:
+          - ip: "{{ consumer_workload_guest_ip }}"
+            marker: "# {mark} consumer onboarding workload host keys for {{ project_slug }}"
     # --- §6: consumer ingress for a USER-FACING workload --------------------
     # fix-consumer-ingress-browser-reachable-oidc. When the manifest declares an
     # `expose` block (enabled), resolve the REAL base-domain host rule + the

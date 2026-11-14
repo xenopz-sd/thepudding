@@ -326,6 +326,14 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(rendered)
         return 0
 
+    # WS-C39: leave an identical inventory untouched so callers can report "changed" truthfully.
+    try:
+        with open(out_path, encoding="utf-8") as fh:
+            if fh.read() == rendered:
+                print(f"inventory unchanged: {out_path}", file=sys.stderr)
+                return 0
+    except OSError:
+        pass
     try:
         _atomic_write(out_path, rendered)
     except OSError as exc:

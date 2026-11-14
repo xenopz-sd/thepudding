@@ -84,6 +84,8 @@ openbao_kv_max_versions: 10
 
 # --- Telemetry (Prometheus) — retention must be >= 1 minute (Req 10.1) ---
 openbao_telemetry_retention: "24h"
+# Metric name prefix (OpenBao default is "vault"). Repo alerts and rules are keyed on openbao_*.
+openbao_telemetry_metrics_prefix: "openbao"
 # Expose /v1/sys/metrics WITHOUT an OpenBao token so Prometheus (SVC-17) can
 # scrape it with no stored bearer token (Req 10.2). Rendered into the primary's
 # telemetry stanza as `unauthenticated_metrics_access = <true|false>`. Kept true

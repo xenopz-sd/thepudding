@@ -27,6 +27,14 @@
 # STEP 0 — Validate inputs (slug present; optionally recorded in projects.yaml)
 # ============================================================================
 
+# WS-C41 part 2: ansible-core 2.21 rejects `omit` in task vars, so the no-delegate branch of every delegated
+# task below reuses this host's own connection values, captured once here.
+- name: "3 — Capture this host's own connection settings (for the no-delegate path)"
+  ansible.builtin.set_fact:
+    openbao_workload_self_connection: "{{ ansible_connection | default('ssh') }}"
+    openbao_workload_self_user: "{{ ansible_user | default(lookup('ansible.builtin.env', 'USER')) }}"
+    openbao_workload_self_python: "{{ ansible_python_interpreter | default('auto_silent') }}"
+  changed_when: false
 - name: "3 — Assert project_slug is supplied"
   ansible.builtin.assert:
     that:
@@ -86,7 +94,8 @@
 - name: "3 — Resolve the platform-admin token from its env var (never committed)"
   ansible.builtin.set_fact:
     openbao_admin_token: >-
-      {{ lookup('ansible.builtin.env', openbao_admin_token_env_var, default='') }}
+      {{ openbao_admin_token_value
+         | default(lookup('ansible.builtin.env', openbao_admin_token_env_var, default=''), true) }}
   no_log: "{{ openbao_no_log }}"
   changed_when: false
 
@@ -188,15 +197,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_connection }}
     ansible_user: >-
       {{ openbao_workload_delegate_user
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_workload_delegate_python
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_python }}
 
 - name: "3 — Decide whether the approle/ method must be enabled"
   ansible.builtin.set_fact:
@@ -230,15 +239,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_connection }}
     ansible_user: >-
       {{ openbao_workload_delegate_user
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_workload_delegate_python
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_python }}
   when: not (openbao_approle_present | bool)
 
 - name: "3 — Re-read enabled auth methods after enabling approle/ (verify, Req 1.2)"
@@ -260,15 +269,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_connection }}
     ansible_user: >-
       {{ openbao_workload_delegate_user
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_workload_delegate_python
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_python }}
   when: not (openbao_approle_present | bool)
 
 - name: "3 — Assert a mount of type approle is present at approle/ after enable (Req 1.2)"
@@ -325,15 +334,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_connection }}
     ansible_user: >-
       {{ openbao_workload_delegate_user
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_workload_delegate_python
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_python }}
 
 - name: "3 — Assert policy-<slug> is present before creating the Workload_AppRole (Req 2.5)"
   ansible.builtin.assert:
@@ -377,15 +386,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_connection }}
     ansible_user: >-
       {{ openbao_workload_delegate_user
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_workload_delegate_python
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_python }}
 
 - name: "3 — Parse the stored Workload_AppRole data (empty dict when absent)"
   ansible.builtin.set_fact:
@@ -447,15 +456,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_connection }}
     ansible_user: >-
       {{ openbao_workload_delegate_user
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_workload_delegate_python
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_python }}
   when: openbao_workload_role_needs_write | bool
 
 - name: "3 — Re-read the Workload_AppRole after write (verify contract, Req 2.1/2.2)"
@@ -478,15 +487,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_connection }}
     ansible_user: >-
       {{ openbao_workload_delegate_user
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_workload_delegate_python
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_python }}
   when: openbao_workload_role_needs_write | bool
 
 - name: "3 — Assert the stored Workload_AppRole honours the contract (Req 2.1, 2.2, 7.6)"
@@ -545,15 +554,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_connection }}
     ansible_user: >-
       {{ openbao_workload_delegate_user
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_workload_delegate_python
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_python }}
 
 - name: "3 — Extract the Role_ID into a (non-secret) fact"
   ansible.builtin.set_fact:
@@ -603,15 +612,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_connection }}
     ansible_user: >-
       {{ openbao_workload_delegate_user
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_workload_delegate_python
          if (openbao_workload_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_workload_self_python }}
 
 - name: "3 — Extract the minted Secret_ID into a (sensitive) fact (no_log, Req 3.4)"
   ansible.builtin.set_fact:

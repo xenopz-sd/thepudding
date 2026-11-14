@@ -1,0 +1,12 @@
+---
+# defaults/main.yml — known_hosts_refresh (WS-C39)
+# khr_hosts: list of {ip, marker}; `marker` is the blockinfile marker text, e.g.
+#   "# {mark} SVC-07 installer host keys for 10.0.20.10" (kept identical to the callers' previous markers).
+khr_hosts: []
+# Or: a list of addresses that share one marker prefix; the marker becomes "<prefix><ip>".
+khr_ips: []
+khr_marker_prefix: ""
+# Fail when an address returns no key within the timeout (the service installers); the consumer flow tolerates it.
+khr_fail_unreachable: true
+khr_timeout: 30
+khr_known_hosts: "{{ ansible_env.HOME }}/.ssh/known_hosts"

@@ -4,7 +4,7 @@ This is the **provision-then-test spine** for SVC-07 (OpenBao): it takes you fro
 an empty throwaway Proxmox cluster to a running OpenBao primary + Transit
 unsealer, and then runs the SVC-07 `requires_infra` tests against the instance
 you just built. It is the "build the live thing, then test what you built" half
-that the environment-variable table in [`../../../TESTING.md`](../../../TESTING.md)
+that the environment-variable table in [`../../../TESTING.md`](../../../docs/TESTING.md)
 assumes already exists.
 
 There are **two paths through it**. Section **A** is the **Developer B** fast path:
@@ -42,7 +42,7 @@ The live steps in sections 1, 2, 4, and 5 **provision, mutate, and tear down rea
 infrastructure**. The install and test steps run **only against a throwaway /
 ephemeral Proxmox SDN test cluster** — never a shared or production cluster
 (Req 4.8, Security AC 4). This mirrors the strong warnings already in
-[`../../../TESTING.md`](../../../TESTING.md) and [`README.md`](./README.md):
+[`../../../TESTING.md`](../../../docs/TESTING.md) and [`README.md`](./README.md):
 
 - Section 2 initialises and unseals OpenBao and **revokes the root token** as part
   of the one-time bootstrap — irreversible on a real instance.
@@ -59,7 +59,7 @@ procedure instead:
 ---
 
 > **The whole path, in order** — full detail and per-step command links live in the
-> [TESTING.md provision-then-test walkthrough](../../../TESTING.md#provision-then-test-the-whole-path-in-order):
+> [TESTING.md provision-then-test walkthrough](../../../docs/TESTING.md#provision-then-test-the-whole-path-in-order):
 > 1. Apply the platform-foundation root (creates the shared VLAN-20 VNet `p20`).
 > 2. Apply the SVC-07 Terraform root (the two LXCs).
 > 3. Install Docker + Compose on both LXCs (the `common` role).
@@ -305,6 +305,13 @@ a throwaway cluster**:
 > closed** with a named empty-mint error on the unsealer container (distinct from the
 > downstream primary "No Bootstrap_Transit_Token is available" assert), whose
 > deterministic remedy is a `-e clean_slate=true -e clean_slate_confirm=force` re-run.
+
+> **Re-running against an initialised SVC-07 (WS-C41, ADR-0027).** The same command converges a running SVC-07
+> (for example to roll out a configuration change). With no transit token in memory or in the environment, the
+> installer reads the seal token from the primary's own `/openbao/config/config.hcl` over SSH (never printed,
+> never written to the control machine). No admin token is minted on an initialised primary, so the run then
+> checks that the existing `OPENBAO_ADMIN_TOKEN` (environment or cluster env file) is valid; if it is not, it
+> stops with the clean-slate remedy.
 
 <!-- doctest: requires-infra -->
 <!-- cwd: . -->
@@ -1084,7 +1091,7 @@ history and out of this doc. Copy the repo-root
 [`.env.example`](../../../.env.example) to a gitignored `.env` and fill in your
 **throwaway** cluster's endpoint and token — the same values the live test harness
 reads as `PROXMOX_SDN_TEST_ENDPOINT` / `PROXMOX_SDN_TEST_TOKEN` (see that file's
-comments and [`../../../TESTING.md`](../../../TESTING.md)). Then export them under
+comments and [`../../../TESTING.md`](../../../docs/TESTING.md)). Then export them under
 the `TF_VAR_` names Terraform expects:
 
 <!-- doctest: offline -->
@@ -1288,13 +1295,13 @@ never `latest`) and verifies the Compose plugin via
 > `root` password this one time), then verify with
 > `ssh -o BatchMode=yes root@<real-proxmox-lan-ip> true`. The full copy-and-verify
 > commands are in the
-> [`TESTING.md` → SDN VLAN reachability](../../../TESTING.md#step-1--configure-the-host-gateway--firewall-for-vlan-20)
+> [`TESTING.md` → SDN VLAN reachability](../../../docs/TESTING.md#step-1--configure-the-host-gateway--firewall-for-vlan-20)
 > walkthrough (Step 1).
 >
 > **Do not configure this inline here.** The authoritative, tier-annotated
 > walkthrough for both parts (the `sdn-gateway.yml` converge run, the developer
 > static route, and the reachability check) is the
-> [`TESTING.md` → SDN VLAN reachability](../../../TESTING.md#sdn-vlan-reachability-before-any-live-ansibletest-step-against-a-served-vlan)
+> [`TESTING.md` → SDN VLAN reachability](../../../docs/TESTING.md#sdn-vlan-reachability-before-any-live-ansibletest-step-against-a-served-vlan)
 > section — go there, satisfy the prerequisite, then return to run the playbooks
 > below. If you run Ansible **directly on the Proxmox node**, it reaches
 > `10.0.20.x` natively and **neither part is needed** (ADR-0004 Option A).
@@ -1359,7 +1366,7 @@ never `latest`) and verifies the Compose plugin via
 > wildcard block covers VLAN 20 and every project VLAN). This also makes plain
 > `ssh root@10.0.20.10` and every `ansible-playbook` run pick the right key
 > automatically. See
-> [`TESTING.md` → (c) One-time SSH client config](../../../TESTING.md#c-one-time-ssh-client-config--pin-the-right-key-for-the-platform-hosts).
+> [`TESTING.md` → (c) One-time SSH client config](../../../docs/TESTING.md#c-one-time-ssh-client-config--pin-the-right-key-for-the-platform-hosts).
 
 Install the collections the role needs (once per control host):
 
@@ -2082,12 +2089,18 @@ point at what you just built rather than at some pre-existing instance (Req 4.5)
 - `OPENBAO_TEST_PRIMARY_CONTAINER` / `OPENBAO_TEST_UNSEALER_CONTAINER` — the docker
   container names of the primary and unsealer stacks that `openbao_install`
   brought up (used by the auto-unseal test to cycle containers).
+- `OPENBAO_TEST_PRIMARY_DOCKER_HOST` / `OPENBAO_TEST_UNSEALER_DOCKER_HOST` (optional, WS-C40) — the docker endpoint
+  of each guest, e.g. `ssh://root@<primary-ip>` and `ssh://root@<unsealer-ip>`, because the two containers run on
+  different guests and one `DOCKER_HOST` cannot reach both.
+- `OPENBAO_TEST_ALLOW_SEAL` (optional) — opt in to the two negative auto-unseal arms. **Destructive:** stopping or
+  sealing the unsealer leaves it Shamir-sealed, and the throwaway bring-up does not keep the Shamir keys, so SVC-07
+  needs a clean-slate and re-bootstrap afterwards (and every service that depends on it).
 
 For the authoritative per-variable semantics (what each variable must be able to
 do, the optional TLS-verify and audit-dir variables, and which test consumes
 each), see the `TESTING.md` **SVC-07 OpenBao engine/auth/audit contract tests**
 variable table — do **not** re-tabulate it here:
-[`../../../TESTING.md`](../../../TESTING.md#svc-07-openbao-engineauthaudit-contract-tests).
+[`../../../TESTING.md`](../../../docs/TESTING.md#svc-07-openbao-engineauthaudit-contract-tests).
 
 Author the throwaway `.env` (placeholders only — the token is set by **name**;
 never paste a real value; never commit this file):
@@ -2114,7 +2127,7 @@ tests. These are `requires_infra` (deselected by default) and the `-m
 requires_infra` flag is mandatory to opt into the live tier (Req 4.4, 4.6). For
 the canonical commands, the container-cycling caveats, and the clean-skip
 contract, see the `TESTING.md`
-[**SVC-07 OpenBao engine/auth/audit contract tests**](../../../TESTING.md#svc-07-openbao-engineauthaudit-contract-tests)
+[**SVC-07 OpenBao engine/auth/audit contract tests**](../../../docs/TESTING.md#svc-07-openbao-engineauthaudit-contract-tests)
 subsection — this section links, it does not restate the table.
 
 Run the engine/auth/audit contract tier:
@@ -2437,7 +2450,7 @@ touching anything. Wire them from what you built:
 - `OPENBAO_TEST_ADDR` / `OPENBAO_TEST_TOKEN` — the Primary API base URL + a
   read-scoped token, to read back the AppRole state the role wrote (reuses the
   SVC-07 contract-test variables; see
-  [`../../../TESTING.md`](../../../TESTING.md#svc-07-openbao-engineauthaudit-contract-tests)).
+  [`../../../TESTING.md`](../../../docs/TESTING.md#svc-07-openbao-engineauthaudit-contract-tests)).
 - `WORKLOAD_AUTH_TEST_ALLOW_MUTATE` — set to `1` to arm the tests that enable
   AppRole / mint a Secret_ID / bring up the stack (safety interlock; unset, the
   mutating tests stay skipped).

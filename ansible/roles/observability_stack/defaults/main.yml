@@ -242,9 +242,10 @@ observability_prometheus_self_scrape_interval: "30s"
 observability_prometheus_evaluation_interval: "15s"
 observability_prometheus_file_sd_refresh_interval: "30s"
 
-# Alertmanager address Prometheus routes alerts to — co-located on this guest.
-# `localhost` because Alertmanager runs in the same Compose stack (:9093).
-observability_alertmanager_scrape_host: "localhost"
+# Alertmanager address Prometheus routes alerts to — co-located on this guest, in the same Compose stack but
+# a SEPARATE container, so it is reached by its Compose service name on the stack network. `localhost` inside
+# the Prometheus container is Prometheus itself: every notification failed (WS-C37, found live).
+observability_alertmanager_scrape_host: "alertmanager"
 
 # =============================================================================
 # SCRAPE-TARGET GENERATION (file_sd, from the generated inventory) — TASK 5.1

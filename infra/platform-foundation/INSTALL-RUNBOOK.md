@@ -562,6 +562,8 @@ scoped strictly to what the platform layer owns:
    **and** SDN absence (`p20` gone from `ip link` AND `pvesh get /cluster/sdn/vnets`).
    Any survivor exits non-zero naming every survivor.
 
+**Expected residue after a full clean-slate (WS-C14, operator decision 2026-11-07).** The two standing cluster firewall DENY rules written by the `sdn_gateway` role are platform-owned baseline and are NOT removed: `sdn_gateway: DENY any -> management VLAN 10 (managed)` and `sdn_gateway: DENY cross-project VLAN -> VLAN (managed)`. The final gate tolerates exactly those two comments and fails on any other `sdn_gateway:`-prefixed cluster rule (for example a per-VLAN ALLOW rule that was not removed), and on a surviving SDN zone (WS-C33). Your own firewall rules without that prefix are never judged. Guest-scoped unsealer scoping rules (ADR-0008) are removed through the existing teardown path when they were enabled.
+
 **Controls (all default to the safe/off position):**
 
 | Flag / env | Default | Effect |
@@ -570,7 +572,7 @@ scoped strictly to what the platform layer owns:
 | `-e clean_slate_confirm=force` | `""` (prompt) | skip the interactive typed-`yes` confirmation prompt (which names that this tears the WHOLE prerequisites layer down); **required for non-interactive / CI / agent runs** |
 | `-e platform_clean_slate_reboot=true` | `false` | opt in to the host reboot when the SDN zone/bridge survives the destroy; **reboots a shared host — throwaway only** |
 | `-e clean_slate_scope=all\|fabric-only` | `all` | `all` orchestrates service clean-slates then the fabric; `fabric-only` still fails closed if a service guest is attached (never orphan-destroys) |
-| `-e platform_clean_slate_remove_zone_occupants=true` | `false` (fail closed) | the SDN zone cannot be destroyed while a VNet it holds is not tracked by the platform-foundation state (a project's network slice, or an untracked / orphan VNet). By default the clean-slate **halts before changing anything**, naming each such VNet and its owning project (or `untracked`). This opt-in removes them through the Proxmox SDN API (subnets, then the VNet, then an SDN apply), refuses any VNet that still has a guest attached, and clears the project slice's dangling local state; the host gateway stanzas of every registry VLAN are decommissioned too |
+| `-e platform_clean_slate_remove_zone_occupants=true` | `false` (fail closed) | the SDN zone cannot be destroyed while a VNet it holds is not tracked by the platform-foundation state (a project's network slice, or an untracked / orphan VNet). By default the clean-slate **halts before changing anything**, naming each such VNet and its owning project (or `untracked`). This opt-in removes them through the Proxmox SDN API (subnets, then the VNet, then an SDN apply), refuses any VNet that still has a guest attached, and clears the project slice's dangling local state; the host gateway stanzas of every registry VLAN are decommissioned too Also removes an SDN zone that exists in Proxmox but is not tracked by the foundation state (WS-C33); without the flag that case halts, naming the zone. |
 | `-e platform_clean_slate_proxmox_host=<proxmox-lan-ip>` | `""` (fail closed) | the real Proxmox LAN IP for the host-scoped `pct`/`ip link`/reboot child runs — **required**; a host-scoped step fails closed naming this var if unset |
 | `AGENT_LIVE_AUTHORIZED=1` (env) | unset | arms an **agent-driven** run; consulted by the throwaway guard at the HEAD of the role before ANY destruction (see [section 1b](#1b--agent-driven-live-runs-throwaway-guard)) |
 

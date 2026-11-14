@@ -72,7 +72,7 @@ The binding rules are in [`project-constitution.md`](./.kiro/steering/project-co
 
 ## What's in the box
 
-The platform foundation and five shared services are released (plus a dev-only mail catcher, live-validated on a throwaway cluster): SVC-07 (secrets), SVC-09 (reverse proxy), SVC-01 (SQL database), SVC-06 (identity provider) and SVC-17/18 (observability).
+The platform foundation and five shared services are released, plus a dev-only mail catcher, all live-validated on a throwaway cluster: SVC-07 (secrets), SVC-09 (reverse proxy), SVC-01 (SQL database), SVC-06 (identity provider) and SVC-17/18 (observability). To consume them from a project, see [Use the platform from your project](#use-the-platform-from-your-project).
 
 | Component | Status | What it does | Runbook | Spec |
 |---|---|---|---|---|
@@ -83,7 +83,7 @@ The platform foundation and five shared services are released (plus a dev-only m
 | **SVC-01 — SQL database** ([PostgreSQL](https://www.postgresql.org)) | ✅ Released | The dedicated-per-project relational database, delivered as a reusable Terraform root + Ansible role: `postgres:17` + a `postgres_exporter` sidecar, a least-privilege per-project app role, per-flag pgvector/PostGIS/TimescaleDB, nightly `pg_dump`, and credentials stored in OpenBao. MariaDB is a selectable strict-EU alternative. | [Install runbook](./infra/projects/svc-01-sql-database/INSTALL-RUNBOOK.md) | [`svc-01-sql-database`](./.kiro/specs/svc-01-sql-database/) |
 | **SVC-06 — Identity provider** ([ZITADEL](https://zitadel.com)) | ✅ Released | The shared OIDC/SAML SSO backbone: one ZITADEL LXC on VLAN 20 fronted by Traefik, backed by its own dedicated SVC-01 PostgreSQL instance; masterkey + OIDC client secrets in OpenBao; idempotent per-project org/OIDC-app onboarding via a pure-Python management-API helper, with the provisioning token auto-minted at first-init and stored in OpenBao so a from-scratch bring-up onboards the first org with no human-minted token. | [Install runbook](./infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md) | [`svc-06-identity-provider`](./.kiro/specs/svc-06-identity-provider/) |
 | **SVC-17/18 — Observability** ([Prometheus](https://prometheus.io) + [Grafana](https://grafana.com) + [Loki](https://grafana.com/oss/loki/)) | ✅ Released | The shared metrics/dashboards/logs stack on three VLAN-20 LXCs: Prometheus (+ Alertmanager) with 30-day local TSDB and `file_sd`-generated scrape targets, Grafana fronted by Traefik, and Loki with Promtail shipping fleet-wide logs. Its v1 scrape set wires up the four already-built services (SVC-01/06/07/09). Ships default-off mock stand-ins for the not-yet-built CA (SVC-08), the un-registered Grafana OIDC client (SVC-06) and the GPU host (SVC-23). | [Install runbook](./infra/projects/svc-17-18-observability/INSTALL-RUNBOOK.md) | [`svc-17-18-observability`](./.kiro/specs/svc-17-18-observability/) |
-| **Shared dev mail catcher** ([Mailpit](https://mailpit.axllent.org)) | ✅ Implemented, **live-validated** (dev-only mock; residual paths in WS-C19) | A dev-only permanent mock on one VLAN-20 LXC so ZITADEL self-registration and password-reset mail has somewhere to go on a cluster with no SMTP; read verification codes in its Traefik-fronted, access-controlled web UI. Off by default; ZITADEL is only pointed at it by an explicit opt-in. Offline-tested and live-validated on a throwaway cluster (WS-C16, WS-C17); residual live paths are tracked in [`PLANNING.md`](./PLANNING.md) (WS-C19). | [Install runbook](./infra/projects/mailcatcher/INSTALL-RUNBOOK.md) | [`dev-mail-catcher`](./.kiro/specs/dev-mail-catcher/) |
+| **Shared dev mail catcher** ([Mailpit](https://mailpit.axllent.org)) | ✅ Implemented, **live-validated** (dev-only mock) | A dev-only permanent mock on one VLAN-20 LXC so ZITADEL self-registration and password-reset mail has somewhere to go on a cluster with no SMTP; read verification codes in its Traefik-fronted, access-controlled web UI. Off by default; ZITADEL is only pointed at it by an explicit opt-in. Offline-tested and live-validated on a throwaway cluster (WS-C16, WS-C17, WS-C19, WS-C30); pinned to Mailpit `v1.33.1`. | [Install runbook](./infra/projects/mailcatcher/INSTALL-RUNBOOK.md) | [`dev-mail-catcher`](./.kiro/specs/dev-mail-catcher/) |
 
 ## Implemented services
 
@@ -97,6 +97,27 @@ are in [What's in the box](#whats-in-the-box) above; the table below adds the
 | Implemented path | What it is | Install runbook | Spec |
 |---|---|---|---|
 | **Per-project SVC-01 consumer DB + consumer onboarding orchestrator** | A per-project PostgreSQL guest on the project's own VLAN (100+) via the `db/` SVC01_Consumer_Root, plus the manifest-driven `project-consumer-bootstrap.yml` orchestrator that wires a project's declared DB + SSO + secrets by composing the per-service onboarders. First per-project-VLAN SVC-01 consumer; validated end-to-end live (per-project DB coexisting with the shared VLAN-20 services, OpenBao isolation triple + workload AppRole, and a two-client SSO org — public SPA + API — in one ZITADEL org/project). | [Install runbook](./infra/projects/dronefleet/INSTALL-RUNBOOK.md) | [`project-consumer-onboarding`](./.kiro/specs/project-consumer-onboarding/) |
+
+## Use the platform from your project
+
+Once the shared services are running, a project gets its own database, SSO organization and apps, OpenBao secrets
+and an optional workload guest from **one manifest and one command**:
+
+1. **Reserve a slug and VLAN** with a merge request to `infra/platform-foundation/projects.yaml`
+   (see [Onboarding a project](#onboarding-a-project) below).
+2. **Declare what you need** in `infra/projects/<slug>/consumer-manifest.yml`:
+   [manifest reference](./docs/CONSUMER-MANIFEST-REFERENCE.md) (every field, with an annotated example).
+3. **Run `project-consumer-bootstrap.yml`** (the platform operator does this; it needs the cluster's tokens):
+   [consumer journey](./docs/CONSUMER-JOURNEY.md), which starts with who does what, the services that must already
+   be running and the cluster env keys the run reads.
+4. **Consume the result**: where the DB URL, the OIDC client credentials and the workload AppRole live, how the
+   OpenBao Agent sidecar renders them, which ZITADEL org your users land in, and how to expose the app through
+   Traefik: [consumer journey, Steps 3 and 4 and the SSO sections](./docs/CONSUMER-JOURNEY.md#step-3--what-you-get-wired-services).
+5. **Tear down or reset**: [consumer journey, Reset](./docs/CONSUMER-JOURNEY.md#reset).
+
+The worked example project is `dronefleet`: its
+[install runbook](./infra/projects/dronefleet/INSTALL-RUNBOOK.md) runs every step on a throwaway cluster and its
+live test suite.
 
 ## Quick start
 
@@ -241,7 +262,9 @@ PYTHONPATH=infra/platform-foundation/scripts \
 
 The script allocates the next free VLAN ID, appends it to `projects.yaml`, and —
 without `--no-mr` — opens a merge request so a human reviews the record. Then copy
-`infra/projects/_TEMPLATE/` to `infra/projects/<slug>/` and apply. Details are in the
+`infra/projects/_TEMPLATE/` to `infra/projects/<slug>/`, add the project's host-index rows to
+`infra/platform-foundation/host-indices.yaml`, write its `consumer-manifest.yml` and run the consumer orchestrator,
+as described in the [consumer journey](./docs/CONSUMER-JOURNEY.md). Details on the registry are in the
 [foundation README](./infra/platform-foundation/README.md#onboarding-a-new-project).
 
 ## Roadmap

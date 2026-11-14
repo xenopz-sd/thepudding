@@ -216,3 +216,13 @@
       surviving state address(es):
       {{ svc01_surviving_state_addrs | default([]) | join(', ') | default('none', true) }}.
     success_msg: "Clean-Slate reset complete — zero SVC-01 containers + EMPTY SVC-01 state."
+
+# WS-C42: the guests are gone, so their generated inventory must go too (no stale file left for
+# SVC-17 discovery or later runs). Runs only after the gate above passed.
+- name: "Clean-Slate | Remove the generated inventory of the torn-down guests (WS-C42)"
+  ansible.builtin.include_role:
+    name: generated_inventory_cleanup
+  vars:
+    gic_paths:
+      - "{{ svc01_repo_root }}/{{ svc01_generated_inventory }}"
+    gic_only_if_vmid: "{{ svc01_vmid }}"

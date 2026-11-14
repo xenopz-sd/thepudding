@@ -20,3 +20,9 @@
 #
 # The role therefore owns no phase-specific defaults; this file is intentionally
 # empty of keys.
+
+# WS-C41 / ADR-0027: on a re-run against an initialised SVC-07 the seal transit token is read from the primary's
+# existing config.hcl on its guest (never persisted on the control node). The primary is VLAN-20 host_index 0.
+svc07_primary_host: "10.0.20.10"
+svc07_primary_config_path: "/openbao/config/config.hcl"
+svc07_primary_api: "https://10.0.20.10:8200"

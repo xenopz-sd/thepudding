@@ -21,6 +21,10 @@ live/acceptance tier needs a throwaway Proxmox SDN cluster and a local `.env`.
 > live-test `.env` loaded in your shell** — the live tests are never collected,
 > never run, and cannot hang on an unroutable endpoint or hit a real cluster.
 > Running the live tier is an explicit opt-in with `-m requires_infra` (below).
+>
+> **Determinism (WS-C46):** `addopts` also carries `-rf`, so every failed test is named in the summary, and each
+> test root's `conftest.py` loads a Hypothesis profile with no per-example deadline, so a slow or loaded machine
+> cannot fail a property test on timing alone.
 
 ---
 
@@ -329,6 +333,9 @@ contract as the Proxmox live tests. They reach a live OpenBao over its HTTP API
 | `OPENBAO_TEST_UNSEALER_ADDR` | auto-unseal test only (`test_svc07_openbao_autounseal.py`) | The Transit **unsealer's** API base URL (e.g. `https://127.0.0.1:8201`). Used to confirm the unsealer is healthy before the round-trip (Req 5.3) and to seal it for the Req 5.7 present-but-sealed swap-gate arm. |
 | `OPENBAO_TEST_PRIMARY_CONTAINER` | auto-unseal test only | The docker container **name/id** of the primary OpenBao container, cycled with `docker stop`/`start`/`restart` to trigger auto-unseal and read its logs (Req 5.3, 5.6, 5.7). Requires a `docker` CLI on the runner. |
 | `OPENBAO_TEST_UNSEALER_CONTAINER` | auto-unseal test only | The docker container **name/id** of the Transit unsealer container, stopped for the Req 5.6 "unsealer unreachable" swap-gate arm and restarted afterwards. Requires a `docker` CLI on the runner. |
+| `OPENBAO_TEST_PRIMARY_DOCKER_HOST` / `OPENBAO_TEST_UNSEALER_DOCKER_HOST` | auto-unseal test only (optional) | The docker endpoint of each guest (for example `ssh://root@<guest-ip>`), applied to the commands for that container, because the primary and the unsealer run on different guests (WS-C40). Unset keeps the ambient docker context. |
+| `OPENBAO_TEST_ALLOW_SEAL` (auto-unseal arms) | auto-unseal negative arms | Opt-in for the "unsealer stopped" and "unsealer sealed" arms. **Destructive on the throwaway cluster:** the unsealer comes back Shamir-sealed and the bring-up keeps no Shamir keys, so SVC-07 (and its dependents) need a clean-slate and re-bootstrap afterwards (WS-C40). |
+| `OPENBAO_TEST_ONBOARD_DELEGATE_HOST` | onboard idempotency test (optional) | The primary guest address (for example `10.0.20.10`). The fixture then delegates the role's `docker exec` calls there, as the consumer flow does; needed when the tests run on a workstation rather than on the primary guest (WS-C40). |
 
 Run the SVC-07 contract tier against a live throwaway OpenBao:
 

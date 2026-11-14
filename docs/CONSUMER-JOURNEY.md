@@ -63,6 +63,43 @@ graph TD
 
 ---
 
+## Step 0 — Before you start: who does what, and what must exist
+
+**Who does what.** A project team (the *consumer*) declares what it needs; the **platform operator** of the cluster
+runs the orchestrator, because the run needs the cluster's Proxmox token and the OpenBao platform-admin token.
+If you run your own cluster with this repository, you are both.
+
+| Step | Who | Where |
+|---|---|---|
+| Reserve a project slug and VLAN | consumer asks, operator merges | a merge request appending the slug to [`infra/platform-foundation/projects.yaml`](../infra/platform-foundation/projects.yaml), created by `onboard_project.py` (see the [foundation README](../infra/platform-foundation/README.md#onboarding-a-new-project)); the VLAN ID is assigned sequentially and never reused |
+| Reserve host indices on the project VLAN | operator | a row per guest in [`infra/platform-foundation/host-indices.yaml`](../infra/platform-foundation/host-indices.yaml) (ADR-0015): the DB is index 0, the workload guest index 1 |
+| Create the project directory | consumer or operator | copy `infra/projects/_TEMPLATE/` to `infra/projects/<slug>/` and write `consumer-manifest.yml` there (Step 1) |
+| Run the orchestrator | operator | Step 2 |
+| Consume the result | consumer | Steps 3 and 4, plus the SSO notes below |
+
+**Services that must already be running** (each installed by its own runbook, see the
+[README index](../README.md#whats-in-the-box)): the platform prerequisites, SVC-07 OpenBao, SVC-09 Traefik, SVC-06
+ZITADEL (with its backing SVC-01 database), and, for self-registration in dev, the mail catcher. The orchestrator's
+preflight probes OpenBao and ZITADEL and stops, naming the missing one, before it changes anything.
+
+**Cluster env file keys the orchestrator reads** (the gitignored file passed as `cluster_env_file`; template:
+[`cluster.env.example`](../cluster.env.example)):
+
+| Key | Used for |
+|---|---|
+| `PROXMOX_ENDPOINT`, `PROXMOX_API_TOKEN`, `PROXMOX_NODE_NAME`, `PROXMOX_LXC_TEMPLATE`, `PROXMOX_DATASTORE_ID` | creating the network slice and guests |
+| `PROXMOX_SSH_PUBLIC_KEY_FILE` | SSH access to the new guests |
+| `PROXMOX_HOST_LAN_IP`, `ADMIN_SOURCE_CIDR` | converging the host gateway for the project VLAN (WS-C44); `-e consumer_proxmox_host=<ip>` overrides the host |
+| `OPENBAO_ADMIN_TOKEN` | the OpenBao writes (written there by SVC-07's bootstrap; the shell environment takes precedence, WS-C45) |
+| `OPENBAO_TLS_SELF_SIGNED` | dev clusters whose OpenBao serves the self-signed mock certificate |
+
+**Guest VMIDs** are computed as `vlan_id * 1000 + host_index` (ADR-0022): on VLAN 101 the DB (index 0) is
+`101000` and the workload guest (index 1) `101001`. A standing DB keeps the VMID recorded in the project's generated
+inventory, so an older install is never re-created under a new ID (WS-C48). `-e consumer_svc01_vmid=<n>` overrides
+it.
+
+---
+
 ## Step 1 — Declare the Consumer_Manifest
 
 A project declares the catalog services it consumes in one per-project file,
@@ -138,8 +175,7 @@ resolved from the Registry.
 ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
   ansible/playbooks/project-consumer-bootstrap.yml \
   -e cluster_env_file=cluster.dev.env \
-  -e project_slug=dronefleet \
-  -e svc01_vmid=1101
+  -e project_slug=<slug>
 ```
 
 The four phases:
@@ -152,7 +188,9 @@ The four phases:
    A project VLAN and its network slice (VNet) are only created when the manifest
    declares a guest to place (`database` or an enabled `workload`). An **SSO-only
    or secrets-only manifest needs no VLAN**: the slug is still resolved from the
-   Registry, but no VNet is required or created, and the preflight says so.
+   Registry, but no VNet is required or created, and the preflight says so. When a
+   slice is needed, the run also converges the host L3 gateway for the project VLAN
+   (WS-C44), so the guests are reachable without a separate gateway run.
 3. **Bootstrap** — compose the onboarders: the DB + least-priv app role (password
    → OpenBao), the OpenBao isolation triple + `<slug>-workload` AppRole, and the
    ZITADEL org + SPA/API clients (OIDC client secret → OpenBao).
@@ -160,8 +198,9 @@ The four phases:
    the DB endpoint, SSO app IDs, and the OpenBao path + workload AppRole — secrets
    **by name/path only, never by value**.
 
-**Re-runs are safe** (Req 6): a converged re-run reports zero changes; a re-run
-after a partial failure completes only the remainder.
+**Re-runs are safe** (Req 6): a converged re-run changes nothing except a fresh, TTL-bounded workload
+Secret_ID (minted on every run by design); a re-run after a partial failure completes only the remainder.
+`ansible-playbook --check` is **not** supported for this orchestrator (WS-C43): use a plain re-run.
 
 **Degraded mode** (Req 9): if OpenBao is sealed, ZITADEL is down, or the DB guest
 is unreachable, the run halts non-zero naming the dependency with no partial
@@ -175,7 +214,7 @@ automated path, then re-run.
 | Service | What the orchestrator wired | Where the secret lives |
 |---|---|---|
 | **Database** (SVC-01) | per-project PostgreSQL on VLAN 100+, DB + least-priv app role | source record at `secret/proj-<slug>/postgres`; bridged for the workload to `secret/data/<slug>/db` (field `database_url`, env `DATABASE_URL`) — see the [workload-readable DB path](CONSUMER-MANIFEST-REFERENCE.md#workload-readable-db-credential-path-authoritative) |
-| **SSO** (SVC-06) | ZITADEL org + a public SPA client + an API client | OIDC client secret at `secret/proj-<slug>/zitadel/...` in OpenBao |
+| **SSO** (SVC-06) | ZITADEL org (`sso.org_name`) + one OIDC app per `sso.app_registrations[]` entry, project roles per `sso.roles` | per app: `secret/proj-<slug>/zitadel/oidc/<app name>` (client id and, for confidential apps, the client secret); the issuer is `https://auth.<platform-domain>`; the completion summary prints the org id |
 | **Secrets** (SVC-07) | `policy-<slug>` + KV path + `<slug>-workload` AppRole (renewable TTL) | AppRole `role_id`/`secret_id` handed off per PF FR-8 |
 
 Nothing in this table is ever echoed to stdout or committed — the completion
@@ -488,11 +527,11 @@ audience/role scopes it already sends:
 scope=openid profile email urn:zitadel:iam:org:id:<your org id>
 ```
 
-**Getting your org id.** Onboarding does not print it (it runs with output suppressed to protect secrets), so ask the
-platform operator who ran your onboarding. They can read it from the ZITADEL console (organization details; this path is from
-ZITADEL's documentation and was not re-checked here) or from the admin API (`POST /admin/v1/orgs/_search` by org name, which
-was confirmed live). It is stable for the life of the org, so it is safe to put in your app's configuration. Surfacing it in
-the onboarding handoff is tracked as a follow-up in `PLANNING.md` (WS-C27).
+**Getting your org id.** The onboarding completion summary now prints it on an `SSO org id:` line, together with the exact
+scope to request. It is a non-secret identifier, stable for the life of the org, so it is safe to put in your app's
+configuration. If a run could not determine it, the line says so; the platform operator can then read it from the ZITADEL console
+(organization details; this path is from ZITADEL's documentation and was not re-checked here) or from the admin API
+(`POST /admin/v1/orgs/_search` by org name, which was confirmed live). The summary line was verified live (the printed id matched the id read from the ZITADEL admin API).
 
 **Self-registration also needs two switches.**
 1. The org's login policy must allow it. Set `sso.login_policy.allow_register: true` in your manifest (see the
@@ -518,4 +557,21 @@ To return a mis-onboarded project to a clean baseline before re-onboarding, use
 the clean-slate reset documented in the per-project install runbook
 ([`infra/projects/<slug>/INSTALL-RUNBOOK.md` Part 4](../infra/projects/dronefleet/INSTALL-RUNBOOK.md#part-4--clean-slate-teardown-tier-2-requires-infra)).
 It tears the consumer resources to baseline but **preserves** the Registry entry
-and the `<slug>-infra` network slice (Req 7.7).
+and the `<slug>-infra` network slice (Req 7.7), and deletes the project's generated
+inventory files once the teardown is verified (WS-C42):
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+  ansible/playbooks/project-consumer-bootstrap.yml \
+  -e clean_slate=true -e clean_slate_confirm=force \
+  -e cluster_env_file=cluster.dev.env \
+  -e project_slug=<slug> \
+  -e consumer_proxmox_host=<proxmox-lan-ip> \
+  -e consumer_workload_vmid=<vlan_id * 1000 + 1>
+```
+
+`consumer_workload_vmid` is required when the manifest declares a workload guest (it is the confirmation token
+for destroying it); `consumer_proxmox_host` lets the teardown run `pct` on the node. The DB VMID is read from the
+project's generated inventory; if that file is gone, the teardown stops and asks for `-e consumer_svc01_vmid=<n>`.

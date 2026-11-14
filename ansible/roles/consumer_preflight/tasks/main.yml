@@ -54,6 +54,38 @@
     consumer_tfvars: "{{ consumer_env_resolve.stdout | from_json }}"
   no_log: true
 
+# WS-C45: resolve the platform-admin token like SVC-01 / SVC-17/18 do (process env first, else the cluster env
+# file) and fail closed here, before any mutation, when OpenBao is wired and it is empty. Every consumer use and the
+# composed OpenBao/ZITADEL steps take this fact. The value is never echoed.
+- name: "Preflight | Slurp the cluster env file for the OpenBao admin token (no_log)"
+  ansible.builtin.slurp:
+    src: >-
+      {{ (consumer_repo_root ~ '/' ~ cluster_env_file)
+         if (cluster_env_file is not match('^/'))
+         else cluster_env_file }}
+  register: consumer_cluster_env_slurp
+  check_mode: false
+  no_log: true
+- name: "Preflight | Resolve the OpenBao admin token (process env first, else the cluster env file) (no_log)"
+  ansible.builtin.set_fact:
+    consumer_openbao_admin_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         or ((consumer_cluster_env_slurp.content | b64decode
+              | regex_findall('(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*["\']?([^"\'\r\n]*?)["\']?[ \t]*$')
+              | first | default('') | trim)) }}
+  no_log: true
+  changed_when: false
+- name: "Preflight | Fail closed if OpenBao is wired but no admin token is resolvable"
+  ansible.builtin.assert:
+    that:
+      - (consumer_openbao_admin_token | default('') | trim | length) > 0
+    fail_msg: >-
+      OpenBao is wired (openbao_addr='{{ openbao_addr }}') but OPENBAO_ADMIN_TOKEN resolved empty from both the
+      process environment and the cluster env file ({{ cluster_env_file }}, see cluster_env_file). Add it to that
+      file (SVC-07's bootstrap writes it there) or export it, then re-run. Nothing was provisioned.
+    success_msg: "OpenBao admin token resolved (value not shown)."
+    quiet: true
+  when: (openbao_addr | default('') | trim | length) > 0
 - name: "Preflight | Bind non-secret cluster facts for later phases"
   ansible.builtin.set_fact:
     consumer_proxmox_node_name: "{{ consumer_tfvars['TF_VAR_proxmox_node_name'] }}"

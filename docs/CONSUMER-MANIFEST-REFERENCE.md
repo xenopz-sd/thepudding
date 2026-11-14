@@ -26,14 +26,15 @@ The manifest may declare exactly these top-level service blocks, and no others:
 
 | Top-level key | Catalog service | Block below |
 |---|---|---|
-| `database` | SVC-01 (per-project PostgreSQL/MariaDB) | [`database`](#database-block-svc-01) |
-| `sso` | SVC-06 (ZITADEL org + app registrations) | [`sso`](#sso-block-svc-06) |
-| `secrets` | SVC-07 (OpenBao policy/path + workload AppRole) | [`secrets`](#secrets-block-svc-07) |
+| `database` | SVC-01 (per-project PostgreSQL/MariaDB) | [`database`](#schema-field-table) |
+| `sso` | SVC-06 (ZITADEL org + app registrations) | [`sso`](#schema-field-table) |
+| `secrets` | SVC-07 (OpenBao policy/path + workload AppRole) | [`secrets`](#schema-field-table) |
 | `workload` | the per-project **workload guest** (an LXC on the project VLAN to run the app) | [`workload`](#workload-block) |
+| `expose` | public ingress for the workload through the shared Traefik (SVC-09) | [`expose`](#expose-block) |
 
 Any other top-level service key — or a **duplicate** of one of these — is
 rejected at preflight, naming the offending entry (Req 1.7). The only permitted
-top-level keys are `slug`, `database`, `sso`, `secrets`, and `workload`.
+top-level keys are `slug`, `database`, `sso`, `secrets`, `workload`, and `expose`.
 
 ---
 
@@ -54,6 +55,8 @@ top-level keys are `slug`, `database`, `sso`, `secrets`, and `workload`.
 | `sso.app_registrations[].dev_mode` | bool, optional | v0.14.0 #3 | declares OIDC `devMode` (needed for non-https redirect URIs, dev only); reconciled on re-run; omitted = live value untouched |
 | `sso.login_policy.allow_register` | bool, optional | dev-mail-catcher R7 | reconciles the project org's login-policy `allowRegister` (self-registration) with a read-back gate; omitted = untouched; unknown keys under `login_policy` are rejected Self-registered users only land in your org if the app requests the org-id scope: see [which org does a new user land in?](CONSUMER-JOURNEY.md#sso-consumption-which-org-does-a-new-user-land-in) |
 | `sso.default_role` | string role key, or `false`, optional | WS-C18 | grants that project role to every user created in the project org (a ZITADEL Post Creation action, reconciled with a read-back gate); must be one of `sso.roles` (or `admin`/`member`/`viewer` when none declared); `false` removes it; omitted = untouched. Use a least-privilege role: see [the journey note](CONSUMER-JOURNEY.md#sso-consumption-which-org-does-a-new-user-land-in) |
+| `sso.roles` | non-empty list, optional | §4 | the project's role vocabulary; each entry is a key string or `{key, display_name?, group?}`; keys unique, `^[A-Za-z0-9_.:-]{1,200}$`. Onboarding makes the project's roles **exactly** this set (it removes others, including ZITADEL's auto-created `admin`/`member`/`viewer`); omitted = keep `admin`/`member`/`viewer` |
+| `sso.project_role_assertion` | bool, optional | §4 | sets the project's `projectRoleAssertion`, so tokens carry the role claim; default `true` |
 | `secrets.policy` | string, non-empty | 1.4 | OpenBao ACL policy name |
 | `secrets.path` | string, `secret/...` | 1.4 | OpenBao KV path prefix |
 | `secrets.workload_token_ttl` | integer > 0 | 1.4 | ≤ `workload_token_max_ttl` |
@@ -63,7 +66,11 @@ top-level keys are `slug`, `database`, `sso`, `secrets`, and `workload`.
 | `workload.enabled` | bool | 2.1 | default `false`; `false`/absent = no workload guest |
 | `workload.tier` | enum `small` \| `medium` | 2.1 | default `small` (reuses the `database` sizing bands) |
 | `workload.count` | integer ≥ 1 | 2.1 | default `1`; `>1` reserved for a later increment |
-| *(top-level key)* | one of `slug` / `database` / `sso` / `secrets` / `workload` | 1.7 | unknown/duplicate key → reject naming it |
+| `expose.enabled` | bool, optional | §6 | default `false`; `true` publishes the workload through Traefik |
+| `expose.host` | string, required when enabled | §6 | a **bare** subdomain label (no dots), `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`; the platform domain is appended, giving `https://<host>.<platform-domain>` |
+| `expose.port` | integer 1..65535, optional | §6 | the workload's backend port; default `8080` |
+| `expose.tls` | enum `terminate` \| `passthrough`, optional | §6 | default `terminate` (Traefik terminates TLS) |
+| *(top-level key)* | one of `slug` / `database` / `sso` / `secrets` / `workload` / `expose` | 1.7 | unknown/duplicate key → reject naming it |
 
 ### `app_type` / `auth_method` combinations
 
@@ -111,6 +118,16 @@ For the supported topologies (dedicated guest vs. co-locate on the DB guest vs.
 bring-your-own host) and the end-to-end last-mile walkthrough, see the
 [Consumer Journey Runbook](CONSUMER-JOURNEY.md#the-last-mile--where-your-workload-runs-b).
 
+### `expose` block
+
+The optional `expose` block makes the workload **user-facing**: the deploy step registers a Traefik route
+`https://<expose.host>.<platform-domain>` to the workload guest's backend port (the ADR-0018 file-provider route,
+so no host port is published to the LAN). The platform domain comes from the operator's configuration
+(`consumer_platform_domain`), never from the manifest. The handoff checks the route and prints it. Browser OIDC
+login additionally needs the browser to reach both the app host and the ZITADEL issuer host; see the
+[dev issuer-reachability recipe](CONSUMER-JOURNEY.md#sso-consumption-dev-issuer-reachability-recipe-d).
+Protecting a route with SSO at the proxy (forward-auth) is not offered to consumers yet (WS-C31).
+
 ---
 
 ## Annotated example (placeholders only)
@@ -135,6 +152,10 @@ sso:                                # OPTIONAL — SVC-06 (Req 1.3)
     - name: dronefleet-api
       app_type: api
       auth_method: jwt-profile
+  # roles: [owner, collaborator, observer]   # OPTIONAL — exact project role set (default admin/member/viewer)
+  # project_role_assertion: true            # OPTIONAL — role claim in tokens (default true)
+  # login_policy: {allow_register: true}    # OPTIONAL — self-registration (dev: needs the mail catcher)
+  # default_role: observer                  # OPTIONAL — granted to every user created in the org
 
 secrets:                            # OPTIONAL — SVC-07 (Req 1.4)
   policy: policy-dronefleet         # OpenBao ACL policy name
@@ -148,6 +169,12 @@ workload:                           # OPTIONAL — per-project workload guest (R
   enabled: true                     # false/absent (default) => no guest, strict no-op
   tier: small                       # small (default) | medium
   count: 1                          # >=1 (default 1); >1 reserved for a later increment
+
+# expose:                           # OPTIONAL — public ingress for the workload (§6)
+#   enabled: true
+#   host: dronefleet                # bare label -> https://dronefleet.<platform-domain>
+#   port: 8080
+#   tls: terminate
 ```
 
 ---

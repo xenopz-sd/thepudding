@@ -458,6 +458,12 @@ class TestOpenBaoEngineAuthAuditContract:
             ],
         }
 
+        # The external AWS secrets engine is DESCOPED (project-constitution decision log: "SVC-07 external AWS
+        # secrets-engine plugin: NOT supported"). OpenBao 2.4 no longer ships it built in, so the live write 404s.
+        # Opt in only on an instance that really has the plugin.
+        if os.environ.get("OPENBAO_TEST_ENABLE_AWS") != "1":
+            pytest.skip("AWS secrets engine is descoped (constitution decision log); set OPENBAO_TEST_ENABLE_AWS=1 "
+                        "on an instance that carries the plugin")
         enabled_aws = False
         try:
             if not bao.mount_exists("aws"):

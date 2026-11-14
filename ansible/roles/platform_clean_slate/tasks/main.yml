@@ -1116,30 +1116,102 @@
                  and 'does not exist' not in platform_cs_gate_pvesh_out))
          else [] }}
 
-# Final gate (Req 7.4, 7.5): ALL THREE survivor sets MUST be empty. If any is
-# non-empty the run halts non-zero, naming every survivor by VMID, state
-# address, or SDN object, with the remedy.
-- name: "Clean-Slate | GATE — assert an empty baseline (0 guests, 0 state, no SDN), Req 7.4/7.5"
+# WS-C33: the zone itself. The p20 probe above cannot see a zone with no VNet that the foundation state never
+# tracked; read the zone list and flag the platform zone if it still exists after the destroy and SDN apply.
+- name: "Clean-Slate | GATE — list the SDN zones on the host (pvesh, read-only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pvesh get /cluster/sdn/zones"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_gate_zone
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | GATE — bind the SDN zone probe stdout"
+  ansible.builtin.set_fact:
+    platform_cs_gate_zone_out: "{{ (platform_cs_gate_zone | default({})).stdout | default('') }}"
+
+- name: "Clean-Slate | GATE — compute the surviving SDN zone"
+  ansible.builtin.set_fact:
+    platform_cs_surviving_zone: >-
+      {{ [platform_clean_slate_sdn_zone_id]
+         if (platform_clean_slate_sdn_zone_id in platform_cs_gate_zone_out
+             and 'does not exist' not in platform_cs_gate_zone_out)
+         else [] }}
+
+# WS-C14: the standing isolation DENY rules are platform-owned BASELINE (operator decision 2026-11-07). Read the
+# cluster firewall rules and flag any OTHER platform-owned rule; the two DENY rules are the expected residue.
+- name: "Clean-Slate | GATE — read the cluster firewall rules (pvesh, read-only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ platform_venv_python | dirname }}/ansible"
+      - proxmox
+      - -i
+      - "{{ platform_clean_slate_proxmox_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ platform_clean_slate_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pvesh get /cluster/firewall/rules --output-format json"
+  args:
+    chdir: "{{ platform_repo_root }}"
+  register: platform_cs_gate_fw
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | GATE — classify the platform-owned cluster firewall rules"
+  ansible.builtin.set_fact:
+    platform_cs_unexpected_firewall_rules: >-
+      {{ ((platform_cs_gate_fw_out | default((platform_cs_gate_fw | default({})).stdout | default('')))
+          | regex_search('(?s)\[.*\]') or '[]') | from_json
+         | map(attribute='comment', default='') | select('string')
+         | select('match', platform_clean_slate_firewall_rule_prefix | regex_escape)
+         | reject('in', platform_cs_expected_firewall_residue | default(platform_clean_slate_expected_firewall_residue))
+         | list }}
+
+# Final gate (Req 7.4, 7.5): ALL FIVE survivor sets MUST be empty. If any is non-empty the run halts non-zero,
+# naming every survivor by VMID, state address, SDN object, zone or firewall rule, with the remedy. The two
+# standing DENY rules are expected residue (WS-C14) and are not counted.
+- name: "Clean-Slate | GATE — assert an empty baseline (0 guests, 0 state, no SDN, no zone), Req 7.4/7.5"
   ansible.builtin.assert:
     that:
       - "(platform_cs_surviving_vmids | length) == 0"
       - "(platform_cs_surviving_state_addrs | length) == 0"
       - "(platform_cs_surviving_sdn | length) == 0"
+      - "(platform_cs_surviving_zone | length) == 0"
+      - "(platform_cs_unexpected_firewall_rules | length) == 0"
     fail_msg: >-
       Platform clean-slate did NOT reach an empty baseline. Surviving service
       container(s): {{ platform_cs_surviving_vmids | join(', ') | default('none', true) }};
       surviving Terraform state address(es):
       {{ platform_cs_surviving_state_addrs | join(', ') | default('none', true) }};
       surviving SDN object(s):
-      {{ platform_cs_surviving_sdn | join(', ') | default('none', true) }}.
+      {{ platform_cs_surviving_sdn | join(', ') | default('none', true) }};
+      surviving SDN zone(s): {{ platform_cs_surviving_zone | join(', ') | default('none', true) }};
+      unexpected platform-owned cluster firewall rule(s):
+      {{ platform_cs_unexpected_firewall_rules | join(' | ') | default('none', true) }}.
       Investigate on the Proxmox host / in Terraform state (a surviving SDN
       object usually means a host reboot is still needed — re-run with
-      -e platform_clean_slate_reboot=true) and re-run the clean-slate until all
-      three are empty before re-provisioning.
+      -e platform_clean_slate_reboot=true; a surviving zone means re-run with
+      -e platform_clean_slate_remove_zone_occupants=true) and re-run the clean-slate until
+      all are empty before re-provisioning. The two standing isolation DENY rules are
+      expected residue and are not counted.
     success_msg: >-
       Platform clean-slate complete — zero discovered-service containers on the
       host, zero Terraform state addresses (service roots + platform-foundation),
-      and no surviving SDN object.
+      no surviving SDN object or zone, and no platform-owned cluster firewall rule
+      other than the standing isolation DENY rules (expected residue, by design).
 
 - name: "Clean-Slate | Report the platform prerequisites baseline is empty"
   ansible.builtin.debug:

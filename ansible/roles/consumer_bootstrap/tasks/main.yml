@@ -63,7 +63,7 @@
   ansible.builtin.command:
     argv: >-
       {{ ['docker', 'exec', '-e', 'BAO_ADDR=https://127.0.0.1:' ~ 8200,
-          '-e', 'BAO_TOKEN=' ~ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true)),
+          '-e', 'BAO_TOKEN=' ~ consumer_openbao_admin_token,
           'openbao-openbao-1', 'bao', 'kv', 'get']
          + (['-tls-skip-verify'] if (consumer_openbao_tls_self_signed | bool) else [])
          + ['-field=app_password', consumer_openbao_db_secret_path] }}
@@ -108,6 +108,7 @@
   ansible.builtin.include_role:
     name: "{{ consumer_openbao_project_onboard_role }}"
   vars:
+    openbao_admin_token_value: "{{ consumer_openbao_admin_token }}"
     openbao_tls_self_signed: "{{ consumer_openbao_tls_self_signed }}"
     # Delegate the composed role's docker exec/cp + policy render/slurp to the
     # primary (this role runs on hosts: localhost, where the container does not
@@ -161,7 +162,7 @@
   ansible.builtin.command:
     argv: >-
       {{ ['docker', 'exec', '-e', 'BAO_ADDR=https://127.0.0.1:' ~ 8200,
-          '-e', 'BAO_TOKEN=' ~ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true)),
+          '-e', 'BAO_TOKEN=' ~ consumer_openbao_admin_token,
           'openbao-openbao-1', 'bao', 'kv', 'get']
          + (['-tls-skip-verify'] if (consumer_openbao_tls_self_signed | bool) else [])
          + ['-format=json', consumer_openbao_db_secret_path] }}
@@ -204,7 +205,7 @@
   ansible.builtin.command:
     argv: >-
       {{ ['docker', 'exec', '-e', 'BAO_ADDR=https://127.0.0.1:' ~ 8200,
-          '-e', 'BAO_TOKEN=' ~ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true)),
+          '-e', 'BAO_TOKEN=' ~ consumer_openbao_admin_token,
           'openbao-openbao-1', 'bao', 'kv', 'get']
          + (['-tls-skip-verify'] if (consumer_openbao_tls_self_signed | bool) else [])
          + ['-format=json',
@@ -262,7 +263,7 @@
   ansible.builtin.command:
     argv: >-
       {{ ['docker', 'exec', '-e', 'BAO_ADDR=https://127.0.0.1:' ~ 8200,
-          '-e', 'BAO_TOKEN=' ~ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true)),
+          '-e', 'BAO_TOKEN=' ~ consumer_openbao_admin_token,
           'openbao-openbao-1', 'bao', 'kv', 'put']
          + (['-tls-skip-verify'] if (consumer_openbao_tls_self_signed | bool) else [])
          + ['secret/' ~ project_slug ~ '/' ~ consumer_db_bridge_subpath,
@@ -315,6 +316,7 @@
   ansible.builtin.include_role:
     name: "{{ consumer_openbao_workload_approle_role }}"
   vars:
+    openbao_admin_token_value: "{{ consumer_openbao_admin_token }}"
     openbao_tls_self_signed: "{{ consumer_openbao_tls_self_signed }}"
     openbao_workload_handoff: "{{ consumer_workload_handoff }}"
     openbao_workload_token_ttl: "{{ consumer_manifest.secrets.workload_token_ttl }}"
@@ -465,11 +467,22 @@
         {{ {'zop_default_role': (consumer_manifest.sso.default_role | default(none))} | to_json }}
   args:
     chdir: "{{ consumer_repo_root }}"
+  environment:
+    # WS-C45: the child reads OPENBAO_ADMIN_TOKEN from its environment; pass the resolved value.
+    OPENBAO_ADMIN_TOKEN: "{{ consumer_openbao_admin_token }}"
   register: consumer_sso_run
   changed_when: "'changed=0' not in (consumer_sso_run.stdout | default(''))"
   no_log: true
   when: consumer_manifest.sso is defined
 
+# WS-C27: lift ONLY the numeric org id out of the (otherwise suppressed) child output, for the handoff banner.
+# Strictly digits, so nothing else from the child run can ride along into the summary.
+- name: "Bootstrap | STEP 4 — Capture the project org id for the handoff (non-secret, digits only)"
+  ansible.builtin.set_fact:
+    consumer_sso_org_id: >-
+      {{ ((consumer_sso_run.stdout | default('')) | regex_findall('ZITADEL_ORG_ID=([0-9]+)') + ['']) | first }}
+  changed_when: false
+  when: consumer_manifest.sso is defined
 - name: "Bootstrap | STEP 4 — INFO — SSO step skipped (no sso declared)"
   ansible.builtin.debug:
     msg: "INFO: SSO onboarding step skipped for '{{ project_slug }}' — the Consumer_Manifest declares no sso block."

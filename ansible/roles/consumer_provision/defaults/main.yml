@@ -55,9 +55,9 @@ consumer_svc01_bootstrap_playbook: ansible/playbooks/svc-01-bootstrap.yml
 consumer_svc01_generated_inventory: ansible/inventory/svc-01-sql-database.generated.yml
 consumer_generated_inventory: "ansible/inventory/{{ project_slug }}-consumer.generated.yml"
 
-# The per-project DB guest VMID. Supplied explicitly so instances get stable,
-# non-colliding IDs; a real per-project copy overrides via -e consumer_svc01_vmid=.
-consumer_svc01_vmid: 1101
+# The per-project DB guest VMID override (ADR-0022). 0 = computed (vlan_id * 1000 + host_index). WS-C48: a standing
+# DB keeps the VMID recorded in its generated inventory (never force-replaced); -e consumer_svc01_vmid=<n> wins.
+consumer_svc01_vmid: 0
 
 # --- Optional workload guest (consumer-last-mile-hello-workload §B, task 3.1) --
 #

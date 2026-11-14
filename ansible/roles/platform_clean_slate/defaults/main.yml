@@ -254,3 +254,15 @@ platform_clean_slate_zone_poll_delay: 5
 platform_clean_slate_sdn_apply: true
 platform_clean_slate_sdn_apply_poll_retries: 6
 platform_clean_slate_sdn_apply_poll_delay: 5
+
+# WS-C14 (operator decision 2026-11-07): the two STANDING isolation DENY rules that
+# `sdn_gateway/tasks/isolation.yml` writes at CLUSTER scope are platform-owned BASELINE. They are the isolation
+# floor, are NOT per-VLAN teardown-able, and therefore survive a full clean-slate by design. The final gate
+# tolerates EXACTLY these two comments (exact match) and flags any other platform-owned (`sdn_gateway:`-prefixed)
+# cluster rule, e.g. a per-VLAN ALLOW rule that failed to be removed. Rules without the platform prefix are the
+# operator's own and are never judged. A drift guard pins these strings to isolation.yml.
+platform_clean_slate_management_vlan_id: 10
+platform_clean_slate_firewall_rule_prefix: "sdn_gateway:"
+platform_clean_slate_expected_firewall_residue:
+  - "sdn_gateway: DENY any -> management VLAN {{ platform_clean_slate_management_vlan_id }} (managed)"
+  - "sdn_gateway: DENY cross-project VLAN -> VLAN (managed)"

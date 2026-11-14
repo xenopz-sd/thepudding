@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-11-14
+
+> Operator-visible defects found by live acceptance on a throwaway cluster and fixed test-first, consumer
+> onboarding that works from scratch with one command, truthful re-runs (`changed=0`) for every installer, and
+> consumer documentation an external project can follow. One behaviour change needs attention when upgrading:
+> see "Upgrade notes".
+
+### Upgrade notes
+- **SVC-17/18 now wires OpenBao by default** (`obs_openbao_addr=10.0.20.10`). The installer seeds and reads the
+  Grafana admin password from `secret/observability/grafana-admin`. For a deliberate offline run pass
+  `-e obs_openbao_addr=""` and an explicit `observability_grafana_admin_password_override`. A Grafana that already
+  initialised with `admin`/`admin` keeps it until a clean-slate (Grafana applies the password only at first start).
+- **OpenBao metrics are now named `openbao_*`** (were `vault_*`). Dashboards or queries outside this repository that
+  used `vault_*` names must be updated.
+- **Consumer DB VMIDs are computed for new projects** (`vlan_id * 1000 + host_index`). A standing project DB keeps
+  the VMID recorded in its generated inventory; pass `-e consumer_svc01_vmid=<n>` if that file is gone.
+
+### Fixed
+- **Grafana could start with `admin`/`admin`** when the documented install command ran without OpenBao; an empty or
+  default admin password now stops the install (WS-C37).
+- **Alerts never reached Alertmanager** (Prometheus targeted `localhost:9093` from its own container) (WS-C37).
+- **The OpenBaoSealed alerts could never fire**: OpenBao exported `vault_*` metrics; the expression now also ignores
+  the stale sealed series OpenBao keeps after an unseal (WS-C36).
+- **From-scratch consumer onboarding failed** until the platform gateway was re-run by hand; the consumer now
+  converges the gateway for its own VLAN (WS-C44).
+- **The consumer flow needed `OPENBAO_ADMIN_TOKEN` exported** in the shell; it now reads the cluster env file too and
+  stops at preflight when the token is missing (onboarding and clean-slate) (WS-C45, WS-C42).
+- **An SVC-07 re-run halted** on the missing seal token; it now reads it from the primary's own `config.hcl` and
+  keeps the existing admin token (ADR-0027, WS-C41). `openbao_project_onboard` / `openbao_workload_approle` no longer
+  fail on ansible-core 2.21 without a delegate host.
+- **Re-runs were never `changed=0`**: SVC-01 rewrote its OpenBao credential and DB roles every run (WS-C34), and every
+  installer reported `terraform init`, inventory generation and known_hosts as changed (WS-C39, new shared
+  `known_hosts_refresh` role).
+- **Every consumer DB defaulted to VMID `1101`**, so a second project's DB collided (WS-C48).
+- **Platform clean-slate** now detects an SDN zone the foundation state does not track and tolerates exactly the two
+  standing isolation DENY rules (WS-C33, WS-C14).
+- **Stale generated inventories** survived teardowns and fed SVC-17 discovery; every clean-slate now removes its own
+  (WS-C42, new shared `generated_inventory_cleanup` role).
+
+### Changed
+- `ansible-playbook --check` is documented as unsupported for the consumer orchestrator; idempotency is a plain
+  second run (WS-C43).
+- SVC-07 Req 5.6 corrected to the log message OpenBao really prints when its Transit seal fails (WS-C40).
+- Mailpit pinned to `v1.33.1` (WS-C28); the onboarding summary prints the ZITADEL org id and the scope to request
+  (WS-C27).
+- Tests: every run names failed tests (`-rf`) and Hypothesis has no per-example deadline (WS-C46); the SVC-07 live
+  tier gained per-guest docker endpoints, and its two destructive auto-unseal arms are opt-in
+  (`OPENBAO_TEST_ALLOW_SEAL`) (WS-C40).
+
+### Documentation
+- README "Use the platform from your project"; consumer journey Step 0 (who does what, required services, cluster
+  env keys, VMIDs), exact OIDC secret path and issuer, inline teardown; manifest reference covers `sso.roles`,
+  `sso.project_role_assertion` and `expose` (WS-C49). CONTRIBUTING explains how to get involved.
+
+### Decisions
+- ADR-0024 (live-shape capture CLI) and ADR-0026 (oauth2-proxy forward-auth, flagged non-EU exception; implementation
+  is backlog WS-C31) Accepted; ADR-0027 (SVC-07 re-run seal-token source) Accepted. WS-C47: no Shamir key persistence
+  on throwaway clusters.
 ## [0.15.0] — 2026-11-08
 
 > A shared dev mail catcher, five operator-feedback fixes from v0.14.0, five backlog streams closed
@@ -1397,7 +1455,8 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
-[Unreleased]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.15.0...HEAD
+[Unreleased]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.16.0...HEAD
+[0.16.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.15.0...v0.16.0
 [0.15.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.14.0...v0.15.0
 [0.14.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.13.0...v0.14.0
 [0.13.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.12.0...v0.13.0

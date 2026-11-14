@@ -149,7 +149,9 @@ export AGENT_LIVE_AUTHORIZED=1           # throwaway interlock (per-run; never c
 The SVC01_Consumer_Root is stood up by the sanctioned consumer orchestrator,
 which composes the SVC-01 orchestrator for the DB. `project_slug` is the only
 identity you pass — `vlan_id` is resolved from the Registry and `host_index` from
-the ledger (never hand-picked). Pick a free `svc01_vmid`.
+the ledger (never hand-picked). The DB VMID is computed as `vlan_id * 1000 + host_index`
+(`100000` here, ADR-0022). An install made before v0.16.0 with VMID `1101` keeps it automatically while its
+generated inventory exists (WS-C48); otherwise pass `-e consumer_svc01_vmid=1101`.
 
 <!-- doctest: requires-infra -->
 <!-- cwd: . -->
@@ -157,8 +159,7 @@ the ledger (never hand-picked). Pick a free `svc01_vmid`.
 ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
   ansible/playbooks/project-consumer-bootstrap.yml \
   -e cluster_env_file=cluster.throwaway.env \
-  -e project_slug=dronefleet \
-  -e svc01_vmid=1101
+  -e project_slug=dronefleet
 ```
 
 This runs the four phases: preflight (manifest + Registry + bounded dependency
@@ -166,6 +167,15 @@ probes) → provision (the `db/` apply on VLAN 100 + the `postgres-server` role)
 bootstrap (DB + least-priv app role, generated password → OpenBao, the OpenBao
 isolation triple + `<slug>-workload` AppRole, the ZITADEL org/SPA/API clients) →
 health/handoff (the completion summary).
+
+> **OpenBao admin token (WS-C45).** The orchestrator reads `OPENBAO_ADMIN_TOKEN` from the environment, else
+> from the cluster env file (SVC-07's bootstrap writes it there), and stops at preflight if neither has it.
+
+> **Host gateway (WS-C44).** When the manifest declares a database or workload, the provision phase also
+> converges the host L3 gateway (the `platform_gateway` role) right after the network slice exists, so a
+> from-scratch onboarding needs no separate gateway re-run. It needs `PROXMOX_HOST_LAN_IP` and
+> `ADMIN_SOURCE_CIDR` in the cluster env file (or `-e consumer_proxmox_host=<ip>`); without them it stops
+> before touching the gateway.
 
 > Alternatively, to provision **only** the DB layer (not the full consumer
 > onboarding), apply the `db/` root directly via the composed SVC-01 path:
@@ -209,6 +219,7 @@ export CONSUMER_TEST_CLUSTER_ENV=cluster.throwaway.env
 export CONSUMER_TEST_DB_HOST=10.0.100.10
 export CONSUMER_TEST_DB_PORT=5432
 export CONSUMER_TEST_ALLOW_MUTATE=1       # arm the apply/destroy tests (throwaway only)
+export CONSUMER_TEST_PROXMOX_HOST=<proxmox-lan-ip>   # the clean-slate test tears the workload guest down on the node
 # OPENBAO_ADMIN_TOKEN / OPENBAO_TEST_ADDR / OPENBAO_TEST_TOKEN come from the
 # throwaway cluster's gitignored .env — referenced by name, never echoed.
 ```
@@ -227,8 +238,15 @@ With no cluster wired these tests **skip cleanly** (never fail) — the
 assert: the DB guest is reachable on VLAN 100 (10.1), the full orchestrator run
 wires DB + OpenBao triple + `<slug>-workload` AppRole + ZITADEL clients with the
 secrets stored in OpenBao (10.2), the degraded-mode halts name their dependency
-(10.3), a converged re-run reports zero changes (10.4), and clean-slate tears to
+(10.3), a converged re-run changes only the allowed tasks (10.4), and clean-slate tears to
 baseline while preserving the Registry entry + `<slug>-infra` slice (10.5).
+
+> **Idempotency and `--check` (WS-C43).** The consumer orchestrator does **not** support `ansible-playbook
+> --check`: its read-only preflight commands and API probes are skipped in check mode, so the run cannot even
+> resolve its inputs. Idempotency is checked with a plain second run instead. That run must succeed and may
+> change only the tasks listed in `SECOND_RUN_ALLOWED_CHANGES` in
+> `tests/installer/test_consumer_onboarding_integration.py`: the Secret_ID re-mint (a fresh, TTL-bounded
+> Secret_ID on every run, by design). Since WS-C39 nothing else reports a change on a converged re-run.
 
 ---
 
@@ -258,7 +276,6 @@ onboarders' own paths. It **never** removes the Registry entry or the
   -e clean_slate=true -e clean_slate_confirm=force \
   -e cluster_env_file=cluster.throwaway.env \
   -e project_slug=dronefleet \
-  -e svc01_vmid=1101 \
   -e consumer_proxmox_host=<real-proxmox-lan-ip> \
   -e consumer_workload_vmid=100001
 ```
@@ -266,7 +283,10 @@ onboarders' own paths. It **never** removes the Registry entry or the
 The verification gate asserts zero surviving consumer compute + zero Terraform
 state before reporting a clean baseline: a surviving workload container / a
 non-empty `<slug>-workload` state (as well as the DB baseline) halts the run
-without reporting clean (Req 7.4–7.6, WS-C3 FR-3). After it completes, confirm the
+without reporting clean (Req 7.4–7.6, WS-C3 FR-3). Once the gate passes, the clean-slate also deletes the
+project's generated inventories (`ansible/inventory/<slug>-consumer.generated.yml` and
+`<slug>-workload.generated.yml`, WS-C42), so nothing keeps scraping or targeting the removed guests. After it
+completes, confirm the
 workload guest is gone and its state is empty, then re-install is safe (re-run
 Part 2):
 
@@ -392,8 +412,7 @@ strict no-op:
 ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
   ansible/playbooks/project-consumer-bootstrap.yml \
   -e cluster_env_file=cluster.throwaway.env \
-  -e project_slug=dronefleet \
-  -e svc01_vmid=1101
+  -e project_slug=dronefleet
 ```
 
 This wires DB + secrets + the `dronefleet-workload` AppRole, and (workload
@@ -551,7 +570,8 @@ with the rest of the project — no orphan, one-state-per-service (Req 2.5):
   -e clean_slate=true -e clean_slate_confirm=force \
   -e cluster_env_file=cluster.throwaway.env \
   -e project_slug=dronefleet \
-  -e svc01_vmid=1101
+  -e consumer_proxmox_host=<real-proxmox-lan-ip> \
+  -e consumer_workload_vmid=100001
 ```
 
 A green happy-path `/healthz` 200 (5.4) is the onboarding **definition-of-done**:

@@ -6,12 +6,13 @@
 # (MAILCATCHER_UI_PASSWORD) and written only to a 0600 file on the guest.
 
 # --- Image pin (security-standards: exact version, never `latest`) ------------
-# Verified against Docker Hub on 2026-11-07: tag v1.33.0 is the latest stable
-# release; the multi-arch index digest below is what the tag resolved to. The
-# digest pins the content even if the tag were re-pushed. Refresh deliberately.
+# Verified against Docker Hub and the GitHub releases API: tag v1.33.1 (published
+# 2026-11-07) is the latest stable release; the multi-arch index digest below is what
+# the tag resolved to. The digest pins the content even if the tag were re-pushed.
+# Refresh deliberately: see "Image bumps and security advisories" in the runbook.
 mailcatcher_image_repo: "axllent/mailpit"
-mailcatcher_image_tag: "v1.33.0"
-mailcatcher_image_digest: "sha256:9b3a463be15354c0f0eba91697d80e3e0d8a5623ef0e627cacc836bc17fd5231"
+mailcatcher_image_tag: "v1.33.1"
+mailcatcher_image_digest: "sha256:aef2aacc11f075ec0fb6874275ee4a421e688e11a96ebb296134d1735c7761ce"
 mailcatcher_image: "{{ mailcatcher_image_repo }}:{{ mailcatcher_image_tag }}@{{ mailcatcher_image_digest }}"
 
 mailcatcher_stack_name: "mailcatcher"

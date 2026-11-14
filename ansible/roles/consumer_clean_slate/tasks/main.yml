@@ -160,6 +160,25 @@
       deletes (Req 9.6).
   when: consumer_manifest.sso is defined
 
+# WS-C45/WS-C42: resolve the platform-admin token like the provisioning path does (process env first, else the
+# cluster env file), so the composed teardowns work with the token only in the cluster env file.
+- name: "Clean-Slate | Slurp the cluster env file for the OpenBao admin token (no_log)"
+  ansible.builtin.slurp:
+    src: >-
+      {{ (consumer_repo_root ~ '/' ~ cluster_env_file)
+         if (cluster_env_file is not match('^/'))
+         else cluster_env_file }}
+  register: consumer_cs_env_slurp
+  no_log: true
+- name: "Clean-Slate | Resolve the OpenBao admin token (process env first, else the cluster env file) (no_log)"
+  ansible.builtin.set_fact:
+    consumer_openbao_admin_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         or ((consumer_cs_env_slurp.content | b64decode
+              | regex_findall('(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*["\']?([^"\'\r\n]*?)["\']?[ \t]*$')
+              | first | default('') | trim)) }}
+  no_log: true
+  changed_when: false
 # === WS-C4 (ADR-0023): remove the per-org user-manager identity (teardown parity) =========
 # The onboarding mints a per-org ORG_USER_MANAGER machine user + a PAT in OpenBao. Its OWN
 # reversal path is the zitadel-user-provision.yml playbook (zup_action=teardown): it deletes the
@@ -184,6 +203,9 @@
       - "zup_platform_domain={{ consumer_platform_domain | default('platform.example.test') }}"
   args:
     chdir: "{{ consumer_repo_root }}"
+  environment:
+    OPENBAO_ADMIN_TOKEN: "{{ consumer_openbao_admin_token }}"
+  no_log: true
   register: consumer_cs_usermgr_run
   changed_when: "'changed=0' not in (consumer_cs_usermgr_run.stdout | default(''))"
   failed_when:
@@ -422,6 +444,33 @@
 # child run owns the DB guest's pct-destroy + its own Terraform state rm + its
 # empty-baseline verification — the consumer clean-slate never reaches across
 # that boundary. A non-zero child exit propagates to the clean-slate rescue.
+# WS-C48: the DB VMID is the explicit override, else the one recorded in the project's generated inventory
+# (removed only after a verified teardown, WS-C42). Never guessed: unknown -> stop before destroying anything.
+- name: "Clean-Slate | Resolve the DB VMID (explicit, else the standing DB's recorded one)"
+  ansible.builtin.set_fact:
+    consumer_svc01_vmid_effective: |-
+      {%- set inv = (consumer_db_inventory_text | default('', true) | from_yaml) or {} -%}
+      {%- set hosts = (((inv.get('all') or {}).get('children') or {}).get('postgres') or {}).get('hosts') or {} -%}
+      {%- set recorded = (hosts.values() | list | map(attribute='vmid', default=0) | select | list) -%}
+      {{ (consumer_svc01_vmid | int) if (consumer_svc01_vmid | int) != 0
+         else ((recorded | first) if recorded else 0) }}
+  vars:
+    consumer_db_inventory_text: >-
+      {{ lookup('ansible.builtin.file', consumer_repo_root ~ '/' ~ consumer_generated_inventory, errors='ignore')
+         | default('', true) }}
+  changed_when: false
+  when: consumer_manifest.database is defined
+- name: "Clean-Slate | Assert a concrete DB VMID is known before tearing the DB down"
+  ansible.builtin.assert:
+    that:
+      - (consumer_svc01_vmid_effective | int) > 0
+    fail_msg: >-
+      The DB VMID for '{{ project_slug }}' is unknown: no -e consumer_svc01_vmid=<n> was given and
+      {{ consumer_generated_inventory }} does not record one. Pass the VMID used at provision (for a computed one,
+      vlan_id * 1000 + the DB's host index). Nothing was destroyed.
+    success_msg: "DB VMID {{ consumer_svc01_vmid_effective }} resolved for the teardown."
+    quiet: true
+  when: consumer_manifest.database is defined
 - name: "Clean-Slate | Compose svc-01-bootstrap.yml clean-slate for the per-project DB (ADR-0011)"
   ansible.builtin.command:
     argv:
@@ -440,7 +489,7 @@
       - -e
       - "vlan_id={{ consumer_vlan_id | default(0) }}"
       - -e
-      - "svc01_vmid={{ consumer_svc01_vmid }}"
+      - "svc01_vmid={{ consumer_svc01_vmid_effective }}"
       # WS-C9 (ADR-0019): the DB was provisioned through the per-project wrapper
       # root (state <slug>-db), so its clean-slate must target that same root.
       - -e
@@ -476,6 +525,15 @@
       are preserved (clean-slate removed only CONSUMER resources, Req 7.7).
     quiet: true
 
+# WS-C42: the guests are gone, so their generated inventory must go too (no stale file left for
+# SVC-17 discovery or later runs). Runs only after the gate above passed.
+- name: "Clean-Slate | Remove the generated inventory of the torn-down guests (WS-C42)"
+  ansible.builtin.include_role:
+    name: generated_inventory_cleanup
+  vars:
+    gic_paths:
+      - "{{ consumer_repo_root }}/ansible/inventory/{{ project_slug }}-consumer.generated.yml"
+      - "{{ consumer_repo_root }}/ansible/inventory/{{ project_slug }}-workload.generated.yml"
 - name: "Clean-Slate | Compose the workload line for the baseline report"
   ansible.builtin.set_fact:
     consumer_workload_report: >-

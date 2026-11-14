@@ -168,7 +168,7 @@
     chdir: "{{ svc07_tf_root }}"
   environment: "{{ svc07_tf_env }}"
   register: svc07_tf_init_local
-  changed_when: true
+  changed_when: "'Installing ' in (svc07_tf_init_local.stdout | default(''))"
   when: not (svc07_use_gitlab_backend | bool)
   no_log: true
 
@@ -191,7 +191,7 @@
     chdir: "{{ svc07_tf_root }}"
   environment: "{{ svc07_tf_env }}"
   register: svc07_tf_init_gitlab
-  changed_when: true
+  changed_when: "'Installing ' in (svc07_tf_init_gitlab.stdout | default(''))"
   when: svc07_use_gitlab_backend | bool
   no_log: true
 
@@ -273,7 +273,7 @@
   args:
     chdir: "{{ svc07_repo_root }}"
   register: svc07_gen_inventory
-  changed_when: true
+  changed_when: "'inventory unchanged' not in (svc07_gen_inventory.stderr | default(''))"
   # A non-zero exit fails the task -> rescue -> no Bootstrap (Req 4.7).
 
 # Guard the OTHER half of Req 4.7: the generator could in principle exit
@@ -339,48 +339,9 @@
 # Remove stale fingerprints for both addresses. ssh-keygen -R rewrites
 # known_hosts removing every entry for the host; a missing known_hosts or
 # an absent entry is not an error (rc 0), so this is idempotent.
-- name: "Provisioning | Remove stale known_hosts fingerprints for the guest IPs"
-  ansible.builtin.command:
-    argv:
-      - ssh-keygen
-      - -R
-      - "{{ item }}"
-      - -f
-      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
-  loop: "{{ svc07_guest_ips }}"
-  register: svc07_knownhosts_purge
-  changed_when: "'updated' in (svc07_knownhosts_purge.stderr | default(''))"
-  failed_when: false
-
-# ssh-keyscan each address with a per-address 30 s timeout (Req 4.9). The
-# command's own -T bounds the connect, and the async/poll wrapper bounds
-# the whole task at 30 s so a hung scan cannot exceed the budget.
-- name: "Provisioning | ssh-keyscan the guest IPs (per-address 30s timeout)"
-  ansible.builtin.command:
-    argv:
-      - ssh-keyscan
-      - -T
-      - "30"
-      - "{{ item }}"
-  loop: "{{ svc07_guest_ips }}"
-  register: svc07_keyscan
-  changed_when: false
-  # A blank scan (no key recorded) or a non-zero rc means the address was
-  # unreachable within the timeout -> halt naming it (Req 4.9).
-  failed_when: >-
-    svc07_keyscan.rc != 0
-    or (svc07_keyscan.stdout | default('') | trim | length == 0)
-
-# Append the current keys to known_hosts. Each loop item carries the
-# scanned key(s) for one address in .stdout; write them so subsequent SSH
-# (the Bootstrap child runs) does not prompt for host-key verification.
-- name: "Provisioning | Append current host keys to known_hosts"
-  ansible.builtin.blockinfile:
-    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
-    create: true
-    mode: "0600"
-    marker: "# {mark} SVC-07 installer host keys for {{ item.item }}"
-    block: "{{ item.stdout }}"
-  loop: "{{ svc07_keyscan.results }}"
-  loop_control:
-    label: "{{ item.item }}"
+- name: "Provisioning | ssh-keyscan the guest IPs and refresh known_hosts (known_hosts_refresh)"
+  ansible.builtin.include_role:
+    name: known_hosts_refresh
+  vars:
+    khr_ips: "{{ svc07_guest_ips }}"
+    khr_marker_prefix: "# {mark} SVC-07 installer host keys for "

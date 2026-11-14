@@ -206,6 +206,8 @@
     ansible_connection: ssh
     ansible_user: "{{ zop_zitadel_guest_ssh_user }}"
     ansible_python_interpreter: "{{ zop_guest_python }}"
+  # WS-C39: transient scratch, scrubbed again below; staging it is not a change to the system.
+  changed_when: false
   when: zop_dev_guest_run | bool
 
 # Per-app loop over the normalized registrations. org/project/roles are created
@@ -374,6 +376,13 @@
   loop_control:
     label: "{{ item.item.name | default('<unnamed>') }}"
 
+# WS-C27: one stable, machine-parseable marker carrying ONLY the (non-secret) org id, so the consumer
+# onboarding handoff can show it to the project author (needed to build the urn:zitadel:iam:org:id:<id>
+# scope, see docs/CONSUMER-JOURNEY.md). Nothing else from the helper result is printed here.
+- name: "ZITADEL-org | Print the org id marker (non-secret)"
+  ansible.builtin.debug:
+    msg: "ZITADEL_ORG_ID={{ ((zop_app_results | first).stdout | default('{}') | from_json).org.id | default('') }}"
+  when: (zop_app_results | default([]) | length) > 0
 # --- Per-app OpenBao capture (unique path, read-back verify, no-secret skip) --
 # (spec: zitadel-spa-pkce-onboarding, design Component 6; R5.1-R5.4.)
 # Each newly-created confidential-web client secret is written to the UNIQUE path

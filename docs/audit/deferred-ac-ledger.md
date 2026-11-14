@@ -39,10 +39,10 @@
 | AC / FR | Evidence status | Classification | Note |
 |---|---|---|---|
 | FR-1..FR-5 (provision, SDN, compute, inventory, bring-up skeleton) | CONFIRMED-live | — | TF + provisioning layer proven live. |
-| FR-6 OpenBao credential write | DEFERRED | **real-gap** | Live run used `openbao_addr=''` — the credential was never written to OpenBao. |
+| FR-6 OpenBao credential write | CONFIRMED-live | — | Closed by WS-C34 (2026-11-07, `shrimp`): the wired backing-DB run stores all eight keys at `secret/proj-shared-zitadel/postgres`, and a re-run no longer creates a new KV version (check-then-write; spec `fix-svc01-openbao-write-and-role-idempotency`). |
 | FR-7 / AC-7 MariaDB full DB bring-up | DEFERRED | **real-gap** | Only the Terraform layer ran live; local-backend state-collision artifact + the role is still a skeleton. |
 | gap(c) PostGIS / TimescaleDB extension images | DEFERRED | **real-gap** (deliberate) | Only `pgvector` is wired; the other extension images are declared-not-wired. |
-| FR-8 clean-slate (`svc01_clean_slate`, `clean_slate=true`) | DEFERRED | **real-gap** | Reset half never exercised live; guests were torn down by hand (the anti-pattern the installer contract forbids). |
+| FR-8 clean-slate (`svc01_clean_slate`, `clean_slate=true`) | CLOSED-by-later-work | — | Exercised live through the installer in `fix-svc01-db-install-first-run-transient`, `fix-consumer-db-wrapper-routing`, `fix-consumer-clean-slate-workload-guest-destroy` and the platform clean-slate runs; `validation.md` of SVC-01 predates them. |
 | gap(d) VLAN-20 `host_index=0` collision | CLOSED-by-later-work | — | Addressed by ADR-0015 host-index authority. `validation.md` predates the fix. |
 
 ### SVC-06 — Identity provider (ZITADEL)
@@ -71,15 +71,15 @@
 | Property / AC | Evidence status | Classification | Note |
 |---|---|---|---|
 | From-scratch bring-up | CONFIRMED-live | — | 2026-09-30 `failed=0`; re-confirmed by this session's v0.14.0 run w/ `openbao_mint_admin_token`. |
-| Property 7 idempotent re-run | DEFERRED | **real-gap** | Second-run `changed=0` never proven live. |
+| Property 7 idempotent re-run | CONFIRMED-live | — | WS-C41 (2026-11-08, ADR-0027): a re-run reads the seal token from the primary's config, converges `failed=0` and keeps the existing admin token; a second re-run changes only control-node bookkeeping (WS-C39). An invalid admin token halts with the clean-slate remedy. |
 | Properties 5,6 clean-slate round-trip | CONFIRMED-live (partial) | — | Recorded PENDING, but this session ran svc07 clean-slate to empty (1070/1071 destroyed, state emptied). **Doc lags reality.** |
 
 **Contract level (`svc-07-secrets-manager` §5)**
 
 | Tier | Evidence status | Classification | Note |
 |---|---|---|---|
-| `requires_infra` contract tier (SEC.* rows, OpenBao role-shape, auto-unseal contract, live degraded) | DEFERRED | **real-gap** | Written but never run live — the entire live contract tier. |
-| Ansible check-mode idempotency (Req 13) | DEFERRED | **real-gap** (offline-able) | Needs ansible + sudo; runnable offline, never run. |
+| `requires_infra` contract tier (SEC.* rows, OpenBao role-shape, auto-unseal contract, live degraded) | DEFERRED | **real-gap** (partly run) | WS-C36 then WS-C40 (2026-11-08): metrics, role shapes, the non-destructive auto-unseal round-trip and the onboard idempotency pass live; the negative auto-unseal arms ran and are now opt-in (destructive, WS-C47); the rest is blocked on missing services and vantages (WS-C40). |
+| Ansible check-mode idempotency (Req 13) | CONFIRMED-offline-only | — | Skips locally without passwordless sudo; passes in CI as root (pipeline 497, both idempotency test files without skips). Closed by WS-C36. |
 | AWS / Garage engine (Req 3.4–3.6) | CLOSED-by-descope | — | AWS engine dropped per constitution decision-log. Not a gap. |
 
 > **Stale-doc finding (SVC-07, strong):** `svc-07-automated-installer`
@@ -112,10 +112,10 @@
 | AC-4 exporters up | CONFIRMED-live | — | node_exporter + cAdvisor + Promtail healthy on all 3 guests. |
 | AC-5 Grafana via Traefik | CONFIRMED-live | — | Originally BLOCKED; RESOLVED by ADR-0018 (traefik-cross-guest-ingress). Doc explicitly flipped BLOCKED→CONFIRMED. |
 | AC-10 clean-slate empty-baseline | CONFIRMED-live | — | Full two-way empty-baseline gate, `failed=0`. |
-| AC-6 logs queryable in Grafana via Loki | DEFERRED | **real-gap** (bounded, not blocked) | In-Grafana functional assertion not re-exercised after ingress unblocked. |
-| AC-7 baseline/test alert fires to receiver | DEFERRED | **real-gap** (bounded) | |
-| AC-8 full stack idempotent 2nd run `changed=0` | DEFERRED | **real-gap** | Cross-guest route path alone proven `changed=0`; full stack not. |
-| AC-9 fully-green one-command from-scratch | DEFERRED | **real-gap** | Orchestrated path hit a first-run transient a direct re-run cleared — chase the transient. |
+| AC-6 logs queryable in Grafana via Loki | CONFIRMED-live | — | WS-C37 (2026-11-07): Loki labels include `project`/`service`/`host`; a `query_range` through Grafana's Loki datasource proxy returned 4 streams. |
+| AC-7 baseline/test alert fires to receiver | CONFIRMED-live | — | WS-C37: found and fixed a real defect (Prometheus targeted `localhost:9093`, every notification failed). After the fix alerts reach Alertmanager on the `null-ui-only` receiver; notification errors 0. |
+| AC-8 full stack idempotent 2nd run `changed=0` | CONFIRMED-live | — | WS-C39 (2026-11-08): the whole SVC-17/18 orchestrator re-run reports `changed=0`. |
+| AC-9 fully-green one-command from-scratch | CONFIRMED-live | — | WS-C37: clean-slate, then the documented command alone: `failed=0`, no retries, 215 s; the first-run transient did not reproduce. It also exposed Grafana starting on `admin`/`admin` when OpenBao was unwired (fixed). |
 | dcgm GPU metrics (Mock C) | DEFERRED | **legit-blocked** | No GPU / SVC-23 absent. |
 
 > **Positive note:** SVC-17/18 `validation.md` is the best-reconciled doc in the
@@ -129,7 +129,7 @@
 | svc-06-cross-guest-ingress | CONFIRMED-live | — | task 6.2 DONE+PASSED (ZITADEL via Traefik h2c cleartext hop). `zitadel-org-provision` Phase-3 smoke failure = out-of-scope pre-existing role defect, later closed by v0.14.0 `fix-zitadel-onboarding-role-keys-assertion`. |
 | svc-07-cross-guest-ingress / traefik-cross-guest-ingress | CONFIRMED-live | — | Grafana `https://…` → HTTP 302 through Traefik on `.12`. Shared mechanism for OpenBao + ZITADEL. |
 | platform-prerequisites-bootstrap | CONFIRMED-live | — | §5 known-limits both LEGIT: (1) token file mode 755-not-0600 = environmental CIFS mode-display artifact; (2) cross-service clean-slate scoping deferred to "Fix B" = platform-clean-slate. |
-| project-consumer-onboarding | DEFERRED | **real-gap** (mostly closed by session) | Reqs 1–11 offline-CONFIRMED; all Task-10 requires-infra (10.1–10.5) recorded PENDING (AGENT_LIVE_AUTHORIZED unset at authoring). dronefleet onboarding + clean-slate WERE exercised live this session — **doc lags reality**. |
+| project-consumer-onboarding | CONFIRMED-live | — | WS-C38 (2026-11-07): Task 10 run live, 11 passed and 1 strict xfail (`--check` re-run, WS-C43). Findings WS-C42..C45. |
 | openbao-workload-auth | DEFERRED | **real-gap** | Offline tier (swap-gate/structure/render/contract/doc) proven; requires-infra tasks 8.1–8.3 PENDING — 4 fail-closed runtime scenarios (sealed Primary → no rendered secret file; Secret_ID invalid/expired; `OPENBAO_ADMIN_TOKEN` unset; `policy-<slug>` absent). Fail-closed STRUCTURE proven offline; runtime behaviour never run live. |
 
 ---

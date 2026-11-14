@@ -105,6 +105,36 @@
   no_log: true
   changed_when: false
 
+# WS-C34 (found live): `bao kv put` of an IDENTICAL credential still creates a new KV v2 version and the
+# task reports changed, so a wired re-run could never be changed=0. Compare the stored credential with the
+# one about to be written (all eight keys, string-compared) and write only when absent or different.
+- name: "Postgres | Detect whether the stored OpenBao credential already matches the desired one (no_log)"
+  ansible.builtin.set_fact:
+    postgres_openbao_in_sync: >-
+      {%- set ns = namespace(ok=true) -%}
+      {%- for k, v in _pg_desired.items() -%}
+      {%- if (_pg_stored.get(k) | string) != (v | string) -%}{%- set ns.ok = false -%}{%- endif -%}
+      {%- endfor -%}
+      {{ (_pg_stored | length > 0) and ns.ok }}
+  vars:
+    _pg_stored: >-
+      {{ (postgres_openbao_read.stdout | default('') | trim | from_json).data.data
+         if ((postgres_openbao_read.rc | default(1) == 0)
+              and ((postgres_openbao_read.stdout | default('') | trim) | length > 0))
+         else {} }}
+    _pg_desired:
+      superuser_password: "{{ postgres_superuser_password }}"
+      app_role: "{{ postgres_app_role }}"
+      app_password: "{{ postgres_app_password }}"
+      exporter_role: "{{ postgres_exporter_role }}"
+      exporter_password: "{{ postgres_exporter_password }}"
+      db_name: "{{ postgres_db_name }}"
+      host: "{{ postgres_bind_ip }}"
+      port: "{{ postgres_port }}"
+  no_log: true
+  changed_when: false
+  when:
+    - (openbao_addr | default(lookup('ansible.builtin.env', 'OPENBAO_ADDR'), true) | default('', true)) | length > 0
 # Persist to OpenBao under secret/proj-<slug>/postgres (integration-boundaries §2).
 # Day-2, consuming containers fetch these via their own OpenBao Agent; here the
 # installer stores them at provision. We use the `bao` CLI via `docker exec`
@@ -168,6 +198,7 @@
   # (Compose deploy / config template) keep their own version gate.
   when:
     - (openbao_addr | default(lookup('ansible.builtin.env', 'OPENBAO_ADDR'), true) | default('', true)) | length > 0
+    - not (postgres_openbao_in_sync | default(false) | bool)
 
 # Loud signal: on a WIRED run (OpenBao address present), the credential MUST have
 # been persisted. If the write did not run or did not succeed, fail loudly rather
@@ -178,8 +209,10 @@
 - name: "Postgres | Assert the OpenBao credential write succeeded on a wired run"
   ansible.builtin.assert:
     that:
-      - not (postgres_openbao_write.skipped | default(false))
-      - (postgres_openbao_write.rc | default(1)) == 0
+      - >-
+        (postgres_openbao_in_sync | default(false) | bool)
+        or (not (postgres_openbao_write.skipped | default(false))
+        and (postgres_openbao_write.rc | default(1)) == 0)
     fail_msg: >-
       OpenBao address is set (wired run) but the DB credential write to
       secret/proj-{{ postgres_project_slug }}/postgres did NOT succeed
@@ -362,6 +395,35 @@
   register: postgres_db_create
   changed_when: "'CREATE DATABASE' in (postgres_db_create.stdout | default(''))"
 
+# WS-C34 (found live): the two role tasks below were `changed_when: true`, so every re-run reported
+# changed. Probe first: the role exists with the intended attributes and grants AND its password really
+# logs in (a loopback scram login inside the container, the password inherited from the environment and
+# never on an argv). Apply only on drift; a rotated password, a flipped CREATEDB opt-in or a missing role
+# all read as DRIFT.
+- name: "Postgres | Probe whether the app role already matches (attributes, grants, password) (no_log)"
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      attrs=$(docker exec -i {{ postgres_container_name }} psql -U postgres -tA 2>/dev/null <<'SQL' || true
+      SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreaterole
+        AND rolcreatedb = {{ postgres_app_role_createdb | default(false) | bool | ternary('true', 'false') }}
+        AND has_database_privilege(rolname, '{{ postgres_db_name }}', 'CONNECT')
+        AND has_database_privilege(rolname, '{{ postgres_db_name }}', 'CREATE')
+        AND has_database_privilege(rolname, '{{ postgres_db_name }}', 'TEMPORARY')
+      FROM pg_roles WHERE rolname='{{ postgres_app_role }}';
+      SQL
+      )
+      [ "$attrs" = "t" ] || { echo DRIFT; exit 0; }
+      docker exec -e PGPASSWORD {{ postgres_container_name }} \
+        psql -h 127.0.0.1 -U {{ postgres_app_role }} -d {{ postgres_db_name }} -tAc 'SELECT 1' \
+        >/dev/null 2>&1 && echo OK || echo DRIFT
+  environment:
+    PGPASSWORD: "{{ postgres_app_password }}"
+  register: postgres_app_role_probe
+  changed_when: false
+  no_log: true
+
 # Create / update the least-privilege app role (NOSUPERUSER, scoped). The
 # password is piped via stdin (never argv); the DO block is idempotent (create
 # only if absent), then ALTER sets the attributes + password every run (so a
@@ -384,6 +446,28 @@
   register: postgres_app_role_create
   changed_when: true
   no_log: true
+  when: ((postgres_app_role_probe.stdout | default('')) | trim) != 'OK'
+
+- name: "Postgres | Probe whether the exporter role already matches (attributes, grants, password) (no_log)"
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      attrs=$(docker exec -i {{ postgres_container_name }} psql -U postgres -tA 2>/dev/null <<'SQL' || true
+      SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb
+        AND has_database_privilege(rolname, '{{ postgres_db_name }}', 'CONNECT')
+      FROM pg_roles WHERE rolname='{{ postgres_exporter_role }}';
+      SQL
+      )
+      [ "$attrs" = "t" ] || { echo DRIFT; exit 0; }
+      docker exec -e PGPASSWORD {{ postgres_container_name }} \
+        psql -h 127.0.0.1 -U {{ postgres_exporter_role }} -d {{ postgres_db_name }} -tAc 'SELECT 1' \
+        >/dev/null 2>&1 && echo OK || echo DRIFT
+  environment:
+    PGPASSWORD: "{{ postgres_exporter_password }}"
+  register: postgres_exporter_role_probe
+  changed_when: false
+  no_log: true
 
 # Create / update the read-only exporter role (NOSUPERUSER). no_log — stdin
 # carries the exporter password.
@@ -403,6 +487,7 @@
   register: postgres_exporter_role_create
   changed_when: true
   no_log: true
+  when: ((postgres_exporter_role_probe.stdout | default('')) | trim) != 'OK'
 
 # Enable requested extensions (per-flag), idempotent via CREATE EXTENSION IF NOT
 # EXISTS, run against the project database.

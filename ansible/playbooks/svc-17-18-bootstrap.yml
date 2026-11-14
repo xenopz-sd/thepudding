@@ -100,8 +100,11 @@
     #     run by obs_bootstrap for the delegated bao-CLI secret reads. The
     #     OPENBAO_ADMIN_TOKEN itself is NEVER a var here; it is read from the
     #     process ENV in obs_bootstrap and bridged in the child ENV (no_log).
-    #     obs_openbao_addr empty => dev/offline: secret reads skipped. ---
-    obs_openbao_addr: ""
+    #     Wired by DEFAULT to the SVC-07 primary (like SVC-06), so the documented one-command install seeds
+    #     and reads a real Grafana admin password (WS-C37: unwired default left Grafana on admin/admin).
+    #     Set obs_openbao_addr="" ONLY for a deliberate dev/offline run, with an explicit
+    #     observability_grafana_admin_password_override. ---
+    obs_openbao_addr: "10.0.20.10"
     obs_openbao_cli_host: "10.0.20.10"
 
   tasks:

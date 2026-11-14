@@ -107,6 +107,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 # scripts/installer is on sys.path via tests/installer/conftest.py. The pure
 # resolver + derivation modules are the SAME symbols the live orchestrator binds
@@ -444,8 +445,10 @@ class TestFullOrchestratorRun:
             f"the {slug}-workload AppRole must exist (Req 4.6)"
         )
         # DB password stored under secret/data/proj-<slug>/<engine> (Req 8.1).
+        # SVC-01 writes the app credential under the field `app_password` (not `password`); the
+        # consumer_bootstrap presence check reads the same field (WS-C38 found this test rot live).
         assert bao.secret_present(
-            f"secret/data/proj-{slug}/postgres", "password"
+            f"secret/data/proj-{slug}/postgres", "app_password"
         ), f"the generated DB password must be stored in OpenBao (Req 8.1)"
 
 
@@ -547,6 +550,26 @@ class TestDegradedModeFailClosed:
             )
 
 
+#: WS-C43: tasks a converged second run of project-consumer-bootstrap.yml is ALLOWED to report as changed.
+#: Everything else must be unchanged. (WS-C39 made the control-node bookkeeping tasks truthful.)
+SECOND_RUN_ALLOWED_CHANGES = (
+    # By design: a fresh, TTL-bounded Secret_ID is minted and written on every run (design Open Risk).
+    "openbao_workload_approle : 3 — Mint a Secret_ID for the Workload_AppRole (no_log, fail-closed, Req 3.2/3.6/3.8)",
+    "openbao_workload_approle : 3 — Write the Secret_ID file (0600, service-owned; sensitive, no_log, Req 3.3/3.4)",
+)
+
+
+def _changed_task_names(ansible_output: str) -> list[str]:
+    """Names (``role : task``) of every task that printed a ``changed:`` line."""
+    names, current = [], None
+    for line in ansible_output.splitlines():
+        if line.startswith("TASK ["):
+            current = line[len("TASK ["):line.rfind("]")]
+        elif line.startswith("changed:") and current:
+            names.append(current)
+    return names
+
+
 # =========================================================================== #
 # 10.4 — Idempotency / resumable (Req 6.1, 6.2, 6.3, 6.4, 6.5, 9.7).
 # =========================================================================== #
@@ -561,23 +584,18 @@ class TestIdempotencyAndResumable:
     resumed converge."""
 
     def test_second_run_reports_zero_changes(self, slug: str, cluster_env_file: str):
-        """After a full run (10.2) a second run against the converged state
-        reports changed=0 on the control-plane writes (Req 6.1).
-
-        NOTE: the workload Secret_ID is re-minted by design each run (an
-        un-rereadable, TTL-bounded credential — design Open Risk), so a bare full
-        run is not strictly changed=0. Idempotence is asserted on the
-        control-plane via --check, which performs check-then-write READS without
-        the always-mint, matching the sibling workload-auth idempotency test."""
-        result = _run_orchestrator(slug, cluster_env_file, check_mode=True)
+        """WS-C43 (operator decision B): the orchestrator does not support ``--check``, so idempotency is a plain
+        second run against the converged state: it succeeds and changes ONLY tasks on the documented allow-list
+        (the by-design Secret_ID re-mint, and the control-node bookkeeping tracked by WS-C39). Any other changed
+        task is a real non-idempotent step and fails the test (Req 6.1)."""
+        result = _run_orchestrator(slug, cluster_env_file)
         assert result.returncode == 0, (
-            "a converged --check re-run must succeed:\n"
+            "a converged second run must succeed:\n"
             f"{result.stdout[-3000:]}\n{result.stderr[-2000:]}"
         )
-        changed = _changed_count(result.stdout)
-        assert changed == 0, (
-            "a converged check-mode re-run must report changed=0 on the "
-            f"control-plane writes (Req 6.1); got changed={changed}"
+        unexpected = sorted(set(_changed_task_names(result.stdout)) - set(SECOND_RUN_ALLOWED_CHANGES))
+        assert not unexpected, (
+            "a converged second run changed tasks outside the allow-list (Req 6.1): " + "; ".join(unexpected)
         )
 
     def test_resume_after_partial_failure_completes_remainder(
@@ -616,10 +634,21 @@ class TestCleanSlateVerification:
         """A forced clean-slate exits 0, reports an empty consumer baseline, and
         explicitly PRESERVES the Registry entry + `<slug>-infra` slice (Req 7.1,
         7.4, 7.7)."""
+        # The consumer clean-slate tears the workload guest down through clean-slate.yml on the Proxmox node,
+        # so it needs the real host address (added after this test was written; WS-C38 found it live).
+        proxmox_host = os.environ.get("CONSUMER_TEST_PROXMOX_HOST", "").strip()
+        if not proxmox_host:
+            pytest.skip("CONSUMER_TEST_PROXMOX_HOST not set: the consumer clean-slate needs the Proxmox LAN IP "
+                        "(consumer_proxmox_host) to tear the workload guest down")
         result = _run_orchestrator(
             slug,
             cluster_env_file,
-            extra_vars={"clean_slate": True, "clean_slate_confirm": "force"},
+            extra_vars={"clean_slate": True, "clean_slate_confirm": "force",
+                        "consumer_proxmox_host": proxmox_host,
+                        # ADR-0022: the workload VMID is vlan_id*1000 + host_index; the anti-footgun gate needs it
+                        # explicitly. Override with CONSUMER_TEST_WORKLOAD_VMID when the manifest uses another index.
+                        "consumer_workload_vmid": int(os.environ.get(
+                            "CONSUMER_TEST_WORKLOAD_VMID", str(resolve_vlan_id_from_file(slug, _REGISTRY) * 1000 + 1)))},
             timeout=1200,
         )
         assert result.returncode == 0, (
@@ -659,6 +688,32 @@ class TestCleanSlateVerification:
 # -m requires_infra and skips cleanly without infra, per the task's verify step).
 # This test is NOT requires_infra: it asserts the GATING is wired correctly.
 # =========================================================================== #
+def test_second_run_allow_list_names_real_tasks():
+    """Offline no-rot guard for the WS-C43 allow-list: every entry names an existing role task."""
+    for entry in SECOND_RUN_ALLOWED_CHANGES:
+        role, task = entry.split(" : ", 1)
+        tasks_dir = _REPO_ROOT / "ansible" / "roles" / role / "tasks"
+        found = any(
+            isinstance(t, dict) and t.get("name") == task
+            for f in tasks_dir.glob("*.yml")
+            for t in _iter_named_tasks(yaml.safe_load(f.read_text(encoding="utf-8")) or [])
+        )
+        assert found, f"allow-list entry does not match a real task: {entry}"
+
+
+def _iter_named_tasks(tasks):
+    for t in tasks:
+        if isinstance(t, dict):
+            yield t
+            for key in ("block", "rescue", "always"):
+                yield from _iter_named_tasks(t.get(key) or [])
+
+
+def test_changed_task_name_parser():
+    out = "TASK [r : a] ***\nok: [localhost]\nTASK [r : b | c] *****\nchanged: [localhost]\n"
+    assert _changed_task_names(out) == ["r : b | c"]
+
+
 def test_all_live_classes_are_requires_infra_and_skip_without_infra():
     """Every live test class carries the requires_infra marker (so the module is
     deselected by default) AND its skipif gate yields a clean skip reason when no

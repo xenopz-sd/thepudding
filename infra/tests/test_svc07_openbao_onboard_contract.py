@@ -212,6 +212,10 @@ class _OpenBao:
             "auth/token/create",
             {"policies": policies, "no_default_policy": True, "ttl": "10m"},
         )
+        if status == 403:
+            # The platform-admin token is least-privilege by design and cannot create child tokens; this
+            # contract needs a short-lived operator-minted token that can (see WS-C40 prerequisites).
+            pytest.skip("OPENBAO_TEST_TOKEN lacks auth/token/create (403); supply a token that can create child tokens")
         assert status in (200, 204), f"token create should succeed, got {status}: {data}"
         return data["auth"]["client_token"]
 
@@ -436,6 +440,16 @@ def _run_onboard(binary: str, *, slug: str, admin_token: str, check_mode: bool):
         "-e", f"project_slug={slug}",
         "-e", "openbao_validate_slug_in_registry=false",
     ]
+    # WS-C40: the role's `docker exec` must run where the primary container is. On a workstation control node that
+    # is a different guest, so delegate exactly as the consumer flow does (optional; unset keeps the old behavior).
+    delegate = os.environ.get("OPENBAO_TEST_ONBOARD_DELEGATE_HOST", "").strip()
+    if delegate:
+        cmd += ["-e", f"openbao_onboard_delegate_host={delegate}", "-e", "openbao_onboard_delegate_user=root",
+                "-e", "openbao_onboard_delegate_python=/usr/bin/python3"]
+    # The same TLS posture the test's own HTTP client uses (OPENBAO_TEST_SKIP_TLS_VERIFY, default on): the role's
+    # `bao` calls must skip verification against the self-signed mock cert, as the consumer flow configures.
+    if os.environ.get("OPENBAO_TEST_SKIP_TLS_VERIFY", "1").strip().lower() not in ("0", "false", "no", ""):
+        cmd += ["-e", "openbao_tls_self_signed=true"]
     if check_mode:
         cmd.append("--check")
 

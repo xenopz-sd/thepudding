@@ -234,6 +234,21 @@
          else (observability_grafana_admin_password_override | default('')) }}
   no_log: true
 
+# WS-C37 (found live): with OpenBao unwired and no override the env rendered GF_SECURITY_ADMIN_PASSWORD= and
+# Grafana fell back to its built-in admin/admin. Refuse an empty (or the default) password on EVERY path.
+- name: "Observability (grafana) | Refuse an empty Break_Glass_Admin password (never the Grafana default)"
+  ansible.builtin.assert:
+    that:
+      - (observability_grafana_admin_password | default('') | trim | length) > 0
+      - (observability_grafana_admin_password | default('') | trim) != 'admin'
+    fail_msg: >-
+      The Grafana Break_Glass_Admin password resolved empty (or to Grafana's built-in default). Grafana would
+      start with admin/admin. Wire OpenBao (obs_openbao_addr, default the SVC-07 primary) so the installer seeds
+      and reads secret/observability/grafana-admin, or for a dev/offline run set obs_openbao_addr="" AND an
+      explicit observability_grafana_admin_password_override. Nothing was rendered (the value is never echoed).
+    success_msg: "Break_Glass_Admin password resolved (value not logged)."
+    quiet: true
+  no_log: true
 - name: "Observability (grafana) | Read OIDC client secret from OpenBao (no_log, OIDC only)"
   ansible.builtin.command:
     argv: >-

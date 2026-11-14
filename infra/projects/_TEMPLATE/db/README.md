@@ -75,7 +75,7 @@ layer (Req 8.1).
 
 > **Terraform is not installed in the local authoring environment.** The
 > `offline` commands below (no infra/credentials) run anywhere the binary
-> exists. See [`TESTING.md`](../../../../TESTING.md) and
+> exists. See [`TESTING.md`](../../../../docs/TESTING.md) and
 > [`../INSTALL-RUNBOOK.md`](../../dronefleet/INSTALL-RUNBOOK.md) for the full offline-vs-cluster
 > guide and the provision-then-test walkthrough.
 

@@ -108,7 +108,7 @@
     chdir: "{{ obs_tf_root }}"
   environment: "{{ obs_tf_env }}"
   register: obs_tf_init_local
-  changed_when: true
+  changed_when: "'Installing ' in (obs_tf_init_local.stdout | default(''))"
   when: not (obs_use_gitlab_backend | bool)
   no_log: true
 
@@ -131,7 +131,7 @@
     chdir: "{{ obs_tf_root }}"
   environment: "{{ obs_tf_env }}"
   register: obs_tf_init_gitlab
-  changed_when: true
+  changed_when: "'Installing ' in (obs_tf_init_gitlab.stdout | default(''))"
   when: obs_use_gitlab_backend | bool
   no_log: true
 
@@ -210,7 +210,7 @@
   args:
     chdir: "{{ obs_repo_root }}"
   register: obs_gen_inventory
-  changed_when: true
+  changed_when: "'inventory unchanged' not in (obs_gen_inventory.stderr | default(''))"
 
 - name: "Provisioning | Confirm the generated inventory file was written"
   ansible.builtin.stat:
@@ -283,40 +283,9 @@
     state: directory
     mode: "0700"
 
-- name: "Provisioning | Remove stale known_hosts fingerprints for the three guest IPs"
-  ansible.builtin.command:
-    argv:
-      - ssh-keygen
-      - -R
-      - "{{ item }}"
-      - -f
-      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
-  loop: "{{ obs_guest_ips }}"
-  register: obs_knownhosts_purge
-  changed_when: "'updated' in (obs_knownhosts_purge.stderr | default(''))"
-  failed_when: false
-
-- name: "Provisioning | ssh-keyscan each guest IP (per-address 30s timeout)"
-  ansible.builtin.command:
-    argv:
-      - ssh-keyscan
-      - -T
-      - "30"
-      - "{{ item }}"
-  loop: "{{ obs_guest_ips }}"
-  register: obs_keyscan
-  changed_when: false
-  failed_when: >-
-    obs_keyscan.rc != 0
-    or (obs_keyscan.stdout | default('') | trim | length == 0)
-
-- name: "Provisioning | Append current host keys to known_hosts"
-  ansible.builtin.blockinfile:
-    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
-    create: true
-    mode: "0600"
-    marker: "# {mark} SVC-17/18 installer host keys for {{ item.item }}"
-    block: "{{ item.stdout }}"
-  loop: "{{ obs_keyscan.results }}"
-  loop_control:
-    label: "{{ item.item }}"
+- name: "Provisioning | ssh-keyscan each guest IP and refresh known_hosts (known_hosts_refresh)"
+  ansible.builtin.include_role:
+    name: known_hosts_refresh
+  vars:
+    khr_ips: "{{ obs_guest_ips }}"
+    khr_marker_prefix: "# {mark} SVC-17/18 installer host keys for "

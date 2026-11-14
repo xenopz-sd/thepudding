@@ -266,7 +266,9 @@ def test_all_mutations_are_gated_on_the_opt_in_and_having_occupants():
         uri = t.get("ansible.builtin.uri") or {}
         if uri.get("method") in ("DELETE", "PUT"):
             w = " ".join(str(x) for x in t["when"]) if isinstance(t["when"], list) else str(t["when"])
-            assert "platform_cs_zone_occupants | length) > 0" in w and "platform_clean_slate_remove_zone_occupants" in w, t["name"]
+            # WS-C33: the untracked-zone removal is gated on ITS own fact plus the same opt-in.
+            gated = ("platform_cs_zone_occupants | length) > 0" in w) or ("platform_cs_zone_untracked | length) > 0" in w)
+            assert gated and "platform_clean_slate_remove_zone_occupants" in w, t["name"]
 
 
 def test_read_only_steps_never_change_anything():
@@ -300,7 +302,7 @@ def test_only_registry_known_owners_get_a_state_cleanup():
 def test_the_existing_destroy_and_gates_are_unchanged():
     names = _names(_tasks(_MAIN))
     for n in ("Clean-Slate | terraform destroy (platform-foundation SDN fabric, scoped)",
-              "Clean-Slate | GATE — assert an empty baseline (0 guests, 0 state, no SDN), Req 7.4/7.5",
+              "Clean-Slate | GATE — assert an empty baseline (0 guests, 0 state, no SDN, no zone), Req 7.4/7.5",
               "Clean-Slate | Halt-before-fabric — assert every discovered service reached empty (Req 2.4)"):
         assert n in names
     destroy = _by(_tasks(_MAIN), "terraform destroy (platform-foundation SDN fabric, scoped)")

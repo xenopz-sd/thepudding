@@ -101,7 +101,7 @@ groups:
       # the baseline still carries the security-critical seal alert even before
       # that fragment is present.
       - alert: OpenBaoSealed
-        expr: openbao_core_unsealed == 0
+        expr: max by (instance) (openbao_core_unsealed) == 0
         for: 2m
         labels:
           severity: critical

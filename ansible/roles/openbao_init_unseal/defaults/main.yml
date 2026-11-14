@@ -722,7 +722,9 @@ openbao_prometheus_alert_group_interval: "30s"
 # --- OpenBaoSealed (critical) — Req 10.4 -------------------------------------
 # openbao_core_unsealed == 0 for > 2 min. Auto-resolves when it returns to 1
 # (expr stops matching). `== bool 0` yields a clean 1/0 series for the alert.
-openbao_alert_sealed_expr: "openbao_core_unsealed == 0"
+# The per-instance MAX: OpenBao keeps a stale core_unsealed=0 series (cluster="") for the telemetry retention
+# window after an unseal, so a bare `== 0` would fire falsely; the max is 0 only when no series reads 1.
+openbao_alert_sealed_expr: "max by (instance) (openbao_core_unsealed) == 0"
 openbao_alert_sealed_for: "2m"
 
 # --- OpenBaoUnsealerUnreachable (critical) — Req 10.5 ------------------------

@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  role_name: known_hosts_refresh
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Control-node known_hosts refresh for freshly provisioned guests: ssh-keyscan each address, and only when
+    the recorded keys differ, purge the stale fingerprints and write the current keys in a managed block.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

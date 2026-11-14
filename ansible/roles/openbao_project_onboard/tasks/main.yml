@@ -53,6 +53,14 @@
 # STEP 0 — Validate inputs (slug present; optionally recorded in projects.yaml)
 # ============================================================================
 
+# WS-C41 part 2: ansible-core 2.21 rejects `omit` in task vars, so the no-delegate branch of every delegated
+# task below reuses this host's own connection values, captured once here.
+- name: "9.1 — Capture this host's own connection settings (for the no-delegate path)"
+  ansible.builtin.set_fact:
+    openbao_onboard_self_connection: "{{ ansible_connection | default('ssh') }}"
+    openbao_onboard_self_user: "{{ ansible_user | default(lookup('ansible.builtin.env', 'USER')) }}"
+    openbao_onboard_self_python: "{{ ansible_python_interpreter | default('auto_silent') }}"
+  changed_when: false
 - name: "9.1 — Assert project_slug is supplied"
   ansible.builtin.assert:
     that:
@@ -121,7 +129,8 @@
 - name: "9.1 — Resolve the platform-admin token from its env var (never committed)"
   ansible.builtin.set_fact:
     openbao_admin_token: >-
-      {{ lookup('ansible.builtin.env', openbao_admin_token_env_var, default='') }}
+      {{ openbao_admin_token_value
+         | default(lookup('ansible.builtin.env', openbao_admin_token_env_var, default=''), true) }}
   no_log: "{{ openbao_no_log }}"
   changed_when: false
 
@@ -198,15 +207,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_connection }}
     ansible_user: >-
       {{ openbao_onboard_delegate_user
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_onboard_delegate_python
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_python }}
 
 - name: "9.1 — List existing policies (check-then-write, no change)"
   ansible.builtin.command:
@@ -228,15 +237,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_connection }}
     ansible_user: >-
       {{ openbao_onboard_delegate_user
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_onboard_delegate_python
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_python }}
 
 - name: "9.1 — Read the live policy-<slug> body when it already exists"
   ansible.builtin.command:
@@ -258,15 +267,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_connection }}
     ansible_user: >-
       {{ openbao_onboard_delegate_user
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_onboard_delegate_python
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_python }}
   when: >-
     openbao_project_policy_name in (openbao_policy_list.stdout | default('[]') | from_json)
 
@@ -287,15 +296,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_connection }}
     ansible_user: >-
       {{ openbao_onboard_delegate_user
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_onboard_delegate_python
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_python }}
 
 - name: "9.1 — Decide whether policy-<slug> must be (re)written"
   ansible.builtin.set_fact:
@@ -329,15 +338,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_connection }}
     ansible_user: >-
       {{ openbao_onboard_delegate_user
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_onboard_delegate_python
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_python }}
   when: openbao_policy_needs_write | bool
 
 - name: "9.1 — Write policy-<slug> (CRUD+list on the five KV sub-paths only, Req 1.2/1.3)"
@@ -360,15 +369,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_connection }}
     ansible_user: >-
       {{ openbao_onboard_delegate_user
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_onboard_delegate_python
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_python }}
   when: openbao_policy_needs_write | bool
 
 - name: "9.1 — Report the policy-<slug> decision"
@@ -417,15 +426,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_connection }}
     ansible_user: >-
       {{ openbao_onboard_delegate_user
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_onboard_delegate_python
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_python }}
 
 - name: "9.1 — Decide whether the jwt role must be (re)written"
   ansible.builtin.set_fact:
@@ -499,15 +508,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_connection }}
     ansible_user: >-
       {{ openbao_onboard_delegate_user
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_onboard_delegate_python
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_python }}
   when: openbao_jwt_role_needs_write | bool
 
 # Re-read the stored role AFTER a write and verify ref_type/ref (when supplied)
@@ -534,15 +543,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_connection }}
     ansible_user: >-
       {{ openbao_onboard_delegate_user
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_onboard_delegate_python
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_python }}
   when: openbao_jwt_role_needs_write | bool
 
 - name: "9.1 — Assert the stored jwt role honours the bound_claims + TTL contract (Req 4.2, 4.7)"
@@ -610,15 +619,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_connection }}
     ansible_user: >-
       {{ openbao_onboard_delegate_user
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_onboard_delegate_python
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_python }}
 
 - name: "9.1 — Ensure the KV path secret/data/<slug>/ exists (metadata-only, no secret version, Req 1.6)"
   ansible.builtin.command:
@@ -640,15 +649,15 @@
     ansible_connection: >-
       {{ 'ssh'
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_connection }}
     ansible_user: >-
       {{ openbao_onboard_delegate_user
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_user }}
     ansible_python_interpreter: >-
       {{ openbao_onboard_delegate_python
          if (openbao_onboard_delegate_host | default('') | trim | length > 0)
-         else omit }}
+         else openbao_onboard_self_python }}
   # Only create when absent, so a re-run is a no-op that reports changed=0 and,
   # by using metadata (not data), never touches a secret version even on create.
   when: openbao_kv_metadata_get.rc != 0

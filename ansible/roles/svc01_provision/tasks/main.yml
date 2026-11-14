@@ -140,7 +140,7 @@
     chdir: "{{ svc01_tf_root }}"
   environment: "{{ svc01_tf_env }}"
   register: svc01_tf_init_local
-  changed_when: true
+  changed_when: "'Installing ' in (svc01_tf_init_local.stdout | default(''))"
   when: not (svc01_use_gitlab_backend | bool)
   no_log: true
 
@@ -163,7 +163,7 @@
     chdir: "{{ svc01_tf_root }}"
   environment: "{{ svc01_tf_env }}"
   register: svc01_tf_init_gitlab
-  changed_when: true
+  changed_when: "'Installing ' in (svc01_tf_init_gitlab.stdout | default(''))"
   when: svc01_use_gitlab_backend | bool
   no_log: true
 
@@ -284,7 +284,7 @@
   args:
     chdir: "{{ svc01_repo_root }}"
   register: svc01_gen_inventory
-  changed_when: true
+  changed_when: "'inventory unchanged' not in (svc01_gen_inventory.stderr | default(''))"
 
 - name: "Provisioning | Confirm the generated inventory file was written"
   ansible.builtin.stat:
@@ -314,30 +314,10 @@
     state: directory
     mode: "0700"
 
-- name: "Provisioning | Remove stale known_hosts fingerprints for the guest IP"
-  ansible.builtin.command:
-    argv:
-      - ssh-keygen
-      - -R
-      - "10.0.{{ vlan_id }}.{{ 10 + (host_index | default(0) | int) }}"
-      - -f
-      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
-  register: svc01_knownhosts_purge
-  changed_when: "'updated' in (svc01_knownhosts_purge.stderr | default(''))"
-  failed_when: false
-
-- name: "Provisioning | ssh-keyscan the guest IP (30s timeout)"
-  ansible.builtin.command:
-    argv: [ssh-keyscan, -T, "30", "10.0.{{ vlan_id }}.{{ 10 + (host_index | default(0) | int) }}"]
-  register: svc01_keyscan
-  changed_when: false
-  failed_when: >-
-    svc01_keyscan.rc != 0 or (svc01_keyscan.stdout | default('') | trim | length == 0)
-
-- name: "Provisioning | Append current host keys to known_hosts"
-  ansible.builtin.blockinfile:
-    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
-    create: true
-    mode: "0600"
-    marker: "# {mark} SVC-01 installer host keys for {{ project_slug }}"
-    block: "{{ svc01_keyscan.stdout }}"
+- name: "Provisioning | ssh-keyscan the guest IP and refresh known_hosts (known_hosts_refresh)"
+  ansible.builtin.include_role:
+    name: known_hosts_refresh
+  vars:
+    khr_hosts:
+      - ip: "10.0.{{ vlan_id }}.{{ 10 + (host_index | default(0) | int) }}"
+        marker: "# {mark} SVC-01 installer host keys for {{ project_slug }}"

@@ -105,7 +105,7 @@
     chdir: "{{ mailcatcher_tf_root }}"
   environment: "{{ mailcatcher_tf_env }}"
   register: mailcatcher_tf_init_local
-  changed_when: true
+  changed_when: "'Installing ' in (mailcatcher_tf_init_local.stdout | default(''))"
   when: not (mailcatcher_use_gitlab_backend | bool)
   no_log: true
 
@@ -128,7 +128,7 @@
     chdir: "{{ mailcatcher_tf_root }}"
   environment: "{{ mailcatcher_tf_env }}"
   register: mailcatcher_tf_init_gitlab
-  changed_when: true
+  changed_when: "'Installing ' in (mailcatcher_tf_init_gitlab.stdout | default(''))"
   when: mailcatcher_use_gitlab_backend | bool
   no_log: true
 
@@ -179,7 +179,7 @@
   args:
     chdir: "{{ mailcatcher_repo_root }}"
   register: mailcatcher_gen_inventory
-  changed_when: true
+  changed_when: "'inventory unchanged' not in (mailcatcher_gen_inventory.stderr | default(''))"
 
 - name: "Provisioning | Confirm the generated inventory file was written"
   ansible.builtin.stat:
@@ -219,40 +219,9 @@
     state: directory
     mode: "0700"
 
-- name: "Provisioning | Remove stale known_hosts fingerprints for the guest IP"
-  ansible.builtin.command:
-    argv:
-      - ssh-keygen
-      - -R
-      - "{{ item }}"
-      - -f
-      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
-  loop: "{{ mailcatcher_guest_ips }}"
-  register: mailcatcher_knownhosts_purge
-  changed_when: "'updated' in (mailcatcher_knownhosts_purge.stderr | default(''))"
-  failed_when: false
-
-- name: "Provisioning | ssh-keyscan the guest IP (per-address 30s timeout)"
-  ansible.builtin.command:
-    argv:
-      - ssh-keyscan
-      - -T
-      - "30"
-      - "{{ item }}"
-  loop: "{{ mailcatcher_guest_ips }}"
-  register: mailcatcher_keyscan
-  changed_when: false
-  failed_when: >-
-    mailcatcher_keyscan.rc != 0
-    or (mailcatcher_keyscan.stdout | default('') | trim | length == 0)
-
-- name: "Provisioning | Append current host keys to known_hosts"
-  ansible.builtin.blockinfile:
-    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
-    create: true
-    mode: "0600"
-    marker: "# {mark} Mail catcher installer host keys for {{ item.item }}"
-    block: "{{ item.stdout }}"
-  loop: "{{ mailcatcher_keyscan.results }}"
-  loop_control:
-    label: "{{ item.item }}"
+- name: "Provisioning | ssh-keyscan the guest IP and refresh known_hosts (known_hosts_refresh)"
+  ansible.builtin.include_role:
+    name: known_hosts_refresh
+  vars:
+    khr_ips: "{{ mailcatcher_guest_ips }}"
+    khr_marker_prefix: "# {mark} Mail catcher installer host keys for "

@@ -91,7 +91,7 @@ graph TD
 > **Terraform is not installed in the local authoring environment.** The Tier-1
 > `terraform` commands below carry the `offline` annotation (no infra or
 > credentials required) and run anywhere the binary exists — locally or in CI. See
-> [`TESTING.md`](../../../TESTING.md) for the full offline-vs-cluster testing guide.
+> [`TESTING.md`](../../../docs/TESTING.md) for the full offline-vs-cluster testing guide.
 
 ---
 

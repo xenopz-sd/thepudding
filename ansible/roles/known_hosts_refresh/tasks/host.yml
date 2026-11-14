@@ -1,0 +1,45 @@
+---
+# tasks/host.yml — known_hosts_refresh: one {ip, marker} entry.
+- name: "known_hosts | ssh-keyscan {{ khr_host.ip }} ({{ khr_timeout }}s timeout)"
+  ansible.builtin.command:
+    argv: [ssh-keyscan, -T, "{{ khr_timeout }}", "{{ khr_host.ip }}"]
+  register: khr_scan
+  changed_when: false
+  failed_when: >-
+    (khr_fail_unreachable | bool)
+    and (khr_scan.rc != 0 or (khr_scan.stdout | default('') | trim | length == 0))
+- name: "known_hosts | Read the recorded keys for {{ khr_host.ip }}"
+  ansible.builtin.command:
+    argv: [ssh-keygen, -F, "{{ khr_host.ip }}", -f, "{{ khr_known_hosts }}"]
+  register: khr_known
+  changed_when: false
+  failed_when: false
+- name: "known_hosts | Compare the presented keys with the recorded ones"
+  ansible.builtin.set_fact:
+    khr_scanned_lines: >-
+      {{ khr_scan.stdout_lines | default([]) | reject('match', '^[ \t]*(#|$)') | map('trim') | unique | sort }}
+    khr_in_sync: >-
+      {{ (khr_scan.stdout_lines | default([]) | reject('match', '^[ \t]*(#|$)')
+           | map('regex_replace', '^[^ \t]+[ \t]+', '') | map('trim') | unique | sort)
+         == (khr_known.stdout_lines | default([]) | reject('match', '^[ \t]*(#|$)')
+           | map('regex_replace', '^[^ \t]+[ \t]+', '') | map('trim') | unique | sort) }}
+  changed_when: false
+- name: "known_hosts | Purge the stale fingerprints for {{ khr_host.ip }} (only when the keys changed)"
+  ansible.builtin.command:
+    argv: [ssh-keygen, -R, "{{ khr_host.ip }}", -f, "{{ khr_known_hosts }}"]
+  register: khr_purge
+  changed_when: "'updated' in ((khr_purge.stdout | default('')) ~ (khr_purge.stderr | default('')))"
+  failed_when: false
+  when:
+    - not (khr_in_sync | bool)
+    - (khr_scanned_lines | length) > 0
+- name: "known_hosts | Write the current keys for {{ khr_host.ip }} (only when the keys changed)"
+  ansible.builtin.blockinfile:
+    path: "{{ khr_known_hosts }}"
+    create: true
+    mode: "0600"
+    marker: "{{ khr_host.marker }}"
+    block: "{{ khr_scanned_lines | join('\n') }}"
+  when:
+    - not (khr_in_sync | bool)
+    - (khr_scanned_lines | length) > 0

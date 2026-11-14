@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  role_name: generated_inventory_cleanup
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Remove the control-node generated inventory of guests a clean-slate just tore down (optionally only when the
+    file lists a given VMID).
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []
