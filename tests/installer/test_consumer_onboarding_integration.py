@@ -122,6 +122,7 @@ from consumer_derivation import (  # noqa: E402
 from consumer_registry import resolve_vlan_id_from_file  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_VENV_PYTHON = str(Path.home() / "venv" / "devinfra" / "bin" / "python")
 _ANSIBLE_PLAYBOOK = str(Path.home() / "venv" / "devinfra" / "bin" / "ansible-playbook")
 _ORCHESTRATOR = "ansible/playbooks/project-consumer-bootstrap.yml"
 _LOCALHOST_INV = "ansible/inventory/localhost.yml"
@@ -450,6 +451,63 @@ class TestFullOrchestratorRun:
         assert bao.secret_present(
             f"secret/data/proj-{slug}/postgres", "app_password"
         ), f"the generated DB password must be stored in OpenBao (Req 8.1)"
+
+
+# =========================================================================== #
+# consumer-object-storage AC-1 — the declared buckets work with the stored key, on VLAN 20 and through the
+# Traefik route (a signed round trip with the route's host name, TCP to the Traefik guest).
+# =========================================================================== #
+_TRAEFIK_IP_ENV = "CONSUMER_TEST_TRAEFIK_IP"
+_S3_INSECURE_ENV = "CONSUMER_TEST_S3_INSECURE"
+
+
+def _declared_buckets(slug: str) -> list[str]:
+    manifest = yaml.safe_load(
+        (_REPO_ROOT / "infra" / "projects" / slug / "consumer-manifest.yml").read_text(encoding="utf-8")
+    )
+    return [f"proj-{slug}-{p}" for p in (manifest.get("object_storage") or {}).get("buckets", [])]
+
+
+def _s3(endpoint: str, bucket: str, creds: dict, *extra: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ, S3_ACCESS_KEY_ID=creds["access_key_id"], S3_SECRET_ACCESS_KEY=creds["secret_access_key"])
+    return subprocess.run(
+        [_VENV_PYTHON, str(_REPO_ROOT / "scripts" / "installer" / "s3_smoke.py"),
+         "--endpoint", endpoint, "--bucket", bucket, *extra, "roundtrip"],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+
+
+@pytest.mark.requires_infra
+@pytest.mark.skipif(
+    _mutate_gate_reason() is not None,
+    reason=_mutate_gate_reason() or "live consumer object-storage gate satisfied",
+)
+class TestObjectStorage:
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def creds(bao: _OpenBao, slug: str) -> dict:
+        if not _declared_buckets(slug):
+            pytest.skip("requires-infra, skipped: the manifest declares no object_storage block")
+        status, data = bao.get(f"secret/data/proj-{slug}/garage")
+        assert status == 200, f"secret/proj-{slug}/garage must exist after onboarding (R2), got HTTP {status}"
+        fields = (data.get("data") or {}).get("data") or {}
+        for f in ("access_key_id", "secret_access_key", "endpoint", "internal_endpoint", "region", "buckets"):
+            assert fields.get(f), f"field {f} missing in secret/proj-{slug}/garage"
+        return fields  # held in memory only; never printed
+
+    def test_stored_entry_lists_the_declared_buckets(self, creds: dict, slug: str):
+        assert creds["buckets"].split(",") == _declared_buckets(slug)
+
+    def test_signed_roundtrip_on_vlan20(self, creds: dict, slug: str):
+        r = _s3(creds["internal_endpoint"], _declared_buckets(slug)[0], creds)
+        assert r.returncode == 0, r.stdout
+
+    def test_signed_roundtrip_through_the_traefik_route(self, creds: dict, slug: str):
+        extra = ["--connect-to", os.environ.get(_TRAEFIK_IP_ENV, "10.0.20.12")]
+        if os.environ.get(_S3_INSECURE_ENV) == "1":
+            extra.append("--insecure")  # dev only: the Traefik self-signed mock (P4)
+        r = _s3(creds["endpoint"], _declared_buckets(slug)[0], creds, *extra)
+        assert r.returncode == 0, r.stdout
 
 
 # =========================================================================== #

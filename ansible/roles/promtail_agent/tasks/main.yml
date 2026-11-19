@@ -61,7 +61,6 @@
     owner: root
     group: root
     mode: "0750"
-  when: not promtail_already_at_pinned_version
 
 # --- 3. Template promtail-config.yaml ----------------------------------------
 - name: "Promtail | Template promtail-config.yaml"
@@ -113,4 +112,5 @@
       # templated here.
       PROMTAIL_LOKI_PUSH_URL: "{{ promtail_loki_push_url }}"
     dca_state: "{{ promtail_state }}"
-  when: not promtail_already_at_pinned_version
+  # Not gated on the pinned-image check: Compose reconciles (changed only on real drift); the gate froze config
+  # changes on running containers (WS-C58, OpenBao precedent).

@@ -1,0 +1,27 @@
+---
+# defaults/main.yml — dns_records_sync (SVC-10 internal DNS, design D2/D3)
+#
+# Reconciles the platform zone's A records with the generated inventories. Runs in
+# the hosts: localhost orchestrator play (the inventories live on the control node);
+# the pdnsutil calls are delegated to the DNS guest over SSH. NO secret here.
+
+# Repo root (absolute) and the venv python the helper runs under.
+drs_repo_root: "{{ playbook_dir | dirname | dirname }}"
+drs_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+drs_helper: scripts/installer/dns_records.py
+# Every file-mediated inventory (integration-boundaries §4) contributes its guests.
+drs_inventory_dir: ansible/inventory
+drs_inventory_pattern: "*.generated.yml"
+
+drs_platform_domain: "platform.example.test"
+# Wildcard targets (*.<domain>, *.web.<domain>): the Traefik guest (ledger index 2).
+drs_traefik_ip: "10.0.20.12"
+
+# The DNS guest and the authoritative container the pdnsutil calls run in.
+drs_dns_host: "10.0.20.25"
+drs_dns_user: "root"
+drs_dns_python: "/usr/bin/python3"
+drs_auth_container: "pdns-auth-1"
+# The recursor caches answers up to the record TTL; its cache for the zone is wiped
+# after a change so added and deleted records take effect at once.
+drs_recursor_container: "pdns-recursor-1"

@@ -80,6 +80,10 @@
     # is the generic alias the configurator roles also read.
     observability_platform_domain: platform.example.test
     platform_domain: "{{ observability_platform_domain }}"
+    # The obs_* roles read obs_platform_domain; follow the one play-level value so
+    # PLATFORM_DOMAIN (or -e observability_platform_domain) reaches Terraform,
+    # the Grafana route and the child run alike.
+    obs_platform_domain: "{{ observability_platform_domain }}"
     # --- Mock stand-in flags (mock-stand-ins.md) — DEFAULT OFF/deferred,
     #     bridged to the observability.yml child run by obs_bootstrap. Opt in
     #     with -e for a CA-less / OIDC-less / GPU-less Day-0 bring-up. ---
@@ -108,6 +112,13 @@
     obs_openbao_cli_host: "10.0.20.10"
 
   tasks:
+    # PLATFORM_DOMAIN in the cluster env file is the default platform domain
+    # (SVC-10 design D5); an explicit -e still wins. Runs first, also on clean-slate.
+    - name: Resolve PLATFORM_DOMAIN from the cluster env file
+      ansible.builtin.import_role:
+        name: platform_domain
+      vars:
+        platform_domain_var: observability_platform_domain
     # === Clean-Slate branch — runs ONLY when clean_slate is truthy. ===
     - name: Clean-Slate reset
       when: clean_slate | default(false) | bool

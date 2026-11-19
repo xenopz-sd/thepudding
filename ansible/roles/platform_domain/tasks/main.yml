@@ -1,0 +1,42 @@
+---
+# Shared: make the cluster env key PLATFORM_DOMAIN the default of one installer's
+# platform-domain variable (SVC-10 design D5, .kiro/specs/svc-10-internal-dns/).
+#
+# Import as the FIRST task of a bootstrap play:
+#   - name: Resolve PLATFORM_DOMAIN from the cluster env file
+#     ansible.builtin.import_role:
+#       name: platform_domain
+#     vars:
+#       platform_domain_var: svc03_platform_domain
+#
+# Precedence: set_fact beats play vars and role defaults but never extra vars, so
+# an explicit `-e <var>=...` still wins. PLATFORM_DOMAIN absent => nothing is set
+# and the committed placeholder default stays. The value is non-secret, but the
+# helper reads the whole env file, so its output is printed only by name below.
+- name: "Platform domain | Read PLATFORM_DOMAIN from {{ cluster_env_file }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+      - "{{ playbook_dir | dirname | dirname }}/scripts/installer/cluster_env.py"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+      - "--platform-domain"
+    chdir: "{{ playbook_dir | dirname | dirname }}"
+  register: platform_domain_lookup
+  changed_when: false
+  # rc 2 = env file missing: the service preflight reports that with its remedy.
+  failed_when: platform_domain_lookup.rc not in [0, 2]
+
+- name: "Platform domain | Set {{ platform_domain_var }} from PLATFORM_DOMAIN (an explicit -e still wins)"
+  ansible.builtin.set_fact:
+    "{{ platform_domain_var }}": "{{ platform_domain_lookup.stdout | trim }}"
+  when:
+    - platform_domain_lookup.rc == 0
+    - (platform_domain_lookup.stdout | trim | length) > 0
+
+- name: "Platform domain | Report the effective platform domain"
+  ansible.builtin.debug:
+    msg: >-
+      {{ platform_domain_var }} = {{ lookup('ansible.builtin.vars', platform_domain_var, default='(unset)') }}
+      (PLATFORM_DOMAIN in {{ cluster_env_file }}:
+      {{ (platform_domain_lookup.stdout | default('') | trim) or 'not set' }}; an explicit -e wins)

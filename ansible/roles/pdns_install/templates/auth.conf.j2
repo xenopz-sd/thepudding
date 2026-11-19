@@ -1,0 +1,17 @@
+# MANAGED BY ANSIBLE (pdns_install, SVC-10) — DO NOT EDIT BY HAND.
+# Included by the image's /etc/powerdns/pdns.conf (launch=gsqlite3, include-dir).
+local-port={{ pdns_auth_dns_port }}
+# No zone transfers, no notifications: the zone is never published (§12).
+disable-axfr=yes
+primary=no
+secondary=no
+default-soa-content={{ pdns_ns_name }}. hostmaster.@ 0 10800 3600 604800 {{ pdns_soa_minimum }}
+default-ttl=300
+# HTTP API (key required) + /metrics. No webserver-password, so /metrics stays
+# readable by Prometheus; the API still demands X-API-Key.
+webserver=yes
+api=yes
+api-key={{ lookup('ansible.builtin.env', 'PDNS_API_KEY') }}
+webserver-address=0.0.0.0
+webserver-port={{ pdns_auth_web_port }}
+webserver-allow-from={{ pdns_web_allow_from | join(',') }}

@@ -1,0 +1,95 @@
+---
+# internal_acme.yml — traefik_install (SVC-08 WS-C59): prepare the `internal` ACME resolver.
+# Sets traefik_internal_acme_enabled; when enabled, installs the root and the 0600 PowerDNS secret env.
+- name: "Traefik internal ACME | Is the platform root published (the gate)?"
+  ansible.builtin.stat:
+    path: "{{ traefik_internal_ca_root_src }}"
+  delegate_to: localhost
+  connection: local
+  become: false
+  register: traefik_internal_root_stat
+- name: "Traefik internal ACME | Decide and log (INFO)"
+  ansible.builtin.set_fact:
+    traefik_internal_acme_enabled: "{{ traefik_internal_root_stat.stat.exists }}"
+- name: "Traefik internal ACME | INFO — resolver selection"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Traefik certificate resolver:
+      {{ 'internal (platform CA via ACME DNS-01)' if traefik_internal_acme_enabled
+         else 'letsencrypt (no platform root published; behaviour unchanged)' }}
+
+- name: "Traefik internal ACME | Preconditions (fail closed, R9/R15)"
+  when: traefik_internal_acme_enabled | bool
+  block:
+    - name: "Traefik internal ACME | SVC-10 must be installed"
+      ansible.builtin.stat:
+        path: "{{ traefik_internal_dns_inventory }}"
+      delegate_to: localhost
+      connection: local
+      become: false
+      register: traefik_internal_dns_stat
+    - name: "Traefik internal ACME | Assert prerequisites"
+      ansible.builtin.assert:
+        that:
+          - not (traefik_tls_self_signed | bool)
+          - traefik_internal_dns_stat.stat.exists
+          - (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | length) > 0
+        fail_msg: >-
+          The internal CA is published, so Traefik uses the `internal` ACME resolver. It needs: the self-signed
+          mock OFF (they are mutually exclusive), SVC-10 installed (ansible/playbooks/svc-10-bootstrap.yml), and
+          OPENBAO_ADMIN_TOKEN in the environment (svc-09-bootstrap.yml passes it) to read the PowerDNS key.
+          Nothing was changed.
+        quiet: true
+    - name: "Traefik internal ACME | Read the PowerDNS API key from OpenBao (no_log)"
+      ansible.builtin.command:
+        argv: >-
+          {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ traefik_internal_openbao_bao_addr, '-e', 'BAO_TOKEN']
+             + (['-e', 'BAO_SKIP_VERIFY=true'] if (traefik_internal_openbao_loopback_skip_verify | bool) else [])
+             + [traefik_internal_openbao_container, 'bao', 'kv', 'get', '-format=json',
+                traefik_internal_pdns_secret_path] }}
+      delegate_to: "{{ traefik_internal_openbao_cli_host }}"
+      become: false
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ traefik_internal_openbao_cli_user }}"
+        ansible_python_interpreter: /usr/bin/python3
+      environment:
+        BAO_TOKEN: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') }}"
+      register: traefik_internal_pdns_read
+      changed_when: false
+      no_log: true
+    - name: "Traefik internal ACME | Bind the key (no_log)"
+      ansible.builtin.set_fact:
+        traefik_internal_pdns_key: "{{ (traefik_internal_pdns_read.stdout | from_json).data.data.api_key }}"
+      no_log: true
+    - name: "Traefik internal ACME | Ensure the CA directory exists"
+      ansible.builtin.file:
+        path: "{{ traefik_internal_ca_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+    - name: "Traefik internal ACME | Install the platform root (public)"
+      ansible.builtin.copy:
+        src: "{{ traefik_internal_ca_root_src }}"
+        dest: "{{ traefik_internal_ca_dir }}/{{ traefik_internal_ca_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart traefik
+    - name: "Traefik internal ACME | Write the 0600 secret env (PowerDNS key, no_log)"
+      ansible.builtin.copy:
+        content: |
+          PDNS_API_KEY={{ traefik_internal_pdns_key }}
+          PDNS_API_URL={{ traefik_internal_pdns_api_url }}
+          LEGO_CA_CERTIFICATES=/etc/traefik/ca/{{ traefik_internal_ca_file }}
+        dest: "{{ traefik_internal_secret_env_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      notify: Restart traefik
+    - name: "Traefik internal ACME | Scrub the key from memory"
+      ansible.builtin.set_fact:
+        traefik_internal_pdns_key: ""
+      no_log: true

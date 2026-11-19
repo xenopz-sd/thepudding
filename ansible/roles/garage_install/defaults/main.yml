@@ -1,0 +1,76 @@
+---
+# defaults/main.yml — garage_install (SVC-03 Garage object storage node)
+#
+# Spec: .kiro/specs/svc-03-object-storage. NO secret value lives here: the RPC
+# secret and admin token are read at run time from the process ENVIRONMENT
+# (GARAGE_RPC_SECRET / GARAGE_ADMIN_TOKEN, bridged by svc03_bootstrap from
+# OpenBao) and written only into the 0600 garage.toml on each guest.
+
+# --- Image pin (security-standards: exact version + digest, never `latest`) ---
+# v2.5.0 (released 2026-10-24) carries the fixes for an invalid-UTF-8 panic
+# (#1581) and owner-key-only lifecycle endpoints (#1573). The digest pins the
+# multi-arch index the tag resolved to. Refresh deliberately: see "Image bumps and
+# security advisories" in the SVC-03 runbook; the advisory table
+# tests/fixtures/advisories/garage-advisories.json and its guard test bind this pin.
+garage_image_repo: "dxflrs/garage"
+garage_image_tag: "v2.5.0"
+garage_image_digest: "sha256:677e5b758e4425a325b811c425c026bf35a4bf42f7ddbaa773de3f4fd779a5a5"
+garage_image: "{{ garage_image_repo }}:{{ garage_image_tag }}@{{ garage_image_digest }}"
+
+garage_stack_name: "garage"
+# docker-compose-app names the container <stack>-<service>-1.
+garage_container_name: "garage-garage-1"
+# The Garage binary inside the (scratch) image.
+garage_bin: "/garage"
+
+# --- Cluster parameters (R2) ---------------------------------------------------
+garage_replication_factor: 3
+garage_consistency_mode: "consistent"
+garage_s3_region: "garage"
+garage_zone: "dc1"
+# Capacity assigned per node in the layout, in GB. Derived from the data volume
+# size (svc03_data_disk_gb) minus headroom for metadata; overridable.
+garage_data_disk_gb: 20
+garage_node_capacity_gb: "{{ ((garage_data_disk_gb | int) * 0.8) | int }}"
+# The number of nodes the layout must contain; the layout step fails closed if
+# fewer guests are in the play.
+garage_expected_nodes: 3
+
+# --- Ports: published ONLY on the guest's own VLAN-20 IP (never 0.0.0.0) -------
+garage_bind_ip: "{{ ansible_host }}"
+garage_s3_port: 3900
+garage_rpc_port: 3901
+garage_admin_port: 3903
+# Static website endpoint (WS-C51); served through Traefik per website bucket.
+garage_web_port: 3902
+
+# --- Paths on the guest ----------------------------------------------------------
+# /var/lib/garage is the DEDICATED data volume (Terraform mount_point, R3).
+garage_data_root: "/var/lib/garage"
+garage_meta_dir: "{{ garage_data_root }}/meta"
+garage_data_dir: "{{ garage_data_root }}/data"
+garage_config_dir: "/etc/garage"
+garage_config_file: "{{ garage_config_dir }}/garage.toml"
+
+# --- S3 ingress (P1: delegated Traefik file-provider Route_Fragment, R5) --------
+garage_platform_domain: "platform.example.test"
+garage_s3_host: "s3.{{ garage_platform_domain }}"
+# Website hosts are <bucket>.web.<platform_domain> (WS-C51).
+garage_web_root_domain: "web.{{ garage_platform_domain }}"
+garage_traefik_route_enabled: true
+garage_traefik_guest_host: "10.0.20.12"
+garage_traefik_guest_user: "root"
+garage_traefik_guest_python: "/usr/bin/python3"
+garage_traefik_dynamic_config_dir: "/etc/traefik/dynamic"
+
+# --- Readiness polling (P3) ------------------------------------------------------
+garage_ready_retries: 30
+garage_ready_delay: 4
+
+# --- Admin-API firewall (WS-C53) ---------------------------------------------------
+# Only these sources may open connections to the admin API (3903): the Prometheus
+# guest (ledger index 8, 10.0.20.18). The guest itself always can (local traffic is
+# not forwarded). false removes the firewall (explicit opt-out).
+garage_admin_firewall_enabled: true
+garage_admin_allowed_sources:
+  - "10.0.20.18"

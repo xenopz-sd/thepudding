@@ -66,7 +66,7 @@
   args:
     chdir: "{{ mailcatcher_repo_root }}"
   register: mailcatcher_common_run
-  changed_when: "'changed=0' not in (mailcatcher_common_run.stdout | default(''))"
+  changed_when: "(mailcatcher_common_run.stdout | default('')) is search('changed=[1-9]')"
 
 # --- 3. Mailpit configurator child run ---------------------------------------------
 # The UI password travels in the child ENVIRONMENT (the play reads it with
@@ -87,7 +87,7 @@
   environment:
     MAILCATCHER_UI_PASSWORD: "{{ mailcatcher_ui_password | default('') }}"
   register: mailcatcher_run
-  changed_when: "'changed=0' not in (mailcatcher_run.stdout | default(''))"
+  changed_when: "(mailcatcher_run.stdout | default('')) is search('changed=[1-9]')"
   no_log: true
 
 # Scrub the credential fact from memory now it is persisted.

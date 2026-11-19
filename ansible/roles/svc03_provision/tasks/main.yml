@@ -1,0 +1,230 @@
+---
+# tasks/main.yml — svc03_provision (SVC-03 Garage installer — Phase 2: Provision)
+#
+# Clone of svc07_provision adapted for the three-guest SVC-03 root:
+#   - backend swap-gate (GitLab HTTP when all three CI keys present, else
+#     local_backend_override.tf) with its single INFO decision log,
+#   - terraform init / apply (Proxmox creds via TF_VAR_* env, no_log),
+#   - generate_inventory.py + existence assert,
+#   - add_host of the three Garage guests,
+#   - ssh-keygen -R + ssh-keyscan known_hosts reconciliation.
+#
+# NOTE (agent-live meta-guard): this role runs `terraform apply` (a destructive
+# marker) but is LEAF-EXEMPT in test_agent_live_wiring_coverage.py exactly like
+# svc07_provision — the throwaway-guard consult is carried UPSTREAM by
+# svc03_preflight (Phase 1 runs before Phase 2 in the same play).
+
+# --- Backend swap-gate selection --------------------------------------------
+- name: "Provisioning | Read the cluster env file to detect the state-backend signal"
+  ansible.builtin.slurp:
+    src: "{{ svc03_repo_root }}/{{ cluster_env_file }}"
+  register: svc03_env_slurp
+  no_log: true
+
+- name: "Provisioning | Reduce the env file to KEY=VALUE lines"
+  ansible.builtin.set_fact:
+    svc03_env_pairs: >-
+      {{ (svc03_env_slurp.content | b64decode).splitlines()
+         | map('trim')
+         | reject('match', '^\s*#')
+         | select('search', '=')
+         | list }}
+  no_log: true
+
+- name: "Provisioning | Extract the set of env keys (names only, no values)"
+  ansible.builtin.set_fact:
+    svc03_env_keys: >-
+      {{ svc03_env_pairs
+         | map('regex_replace', '^\s*([^=]+?)\s*=.*$', '\1')
+         | list }}
+
+- name: "Provisioning | Decide the Terraform backend (swap gate)"
+  ansible.builtin.set_fact:
+    svc03_use_gitlab_backend: >-
+      {{ ('CI_API_V4_URL' in svc03_env_keys)
+         and ('CI_PROJECT_ID' in svc03_env_keys)
+         and ('CI_JOB_TOKEN' in svc03_env_keys) }}
+
+- name: "Provisioning | Extract GitLab CI state-backend values (GitLab backend only)"
+  ansible.builtin.set_fact:
+    svc03_env_ci_values: >-
+      {{ dict(svc03_env_keys | zip(
+           svc03_env_pairs
+           | map('regex_replace', '^[^=]+=\s*(.*?)\s*$', '\1')
+           | map('regex_replace', '^"(.*)"$', '\1')
+           | list
+         )) }}
+  when: svc03_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Derive the GitLab state address + job token (GitLab backend only)"
+  ansible.builtin.set_fact:
+    svc03_env_gitlab_state_address: >-
+      {{ svc03_env_ci_values['CI_API_V4_URL'] }}/projects/{{
+         svc03_env_ci_values['CI_PROJECT_ID'] }}/terraform/state/svc03
+    svc03_env_ci_job_token: "{{ svc03_env_ci_values['CI_JOB_TOKEN'] }}"
+  when: svc03_use_gitlab_backend | bool
+  no_log: true
+
+- name: "Provisioning | Log the Terraform backend selection (INFO)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Terraform backend:
+      {{ 'GitLab HTTP state (svc03) — the Cluster_Env_File '
+         ~ 'configures the GitLab CI state-backend variables'
+         if (svc03_use_gitlab_backend | bool)
+         else 'LOCAL (local_backend_override.tf) — the Cluster_Env_File does not '
+              ~ 'configure the GitLab HTTP backend (solo/offline Developer-B default)' }}
+
+- name: "Provisioning | Ensure local_backend_override.tf is present (local backend)"
+  ansible.builtin.copy:
+    dest: "{{ svc03_tf_root }}/local_backend_override.tf"
+    mode: "0644"
+    content: |
+      # Local, gitignored state backend for a solo/offline apply — overrides the
+      # root's partial backend "http" {}. Never committed (.gitignore: *_override.tf).
+      terraform {
+        backend "local" {}
+      }
+  when: not (svc03_use_gitlab_backend | bool)
+
+- name: "Provisioning | Remove any local_backend_override.tf (GitLab HTTP backend)"
+  ansible.builtin.file:
+    path: "{{ svc03_tf_root }}/local_backend_override.tf"
+    state: absent
+  when: svc03_use_gitlab_backend | bool
+
+- name: "Provisioning | terraform init (local backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+  args:
+    chdir: "{{ svc03_tf_root }}"
+  environment: "{{ svc03_tf_env }}"
+  register: svc03_tf_init_local
+  changed_when: "'Installing ' in (svc03_tf_init_local.stdout | default(''))"
+  when: not (svc03_use_gitlab_backend | bool)
+  no_log: true
+
+- name: "Provisioning | terraform init (GitLab HTTP backend)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - init
+      - -input=false
+      - -reconfigure
+      - "-backend-config=address={{ svc03_env_gitlab_state_address }}"
+      - "-backend-config=lock_address={{ svc03_env_gitlab_state_address }}/lock"
+      - "-backend-config=unlock_address={{ svc03_env_gitlab_state_address }}/lock"
+      - -backend-config=username=gitlab-ci-token
+      - "-backend-config=password={{ svc03_env_ci_job_token }}"
+      - -backend-config=lock_method=POST
+      - -backend-config=unlock_method=DELETE
+      - -backend-config=retry_wait_min=5
+  args:
+    chdir: "{{ svc03_tf_root }}"
+  environment: "{{ svc03_tf_env }}"
+  register: svc03_tf_init_gitlab
+  changed_when: "'Installing ' in (svc03_tf_init_gitlab.stdout | default(''))"
+  when: svc03_use_gitlab_backend | bool
+  no_log: true
+
+# --- guest-variable assembly + non-interactive apply ------------------------
+- name: "Provisioning | Assert all required guest variables are present (before apply)"
+  ansible.builtin.assert:
+    that:
+      - "svc03_proxmox_node_name is defined and (svc03_proxmox_node_name | trim | length > 0)"
+      - "svc03_template_file_id is defined and (svc03_template_file_id | trim | length > 0)"
+      - "svc03_datastore_id is defined and (svc03_datastore_id | trim | length > 0)"
+      - "svc03_datastore_id != svc03_autodetect_sentinel"
+      - "(svc03_vmids | length) == 3"
+    fail_msg: >-
+      A required guest variable is absent or empty; refusing to run
+      `terraform apply` so no Proxmox resource is created. Required:
+      proxmox_node_name, svc03_template_file_id, a resolved
+      svc03_datastore_id (not the auto-detect sentinel), three svc03_vmids.
+    success_msg: "All required guest variables are present; proceeding to terraform apply."
+
+- name: "Provisioning | terraform apply (non-interactive, auto-approve)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - apply
+      - -input=false
+      - -auto-approve
+      - "-var=proxmox_node_name={{ svc03_proxmox_node_name }}"
+      - "-var=garage_node1_vmid={{ svc03_vmids[0] }}"
+      - "-var=garage_node2_vmid={{ svc03_vmids[1] }}"
+      - "-var=garage_node3_vmid={{ svc03_vmids[2] }}"
+      - "-var=garage_template_file_id={{ svc03_template_file_id }}"
+      - "-var=garage_datastore_id={{ svc03_datastore_id }}"
+      - "-var=garage_data_disk_gb={{ svc03_data_disk_gb }}"
+  args:
+    chdir: "{{ svc03_tf_root }}"
+  environment: "{{ svc03_tf_env }}"
+  register: svc03_tf_apply
+  changed_when: "'0 added, 0 changed, 0 destroyed' not in svc03_tf_apply.stdout"
+  no_log: true
+
+# --- inventory generation + refresh handoff ---------------------------------
+- name: "Provisioning | Generate the Ansible inventory from Terraform outputs"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc03_venv_python }}"
+      - ansible/inventory/generate_inventory.py
+      - --root
+      - infra/projects/svc-03-object-storage
+      - --out
+      - "{{ svc03_generated_inventory }}"
+  args:
+    chdir: "{{ svc03_repo_root }}"
+  register: svc03_gen_inventory
+  changed_when: "'inventory unchanged' not in (svc03_gen_inventory.stderr | default(''))"
+
+- name: "Provisioning | Confirm the generated inventory file was written"
+  ansible.builtin.stat:
+    path: "{{ svc03_repo_root }}/{{ svc03_generated_inventory }}"
+  register: svc03_generated_inventory_stat
+
+- name: "Provisioning | Assert the generated inventory exists (else halt before Bootstrap)"
+  ansible.builtin.assert:
+    that:
+      - "svc03_generated_inventory_stat.stat.exists"
+    fail_msg: >-
+      generate_inventory.py did not produce {{ svc03_generated_inventory }};
+      halting before the Bootstrap phase and leaving the provisioned guest in
+      place.
+    success_msg: "Generated inventory present: {{ svc03_generated_inventory }}."
+
+- name: "Provisioning | add_host the three Garage guests into the in-memory inventory"
+  ansible.builtin.add_host:
+    name: "svc03-20-0{{ idx + 1 }}"
+    groups:
+      - garage
+    # cidrhost("10.0.20.0/24", 10 + host_index) for ledger indices 12/13/14
+    # (infra/platform-foundation/host-indices.yaml). The Terraform root derives
+    # them; the Ansible layer carries the computed IPs as constants.
+    ansible_host: "{{ item }}"
+    ansible_user: root
+    ansible_connection: ssh
+  loop: "{{ svc03_guest_ips }}"
+  loop_control:
+    index_var: idx
+  changed_when: false
+
+# --- SSH known_hosts reconciliation -----------------------------------------
+- name: "Provisioning | Ensure ~/.ssh exists (0700)"
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+
+- name: "Provisioning | ssh-keyscan the guest IP and refresh known_hosts (known_hosts_refresh)"
+  ansible.builtin.include_role:
+    name: known_hosts_refresh
+  vars:
+    khr_ips: "{{ svc03_guest_ips }}"
+    khr_marker_prefix: "# {mark} SVC-03 Garage installer host keys for "

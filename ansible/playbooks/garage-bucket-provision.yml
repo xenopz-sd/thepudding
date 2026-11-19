@@ -1,0 +1,21 @@
+---
+# SVC-03 project bucket + scoped key provisioning (spec svc-03-object-storage, R9/R10).
+#
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/svc-03-object-storage.generated.yml \
+#     ansible/playbooks/garage-bucket-provision.yml \
+#     -e project_slug=<slug> -e '{"bucket_purposes": ["artifacts"]}' \
+#     -e cluster_env_file=cluster.env
+#
+# Idempotent: re-running creates nothing new and never rotates the key. The key
+# secret goes ONLY to OpenBao (secret/proj-<slug>/garage). Bind-only: the logic
+# lives in the garage_bucket_provision role.
+- name: Provision a project's Garage buckets and scoped key
+  hosts: garage
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Buckets, key, grants and the OpenBao entry
+      ansible.builtin.import_role:
+        name: garage_bucket_provision

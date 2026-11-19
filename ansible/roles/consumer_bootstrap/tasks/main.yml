@@ -37,6 +37,27 @@
 # memory (include_role facts) or via the onboarders' own 0600 gitignored files —
 # never operator copy-paste.
 
+# --- WS-C13: resolve the dev TLS posture (explicit -e > cluster env file > verify), WS-C6 order ------------------
+- name: "Bootstrap | Read the cluster env file text for the TLS opt-in (control node, no_log)"
+  ansible.builtin.set_fact:
+    consumer_envfile_text: >-
+      {{ lookup('ansible.builtin.file',
+                (cluster_env_file if (cluster_env_file | default('cluster.env')).startswith('/')
+                 else consumer_repo_root ~ '/' ~ (cluster_env_file | default('cluster.env'))),
+                errors='ignore') | default('', true) }}
+  no_log: true
+- name: "Bootstrap | Resolve consumer_openbao_tls_self_signed (explicit -e > env file > verify)"
+  ansible.builtin.set_fact:
+    consumer_openbao_tls_self_signed: >-
+      {{ (consumer_openbao_tls_self_signed | bool) if consumer_openbao_tls_self_signed is defined
+         else (consumer_envfile_text | string is search(consumer_tls_optin_regex)) }}
+    consumer_envfile_text: ""
+- name: "Bootstrap | INFO — primary CLI TLS posture"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: consumer OpenBao CLI TLS: {{ 'skip-verify (dev opt-in OPENBAO_TLS_SELF_SIGNED or -e)'
+      if (consumer_openbao_tls_self_signed | bool) else 'verify (platform CA or trusted certificate)' }}
+
 - name: "Bootstrap | INFO — Phase 3 start (compose onboarders)"
   ansible.builtin.debug:
     msg: >-
@@ -100,7 +121,8 @@
 # === STEP 2 — OpenBao project onboarding (isolation triple, Req 4.6) =========
 # Compose openbao_project_onboard as-is. It is idempotent (changed=0 on re-run,
 # Req 6.1/6.3). It authenticates with the platform-admin token from the
-# OPENBAO_ADMIN_TOKEN env var (never argv). Runs against the generated inventory
+# OPENBAO_ADMIN_TOKEN env var, which the role passes to `docker exec` as
+# `-e BAO_TOKEN=<value>` (on that argv on the guest, WS-C62). Runs against the generated inventory
 # so the role's docker-exec delegation reaches the primary. Gated on a declared
 # database OR secrets (either needs the project KV path / policy). Skipped when
 # OpenBao is unwired.
@@ -149,7 +171,8 @@
 # + its agent mapping are minted with the DB credential already present).
 #
 # SECRET-SAFE (Req 2.4, security-standards.md): every task is no_log; the admin
-# token rides in the command ENVIRONMENT (-e BAO_TOKEN=...) never on argv; the
+# token is passed to `docker exec` as `-e BAO_TOKEN=<value>`, i.e. on that argv on the
+# OpenBao guest for the call's duration (accepted on single-tenant guests, WS-C62); the
 # composed DATABASE_URL embeds the password and is itself secret-bearing, so it is
 # never echoed. IDEMPOTENT / NO ROTATION (Req 3.6): read-or-reuse — the put runs
 # only when the bridged value is absent or differs; the source password is read,
@@ -439,6 +462,9 @@
       - "{{ consumer_zitadel_org_provision_playbook }}"
       - -e
       - "zop_project_slug={{ project_slug }}"
+      # Thread the platform domain (PLATFORM_DOMAIN): without it the child targets auth.platform.example.test.
+      - -e
+      - "zop_platform_domain={{ consumer_platform_domain | default('platform.example.test') }}"
       - -e
       - "{{ {'zop_app_registrations': consumer_mapped_app_registrations} | to_json }}"
       - -e
@@ -471,7 +497,7 @@
     # WS-C45: the child reads OPENBAO_ADMIN_TOKEN from its environment; pass the resolved value.
     OPENBAO_ADMIN_TOKEN: "{{ consumer_openbao_admin_token }}"
   register: consumer_sso_run
-  changed_when: "'changed=0' not in (consumer_sso_run.stdout | default(''))"
+  changed_when: "(consumer_sso_run.stdout | default('')) is search('changed=[1-9]')"
   no_log: true
   when: consumer_manifest.sso is defined
 
@@ -487,6 +513,56 @@
   ansible.builtin.debug:
     msg: "INFO: SSO onboarding step skipped for '{{ project_slug }}' — the Consumer_Manifest declares no sso block."
   when: consumer_manifest.sso is not defined
+
+# === STEP 5 — Object storage (FEATURE-GATED on `object_storage`, consumer-object-storage R2) ===
+# Compose the SVC-03 onboarder garage-bucket-provision.yml as a child run against the SVC-03 generated
+# inventory with the declared purposes. It creates proj-<slug>-<purpose> buckets and one bucket-scoped key
+# and writes the key to secret/proj-<slug>/garage (never rotates on a re-run). The OpenBao admin token travels
+# in the child ENV (never argv); a non-zero child exit propagates to the Phase-3 rescue.
+- name: "Bootstrap | STEP 5 — Compose garage-bucket-provision (buckets + scoped key)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ consumer_svc03_inventory }}"
+      - "{{ consumer_garage_bucket_provision_playbook }}"
+      - -e
+      - "project_slug={{ project_slug }}"
+      - -e
+      - "{{ {'bucket_purposes': consumer_manifest.object_storage.buckets} | to_json }}"
+      - -e
+      - "{{ {'website_purposes': consumer_manifest.object_storage.website | default([])} | to_json }}"
+      - -e
+      - "garage_bp_platform_domain={{ consumer_platform_domain | default('platform.example.test') }}"
+      - -e
+      - "cluster_env_file={{ cluster_env_file }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  environment:
+    OPENBAO_ADMIN_TOKEN: "{{ consumer_openbao_admin_token }}"
+  register: consumer_object_storage_run
+  changed_when: "(consumer_object_storage_run.stdout | default('')) is search('changed=[1-9]')"
+  failed_when: false
+  no_log: true
+  when: consumer_manifest.object_storage is defined
+
+# The child's secret-bearing tasks are no_log, so its output carries no secret value; surfacing its tail keeps a
+# failure diagnosable through the no_log above.
+- name: "Bootstrap | STEP 5 — Fail with the child run's output tail when the bucket step failed"
+  ansible.builtin.fail:
+    msg: >-
+      garage-bucket-provision.yml failed (rc {{ consumer_object_storage_run.rc }}). Last output:
+      {{ (consumer_object_storage_run.stdout | default('')).splitlines()[-30:] | join(' | ') }}
+  when:
+    - consumer_manifest.object_storage is defined
+    - (consumer_object_storage_run.rc | default(0)) != 0
+
+- name: "Bootstrap | STEP 5 — INFO — object storage step skipped (no object_storage declared)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: object storage step skipped for '{{ project_slug }}' — the Consumer_Manifest declares no
+      object_storage block.
+  when: consumer_manifest.object_storage is not defined
 
 - name: "Bootstrap | INFO — Phase 3 complete"
   ansible.builtin.debug:

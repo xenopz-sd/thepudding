@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: pki_trust
+  namespace: devinfra
+  author: Developer Services Platform
+  description: SVC-08 internal PKI (pki_trust).
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

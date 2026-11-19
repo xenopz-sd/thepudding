@@ -1,0 +1,145 @@
+---
+# tasks/main.yml — dns_records_sync (SVC-10 internal DNS, design D2/D3, FR-1/FR-2)
+#
+#   1. collect every generated inventory on the control node,
+#   2. list the zone on the authoritative server,
+#   3. compute the plan with scripts/installer/dns_records.py (pure helper),
+#   4. apply upserts and deletes with pdnsutil (only A records are managed),
+#   5. VERIFY: re-list and re-plan; the plan must now be empty.
+# Records of a torn-down guest disappear because its generated inventory is gone
+# (clean-slate removes it, WS-C42). The pdnsutil calls are delegated to the DNS guest
+# with inline connection vars (P2: the play is `connection: local`).
+
+- name: "DNS records | Find the generated inventories"
+  ansible.builtin.find:
+    paths: "{{ drs_repo_root }}/{{ drs_inventory_dir }}"
+    patterns: "{{ drs_inventory_pattern }}"
+  register: drs_inventories
+
+- name: "DNS records | INFO — inventories feeding the zone"
+  ansible.builtin.debug:
+    msg: >-
+      INFO dns records: {{ drs_inventories.files | length }} generated inventories:
+      {{ drs_inventories.files | map(attribute='path') | map('basename') | sort | join(', ') }}
+
+- name: "DNS records | Sync and verify"
+  block:
+    - name: "DNS records | List the zone (before)"
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ drs_auth_container }}", pdnsutil, zone, list, "{{ drs_platform_domain }}"]
+      delegate_to: "{{ drs_dns_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ drs_dns_user }}"
+        ansible_python_interpreter: "{{ drs_dns_python }}"
+      register: drs_zone_before
+      changed_when: false
+
+    - name: "DNS records | Compute the plan"
+      ansible.builtin.include_tasks: plan.yml
+      vars:
+        drs_listing: "{{ drs_zone_before.stdout }}"
+
+    - name: "DNS records | Keep the first plan"
+      ansible.builtin.set_fact:
+        drs_first_plan: "{{ drs_plan }}"
+
+    - name: "DNS records | Upsert A records"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ drs_auth_container }}"
+          - pdnsutil
+          - rrset
+          - replace
+          - "{{ drs_platform_domain }}"
+          - "{{ item.name }}"
+          - "{{ item.type }}"
+          - "{{ item.ttl | string }}"
+          - "{{ item.content }}"
+      delegate_to: "{{ drs_dns_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ drs_dns_user }}"
+        ansible_python_interpreter: "{{ drs_dns_python }}"
+      loop: "{{ drs_first_plan.upsert }}"
+      loop_control:
+        label: "{{ item.name }} {{ item.type }} {{ item.content }}"
+      changed_when: true
+
+    - name: "DNS records | Delete stale A records"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ drs_auth_container }}"
+          - pdnsutil
+          - rrset
+          - delete
+          - "{{ drs_platform_domain }}"
+          - "{{ item.name }}"
+          - "{{ item.type }}"
+      delegate_to: "{{ drs_dns_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ drs_dns_user }}"
+        ansible_python_interpreter: "{{ drs_dns_python }}"
+      loop: "{{ drs_first_plan.delete }}"
+      loop_control:
+        label: "{{ item.name }} {{ item.type }}"
+      changed_when: true
+
+    # Adds the empty non-terminals (e.g. web.<domain> under *.web.<domain>).
+    - name: "DNS records | Rectify the zone after a change"
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ drs_auth_container }}", pdnsutil, zone, rectify, "{{ drs_platform_domain }}"]
+      delegate_to: "{{ drs_dns_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ drs_dns_user }}"
+        ansible_python_interpreter: "{{ drs_dns_python }}"
+      when: (drs_first_plan.upsert | length) + (drs_first_plan.delete | length) > 0
+      changed_when: true
+
+    # Without this the recursor keeps serving a deleted or changed record for up to
+    # its TTL (seen live: a torn-down guest's record outlived the sync by 300 s).
+    - name: "DNS records | Wipe the recursor cache for the zone after a change"
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ drs_recursor_container }}", rec_control, wipe-cache, "{{ drs_platform_domain }}$"]
+      delegate_to: "{{ drs_dns_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ drs_dns_user }}"
+        ansible_python_interpreter: "{{ drs_dns_python }}"
+      when: (drs_first_plan.upsert | length) + (drs_first_plan.delete | length) > 0
+      changed_when: true
+
+    - name: "DNS records | List the zone (after)"
+      ansible.builtin.command:
+        argv: [docker, exec, "{{ drs_auth_container }}", pdnsutil, zone, list, "{{ drs_platform_domain }}"]
+      delegate_to: "{{ drs_dns_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ drs_dns_user }}"
+        ansible_python_interpreter: "{{ drs_dns_python }}"
+      register: drs_zone_after
+      changed_when: false
+
+    - name: "DNS records | Re-plan against the zone after the sync"
+      ansible.builtin.include_tasks: plan.yml
+      vars:
+        drs_listing: "{{ drs_zone_after.stdout }}"
+
+    - name: "DNS records | VERIFY — the zone now equals the desired record set"
+      ansible.builtin.assert:
+        that:
+          - (drs_plan.upsert | length) == 0
+          - (drs_plan.delete | length) == 0
+        fail_msg: >-
+          The zone {{ drs_platform_domain }} still differs from the inventories after the sync:
+          upsert {{ drs_plan.upsert | map(attribute='name') | list }},
+          delete {{ drs_plan.delete | map(attribute='name') | list }}.
+        success_msg: >-
+          Zone {{ drs_platform_domain }} holds the {{ drs_plan.desired_count }} desired A records
+          ({{ drs_first_plan.upsert | length }} upserted, {{ drs_first_plan.delete | length }} deleted).

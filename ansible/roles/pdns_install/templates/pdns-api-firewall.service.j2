@@ -1,0 +1,18 @@
+# MANAGED BY ANSIBLE (pdns_install, SVC-10) — DO NOT EDIT BY HAND.
+# Re-applies the PowerDNS webserver firewall after boot and after every Docker
+# (re)start: PartOf makes a Docker restart restart this unit too.
+[Unit]
+Description=Restrict the PowerDNS API and metrics ports ({{ pdns_auth_web_port }}, {{ pdns_recursor_web_port }}) to allowed sources
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# No ExecStop: a Docker restart stops this unit (PartOf) and must not open the ports
+# while Docker comes back; removal is an explicit `pdns-api-firewall remove`.
+ExecStart=/usr/local/sbin/pdns-api-firewall apply
+
+[Install]
+WantedBy=multi-user.target docker.service

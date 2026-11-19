@@ -276,7 +276,7 @@
   args:
     chdir: "{{ consumer_repo_root }}"
   register: consumer_db_bootstrap_run
-  changed_when: "'changed=0' not in (consumer_db_bootstrap_run.stdout | default(''))"
+  changed_when: "(consumer_db_bootstrap_run.stdout | default('')) is search('changed=[1-9]')"
   when: consumer_manifest.database is defined
 
 # --- Regenerate a consumer-scoped dynamic inventory (design "Phase 2") -------

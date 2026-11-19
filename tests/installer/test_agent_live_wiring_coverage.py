@@ -132,6 +132,13 @@ _LEAF_EXEMPT = {
     # BEFORE it in the SAME play and carries the gated guard consult (spec
     # dev-mail-catcher, ADR-0025).
     "ansible/roles/mailcatcher_provision/tasks/main.yml",
+    # svc03_provision is the SVC-03 Garage Phase-2 APPLY mechanism, guarded
+    # UPSTREAM like mailcatcher_provision: svc03_preflight (Phase 1) runs BEFORE
+    # it in the SAME play and carries the gated guard consult (--service svc03).
+    "ansible/roles/svc03_provision/tasks/main.yml",
+    # svc10_provision (SVC-10 DNS Phase-2 apply): guarded UPSTREAM by svc10_preflight
+    # (--service svc10) in the same play, like svc03_provision.
+    "ansible/roles/svc10_provision/tasks/main.yml",
     # svc01_provision is the SVC-01 Phase-2 APPLY mechanism (`terraform apply`),
     # guarded UPSTREAM exactly like svc07_provision: svc01_preflight (Phase 1)
     # carries the gated throwaway-guard consult before svc01_provision (Phase 2)
@@ -209,6 +216,13 @@ _PLAYBOOK_LEAF_EXEMPT = {
     # clean-slate.yml). Its guard consult is carried by mailcatcher_preflight
     # (Phase 1) and mailcatcher_clean_slate (reset branch), both role-scanned.
     "ansible/playbooks/mailcatcher-bootstrap.yml",
+    # svc-03-bootstrap.yml drives its mutations via import_role (svc03_provision's
+    # `terraform apply`, svc03_clean_slate's child clean-slate.yml); the guard
+    # consult is carried by svc03_preflight and svc03_clean_slate, both role-scanned.
+    "ansible/playbooks/svc-03-bootstrap.yml",
+    # svc-10-bootstrap.yml: mutations via import_role; guard consult carried by
+    # svc10_preflight and svc10_clean_slate, both role-scanned.
+    "ansible/playbooks/svc-10-bootstrap.yml",
     # svc-01-bootstrap.yml drives its mutations via import_role (svc01_provision's
     # `terraform apply`, svc01_clean_slate's child clean-slate.yml); its guard
     # consult is carried upstream by svc01_preflight + svc01_clean_slate (both

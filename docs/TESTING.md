@@ -124,7 +124,7 @@ only** (spec `.kiro/specs/ci-offline-gate-hardening/`).
 | `svc07b` | SVC-07 OpenBao (second half) | …`s.SLICES['svc07b']`… |
 | `svc06` | SVC-06 ZITADEL | …`s.SLICES['svc06']`… |
 | `obs` | SVC-17/18 observability | …`s.SLICES['obs']`… |
-| `svc01-09` | SVC-01 DB + SVC-09 Traefik | …`s.SLICES['svc01-09']`… |
+| `svc01-09` | SVC-01 DB, SVC-03 Garage, SVC-09 Traefik, SVC-10 DNS, mail catcher | …`s.SLICES['svc01-09']`… |
 | `core` | fast cross-cutting (discovery, slice-completeness, readme-links) | …`s.SLICES['core']`… |
 | `tfplan-a` | heavy terraform apply/destroy/idempotency | …`s.SLICES['tfplan-a']`… |
 | `tfplan-b` | terraform plan/shape/degraded | …`s.SLICES['tfplan-b']`… |
@@ -440,20 +440,16 @@ proven, not asserted.
 >      around it.
 >    - Run ONLY against a throwaway / ephemeral cluster, never shared/acceptance/prod.
 >
-> 2. OPENBAO_ADMIN_TOKEN — resolved from the cluster env file, except SVC-06 needs it exported.
+>
+> 2. OPENBAO_ADMIN_TOKEN — resolved from the cluster env file by every installer.
 >    - SVC-07's own bootstrap writes OPENBAO_ADMIN_TOKEN into .env.throwaway by name
 >      (the value is never echoed), so it is present in the cluster env file once
 >      SVC-07 has run.
->    - SVC-01 and SVC-17/18 resolve the token from the cluster env file automatically
->      (process environment first, then the cluster env file), so no manual export is
->      needed for them. If neither source has it while OpenBao is wired, SVC-01 fails
->      fast at preflight naming the var (OPENBAO_ADMIN_TOKEN).
->    - SVC-06 reads the token from the PROCESS ENV only (no cluster-env-file fallback
->      yet), so before the SVC-06 step you MUST export it from the gitignored
->      throwaway env:
->          set -a; . ./.env.throwaway; set +a
->    - If you skip the export FOR SVC-06, the ZITADEL <-> backing-Postgres credential
->      handoff silently breaks and ZITADEL crash-loops with SQLSTATE 28P01.
+>    - Every installer takes the PROCESS ENV first, then the cluster env file
+>      (WS-C45; SVC-06 joined on 2026-11-18). Do NOT keep an exported token across a
+>      SVC-07 rebuild: the stale exported value wins over the freshly written file and
+>      every OpenBao call is denied. Source the env file in a subshell if you need it:
+>          ( set -a; . ./.env.throwaway; set +a; <command> )
 >
 > 3. SDN reachability (ADR-0004) must already be satisfied.
 >    - A Proxmox SDN VLAN zone is Layer-2 only; an off-VLAN control node needs a
@@ -474,17 +470,27 @@ prerequisites are satisfied by the steps above it:
    L3 gateway every service attaches to. Skip it and every service fails at
    container start with `bridge 'p20' does not exist`.
 2. **SVC-07 (OpenBao)** — the secrets manager. Every later service stores its
-   generated credentials (DB passwords, ZITADEL masterkey, OIDC client secrets) in
-   OpenBao, so it comes up first.
-3. **SVC-09 (Traefik)** — owns the real external `edge` Docker network and TLS
-   termination. Standing it up before SVC-06 lets ZITADEL register against the real
-   ingress with its dev mocks OFF.
-4. **SVC-06 (ZITADEL)** — the identity provider. Its bootstrap internally stands up
-   its **own dedicated SVC-01 PostgreSQL backing DB** (`shared-zitadel`) as a child
-   `svc-01-bootstrap` run, and consumes OpenBao (secrets) + Traefik (ingress).
-5. **SVC-17/18 (observability)** — Prometheus / Grafana / Loki. It comes up **last**
-   because it scrapes and observes every other service (SVC-01/06/07/09) and depends
-   on SVC-07 (secrets) and SVC-09 (Traefik ingress for Grafana).
+   generated credentials in OpenBao, so it comes up first.
+3. **SVC-10 (PowerDNS)** — the platform zone `PLATFORM_DOMAIN`. SVC-08's ACME checks
+   DNS-01 records through it.
+4. **SVC-08 (internal PKI)** — the CA on SVC-07. It publishes the root and issues the
+   OpenBao listener certificates. Everything installed after it trusts the root.
+5. **SVC-07 again** — the re-run switches the primary's transit seal client and its
+   in-container CLI to verify against the root (`changed=1`, then `changed=0`).
+6. **SVC-09 (Traefik)** — owns the real `edge` network; with the root published it
+   gets the `internal` ACME resolver and serves a CA-issued wildcard from the start.
+7. **SVC-06 (ZITADEL)** — the identity provider, with its own backing SVC-01 DB.
+8. **Mail catcher**, then **SVC-03 (Garage)** — routes behind Traefik, secrets in OpenBao.
+9. **SVC-17/18 (observability)** — last of the shared services; scrapes everything above.
+   No TLS mock: Grafana's route gets the CA certificate from Traefik.
+10. **SVC-10 again** — syncs one A record per guest from every generated inventory.
+11. **A project** — `project-consumer-bootstrap.yml` (dronefleet) and its
+    `hello-workload-deploy.yml`; then SVC-10 and SVC-17/18 once more, so the project
+    guests get DNS records, exporters, log shipping and scrape targets (WS-C58).
+
+This order was proven by a from-scratch rebuild on 2026-11-18 (spec
+`.kiro/specs/svc-08-internal-pki/`, validation R1-R12). If SVC-08 is installed later on
+an existing platform instead, re-run SVC-07, SVC-09 and SVC-17/18 afterwards.
 
 **SVC-01 (PostgreSQL) has no standalone step here** — it is covered and validated by
 the dedicated backing DB that SVC-06 stands up as its child `svc-01-bootstrap` run
@@ -537,6 +543,28 @@ into the process env. For the per-step OpenBao deep-dive see the
 [Provision-then-test walkthrough](#provision-then-test-the-whole-path-in-order) above
 and the [SVC-07 install runbook](../infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md).
 
+### 2a. SVC-10 (PowerDNS), SVC-08 (internal PKI), SVC-07 re-run
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+for pb in svc-10-bootstrap.yml svc-08-bootstrap.yml svc-07-bootstrap.yml; do
+  AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
+    -i ansible/inventory/localhost.yml ansible/playbooks/$pb \
+    -e cluster_env_file=.env.throwaway || break
+done
+```
+
+Gate — OpenBao verifies against the published root:
+
+<!-- doctest: display-only -->
+```bash
+BAO_ADDR=https://10.0.20.10:8200 BAO_CACERT=.pki/platform-root-ca.pem bao status   # Sealed false
+```
+
+Depth: [SVC-10](../infra/projects/svc-10-internal-dns/INSTALL-RUNBOOK.md),
+[SVC-08](../infra/projects/svc-08-internal-pki/INSTALL-RUNBOOK.md) install runbooks.
+
 ### 3. SVC-09 (Traefik) — ingress; owns the real `edge` network
 
 <!-- doctest: requires-infra -->
@@ -567,15 +595,12 @@ Depth: [SVC-09 install runbook](../infra/projects/svc-09-reverse-proxy/INSTALL-R
 
 ### 4. SVC-06 (ZITADEL) — identity; stands up its own backing SVC-01
 
-`OPENBAO_ADMIN_TOKEN` must be in the process environment (prerequisite 2) — SVC-06
-still reads the token from the process env only — so export it from the throwaway env
-in the same shell, then run the orchestrator:
+The orchestrator resolves `OPENBAO_ADMIN_TOKEN` from the cluster env file (prerequisite 2):
 
 <!-- doctest: requires-infra -->
 <!-- cwd: . -->
 ```bash
-set -a; . ./.env.throwaway; set +a
-AGENT_LIVE_AUTHORIZED=1 OPENBAO_ADMIN_TOKEN="${OPENBAO_ADMIN_TOKEN}" ~/venv/devinfra/bin/ansible-playbook \
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
   -i ansible/inventory/localhost.yml \
   ansible/playbooks/svc-06-bootstrap.yml \
   -e cluster_env_file=.env.throwaway \
@@ -584,9 +609,7 @@ AGENT_LIVE_AUTHORIZED=1 OPENBAO_ADMIN_TOKEN="${OPENBAO_ADMIN_TOKEN}" ~/venv/devi
 
 The SVC-06 bootstrap stands up its own backing SVC-01 PostgreSQL child
 (`shared-zitadel`) as a `svc-01-bootstrap` run, with its mocks OFF against the real
-Traefik `edge` network. (If you skipped the export, the ZITADEL ↔ backing-Postgres
-credential handoff breaks and ZITADEL crash-loops with `SQLSTATE 28P01` — see
-prerequisite 2.)
+Traefik `edge` network.
 
 Gates — the backing DB accepts connections and ZITADEL's OIDC discovery answers 200
 through Traefik:
@@ -600,6 +623,18 @@ curl -sk -H 'Host: auth.platform.example.test' \
 
 Depth: [SVC-06 install runbook](../infra/projects/svc-06-identity-provider/INSTALL-RUNBOOK.md).
 
+### 4a. Mail catcher and SVC-03 (Garage)
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+for pb in mailcatcher-bootstrap.yml svc-03-bootstrap.yml; do
+  AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
+    -i ansible/inventory/localhost.yml ansible/playbooks/$pb \
+    -e cluster_env_file=.env.throwaway || break
+done
+```
+
 ### 5. SVC-17/18 (observability) — last; scrapes everything above
 
 Observability comes up last, after everything it observes is running. The orchestrator
@@ -609,19 +644,16 @@ so no manual export is required for this step:
 <!-- doctest: requires-infra -->
 <!-- cwd: . -->
 ```bash
-# optional: SVC-17/18 also resolves the token from the cluster env file
-set -a; . ./.env.throwaway; set +a
-AGENT_LIVE_AUTHORIZED=1 OPENBAO_ADMIN_TOKEN="${OPENBAO_ADMIN_TOKEN}" ~/venv/devinfra/bin/ansible-playbook \
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
   -i ansible/inventory/localhost.yml \
   ansible/playbooks/svc-17-18-bootstrap.yml \
-  -e cluster_env_file=.env.throwaway \
-  -e obs_tls_self_signed=true
+  -e cluster_env_file=.env.throwaway
 ```
 
-`obs_tls_self_signed=true` is the default-off dev stand-in (FR-14 / mock-stand-ins)
-required until an SVC-08 / Let's Encrypt CA exists — Grafana is served a self-signed
-cert via SVC-09's file provider. Without it SVC-17/18 fails **CLOSED** (it refuses to
-serve Grafana without TLS), which is correct.
+With the SVC-08 root published the installer selects the real-CA path for Grafana
+(Traefik's ACME certificate). Without SVC-08, pass `-e obs_tls_self_signed=true`
+(the default-off dev stand-in); otherwise SVC-17/18 fails **CLOSED**. Passing the mock
+while the root is published also fails closed.
 
 Gates — Grafana answers 200 through Traefik, Loki is ready, and the V1 Prometheus
 scrape set is up:
@@ -636,9 +668,34 @@ curl -s http://10.0.20.20:3100/ready                     # Loki ready (200)
 
 Depth: [SVC-17/18 install runbook](../infra/projects/svc-17-18-observability/INSTALL-RUNBOOK.md).
 
+### 6. SVC-10 re-run, then a project
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-10-bootstrap.yml -e cluster_env_file=.env.throwaway
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+  ansible/playbooks/project-consumer-bootstrap.yml -e cluster_env_file=.env.throwaway -e project_slug=dronefleet
+~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/dronefleet-workload.generated.yml \
+  ansible/playbooks/hello-workload-deploy.yml -e cluster_env_file=.env.throwaway \
+  -e project_slug=dronefleet -e hello_workload_enabled=true
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-10-bootstrap.yml -e cluster_env_file=.env.throwaway
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+  ansible/playbooks/svc-17-18-bootstrap.yml -e cluster_env_file=.env.throwaway
+```
+
+Gate — every route verifies against the root (`<domain>` = `PLATFORM_DOMAIN`):
+
+<!-- doctest: display-only -->
+```bash
+curl --cacert .pki/platform-root-ca.pem https://grafana.<domain>/   # 302, no -k
+```
+
 ### Mocks & degraded-mode
 
-Two default-off dev stand-ins appear above. Both exist only to let a service come up
+Two default-off dev stand-ins are relevant here (only the first is used in the chain above). Both exist only to let a service come up
 before its real dependency does; both **fail CLOSED when off and the real dependency
 is absent** — by design, so a misconfiguration surfaces loudly rather than silently
 degrading to no-auth or no-TLS:
@@ -646,48 +703,36 @@ degrading to no-auth or no-TLS:
 | Mock flag | Service | Stand-in behaviour (when `true`) | Flips to real when |
 |---|---|---|---|
 | `traefik_dashboard_auth_disabled=true` | SVC-09 | Dashboard served without forward-auth (internal-only on VLAN 20) | SVC-06 forward-auth is wired (flag back to its default `false`) |
-| `obs_tls_self_signed=true` | SVC-17/18 | Grafana served a self-signed cert via SVC-09's file provider | an SVC-08 / Let's Encrypt CA exists (flag back to its default `false`) |
+| `obs_tls_self_signed=true` | SVC-17/18 | Grafana served a self-signed cert via SVC-09's file provider | not needed once SVC-08 publishes the root; set together with the root it fails closed |
 
 In production both flags stay at their default (`false`): Traefik owns real TLS + the
 real `edge` network, and the real dependencies are present.
 
 ### Teardown (reverse order)
 
-Tear everything down in reverse dependency order, each service via its own
-clean-slate contract (`-e clean_slate=true -e clean_slate_confirm=force`). Services
-that must SSH to the Proxmox host for `pct` destruction take `-e svcNN_proxmox_host=…`;
-SVC-06 additionally needs its guest VMID:
+Tear projects down first with their own clean-slate, then let the platform clean-slate
+discover every shared service (its `platform_clean_slate_services` catalog, SVC-08
+included) and run each one's own clean-slate in turn before the fabric:
 
 <!-- doctest: requires-infra -->
 <!-- cwd: . -->
 ```bash
-# 5 -> 1: SVC-17/18, then SVC-06 (+ its backing DB), SVC-09, SVC-07, platform.
-AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
-  -i ansible/inventory/localhost.yml \
-  ansible/playbooks/svc-17-18-bootstrap.yml \
-  -e cluster_env_file=.env.throwaway -e clean_slate=true -e clean_slate_confirm=force
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+  ansible/playbooks/project-consumer-bootstrap.yml -e cluster_env_file=.env.throwaway \
+  -e clean_slate=true -e clean_slate_confirm=force -e project_slug=dronefleet \
+  -e consumer_proxmox_host=<proxmox-lan-ip> -e consumer_workload_vmid=100001
 
-AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
-  -i ansible/inventory/localhost.yml \
-  ansible/playbooks/svc-06-bootstrap.yml \
-  -e cluster_env_file=.env.throwaway -e clean_slate=true -e clean_slate_confirm=force \
-  -e svc06_zitadel_vmid=1103 -e svc06_proxmox_host=<proxmox-lan-ip>
-
-AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
-  -i ansible/inventory/localhost.yml \
-  ansible/playbooks/svc-09-bootstrap.yml \
-  -e cluster_env_file=.env.throwaway -e clean_slate=true -e clean_slate_confirm=force
-
-AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
-  -i ansible/inventory/localhost.yml \
-  ansible/playbooks/svc-07-bootstrap.yml \
-  -e cluster_env_file=.env.throwaway -e clean_slate=true -e clean_slate_confirm=force
-
-AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook \
-  -i ansible/inventory/localhost.yml \
-  ansible/playbooks/platform-bootstrap.yml \
-  -e cluster_env_file=.env.throwaway -e clean_slate=true -e clean_slate_confirm=force
+AGENT_LIVE_AUTHORIZED=1 ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/localhost.yml \
+  ansible/playbooks/platform-bootstrap.yml -e cluster_env_file=.env.throwaway \
+  -e clean_slate=true -e clean_slate_confirm=force \
+  -e platform_clean_slate_proxmox_host=<proxmox-lan-ip> -e platform_clean_slate_reboot=true \
+  -e platform_clean_slate_remove_zone_occupants=true
 ```
+
+`platform_clean_slate_remove_zone_occupants=true` removes project VNets (here `p100`)
+that the consumer clean-slate leaves in the zone; it only removes VNets with no guest
+attached. Without it the platform teardown halts with that remedy. A single service can
+still be reset on its own with its bootstrap's `-e clean_slate=true -e clean_slate_confirm=force`.
 
 End-state gate — no service guests survive and every root's Terraform state is empty:
 

@@ -1,0 +1,103 @@
+---
+# tasks/main.yml — svc08_preflight (SVC-08 Phase 1). Option B has no guest: preflight proves
+# SVC-07 is up and unsealed, the admin token works, and SVC-10 exists (R15). Fails closed with the
+# remedy naming the missing installer; nothing is changed.
+- name: "Preflight | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc08_venv_python }}"
+      - "{{ svc08_throwaway_guard }}"
+      - --service
+      - svc08
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ svc08_throwaway_allowlist }}"
+  args:
+    chdir: "{{ svc08_repo_root }}"
+  register: svc08_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+- name: "Preflight | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (svc08_throwaway_decision.stdout | default('{}') | from_json).reason | default('no decision') }}
+  when: agent_live_run | default(false) | bool
+- name: "Preflight | Refuse the run unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "svc08_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live run REFUSED by the throwaway-cluster guard:
+      {{ (svc08_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      Nothing was changed.
+  when: agent_live_run | default(false) | bool
+
+- name: "Preflight | Slurp the cluster env file for the OpenBao admin token (no_log)"
+  ansible.builtin.slurp:
+    src: >-
+      {{ (svc08_repo_root ~ '/' ~ cluster_env_file) if (cluster_env_file is not match('^/')) else cluster_env_file }}
+  register: svc08_env_slurp
+  no_log: true
+- name: "Preflight | Resolve the OpenBao admin token (process env first, else the cluster env file) (no_log)"
+  ansible.builtin.set_fact:
+    pki_ca_admin_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         if ((lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim) | length > 0)
+         else ((svc08_env_slurp.content | b64decode
+                | regex_findall('(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*[\"\']?([^\"\'\r\n]*?)[\"\']?[ \t]*$')
+                | first | default('') | trim)) }}
+  no_log: true
+- name: "Preflight | Fail closed when no OpenBao admin token is resolvable"
+  ansible.builtin.assert:
+    that:
+      - (pki_ca_admin_token | default('') | length) > 0
+    fail_msg: >-
+      SVC-08 configures the PKI engine on SVC-07 and needs the OpenBao admin token. None was found in the
+      environment or in {{ cluster_env_file }}. Remedy: run ansible/playbooks/svc-07-bootstrap.yml
+      (with -e openbao_mint_admin_token=true). Nothing was changed.
+    quiet: true
+
+- name: "Preflight | SVC-10 (internal DNS) must exist: ACME DNS-01 and resolver depend on it (R15)"
+  ansible.builtin.stat:
+    path: "{{ svc08_repo_root }}/{{ svc08_dns_inventory }}"
+  register: svc08_dns_stat
+- name: "Preflight | Fail closed naming the missing prerequisite"
+  ansible.builtin.assert:
+    that:
+      - svc08_dns_stat.stat.exists
+    fail_msg: >-
+      SVC-10 (internal DNS) is not installed ({{ svc08_dns_inventory }} is missing). SVC-08's ACME needs it.
+      Remedy: ansible/playbooks/svc-10-bootstrap.yml. Nothing was changed.
+    quiet: true
+
+- name: "Preflight | OpenBao status on the primary (unauthenticated)"
+  ansible.builtin.include_role:
+    name: pki_ca
+    tasks_from: bao.yml
+  vars:
+    pki_bao_args: [status, -format=json]
+    pki_bao_allow_fail: true
+- name: "Preflight | Classify SVC-07 readiness (non-secret)"
+  ansible.builtin.set_fact:
+    svc08_openbao_ready: >-
+      {{ (pki_bao_result.stdout | default('{}') | from_json).initialized | default(false)
+         and not (pki_bao_result.stdout | default('{}') | from_json).sealed | default(true) }}
+- name: "Preflight | Fail closed when SVC-07 is not initialized and unsealed"
+  ansible.builtin.assert:
+    that:
+      - svc08_openbao_ready | bool
+    fail_msg: >-
+      OpenBao on {{ pki_ca_cli_host }} is not initialized and unsealed
+      (status rc {{ pki_bao_result.rc | default('n/a') }}).
+      Remedy: ansible/playbooks/svc-07-bootstrap.yml. Nothing was changed.
+    quiet: true
+- name: "Preflight | The admin token must work (token lookup, no_log)"
+  ansible.builtin.include_role:
+    name: pki_ca
+    tasks_from: bao.yml
+  vars:
+    pki_bao_args: [token, lookup, -format=json]

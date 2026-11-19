@@ -1,0 +1,103 @@
+---
+# tasks/admin_firewall.yml — garage_install (SVC-03 WS-C53)
+#
+# Restricts the admin API (container port garage_admin_port) to
+# garage_admin_allowed_sources with a DOCKER-USER jump to the GARAGE-ADMIN chain,
+# applied by a systemd oneshot unit so it survives reboots and Docker restarts.
+# Disabled (garage_admin_firewall_enabled=false) removes chain, jump and unit.
+
+- name: "Firewall | Install the admin-API firewall script"
+  ansible.builtin.template:
+    src: garage-admin-firewall.sh.j2
+    dest: /usr/local/sbin/garage-admin-firewall
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart garage admin firewall
+  when: garage_admin_firewall_enabled | bool
+
+- name: "Firewall | Install the admin-API firewall unit"
+  ansible.builtin.template:
+    src: garage-admin-firewall.service.j2
+    dest: /etc/systemd/system/garage-admin-firewall.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart garage admin firewall
+  when: garage_admin_firewall_enabled | bool
+
+- name: "Firewall | Enable and start the admin-API firewall unit"
+  ansible.builtin.systemd_service:
+    name: garage-admin-firewall.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: garage_admin_firewall_enabled | bool
+
+- name: "Firewall | Apply a changed script or unit now"
+  ansible.builtin.meta: flush_handlers
+
+- name: "Firewall | VERIFY — the DOCKER-USER jump to GARAGE-ADMIN is present (R4)"
+  ansible.builtin.command:
+    argv:
+      - iptables
+      - -C
+      - DOCKER-USER
+      - -p
+      - tcp
+      - -m
+      - conntrack
+      - --ctorigdstport
+      - "{{ garage_admin_port }}"
+      - --ctdir
+      - ORIGINAL
+      - -j
+      - GARAGE-ADMIN
+  register: garage_admin_fw_check
+  changed_when: false
+  failed_when: false
+  when: garage_admin_firewall_enabled | bool
+
+- name: "Firewall | Fail closed when the admin-API firewall is not in place"
+  ansible.builtin.assert:
+    that:
+      - (garage_admin_fw_check.rc | default(1)) == 0
+    fail_msg: >-
+      The admin-API firewall jump is missing on {{ inventory_hostname }} after applying it.
+      Inspect `systemctl status garage-admin-firewall` and `iptables -S DOCKER-USER` on the guest.
+    success_msg: "Admin API {{ garage_admin_port }} limited to {{ garage_admin_allowed_sources | join(', ') }}."
+    quiet: true
+  when: garage_admin_firewall_enabled | bool
+
+# --- Opt-out: remove everything (R6) ---------------------------------------------------
+- name: "Firewall | Stat the unit (opt-out path)"
+  ansible.builtin.stat:
+    path: /etc/systemd/system/garage-admin-firewall.service
+  register: garage_admin_fw_unit
+  when: not (garage_admin_firewall_enabled | bool)
+
+- name: "Firewall | Stop and disable the unit (opt-out path)"
+  ansible.builtin.systemd_service:
+    name: garage-admin-firewall.service
+    enabled: false
+    state: stopped
+  when:
+    - not (garage_admin_firewall_enabled | bool)
+    - garage_admin_fw_unit.stat.exists | default(false)
+
+- name: "Firewall | Remove the chain and the jump (opt-out path)"
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/garage-admin-firewall, remove]
+  changed_when: true
+  when:
+    - not (garage_admin_firewall_enabled | bool)
+    - garage_admin_fw_unit.stat.exists | default(false)
+
+- name: "Firewall | Remove the unit and the script (opt-out path)"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/garage-admin-firewall.service
+    - /usr/local/sbin/garage-admin-firewall
+  when: not (garage_admin_firewall_enabled | bool)

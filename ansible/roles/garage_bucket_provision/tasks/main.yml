@@ -1,0 +1,28 @@
+---
+# tasks/main.yml — garage_bucket_provision (SVC-03; consumer-object-storage D2)
+#
+# One onboarder, two actions, so the reversal lives next to the creation:
+#   garage_bp_action=provision (default) — tasks/provision.yml
+#   garage_bp_action=teardown            — tasks/teardown.yml (destroys the project's buckets, key and OpenBao entry)
+#   garage_bp_action=rotate              — tasks/rotate.yml (replaces the project key, WS-C55)
+- name: "Bucket provision | Validate the action"
+  ansible.builtin.assert:
+    that:
+      - garage_bp_action in ['provision', 'teardown', 'rotate']
+    fail_msg: >-
+      garage_bp_action must be 'provision', 'teardown' or 'rotate', got '{{ garage_bp_action }}'.
+      Nothing was changed.
+    quiet: true
+  run_once: true
+
+- name: "Bucket provision | Provision the project's buckets and key"
+  ansible.builtin.include_tasks: provision.yml
+  when: garage_bp_action == 'provision'
+
+- name: "Bucket provision | Tear down the project's buckets, key and OpenBao entry"
+  ansible.builtin.include_tasks: teardown.yml
+  when: garage_bp_action == 'teardown'
+
+- name: "Bucket provision | Rotate the project's key"
+  ansible.builtin.include_tasks: rotate.yml
+  when: garage_bp_action == 'rotate'

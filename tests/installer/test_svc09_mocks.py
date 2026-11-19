@@ -197,7 +197,7 @@ def test_catalogue_has_both_new_mock_rows():
 def test_svc07_mocks_preserved_unchanged():
     """Non-negotiable: SVC-07's existing mocks must remain catalogued (never removed)."""
     text = _CATALOGUE.read_text(encoding="utf-8")
-    assert "Mock 1 — self-signed TLS cert (stand-in for SVC-08 / EJBCA)" in text, (
+    assert "Mock 1 — self-signed TLS cert (stand-in for SVC-08 / OpenBao CA)" in text, (
         "SVC-07 Mock 1 (openbao_tls_self_signed) must remain in the catalogue — mocks are permanent"
     )
     assert "Mock 2 — placeholder `edge` network (stand-in for SVC-09 / Traefik)" in text, (

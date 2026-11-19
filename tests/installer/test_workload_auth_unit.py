@@ -191,3 +191,17 @@ def test_render_agent_hcl_requires_non_empty_mappings():
     )
     with pytest.raises(ValidationError):
         render_agent_hcl(cfg)
+
+
+def test_ca_cert_line_only_when_set_and_not_skipping():
+    """SVC-08 WS-C60: ca_cert is emitted iff set and tls_skip_verify is false; default output unchanged."""
+    import dataclasses
+
+    base = dataclasses.replace(_golden_config(), tls_skip_verify=False)
+    assert "ca_cert" not in render_agent_hcl(base)
+    with_ca = dataclasses.replace(base, ca_cert="/openbao/agent/rendered/platform-root-ca.pem")
+    out = render_agent_hcl(with_ca)
+    assert '  ca_cert = "/openbao/agent/rendered/platform-root-ca.pem"' in out
+    assert out.index("ca_cert") < out.index("retry")
+    both = dataclasses.replace(with_ca, tls_skip_verify=True)
+    assert "ca_cert" not in render_agent_hcl(both) and "tls_skip_verify = true" in render_agent_hcl(both)

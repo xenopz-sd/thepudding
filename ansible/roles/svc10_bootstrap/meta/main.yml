@@ -1,0 +1,14 @@
+---
+# meta/main.yml — svc10_bootstrap (SVC-10 DNS installer — Phase 3)
+galaxy_info:
+  role_name: svc10_bootstrap
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-10 DNS installer Phase 3 — host hardening & service bootstrap:
+    PowerDNS API key from OpenBao (generated once), common baseline child run
+    (Docker + Compose), the pdns.yml configurator child run, and the zone's A
+    records reconciled from the generated inventories (dns_records_sync).
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

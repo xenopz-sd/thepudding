@@ -1,0 +1,177 @@
+---
+# tasks/layout.yml — garage_install (SVC-03): cluster join + layout (R2)
+#
+# Runs ONCE (run_once on the first Garage guest) after every node is up. All calls
+# use `garage json-api` inside the container: it proxies the admin API over the
+# local RPC, so no token travels on the wire or on argv.
+#
+# Idempotent: a node already holding a role is left untouched, and the layout is
+# applied ONLY when at least one node lacks a role (a re-run reports no change).
+# Each step gates on a real polled signal (P3): all nodes connected before the
+# layout is touched, cluster health "healthy" after it is applied.
+
+- name: "Layout | Collect every node's id@addr from the play hosts"
+  ansible.builtin.set_fact:
+    garage_layout_peers: >-
+      {{ ansible_play_hosts | map('extract', hostvars, 'garage_node_id_full') | list }}
+    garage_layout_hosts: "{{ ansible_play_hosts }}"
+  run_once: true
+
+- name: "Layout | Fail closed unless all expected nodes are in the play"
+  ansible.builtin.assert:
+    that:
+      - (garage_layout_peers | length) == (garage_expected_nodes | int)
+    fail_msg: >-
+      The Garage layout needs {{ garage_expected_nodes }} nodes but the play holds
+      {{ garage_layout_peers | length }} ({{ garage_layout_hosts | join(', ') }}).
+      Check the generated inventory (group `garage`).
+    quiet: true
+  run_once: true
+
+# `node connect` is safe to repeat: an already-connected peer is a no-op.
+- name: "Layout | Connect the first node to every peer"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - node
+      - connect
+      - "{{ item }}"
+  loop: "{{ garage_layout_peers[1:] }}"
+  run_once: true
+  changed_when: false
+
+- name: "Layout | Wait until every node is connected (GetClusterStatus)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - GetClusterStatus
+  register: garage_status_run
+  run_once: true
+  changed_when: false
+  failed_when: false
+  until: >-
+    (garage_status_run.rc | default(1)) == 0
+    and ((garage_status_run.stdout | from_json).nodes
+         | selectattr('isUp') | list | length) >= (garage_expected_nodes | int)
+  retries: "{{ garage_ready_retries | int }}"
+  delay: "{{ garage_ready_delay | int }}"
+
+- name: "Layout | Assert every node is connected"
+  ansible.builtin.assert:
+    that:
+      - (garage_status_run.rc | default(1)) == 0
+      - >-
+        ((garage_status_run.stdout | from_json).nodes
+         | selectattr('isUp') | list | length) >= (garage_expected_nodes | int)
+    fail_msg: >-
+      Not all {{ garage_expected_nodes }} Garage nodes connected within
+      {{ (garage_ready_retries | int) * (garage_ready_delay | int) }} s. RPC 3901 must
+      be reachable between the guests on VLAN 20, and all nodes must share the RPC
+      secret. Output: {{ garage_status_run.stdout | default('') | truncate(400) }}
+    quiet: true
+  run_once: true
+
+- name: "Layout | Read the current cluster layout"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - GetClusterLayout
+  register: garage_layout_run
+  run_once: true
+  changed_when: false
+
+- name: "Layout | Compute the nodes that still lack a storage role"
+  ansible.builtin.set_fact:
+    garage_layout_current: "{{ garage_layout_run.stdout | from_json }}"
+    garage_layout_missing: >-
+      {{ garage_layout_peers | map('split', '@') | map('first') | list
+         | difference(
+             ((garage_layout_run.stdout | from_json).roles | map(attribute='id') | list)
+             + ((garage_layout_run.stdout | from_json).stagedRoleChanges | map(attribute='id') | list)) }}
+  run_once: true
+
+- name: "Layout | INFO — layout decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO garage layout: version {{ garage_layout_current.version }},
+      {{ garage_layout_current.roles | length }} node(s) with a role;
+      {{ ('assigning ' ~ (garage_layout_missing | length) ~ ' node(s) to zone '
+          ~ garage_zone ~ ' with ' ~ garage_node_capacity_gb ~ ' GB each')
+         if (garage_layout_missing | length) > 0 else 'no change' }}
+  run_once: true
+
+- name: "Layout | Stage storage roles for the nodes without one"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - UpdateClusterLayout
+      - >-
+        {{ {'roles': garage_layout_missing | map('community.general.dict_kv', 'id') | map('combine',
+             {'zone': garage_zone, 'capacity': (garage_node_capacity_gb | int) * 1000000000, 'tags': []})
+             | list} | to_json }}
+  run_once: true
+  register: garage_layout_update
+  changed_when: true
+  when: (garage_layout_missing | length) > 0
+
+- name: "Layout | Apply the staged layout (version + 1)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - ApplyClusterLayout
+      - "{{ {'version': (garage_layout_current.version | int) + 1} | to_json }}"
+  run_once: true
+  changed_when: true
+  when: (garage_layout_missing | length) > 0
+
+- name: "Layout | Wait until the cluster reports healthy (GetClusterHealth)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - GetClusterHealth
+  register: garage_health_run
+  run_once: true
+  changed_when: false
+  failed_when: false
+  until: >-
+    (garage_health_run.rc | default(1)) == 0
+    and (garage_health_run.stdout | from_json).status == 'healthy'
+    and ((garage_health_run.stdout | from_json).storageNodesUp | int) >= (garage_expected_nodes | int)
+  retries: "{{ garage_ready_retries | int }}"
+  delay: "{{ garage_ready_delay | int }}"
+
+- name: "Layout | Assert the cluster is healthy with every storage node up"
+  ansible.builtin.assert:
+    that:
+      - (garage_health_run.rc | default(1)) == 0
+      - (garage_health_run.stdout | from_json).status == 'healthy'
+    fail_msg: >-
+      The Garage cluster did not report healthy within
+      {{ (garage_ready_retries | int) * (garage_ready_delay | int) }} s:
+      {{ garage_health_run.stdout | default('') | truncate(400) }}
+    success_msg: "Garage cluster healthy: {{ garage_health_run.stdout | default('') | from_json }}"
+    quiet: true
+  run_once: true

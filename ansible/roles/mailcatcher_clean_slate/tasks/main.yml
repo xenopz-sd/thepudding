@@ -141,7 +141,7 @@
   loop_control:
     label: "{{ item.name }} (vmid {{ item.vmid }})"
   register: mailcatcher_clean_slate_runs
-  changed_when: "'changed=0' not in (mailcatcher_clean_slate_runs.stdout | default(''))"
+  changed_when: "(mailcatcher_clean_slate_runs.stdout | default('')) is search('changed=[1-9]')"
 
 # ---- Remove the delegated web-UI Route_Fragment from the Traefik guest ---------
 # The catcher guest is now destroyed. The Route_Fragment it delegated onto the

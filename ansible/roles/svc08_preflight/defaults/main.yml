@@ -1,0 +1,4 @@
+---
+# defaults/main.yml — svc08_preflight (SVC-08 Phase 1). No secret values.
+svc08_dns_inventory: ansible/inventory/svc-10-internal-dns.generated.yml
+svc08_openbao_inventory: ansible/inventory/svc-07-secrets-manager.generated.yml

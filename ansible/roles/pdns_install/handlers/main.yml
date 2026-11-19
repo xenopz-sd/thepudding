@@ -1,0 +1,26 @@
+---
+# handlers/main.yml — pdns_install
+#
+# Both servers read their config only at start, so a changed config recreates the
+# container (the zone database lives in the pdns-data volume and survives).
+- name: Restart pdns auth
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ pdns_stack_name }}"
+    project_name: "{{ pdns_stack_name }}"
+    services: [auth]
+    state: present
+    recreate: always
+
+- name: Restart pdns recursor
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ pdns_stack_name }}"
+    project_name: "{{ pdns_stack_name }}"
+    services: [recursor]
+    state: present
+    recreate: always
+
+- name: Restart pdns api firewall
+  ansible.builtin.systemd_service:
+    name: pdns-api-firewall.service
+    state: restarted
+    daemon_reload: true

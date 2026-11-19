@@ -1,0 +1,351 @@
+---
+# tasks/main.yml — svc03_clean_slate (SVC-03 Garage installer — clean-slate branch)
+#
+# Clone of svc07_clean_slate adapted for the three Garage guests. The enclosing
+# `when: clean_slate` gate and the block/rescue phase-naming stay in the thin
+# orchestrator play; this role owns the branch BODY only:
+#   - agent-live throwaway-guard consult (FIRST, gated, fail-closed),
+#   - confirmation gating (pause 300s unless clean_slate_confirm=force),
+#   - independent cluster_env.py node-name resolution (no_log),
+#   - Proxmox-host-address assertion,
+#   - three-target assembly (the Garage LXC vmids),
+#   - child clean-slate.yml run (invoking the generic terraform_clean_slate role
+#     — does NOT reimplement destroy logic),
+#   - two-way empty-baseline verification gate (pct list + terraform state list).
+
+# --- Agent-live throwaway-cluster authorization gate (FIRST, gated) ----------
+- name: "Clean-Slate | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc03_venv_python }}"
+      - "{{ svc03_throwaway_guard }}"
+      - --service
+      - svc03
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ svc03_throwaway_allowlist }}"
+  args:
+    chdir: "{{ svc03_repo_root }}"
+  register: svc03_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (svc03_throwaway_decision.stdout | default('{}') | from_json).reason | default('no decision') }}
+  when: agent_live_run | default(false) | bool
+
+- name: "Clean-Slate | Refuse the reset unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "svc03_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live clean-slate REFUSED by the throwaway-cluster guard:
+      {{ (svc03_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      No container was destroyed and no Terraform state was modified. Arm the run
+      only against a throwaway cluster listed in throwaway-clusters.yml with
+      AGENT_LIVE_AUTHORIZED set.
+    success_msg: "Throwaway-cluster guard AUTHORIZED the agent-live clean-slate."
+  when: agent_live_run | default(false) | bool
+
+# --- Confirmation gating -----------------------------------------------------
+- name: "Clean-Slate | Prompt for explicit confirmation (300s timeout; skipped on force)"
+  ansible.builtin.pause:
+    prompt: >-
+      DESTRUCTIVE Clean-Slate reset of SVC-03 Garage requested. This will pct-destroy
+      the three Garage containers ({{ svc03_vmids | join(', ') }}) and ALL object
+      data on their data volumes, and remove them from Terraform state. Type 'yes' to proceed, anything else to abort
+  register: svc03_clean_slate_prompt
+  when: (clean_slate_confirm | default('')) != 'force'
+
+- name: "Clean-Slate | Resolve whether the reset is confirmed"
+  ansible.builtin.set_fact:
+    svc03_clean_slate_confirmed: >-
+      {{ (clean_slate_confirm | default('')) == 'force'
+         or ((svc03_clean_slate_prompt.user_input | default('') | trim | lower) in ['yes', 'y']) }}
+
+- name: "Clean-Slate | Abort with non-zero exit when not confirmed (destroys nothing)"
+  ansible.builtin.fail:
+    msg: >-
+      Clean-Slate reset ABORTED — confirmation was not given (received a
+      non-affirmative or empty/timed-out response). No container was destroyed
+      and no Terraform state was modified. Re-run with an affirmative 'yes' at the
+      prompt, or pass -e clean_slate_confirm=force to skip the prompt.
+  when: not (svc03_clean_slate_confirmed | bool)
+
+# --- Delegated reset + verification gate -------------------------------------
+# Phase 1 does NOT run on a clean-slate invocation, so proxmox_node_name is not
+# resolved by preflight. Resolve it independently from the same cluster env.
+- name: "Clean-Slate | Resolve cluster env for the Proxmox node name ({{ cluster_env_file }})"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc03_venv_python }}"
+      - "{{ svc03_cluster_env_helper }}"
+      - "--env-file"
+      - "{{ cluster_env_file }}"
+  args:
+    chdir: "{{ svc03_repo_root }}"
+  register: svc03_cs_env_resolve
+  changed_when: false
+  no_log: true
+
+- name: "Clean-Slate | Bind the resolved Proxmox node name (no_log)"
+  ansible.builtin.set_fact:
+    proxmox_node_name: "{{ (svc03_cs_env_resolve.stdout | from_json)['TF_VAR_proxmox_node_name'] }}"
+  no_log: true
+
+- name: "Clean-Slate | Assert the Proxmox host SSH address was supplied"
+  ansible.builtin.assert:
+    that:
+      - "svc03_proxmox_host is defined"
+      - "(svc03_proxmox_host | trim | length) > 0"
+    fail_msg: >-
+      The Clean-Slate reset delegates to clean-slate.yml against the Proxmox-host
+      inventory ({{ svc03_proxmox_host_inventory }}), which runs `pct` on the node
+      over SSH. Supply the real Proxmox LAN IP with
+      -e svc03_proxmox_host=<real-proxmox-lan-ip>. Nothing was destroyed.
+    success_msg: "Proxmox host SSH address supplied for the reset."
+
+- name: "Clean-Slate | Assemble the three SVC-03 Garage clean_slate_targets"
+  ansible.builtin.set_fact:
+    svc03_clean_slate_targets: >-
+      {{ svc03_clean_slate_targets | default([]) + [{
+           'name': 'svc03-20-0' ~ (idx + 1),
+           'terraform_root': 'infra/projects/svc-03-object-storage',
+           'resource_address': 'proxmox_virtual_environment_container.node' ~ (idx + 1),
+           'node': proxmox_node_name,
+           'vmid': item }] }}
+  loop: "{{ svc03_vmids }}"
+  loop_control:
+    index_var: idx
+
+- name: "Clean-Slate | Delegate the reset to clean-slate.yml (one child run per target)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc03_proxmox_host_inventory }}"
+      - ansible/playbooks/clean-slate.yml
+      - --extra-vars
+      - "ansible_host={{ svc03_proxmox_host }}"
+      - -e
+      - clean_slate_enabled=true
+      - -e
+      - "clean_slate_confirm={{ item.vmid }}"
+      - -e
+      - "{{ {'clean_slate_targets': [item]} | to_json }}"
+  args:
+    chdir: "{{ svc03_repo_root }}"
+  loop: "{{ svc03_clean_slate_targets }}"
+  loop_control:
+    label: "{{ item.name }} (vmid {{ item.vmid }})"
+  register: svc03_clean_slate_runs
+  changed_when: "(svc03_clean_slate_runs.stdout | default('')) is search('changed=[1-9]')"
+
+# ---- Remove the delegated S3 Route_Fragment from the Traefik guest ---------
+# The catcher guest is now destroyed. The Route_Fragment it delegated onto the
+# Traefik guest's watched file-provider dir (garage-s3-route.yml) must ALSO be
+# removed, or Traefik keeps a dangling route to the freed VLAN-20 IP (10.0.20.22).
+# This is a TRAEFIK-GUEST-SIDE cleanup (P1/P2): the clean-slate runs in the
+# `hosts: localhost` orchestrator play, which has NO add_host and NO known_hosts
+# entry for the Traefik guest, so a bare delegate_to an IP would have no working SSH
+# connection and a `failed_when: false` would report a FALSE "already absent". So:
+# reconcile known_hosts, add_host with connection vars, gate on reachability (a full
+# teardown may have removed Traefik already), and keep a REAL failure condition.
+- name: "Clean-Slate | Ensure ~/.ssh exists (0700) for the Traefik guest known_hosts reconcile"
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/.ssh"
+    state: directory
+    mode: "0700"
+- name: "Clean-Slate | Remove any stale known_hosts fingerprint for the Traefik guest"
+  ansible.builtin.command:
+    argv:
+      - ssh-keygen
+      - -R
+      - "{{ svc03_traefik_guest_host }}"
+      - -f
+      - "{{ ansible_env.HOME }}/.ssh/known_hosts"
+  register: svc03_traefik_knownhosts_purge
+  changed_when: "'updated' in (svc03_traefik_knownhosts_purge.stderr | default(''))"
+  failed_when: false
+- name: "Clean-Slate | ssh-keyscan the Traefik guest (30s; tolerant of a torn-down guest)"
+  ansible.builtin.command:
+    argv:
+      - ssh-keyscan
+      - -T
+      - "30"
+      - "{{ svc03_traefik_guest_host }}"
+  register: svc03_traefik_keyscan
+  changed_when: false
+  failed_when: false
+- name: "Clean-Slate | Resolve whether the Traefik guest is reachable (keyscan succeeded)"
+  ansible.builtin.set_fact:
+    svc03_traefik_reachable: >-
+      {{ (svc03_traefik_keyscan.rc | default(1)) == 0
+         and ((svc03_traefik_keyscan.stdout | default('') | trim | length) > 0) }}
+- name: "Clean-Slate | Append the Traefik guest host key to known_hosts (only when reachable)"
+  ansible.builtin.blockinfile:
+    path: "{{ ansible_env.HOME }}/.ssh/known_hosts"
+    create: true
+    mode: "0600"
+    marker: "# {mark} svc03 clean-slate Traefik guest key for {{ svc03_traefik_guest_host }}"
+    block: "{{ svc03_traefik_keyscan.stdout }}"
+  when: svc03_traefik_reachable | bool
+- name: "Clean-Slate | Register the Traefik guest for the orchestrator-context delegation"
+  ansible.builtin.add_host:
+    name: svc03-traefik-route-cleanup
+    ansible_host: "{{ svc03_traefik_guest_host }}"
+    ansible_user: "{{ svc03_traefik_guest_user | default('root') }}"
+    ansible_python_interpreter: "{{ svc03_traefik_guest_python | default('/usr/bin/python3') }}"
+    ansible_connection: ssh
+  changed_when: false
+  when: svc03_traefik_reachable | bool
+- name: "Clean-Slate | Remove the delegated S3 Route_Fragment from the Traefik guest"
+  ansible.builtin.file:
+    path: "{{ svc03_traefik_dynamic_config_dir }}/garage-s3-route.yml"
+    state: absent
+  delegate_to: svc03-traefik-route-cleanup
+  register: svc03_route_removed
+  when: svc03_traefik_reachable | default(true) | bool
+  failed_when:
+    - svc03_route_removed is failed
+    - "'unreachable' not in (svc03_route_removed.msg | default('') | lower)"
+- name: "Clean-Slate | INFO — S3 Route_Fragment removal outcome"
+  ansible.builtin.debug:
+    msg: >-
+      {{ ('SVC-03 S3 Route_Fragment removal SKIPPED: the Traefik guest is unreachable '
+          ~ '(full teardown — the fragment dies with that guest).')
+         if not (svc03_traefik_reachable | bool)
+         else 'SVC-03 S3 Route_Fragment removed (or already absent) from the Traefik guest.' }}
+  changed_when: false
+
+# ---- Verification gate (empty baseline, two ways) ---------------------------
+- name: "Clean-Slate | VERIFY — list any surviving SVC-03 Garage container on the host (pct list)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible"
+      - proxmox
+      - -i
+      - "{{ svc03_proxmox_host_inventory }}"
+      - --extra-vars
+      - "ansible_host={{ svc03_proxmox_host }}"
+      - -m
+      - ansible.builtin.command
+      - -a
+      - "pct list"
+  args:
+    chdir: "{{ svc03_repo_root }}"
+  register: svc03_pct_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the set of surviving SVC-03 Garage container VMIDs"
+  ansible.builtin.set_fact:
+    svc03_surviving_vmids: >-
+      {{ svc03_vmids | map('string')
+         | select('in', (svc03_pct_list.stdout | default('')))
+         | list }}
+
+# Zero RESOURCES of ANY kind in the SVC-03 Garage Terraform state. The child
+# clean-slate.yml run above already `pct destroy`'d the Garage guests and
+# `terraform state rm`'d its container address. But the SVC-03 Garage root also carries
+# NON-guest `terraform_data` book-keeping resources that manage no live Proxmox
+# object — the root-level ledger-drift guard (`terraform_data.ledger_index_assert`)
+# and `module.svc03.terraform_data.input_guards` — which the container-only
+# state rm leaves behind (the residue bug, spec
+# fix-svc07-clean-slate-terraform-data-residue). A correct clean-slate must leave
+# `terraform state list` EMPTY. So, PROVIDER-FREE, enumerate every remaining
+# ADDRESS and `terraform state rm` it (NOT `terraform destroy` — that would
+# contact the provider and risk a hang / stale lock, Req 2.5). All ops run on
+# the CONTROL NODE (state lives there).
+- name: "Clean-Slate | List ALL remaining addresses in the SVC-03 Garage Terraform state (residue sweep)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+  args:
+    chdir: "{{ svc03_tf_root }}"
+  register: svc03_residual_state_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the residual (non-guest terraform_data) addresses to remove"
+  ansible.builtin.set_fact:
+    svc03_residual_state_addrs: >-
+      {{ (svc03_residual_state_list.stdout | default('')).splitlines()
+         | map('trim') | select('ne', '') | list }}
+
+- name: "Clean-Slate | Remove ALL remaining state addresses provider-free (terraform state rm)"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - rm
+      - "{{ item }}"
+  args:
+    chdir: "{{ svc03_tf_root }}"
+  loop: "{{ svc03_residual_state_addrs }}"
+  loop_control:
+    label: "{{ item }}"
+  register: svc03_residual_state_rm
+  changed_when: "'Removed' in (svc03_residual_state_rm.stdout | default(''))"
+  failed_when:
+    - (svc03_residual_state_rm.rc | default(1)) != 0
+    - "'No matching objects' not in (svc03_residual_state_rm.stdout | default(''))"
+    - "'No matching objects' not in (svc03_residual_state_rm.stderr | default(''))"
+
+- name: "Clean-Slate | VERIFY — list the FULL SVC-03 Garage Terraform state after the residue sweep"
+  ansible.builtin.command:
+    argv:
+      - terraform
+      - state
+      - list
+  args:
+    chdir: "{{ svc03_tf_root }}"
+  register: svc03_state_list
+  changed_when: false
+  failed_when: false
+
+- name: "Clean-Slate | Compute the set of surviving SVC-03 Garage state addresses (FULL state)"
+  ansible.builtin.set_fact:
+    svc03_surviving_state_addrs: >-
+      {{ (svc03_state_list.stdout | default('')).splitlines()
+         | map('trim') | select('ne', '') | list }}
+
+- name: "Clean-Slate | GATE — assert an empty baseline (0 containers, 0 state), Req 2.2"
+  ansible.builtin.assert:
+    that:
+      - "(svc03_surviving_vmids | length) == 0"
+      - "(svc03_surviving_state_addrs | length) == 0"
+    fail_msg: >-
+      Clean-Slate reset did NOT reach an empty baseline. Surviving SVC-03 Garage
+      container(s): {{ svc03_surviving_vmids | default([]) | join(', ') | default('none', true) }};
+      surviving Terraform state address(es):
+      {{ svc03_surviving_state_addrs | default([]) | join(', ') | default('none', true) }}.
+      Investigate on the Proxmox host / in Terraform state and re-run the reset
+      until both are empty before re-installing.
+    success_msg: >-
+      Clean-Slate reset complete — zero SVC-03 Garage containers on the host and an
+      EMPTY SVC-03 Garage Terraform state (guest + non-guest terraform_data resources
+      all removed).
+
+# WS-C42: the guests are gone, so their generated inventory must go too (no stale file left for
+# SVC-17 discovery or later runs). Runs only after the gate above passed.
+- name: "Clean-Slate | Remove the generated inventory of the torn-down guests (WS-C42)"
+  ansible.builtin.include_role:
+    name: generated_inventory_cleanup
+  vars:
+    gic_paths:
+      - "{{ svc03_repo_root }}/{{ svc03_generated_inventory }}"
+- name: "Clean-Slate | Report the reset completed to an empty baseline"
+  ansible.builtin.debug:
+    msg: >-
+      SVC-03 Garage Clean-Slate reset complete: the three Garage containers
+      ({{ svc03_vmids | join(', ') }}) destroyed (or already absent) and removed from
+      Terraform state. The baseline is empty; a fresh install can now run.

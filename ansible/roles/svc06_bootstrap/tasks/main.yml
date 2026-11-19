@@ -11,6 +11,19 @@
 # (OpenBao admin token, ZITADEL provisioning token) travel in the child ENV,
 # never the argv (no_log).
 
+# The OpenBao admin token for the child runs: process env first, else the cluster env file (WS-C45), like every
+# other installer. Process-env-only made ZITADEL's OpenBao reads fail silently in the no_log child (2026-11-18).
+- name: "Bootstrap | Resolve the OpenBao admin token (process env, else the cluster env file) (no_log)"
+  ansible.builtin.set_fact:
+    svc06_openbao_admin_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         or (lookup('ansible.builtin.file',
+                    (cluster_env_file if (cluster_env_file is match('^/'))
+                     else svc06_repo_root ~ '/' ~ cluster_env_file),
+                    errors='ignore') | default('', true)
+             | regex_findall('(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*[\"\']?([^\"\'\r\n]*?)[\"\']?[ \t]*$')
+             | first | default('') | trim) }}
+  no_log: true
 - name: "Bootstrap | common baseline (Docker + Compose) on the ZITADEL guest"
   ansible.builtin.command:
     argv:
@@ -21,7 +34,7 @@
   args:
     chdir: "{{ svc06_repo_root }}"
   register: svc06_common_run
-  changed_when: "'changed=0' not in (svc06_common_run.stdout | default(''))"
+  changed_when: "(svc06_common_run.stdout | default('')) is search('changed=[1-9]')"
 
 # Deploy the ZITADEL Compose stack via zitadel.yml (hosts: zitadel). The mock
 # flags + OpenBao address + platform domain are bridged across the child-process
@@ -44,9 +57,9 @@
   args:
     chdir: "{{ svc06_repo_root }}"
   environment:
-    OPENBAO_ADMIN_TOKEN: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+    OPENBAO_ADMIN_TOKEN: "{{ svc06_openbao_admin_token }}"
   register: svc06_zitadel_run
-  changed_when: "'changed=0' not in (svc06_zitadel_run.stdout | default(''))"
+  changed_when: "(svc06_zitadel_run.stdout | default('')) is search('changed=[1-9]')"
   no_log: true
 
 # Onboard a first org + OIDC app via zitadel-org-provision (opt-in; on by default
@@ -76,8 +89,8 @@
     chdir: "{{ svc06_repo_root }}"
   environment:
     ZITADEL_PROVISION_TOKEN: "{{ lookup('ansible.builtin.env', 'ZITADEL_PROVISION_TOKEN') | default('', true) }}"
-    OPENBAO_ADMIN_TOKEN: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
+    OPENBAO_ADMIN_TOKEN: "{{ svc06_openbao_admin_token }}"
   register: svc06_org_provision_run
-  changed_when: "'changed=0' not in (svc06_org_provision_run.stdout | default(''))"
+  changed_when: "(svc06_org_provision_run.stdout | default('')) is search('changed=[1-9]')"
   no_log: true
   when: svc06_run_org_provision | default(true) | bool

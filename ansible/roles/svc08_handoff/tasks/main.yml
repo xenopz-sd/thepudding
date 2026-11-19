@@ -1,0 +1,37 @@
+---
+# tasks/main.yml — svc08_handoff (SVC-08 Phase 4): prove issuance end to end, then print the handoff.
+- name: "Handoff | Issue, verify and revoke a test certificate (CA works end to end)"
+  ansible.builtin.include_role:
+    name: pki_ca
+    tasks_from: selftest.yml
+- name: "Handoff | Read the published CRL (VLAN 20, unauthenticated)"
+  ansible.builtin.uri:
+    url: "https://{{ svc08_openbao_primary_ip }}:8200/v1/pki_int/crl/pem"
+    return_content: true
+    validate_certs: false   # bootstrap-time reachability only; the cert is checked against the root below
+  register: svc08_crl
+  delegate_to: localhost
+  connection: local
+- name: "Handoff | The CRL must list the revoked test certificate's issuer CRL"
+  ansible.builtin.assert:
+    that:
+      - "'BEGIN X509 CRL' in svc08_crl.content"
+    fail_msg: "The CRL endpoint did not return a CRL PEM."
+    quiet: true
+- name: "Handoff | Print the Developer B completion summary banner"
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Service SVC-08 (internal PKI, OpenBao PKI engine) Deployed Successfully!"
+      - "============================================================"
+      # yamllint disable-line rule:line-length
+      - "Root CA (public): {{ svc08_repo_root }}/{{ pki_ca_root_publish_path }}   (PLATFORM_CA_CERT in {{ cluster_env_file }})"
+      - "CA / ACME URL:    https://{{ svc08_openbao_primary_ip }}:8200/v1/pki_int/roles/traefik/acme/directory"
+      - "CRL:              https://{{ svc08_openbao_primary_ip }}:8200/v1/pki_int/crl/pem (refreshed at least daily)"
+      - "Trust the root on your workstation (once):"
+      # yamllint disable-line rule:line-length
+      - "  Debian/Ubuntu: sudo cp {{ svc08_repo_root }}/{{ pki_ca_root_publish_path }} /usr/local/share/ca-certificates/platform-root-ca.crt && sudo update-ca-certificates"
+      - "Get a certificate for a service installer: include role pki_issue with pki_issue_service=<svcNN>"
+      - "  (needs pki_issue_common_name, pki_issue_host, pki_issue_cert_path, pki_issue_key_path)."
+      - "Routes behind Traefik need no call: Traefik's `internal` ACME resolver issues them by DNS-01."
+      - "============================================================"

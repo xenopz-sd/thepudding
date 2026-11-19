@@ -75,7 +75,7 @@
     AGENT_LIVE_AUTHORIZED: "{{ lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED') | default('', true) }}"
     OPENBAO_ADMIN_TOKEN: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"
   register: svc06_db_bootstrap
-  changed_when: "'changed=0' not in (svc06_db_bootstrap.stdout | default(''))"
+  changed_when: "(svc06_db_bootstrap.stdout | default('')) is search('changed=[1-9]')"
   no_log: true
 
 # ============================================================ #

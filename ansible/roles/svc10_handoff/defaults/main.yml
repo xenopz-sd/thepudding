@@ -1,0 +1,10 @@
+---
+# defaults/main.yml — svc10_handoff (SVC-10 DNS installer — Phase 4: Handoff)
+#
+# Health-gate knobs bridged to the child play svc10-health.yml, plus the banner
+# fields. NO secret here (the API key is read from OpenBao into the child ENVIRONMENT).
+svc10_bind_ip: "10.0.20.25"
+svc10_traefik_ip: "10.0.20.12"
+svc10_public_name: "debian.org"
+svc10_health_retries: 24
+svc10_health_delay: 5

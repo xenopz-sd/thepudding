@@ -1,0 +1,5 @@
+---
+# defaults/main.yml — svc08_clean_slate. No secret values.
+svc08_cs_mounts: [pki_int, pki]
+svc08_cs_policy_names: [pki-issue-svc07, pki-issue-svc09, pki-issue-svc17]
+svc08_generated_inventory: ansible/inventory/svc-08-internal-pki.generated.yml

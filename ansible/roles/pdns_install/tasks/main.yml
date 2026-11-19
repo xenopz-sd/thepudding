@@ -1,0 +1,152 @@
+---
+# tasks/main.yml — pdns_install (SVC-10 internal DNS: PowerDNS authoritative + recursor)
+#
+# Runs NATIVELY on the DNS guest (hosts: dns, child configurator run). Order:
+#   1. assert the API key is in the environment (fail closed),
+#   2. config files (0600 auth config with the API key, recursor config),
+#   3. Compose stack (two containers, ports on the guest's VLAN-20 IP only),
+#   4. readiness: both servers answer,
+#   5. the platform zone exists (created once, then picked up with rediscover),
+#   6. API/metrics firewall (WS-C53 pattern).
+# The zone's A records are reconciled afterwards by the dns_records_sync role
+# (orchestrator side), which needs the generated inventories on the control node.
+
+# --- 1. API key ------------------------------------------------------------------------
+- name: "PowerDNS | Fail closed unless the API key is in the environment (no_log)"
+  ansible.builtin.assert:
+    that:
+      - (lookup('ansible.builtin.env', 'PDNS_API_KEY', default='') | length) >= 32
+    fail_msg: >-
+      PDNS_API_KEY is missing or shorter than 32 characters. Run this play through
+      ansible/playbooks/svc-10-bootstrap.yml, which reads the key from OpenBao
+      (secret/proj-shared-dns/pdns) or generates and stores it. The value is not printed.
+    quiet: true
+  no_log: true
+
+# --- 2. Config files ------------------------------------------------------------------
+- name: "PowerDNS | Ensure the config directory exists"
+  ansible.builtin.file:
+    path: "{{ pdns_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: "PowerDNS | Write the authoritative-server config at 0600 (carries the API key, no_log)"
+  ansible.builtin.template:
+    src: auth.conf.j2
+    dest: "{{ pdns_config_dir }}/auth.conf"
+    owner: "{{ pdns_uid }}"
+    group: "{{ pdns_uid }}"
+    mode: "0600"
+  no_log: true
+  notify: Restart pdns auth
+
+- name: "PowerDNS | Write the recursor config"
+  ansible.builtin.template:
+    src: recursor.yml.j2
+    dest: "{{ pdns_config_dir }}/recursor.yml"
+    owner: "{{ pdns_uid }}"
+    group: "{{ pdns_uid }}"
+    mode: "0644"
+  notify: Restart pdns recursor
+
+# --- 3. Compose stack -----------------------------------------------------------------
+# DNS and the webservers are VLAN-20-bound internal ports (not HTTP ingress; no
+# Traefik route). The zone database lives in the named volume pdns-data, which
+# Docker seeds from the image's pre-initialised /var/lib/powerdns on first use.
+- name: "PowerDNS | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ pdns_stack_name }}"
+    dca_volumes:
+      - pdns-data
+    dca_services:
+      - name: auth
+        image: "{{ pdns_auth_image }}"
+        restart: "unless-stopped"
+        env_file: false
+        ports:
+          - "{{ pdns_bind_ip }}:{{ pdns_auth_dns_port }}:{{ pdns_auth_dns_port }}/udp"
+          - "{{ pdns_bind_ip }}:{{ pdns_auth_dns_port }}:{{ pdns_auth_dns_port }}/tcp"
+          - "{{ pdns_bind_ip }}:{{ pdns_auth_web_port }}:{{ pdns_auth_web_port }}/tcp"
+        volumes:
+          - "pdns-data:/var/lib/powerdns"
+          - "{{ pdns_config_dir }}/auth.conf:/etc/powerdns/pdns.d/svc10.conf:ro"
+      - name: recursor
+        image: "{{ pdns_recursor_image }}"
+        restart: "unless-stopped"
+        env_file: false
+        ports:
+          - "{{ pdns_bind_ip }}:{{ pdns_recursor_dns_port }}:{{ pdns_recursor_container_port }}/udp"
+          - "{{ pdns_bind_ip }}:{{ pdns_recursor_dns_port }}:{{ pdns_recursor_container_port }}/tcp"
+          - "{{ pdns_bind_ip }}:{{ pdns_recursor_web_port }}:{{ pdns_recursor_web_port }}/tcp"
+        volumes:
+          - "{{ pdns_config_dir }}/recursor.yml:/etc/powerdns/recursor.d/svc10.yml:ro"
+
+- name: "PowerDNS | Apply a changed config now"
+  ansible.builtin.meta: flush_handlers
+
+# --- 4. Readiness (P3: polled, never a sleep) -------------------------------------------
+- name: "PowerDNS | Wait until the authoritative server answers on its published port"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ pdns_auth_container }}"
+      - sdig
+      - "{{ pdns_bind_ip }}"
+      - "{{ pdns_auth_dns_port | string }}"
+      - "{{ pdns_platform_domain }}"
+      - SOA
+  register: pdns_auth_ready
+  changed_when: false
+  failed_when: false
+  until: (pdns_auth_ready.rc | default(1)) == 0 and ('Rcode:' in (pdns_auth_ready.stdout | default('')))
+  retries: 24
+  delay: 5
+
+- name: "PowerDNS | Fail when the authoritative server never answered"
+  ansible.builtin.assert:
+    that:
+      - (pdns_auth_ready.rc | default(1)) == 0
+      - "'Rcode:' in (pdns_auth_ready.stdout | default(''))"
+    fail_msg: >-
+      The authoritative server did not answer on {{ pdns_bind_ip }}:{{ pdns_auth_dns_port }}
+      within 120 s. Inspect `docker logs {{ pdns_auth_container }}` on the guest.
+    quiet: true
+
+# --- 5. The platform zone --------------------------------------------------------------
+- name: "PowerDNS | Check whether the platform zone exists"
+  ansible.builtin.command:
+    argv: [docker, exec, "{{ pdns_auth_container }}", pdnsutil, zone, show, "{{ pdns_platform_domain }}"]
+  register: pdns_zone_show
+  changed_when: false
+  failed_when: false
+
+- name: "PowerDNS | Create the platform zone (first run, or after a domain change)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ pdns_auth_container }}"
+      - pdnsutil
+      - zone
+      - create
+      - "{{ pdns_platform_domain }}"
+      - "{{ pdns_ns_name }}"
+  when: (pdns_zone_show.rc | default(1)) != 0
+  changed_when: true
+
+# The authoritative server keeps a zone cache; a zone created by pdnsutil is only
+# served after a rediscover.
+- name: "PowerDNS | Make the authoritative server load the new zone"
+  ansible.builtin.command:
+    argv: [docker, exec, "{{ pdns_auth_container }}", pdns_control, rediscover]
+  when: (pdns_zone_show.rc | default(1)) != 0
+  changed_when: true
+
+# --- 6. API / metrics firewall ---------------------------------------------------------
+- name: "PowerDNS | API and metrics firewall"
+  ansible.builtin.include_tasks: api_firewall.yml

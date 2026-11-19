@@ -1,0 +1,23 @@
+{
+  "shape": "garage-published-security-fixes",
+  "recorded_on": "2026-11-14",
+  "source": "Garage release notes, GET https://git.deuxfleurs.fr/api/v1/repos/Deuxfleurs/garage/releases (rows taken from the 'Security' sections)",
+  "note": "Garage is developed on git.deuxfleurs.fr (Forgejo), not GitHub, so it has no GHSA entries; the release notes' Security sections are the authoritative list. `ref` is the upstream issue/PR number. first_patched is the first release carrying the fix. No secret, host or account data. Refresh by re-reading the source and adding any new row; a row never changes meaning.",
+  "advisories": [
+    {
+      "ref": "#737",
+      "summary": "Timing side channel in admin/metrics token comparison and in SigV4 signature verification",
+      "first_patched": "0.9.2"
+    },
+    {
+      "ref": "#1573",
+      "summary": "Lifecycle configuration endpoints were reachable by non-owner keys (now owner-only)",
+      "first_patched": "2.5.0"
+    },
+    {
+      "ref": "#1581",
+      "summary": "Panic on invalid UTF-8 in a percent-decoded URL (remote denial of service)",
+      "first_patched": "2.5.0"
+    }
+  ]
+}

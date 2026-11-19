@@ -62,7 +62,7 @@
   args:
     chdir: "{{ svc07_repo_root }}"
   register: svc07_common_run
-  changed_when: "'changed=0' not in (svc07_common_run.stdout | default(''))"
+  changed_when: "(svc07_common_run.stdout | default('')) is search('changed=[1-9]')"
 
 # ============================================================ #
 # Task 8.2 — Delegated unsealer bootstrap (Req 2.1, 4.1).        #
@@ -115,7 +115,7 @@
   args:
     chdir: "{{ svc07_repo_root }}"
   register: svc07_unsealer_bootstrap
-  changed_when: "'changed=0' not in (svc07_unsealer_bootstrap.stdout | default(''))"
+  changed_when: "(svc07_unsealer_bootstrap.stdout | default('')) is search('changed=[1-9]')"
   no_log: true
 
 # ============================================================ #
@@ -347,7 +347,7 @@
   environment:
     OPENBAO_BOOTSTRAP_TRANSIT_TOKEN: "{{ svc07_primary_transit_token }}"
   register: svc07_primary_bootstrap
-  changed_when: "'changed=0' not in (svc07_primary_bootstrap.stdout | default(''))"
+  changed_when: "(svc07_primary_bootstrap.stdout | default('')) is search('changed=[1-9]')"
   # Secret hygiene (Req 3.1–3.4, design "Phase-3 primary bootstrap — secret
   # hygiene fix"): this task is no_log:true because the child's captured stdout
   # carries the revealed Admin_Token (TOKEN=<value>) and the child env carries

@@ -1,0 +1,335 @@
+---
+# tasks/rotate.yml — garage_bucket_provision (SVC-03 WS-C55: project key rotation)
+#
+# Replaces proj-<slug>-cikey with a new key holding the SAME bucket grants, stores
+# it in OpenBao (a new KV version; the previous version stays readable for audit),
+# proves the new key can list every bucket, then deletes the old key and gives the
+# new one the canonical name. Opt-in: garage_bp_action=rotate.
+#
+# Cadence: garage_bp_rotate_min_age_days (default 0 = rotate now). A scheduled job
+# can run this daily with 180 so the key is only replaced when it is due.
+# The old key stops working at the delete step; clients that cache credentials must
+# re-read OpenBao (the OpenBao Agent re-renders static secrets on its own schedule).
+
+- name: "Rotate | Validate project_slug and the minimum age"
+  ansible.builtin.assert:
+    that:
+      - project_slug is match('^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$')
+      - (garage_bp_rotate_min_age_days | int) >= 0
+    fail_msg: "Invalid project_slug '{{ project_slug }}' or garage_bp_rotate_min_age_days. Nothing was changed."
+    quiet: true
+  run_once: true
+
+- name: "Rotate | Bind names"
+  ansible.builtin.set_fact:
+    garage_bp_next_key_name: "proj-{{ project_slug }}-cikey-next"
+    garage_bp_purge_endpoint: "http://{{ ansible_host }}:3900"
+  run_once: true
+
+- name: "Rotate | Resolve the OpenBao admin token (no_log)"
+  ansible.builtin.set_fact:
+    garage_bp_openbao_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         if ((lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim) | length > 0)
+         else ((lookup('ansible.builtin.file', (playbook_dir | dirname | dirname) ~ '/' ~ cluster_env_file,
+                       errors='ignore') | default('', true))
+               | regex_findall('(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*[\"\']?([^\"\'\r\n]*?)[\"\']?[ \t]*$')
+               | first | default('') | trim) }}
+  run_once: true
+  no_log: true
+
+- name: "Rotate | Fail closed without an OpenBao admin token"
+  ansible.builtin.assert:
+    that:
+      - (garage_bp_openbao_token | length) > 0
+    fail_msg: "The rotated key must be stored in OpenBao; OPENBAO_ADMIN_TOKEN is required. Nothing was changed."
+    quiet: true
+  run_once: true
+  no_log: true
+
+# --- 1. The current key -------------------------------------------------------------
+- name: "Rotate | List the keys"
+  ansible.builtin.command:
+    argv: ["docker", "exec", "{{ garage_container_name }}", "{{ garage_bin }}", "json-api", "ListKeys"]
+  register: garage_bp_rot_keys
+  run_once: true
+  changed_when: false
+
+- name: "Rotate | Find the current key and any leftover next key"
+  ansible.builtin.set_fact:
+    garage_bp_rot_current: >-
+      {{ garage_bp_rot_keys.stdout | from_json | selectattr('name', 'eq', garage_bp_key_name) | list }}
+    garage_bp_rot_leftover: >-
+      {{ garage_bp_rot_keys.stdout | from_json | selectattr('name', 'eq', garage_bp_next_key_name)
+         | map(attribute='id') | list }}
+  run_once: true
+
+# Interrupted after the old key was deleted: no canonical key, exactly one -next key that OpenBao already holds.
+# Finish that rotation (rename) instead of failing.
+- name: "Rotate | Finish an interrupted rotation — probe OpenBao for the leftover key id (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ garage_bp_openbao_cli_bao_addr, '-e', 'BAO_TOKEN',
+          garage_bp_openbao_primary_container_name, garage_bp_openbao_bao_bin, 'kv', 'get',
+          '-field=access_key_id']
+         + (['-tls-skip-verify'] if (garage_bp_openbao_tls_skip_verify | bool) else [])
+         + [garage_bp_secret_path] }}
+  delegate_to: "{{ garage_bp_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ garage_bp_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ garage_bp_openbao_cli_python }}"
+  environment:
+    BAO_TOKEN: "{{ garage_bp_openbao_token }}"
+  register: garage_bp_rot_resume_probe
+  run_once: true
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - (garage_bp_rot_current | length) == 0
+    - (garage_bp_rot_leftover | length) == 1
+
+- name: "Rotate | Finish an interrupted rotation — rename the leftover key to the canonical name"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - UpdateKey
+      - "{{ {'id': garage_bp_rot_leftover | first, 'body': {'name': garage_bp_key_name}} | to_json }}"
+  register: garage_bp_rot_resumed
+  run_once: true
+  changed_when: true
+  when:
+    - (garage_bp_rot_current | length) == 0
+    - (garage_bp_rot_leftover | length) == 1
+    - (garage_bp_rot_resume_probe.stdout | default('') | trim) == (garage_bp_rot_leftover | first)
+
+- name: "Rotate | Stop after finishing an interrupted rotation"
+  # end_play, not end_host: with run_once the next host would otherwise pick the rotation up again.
+  ansible.builtin.meta: end_play
+  when: garage_bp_rot_resumed is changed
+
+- name: "Rotate | Fail closed unless exactly one current key exists"
+  ansible.builtin.assert:
+    that:
+      - (garage_bp_rot_current | length) == 1
+    fail_msg: >-
+      Expected exactly one key named {{ garage_bp_key_name }}, found {{ garage_bp_rot_current | length }}.
+      Provision the project first (garage_bp_action=provision) or remove stray keys. Nothing was changed.
+    quiet: true
+  run_once: true
+
+- name: "Rotate | Read the current key's grants and age"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - GetKeyInfo
+      - "{{ {'id': (garage_bp_rot_current | first).id} | to_json }}"
+  register: garage_bp_rot_info
+  run_once: true
+  changed_when: false
+
+- name: "Rotate | Decide whether the key is due (non-secret)"
+  ansible.builtin.set_fact:
+    garage_bp_rot_grants: >-
+      {% set out = [] %}{% for b in (garage_bp_rot_info.stdout | from_json).buckets %}{% set _ = out.append({
+        'id': b.id, 'alias': (b.globalAliases | first | default(b.id)),
+        'read': b.permissions.read | default(false), 'write': b.permissions.write | default(false),
+        'owner': b.permissions.owner | default(false)}) %}{% endfor %}{{ out }}
+    garage_bp_rot_age_days: >-
+      {{ (now(utc=true) - (((garage_bp_rot_info.stdout | from_json).created | default('1970-01-01T00:00:00Z'))[:19]
+          | to_datetime('%Y-%m-%dT%H:%M:%S'))).days }}
+  run_once: true
+
+- name: "Rotate | Decide (non-secret)"
+  ansible.builtin.set_fact:
+    garage_bp_rot_due: "{{ (garage_bp_rot_age_days | int) >= (garage_bp_rotate_min_age_days | int) }}"
+  run_once: true
+
+- name: "Rotate | INFO — rotation decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO garage key rotation for {{ project_slug }}: key age {{ garage_bp_rot_age_days }} day(s), minimum
+      {{ garage_bp_rotate_min_age_days }} — {{ 'ROTATING' if (garage_bp_rot_due | bool) else 'not due, no change' }};
+      {{ garage_bp_rot_grants | length }} bucket grant(s) to carry over.
+  run_once: true
+
+# --- 2. New key with the same grants --------------------------------------------------
+- name: "Rotate | Rotation steps"
+  when: garage_bp_rot_due | bool
+  run_once: true
+  block:
+    - name: "Rotate | Remove a next key left by an interrupted rotation"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ garage_container_name }}"
+          - "{{ garage_bin }}"
+          - json-api
+          - DeleteKey
+          - "{{ {'id': item} | to_json }}"
+      loop: "{{ garage_bp_rot_leftover }}"
+      changed_when: true
+      no_log: true
+
+    - name: "Rotate | Create the next key (no_log)"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ garage_container_name }}"
+          - "{{ garage_bin }}"
+          - json-api
+          - CreateKey
+          - "{{ {'name': garage_bp_next_key_name} | to_json }}"
+      register: garage_bp_rot_new
+      changed_when: true
+      no_log: true
+
+    - name: "Rotate | Grant the next key the current key's permissions on each bucket"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ garage_container_name }}"
+          - "{{ garage_bin }}"
+          - json-api
+          - AllowBucketKey
+          - >-
+            {{ {'bucketId': item.id, 'accessKeyId': (garage_bp_rot_new.stdout | from_json).accessKeyId,
+                'permissions': {'read': item.read | bool, 'write': item.write | bool, 'owner': item.owner | bool}}
+               | to_json }}
+      loop: "{{ garage_bp_rot_grants }}"
+      loop_control:
+        label: "{{ item.alias }}"
+      changed_when: true
+      no_log: true
+
+    - name: "Rotate | Prove the next key can list every granted bucket (credentials in env only)"
+      ansible.builtin.command:
+        argv:
+          - "{{ lookup('ansible.builtin.env', 'HOME') }}/venv/devinfra/bin/python"
+          - scripts/installer/s3_smoke.py
+          - --endpoint
+          - "{{ garage_bp_purge_endpoint }}"
+          - --bucket
+          - "{{ item.alias }}"
+          - list
+      args:
+        chdir: "{{ playbook_dir | dirname | dirname }}"
+      environment:
+        S3_ACCESS_KEY_ID: "{{ (garage_bp_rot_new.stdout | from_json).accessKeyId }}"
+        S3_SECRET_ACCESS_KEY: "{{ (garage_bp_rot_new.stdout | from_json).secretAccessKey }}"
+      loop: "{{ garage_bp_rot_grants | selectattr('read') | list }}"
+      loop_control:
+        label: "{{ item.alias }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      no_log: true
+
+    - name: "Rotate | Store the next key in OpenBao as a new version (no_log)"
+      ansible.builtin.command:
+        argv: >-
+          {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ garage_bp_openbao_cli_bao_addr, '-e', 'BAO_TOKEN',
+              '-e', 'S3_ACCESS_KEY_ID', '-e', 'S3_SECRET_ACCESS_KEY',
+              garage_bp_openbao_primary_container_name, 'sh', '-c',
+              garage_bp_openbao_bao_bin ~ ' kv patch'
+              ~ (' -tls-skip-verify' if (garage_bp_openbao_tls_skip_verify | bool) else '')
+              ~ ' ' ~ garage_bp_secret_path
+              ~ ' access_key_id="$S3_ACCESS_KEY_ID" secret_access_key="$S3_SECRET_ACCESS_KEY"'] }}
+      delegate_to: "{{ garage_bp_openbao_cli_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ garage_bp_openbao_cli_user }}"
+        ansible_python_interpreter: "{{ garage_bp_openbao_cli_python }}"
+      environment:
+        BAO_TOKEN: "{{ garage_bp_openbao_token }}"
+        S3_ACCESS_KEY_ID: "{{ (garage_bp_rot_new.stdout | from_json).accessKeyId }}"
+        S3_SECRET_ACCESS_KEY: "{{ (garage_bp_rot_new.stdout | from_json).secretAccessKey }}"
+      changed_when: true
+      no_log: true
+
+    - name: "Rotate | VERIFY — OpenBao now holds the next key's id (no_log)"
+      ansible.builtin.command:
+        argv: >-
+          {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ garage_bp_openbao_cli_bao_addr, '-e', 'BAO_TOKEN',
+              garage_bp_openbao_primary_container_name, garage_bp_openbao_bao_bin, 'kv', 'get',
+              '-field=access_key_id']
+             + (['-tls-skip-verify'] if (garage_bp_openbao_tls_skip_verify | bool) else [])
+             + [garage_bp_secret_path] }}
+      delegate_to: "{{ garage_bp_openbao_cli_host }}"
+      vars:
+        ansible_connection: ssh
+        ansible_user: "{{ garage_bp_openbao_cli_user }}"
+        ansible_python_interpreter: "{{ garage_bp_openbao_cli_python }}"
+      environment:
+        BAO_TOKEN: "{{ garage_bp_openbao_token }}"
+      register: garage_bp_rot_stored
+      changed_when: false
+      failed_when: (garage_bp_rot_stored.stdout | trim) != (garage_bp_rot_new.stdout | from_json).accessKeyId
+      no_log: true
+
+    # --- 3. Revoke the old key and take over the canonical name ----------------------------
+    - name: "Rotate | Delete the old key (revokes it)"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ garage_container_name }}"
+          - "{{ garage_bin }}"
+          - json-api
+          - DeleteKey
+          - "{{ {'id': (garage_bp_rot_current | first).id} | to_json }}"
+      changed_when: true
+      no_log: true
+
+    - name: "Rotate | Give the next key the canonical name"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ garage_container_name }}"
+          - "{{ garage_bin }}"
+          - json-api
+          - UpdateKey
+          - >-
+            {{ {'id': (garage_bp_rot_new.stdout | from_json).accessKeyId,
+                'body': {'name': garage_bp_key_name}} | to_json }}
+      changed_when: true
+      no_log: true
+
+    - name: "Rotate | VERIFY — exactly one key with the canonical name, and it is the new one"
+      ansible.builtin.command:
+        argv: ["docker", "exec", "{{ garage_container_name }}", "{{ garage_bin }}", "json-api", "ListKeys"]
+      register: garage_bp_rot_after
+      changed_when: false
+      failed_when: >-
+        (garage_bp_rot_after.stdout | from_json | selectattr('name', 'eq', garage_bp_key_name)
+         | map(attribute='id') | list) != [(garage_bp_rot_new.stdout | from_json).accessKeyId]
+        or (garage_bp_rot_after.stdout | from_json | selectattr('name', 'eq', garage_bp_next_key_name)
+            | list | length) > 0
+      no_log: true
+
+    - name: "Rotate | Summary (names only)"
+      ansible.builtin.debug:
+        msg: >-
+          Rotated {{ garage_bp_key_name }} for {{ project_slug }}: new key stored at {{ garage_bp_secret_path }}
+          (previous version kept in OpenBao history), {{ garage_bp_rot_grants | length }} bucket grant(s) carried
+          over, old key deleted.
+
+- name: "Rotate | Scrub secret facts (no_log)"
+  ansible.builtin.set_fact:
+    garage_bp_openbao_token: ""
+    garage_bp_rot_new: {}
+  run_once: true
+  no_log: true

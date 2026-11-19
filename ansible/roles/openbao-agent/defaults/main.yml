@@ -322,3 +322,12 @@ openbao_agent_workload_environment: {}
 # sidecar's own RSF-presence healthcheck + the depends_on service_healthy
 # swap-gate, which are unchanged. Absent ⇒ no workload healthcheck (unchanged).
 openbao_agent_workload_healthcheck: {}
+
+# --- SVC-08 platform CA (WS-C60): verify the Agent -> Primary hop with the published root -------------------------
+# When the root is published on the control node and skip-verify is off, the root is copied into the stack dir,
+# mounted read-only into the sidecar and referenced as `ca_cert` in agent.hcl. Otherwise nothing changes.
+openbao_agent_platform_ca_src: "{{ playbook_dir | dirname | dirname }}/.pki/platform-root-ca.pem"
+# Staged in the already-mounted rendered dir (public certificate; only secrets.env there is consumed), so the
+# sidecar's mount list is unchanged.
+openbao_agent_ca_host_path: "{{ openbao_agent_host_rendered_dir }}/platform-root-ca.pem"
+openbao_agent_ca_container_path: "{{ openbao_agent_rendered_dir }}/platform-root-ca.pem"

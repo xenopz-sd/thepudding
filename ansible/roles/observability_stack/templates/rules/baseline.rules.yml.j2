@@ -112,6 +112,139 @@ groups:
             openbao_core_unsealed has been 0 for more than 2 minutes — OpenBao
             is SEALED and cannot serve secrets.
 
+  # --- SVC-03 Garage object storage (spec svc-03-alerts, WS-C52) --------------
+  # Garage's own /metrics (scraped as service="garage") carries cluster health
+  # and per-node disk figures, so no node_exporter is needed on the Garage guests.
+  # Every node reports the same cluster view; min()/max() across nodes make one
+  # alert per condition, not one per node. A down node's own target is covered by
+  # the generic InstanceDown rule.
+  - name: platform-garage
+    interval: "{{ observability_prometheus_evaluation_interval }}"
+    rules:
+      # A storage node in the layout is not connected (reads/writes continue with
+      # 2 of 3, replication is degraded).
+      - alert: GarageStorageNodeDown
+        expr: >-
+          min(cluster_storage_nodes_ok{service="garage"})
+          < max(cluster_storage_nodes{service="garage"})
+        for: 5m
+        labels:
+          severity: warning
+          service: garage
+        annotations:
+          summary: "Garage storage node(s) not connected"
+          description: >-
+            Only {{ '{{' }} $value {{ '}}' }} of the Garage storage nodes are
+            connected. Reads and writes continue while a quorum remains; check the
+            node container and RPC port 3901.
+      # Some partitions have no write quorum: some writes fail now.
+      - alert: GarageQuorumLost
+        expr: >-
+          min(cluster_partitions_quorum{service="garage"})
+          < max(cluster_partitions{service="garage"})
+        for: 2m
+        labels:
+          severity: critical
+          service: garage
+        annotations:
+          summary: "Garage partitions without write quorum"
+          description: >-
+            {{ '{{' }} $value {{ '}}' }} Garage partitions have a write quorum
+            (fewer than all): writes to some objects fail. At least two storage
+            nodes are unreachable.
+      # Data has fewer live copies than the replication factor for a long time.
+      - alert: GarageUnderReplicated
+        expr: >-
+          min(cluster_partitions_all_ok{service="garage"})
+          < max(cluster_partitions{service="garage"})
+        for: 30m
+        labels:
+          severity: warning
+          service: garage
+        annotations:
+          summary: "Garage data under-replicated for 30 minutes"
+          description: >-
+            Only {{ '{{' }} $value {{ '}}' }} Garage partitions have all their
+            copies reachable. Restore the missing node; if it is gone for good,
+            replace it in the layout.
+      # A node's data volume is more than 80 % full (requirements §13).
+      - alert: GarageDiskAlmostFull
+        expr: >-
+          1 - (garage_local_disk_avail{service="garage", volume="data"}
+               / garage_local_disk_total{service="garage", volume="data"}) > 0.8
+        for: 15m
+        labels:
+          severity: warning
+          service: garage
+        annotations:
+          summary: "Garage data volume over 80 % on {{ '{{' }} $labels.instance {{ '}}' }}"
+          description: >-
+            The Garage data volume on {{ '{{' }} $labels.instance {{ '}}' }} is more
+            than 80 % full. Grow garage_data_disk_gb and update the node capacity,
+            or add a node.
+      # Blocks keep failing to resync (corruption or a persistent peer failure).
+      - alert: GarageResyncErrors
+        expr: max by (instance) (block_resync_errored_blocks{service="garage"}) > 0
+        for: 30m
+        labels:
+          severity: warning
+          service: garage
+        annotations:
+          summary: "Garage block resync errors on {{ '{{' }} $labels.instance {{ '}}' }}"
+          description: >-
+            {{ '{{' }} $value {{ '}}' }} blocks on {{ '{{' }} $labels.instance {{ '}}' }}
+            failed their last resync for 30 minutes.
+      # Server-side S3 errors (5xx) above 5 % of requests. Client errors (403/404)
+      # are normal traffic and are not counted.
+      - alert: GarageS3ServerErrors
+        expr: >-
+          sum(rate(api_s3_error_counter{service="garage", status_code=~"5.."}[5m]))
+          / sum(rate(api_s3_request_counter{service="garage"}[5m])) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          service: garage
+        annotations:
+          summary: "Garage S3 API returning server errors"
+          description: >-
+            More than 5 % of Garage S3 requests returned a 5xx status over 15
+            minutes.
+
+  # --- SVC-10 internal DNS (spec svc-10-internal-dns, §13) --------------------
+  - name: platform-dns
+    interval: "{{ observability_prometheus_evaluation_interval }}"
+    rules:
+      # The recursor is what developer machines (and later the CA) query; when it
+      # is down platform names stop resolving for them (guests keep their own
+      # upstream resolver, FR-4).
+      - alert: DnsRecursorDown
+        expr: up{service="pdns-recursor"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: dns
+        annotations:
+          summary: "SVC-10 DNS recursor is down"
+          description: >-
+            The PowerDNS recursor metrics target {{ '{{' }} $labels.instance {{ '}}' }}
+            has been down for 2 minutes: platform names do not resolve for clients
+            that use the platform resolver. Re-run svc-10-bootstrap.yml.
+      # More than 10 % SERVFAIL answers (upstream unreachable, or the authoritative
+      # server not answering the platform zone).
+      - alert: DnsRecursorServfailRate
+        expr: >-
+          sum(rate(pdns_recursor_servfail_answers{service="pdns-recursor"}[5m]))
+          / sum(rate(pdns_recursor_questions{service="pdns-recursor"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: dns
+        annotations:
+          summary: "SVC-10 DNS recursor SERVFAIL rate above 10 %"
+          description: >-
+            More than 10 % of the recursor's answers were SERVFAIL over 10 minutes.
+            Check the authoritative container (pdns-auth-1) and the guest's upstream
+            connectivity.
   # --- Stack self-alerts (FR-12 meta-monitoring) -----------------------------
   - name: observability-self
     interval: "{{ observability_prometheus_evaluation_interval }}"
@@ -155,6 +288,35 @@ groups:
           description: >-
             Loki is returning 5xx for more than 10% of requests on route
             {{ '{{' }} $labels.route {{ '}}' }} over the last 15 minutes.
+  # --- SVC-08: certificates served by Traefik (ACME from the platform CA, or any other resolver) ---
+  # Bound to Traefik's own `traefik_tls_certs_not_after` series (live-confirmed, scraped on :8082), so no extra
+  # exporter is needed. Traefik renews ACME certificates 30 days before expiry; firing at 14 days means renewal
+  # has failed (CA down, DNS-01 broken). Spec svc-08-internal-pki D7 (revised).
+  - name: platform-pki
+    interval: "{{ observability_prometheus_evaluation_interval }}"
+    rules:
+      - alert: PlatformCertExpiringSoon
+        expr: (min by (cn, instance) (traefik_tls_certs_not_after{service="traefik"}) - time()) / 86400 < 14
+        for: 1h
+        labels:
+          severity: warning
+          service: pki
+        annotations:
+          summary: "Traefik certificate {{ '{{' }} $labels.cn {{ '}}' }} expires in under 14 days"
+          description: >-
+            Traefik serves a certificate for {{ '{{' }} $labels.cn {{ '}}' }} that expires in
+            {{ '{{' }} $value | humanize {{ '}}' }} days. Renewal should have happened at 30 days: check the
+            Traefik logs for ACME errors, OpenBao (SVC-07) and the PowerDNS API (SVC-10).
+      - alert: PlatformCertExpired
+        expr: min by (cn, instance) (traefik_tls_certs_not_after{service="traefik"}) - time() < 0
+        for: 5m
+        labels:
+          severity: critical
+          service: pki
+        annotations:
+          summary: "Traefik serves an expired certificate for {{ '{{' }} $labels.cn {{ '}}' }}"
+          description: >-
+            Clients that verify TLS now fail for every route covered by {{ '{{' }} $labels.cn {{ '}}' }}.
 {% if observability_cert_expiry_alert_enabled %}
 
   # --- DEFERRED: certificate-expiry (rendered only when the flag is ON) -------

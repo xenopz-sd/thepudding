@@ -1,0 +1,67 @@
+---
+# tasks/main.yml — svc08_bootstrap (SVC-08 Phase 3): CA, publication, trust, gate key.
+- name: "Bootstrap | Configure the CA on SVC-07 (pki_ca)"
+  ansible.builtin.include_role:
+    name: pki_ca
+- name: "Bootstrap | Record PLATFORM_CA_CERT (the swap gate, D5) in the cluster env file"
+  ansible.builtin.lineinfile:
+    path: >-
+      {{ (svc08_repo_root ~ '/' ~ cluster_env_file) if (cluster_env_file is not match('^/')) else cluster_env_file }}
+    regexp: '^[ \t]*PLATFORM_CA_CERT[ \t]*='
+    line: "PLATFORM_CA_CERT={{ svc08_repo_root }}/{{ pki_ca_root_publish_path }}"
+    mode: "0600"
+  delegate_to: localhost
+  connection: local
+- name: "Bootstrap | Write the discovery marker (file-mediated presence for the platform clean-slate)"
+  ansible.builtin.copy:
+    content: |
+      # MANAGED BY svc-08-bootstrap.yml — SVC-08 has no guest; this marks the CA as configured.
+      all:
+        hosts: {}
+    dest: "{{ svc08_repo_root }}/{{ svc08_marker_inventory }}"
+    mode: "0644"
+  delegate_to: localhost
+  connection: local
+- name: "Bootstrap | Find the generated inventories of installed services"
+  ansible.builtin.find:
+    paths: "{{ svc08_repo_root }}/ansible/inventory"
+    # Every generated inventory (shared services, mail catcher, consumer DB and workload guests), not only svc-*.
+    patterns: "*.generated.yml"
+    excludes: "svc-08-*"
+  register: svc08_inventories
+  delegate_to: localhost
+  connection: local
+- name: "Bootstrap | Install the root in every installed guest's trust store (R4)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ item }}"
+      - ansible/playbooks/pki-trust.yml
+  args:
+    chdir: "{{ svc08_repo_root }}"
+  loop: "{{ svc08_inventories.files | map(attribute='path') | list }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  register: svc08_trust_runs
+  changed_when: "(svc08_trust_runs.stdout | default('')) is search('changed=[1-9]')"
+- name: "Bootstrap | Issue the OpenBao listener certificates (push issuance, D8)"
+  ansible.builtin.include_role:
+    name: pki_issue
+  vars:
+    pki_issue_service: svc07
+    pki_issue_common_name: "{{ item.cn }}"
+    pki_issue_dns_sans: "{{ item.dns }}"
+    # 127.0.0.1 lets the in-container `bao` CLI (BAO_ADDR=https://127.0.0.1:8200) verify too (WS-C60).
+    pki_issue_ip_sans: "{{ [item.ip] + (['127.0.0.1'] if (item.loopback | default(false)) else []) }}"
+    pki_issue_host: "{{ item.ip }}"
+    pki_issue_cert_path: "{{ svc08_openbao_tls_dir }}/cert.pem"
+    pki_issue_key_path: "{{ svc08_openbao_tls_dir }}/key.pem"
+    pki_issue_owner: "{{ svc08_openbao_uid }}"
+    pki_issue_group: "{{ svc08_openbao_gid }}"
+    pki_issue_key_mode: "0640"
+    pki_issue_reload_command: "docker kill --signal=SIGHUP {{ item.container }}"
+  loop: "{{ svc08_openbao_listeners }}"
+  loop_control:
+    label: "{{ item.cn }}"
+  when: svc08_issue_openbao_listeners | bool

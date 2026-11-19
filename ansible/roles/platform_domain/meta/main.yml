@@ -1,0 +1,12 @@
+---
+# meta/main.yml — platform_domain
+galaxy_info:
+  role_name: platform_domain
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Sets one installer's platform-domain variable from PLATFORM_DOMAIN in the
+    cluster env file (SVC-10 design D5); an explicit -e still wins.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

@@ -38,7 +38,21 @@ http:
           - "127.0.0.1/32"
 {% endif %}
 
-{% if traefik_tls_self_signed | default(false) | bool %}
+{% if traefik_internal_acme_enabled | default(false) | bool %}
+# SVC-08 internal CA: the default certificate is obtained by the `internal` ACME resolver (DNS-01) for the platform
+# domain and its wildcards. Every route with `tls: {}` is served this certificate (live finding: an entrypoint-level
+# certResolver does not apply to routers that declare their own tls block).
+tls:
+  stores:
+    default:
+      defaultGeneratedCert:
+        resolver: internal
+        domain:
+          main: "{{ traefik_platform_domain }}"
+          sans:
+            - "*.{{ traefik_platform_domain }}"
+            - "*.web.{{ traefik_platform_domain }}"
+{% elif traefik_tls_self_signed | default(false) | bool %}
 # MOCK TLS (opt-in, default off) — stand-in for SVC-08/EJBCA + Let's Encrypt.
 # The default certificate `websecure` serves before any CA exists. Chains to no
 # known CA, so every TLS client must use validate_certs:false (honest about

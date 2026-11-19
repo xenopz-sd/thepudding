@@ -1,0 +1,124 @@
+---
+# SVC-10 internal DNS (PowerDNS) automated installer — Day-0 orchestrator.
+# Spec: .kiro/specs/svc-10-internal-dns. Single approved entry point
+# (service-installer.md §2): Ansible only.
+#
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/svc-10-bootstrap.yml \
+#     -e cluster_env_file=cluster.dev.env
+#
+# Four phases (preflight -> provision -> bootstrap -> handoff) as thin
+# block/rescue-wrapped import_role calls; no task logic here. Clean-slate reset:
+#     -e clean_slate=true -e clean_slate_confirm=force -e svc10_proxmox_host=<proxmox-lan-ip>
+# Requires SVC-07 (OpenBao holds the PowerDNS API key). Re-run it after installing
+# or removing any service: the zone's guest records follow the generated inventories.
+- name: SVC-10 internal DNS (PowerDNS) automated installer — Day-0 orchestrator
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  any_errors_fatal: true
+  vars:
+    # The gitignored KEY=VALUE .env the installer reads Proxmox/provider params from.
+    cluster_env_file: cluster.env
+    svc10_repo_root: "{{ playbook_dir | dirname | dirname }}"
+    svc10_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+    # Generated inventory path (repo-relative), written by provision, consumed by
+    # the bootstrap + handoff child runs as `-i`.
+    svc10_generated_inventory: ansible/inventory/svc-10-internal-dns.generated.yml
+    # Deterministic VMID = vlan_id * 1000 + host_index = 20 * 1000 + 15 (ADR-0022).
+    # Passed to Terraform as the explicit override (equal to the computed value, so
+    # no drift) and used by the clean-slate. Non-secret.
+    svc10_vmid: 20015
+    # The single guest IP: cidrhost("10.0.20.0/24", 10 + 15) (ledger index 15).
+    svc10_guest_ips:
+      - "10.0.20.25"
+    clean_slate: false
+    clean_slate_confirm: ""
+    # The DNS zone the service serves. Default: PLATFORM_DOMAIN from the cluster env
+    # file (the platform_domain role); an explicit -e wins.
+    svc10_platform_domain: platform.example.test
+    # Agent Live-Test Authorization: truthy ONLY when AGENT_LIVE_AUTHORIZED is set
+    # in the process environment; gates the throwaway-guard consult.
+    agent_live_run: "{{ (lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') | trim) | length > 0 }}"
+    svc10_throwaway_guard: scripts/installer/throwaway_guard.py
+    svc10_throwaway_allowlist: scripts/installer/throwaway-clusters.yml
+  tasks:
+    # PLATFORM_DOMAIN in the cluster env file is the default platform domain
+    # (SVC-10 design D5); an explicit -e still wins. Runs first, also on clean-slate.
+    - name: Resolve PLATFORM_DOMAIN from the cluster env file
+      ansible.builtin.import_role:
+        name: platform_domain
+      vars:
+        platform_domain_var: svc10_platform_domain
+    # === Clean-Slate branch — runs ONLY when clean_slate is truthy. ===
+    - name: Clean-Slate reset
+      when: clean_slate | default(false) | bool
+      block:
+        - name: "Clean-Slate | Run the svc10_clean_slate role"
+          ansible.builtin.import_role:
+            name: svc10_clean_slate
+      rescue:
+        - name: Report Clean-Slate reset failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-10 DNS installer FAILED during the Clean-Slate reset:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    # === Normal install path — Phases 1→4, skipped entirely on clean_slate. ===
+    - name: "Phase 1 — Preflight & environment validation"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Preflight | Run the svc10_preflight role"
+          ansible.builtin.import_role:
+            name: svc10_preflight
+      rescue:
+        - name: Report Phase 1 (Preflight) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-10 DNS installer FAILED in Phase 1 (Preflight & environment validation):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 2 — Infrastructure provisioning"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Provisioning | Run the svc10_provision role"
+          ansible.builtin.import_role:
+            name: svc10_provision
+      rescue:
+        - name: Report Phase 2 (Provisioning) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-10 DNS installer FAILED in Phase 2 (Infrastructure provisioning):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 3 — Host hardening & service bootstrap"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Bootstrap | Run the svc10_bootstrap role"
+          ansible.builtin.import_role:
+            name: svc10_bootstrap
+      rescue:
+        - name: Report Phase 3 (Bootstrap) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-10 DNS installer FAILED in Phase 3 (Host hardening & service bootstrap):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+
+    - name: "Phase 4 — Health sanity & Developer B handoff"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Handoff | Run the svc10_handoff role"
+          ansible.builtin.import_role:
+            name: svc10_handoff
+      rescue:
+        - name: Report Phase 4 (Handoff) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-10 DNS installer FAILED in Phase 4 (Health sanity & handoff):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}

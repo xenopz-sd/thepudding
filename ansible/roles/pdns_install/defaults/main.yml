@@ -1,0 +1,71 @@
+---
+# defaults/main.yml — pdns_install (SVC-10 internal DNS: PowerDNS authoritative + recursor)
+#
+# Spec: .kiro/specs/svc-10-internal-dns. NO secret value lives here: the API key is
+# read at run time from the process ENVIRONMENT (PDNS_API_KEY, bridged from OpenBao
+# by svc10_bootstrap) and written only to a 0600 file on the guest.
+
+# --- Image pins (security-standards: exact version + digest, never `latest`) ------
+# pdns-auth 5.1.5 and pdns-recursor 5.4.9 are the newest stable releases of their
+# series (recursor 5.5 is beta only). The digests are the multi-arch index digests
+# the tags resolved to. Refresh deliberately (runbook "Image bumps").
+pdns_auth_image_ref: "powerdns/pdns-auth-51:5.1.5"
+pdns_auth_image_digest: "sha256:77ff4efdbb9ec30e9309c8a1cbed6121a67fa3be25c848bbbfa756fc75bf9a27"
+pdns_auth_image: "{{ pdns_auth_image_ref }}@{{ pdns_auth_image_digest }}"
+pdns_recursor_image_ref: "powerdns/pdns-recursor-54:5.4.9"
+pdns_recursor_image_digest: "sha256:6c79f7d1677454b68add3d12ba8d5dfe5005c474010632f2d392eb9bfaf9f34e"
+pdns_recursor_image: "{{ pdns_recursor_image_ref }}@{{ pdns_recursor_image_digest }}"
+
+pdns_stack_name: "pdns"
+# docker-compose-app names the containers <stack>-<service>-1.
+pdns_auth_container: "pdns-auth-1"
+pdns_recursor_container: "pdns-recursor-1"
+# The image runs as this uid/gid (pdns); the mounted config files must be readable by it.
+pdns_uid: 953
+
+# --- Ports: all published ONLY on the guest's own VLAN-20 IP (never 0.0.0.0) ------
+# cidrhost("10.0.20.0/24", 10 + 15) per the Host_Index_Authority ledger. The
+# containers listen on unprivileged ports; the host-side recursor port is 53.
+pdns_bind_ip: "10.0.20.25"
+pdns_auth_dns_port: 5300        # authoritative DNS (container and host side); queried by the recursor
+pdns_auth_web_port: 8081        # authoritative webserver: HTTP API (key required) + /metrics
+pdns_recursor_dns_port: 53      # host side; what clients use
+pdns_recursor_container_port: 5353
+pdns_recursor_web_port: 8082    # recursor webserver: /metrics
+
+# --- Zone + resolver policy ---------------------------------------------------------
+pdns_platform_domain: "platform.example.test"
+# SOA primary and the zone's NS name: the guest's own record (managed by dns_records_sync).
+pdns_ns_name: "svc10-20-01.{{ pdns_platform_domain }}"
+# Negative-cache TTL (SOA minimum): short so a newly added record shows up quickly.
+pdns_soa_minimum: 60
+# Who may use the recursor (FR-3: no open resolver). RFC1918 covers VLAN 20, the
+# project VLANs and the developer LAN routed through the host gateway.
+pdns_recursor_allow_from:
+  - 127.0.0.0/8
+  - ::1/128
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+# Who may reach the webservers at the PowerDNS level. The in-guest firewall below
+# is the narrow control (FR-5); this list only keeps the webservers off non-private sources.
+pdns_web_allow_from:
+  - 127.0.0.1
+  - ::1
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+
+# --- API / metrics firewall (FR-5, WS-C53 pattern) ----------------------------------
+# Sources allowed to open connections to the published webserver ports
+# (pdns_auth_web_port, pdns_recursor_web_port): the Traefik guest (SVC-08 DNS-01
+# path), the Prometheus guest (metrics) and, when set, the operator's admin CIDR.
+# Queries from the guest itself never cross FORWARD, so the health gate is unaffected.
+pdns_api_firewall_enabled: true
+pdns_api_allowed_sources:
+  - 10.0.20.12/32
+  - 10.0.20.18/32
+pdns_admin_source_cidr: ""
+
+# --- Paths on the guest -------------------------------------------------------------
+pdns_config_dir: "/opt/compose/pdns/config"

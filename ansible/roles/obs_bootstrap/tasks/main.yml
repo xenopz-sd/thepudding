@@ -71,7 +71,7 @@
   args:
     chdir: "{{ obs_repo_root }}"
   register: obs_common_run
-  changed_when: "'changed=0' not in (obs_common_run.stdout | default(''))"
+  changed_when: "(obs_common_run.stdout | default('')) is search('changed=[1-9]')"
 
 
 # ============================================================ #
@@ -141,6 +141,30 @@
 # and the platform domain are bridged with -e; the              #
 # OPENBAO_ADMIN_TOKEN travels in the child ENV (Task 2, no_log). #
 # ============================================================ #
+# SVC-08 gate (D5): a published platform root means Traefik serves CA-issued certificates (ACME, WS-C59), so the
+# real-CA path is selected; an explicit -e still wins. Mock B together with the CA fails closed.
+- name: "Bootstrap | Is the SVC-08 platform root published?"
+  ansible.builtin.stat:
+    path: "{{ obs_repo_root }}/.pki/platform-root-ca.pem"
+  register: obs_platform_root_stat
+- name: "Bootstrap | Derive obs_tls_real_ca_available from the SVC-08 gate"
+  ansible.builtin.set_fact:
+    obs_tls_real_ca_available: true
+  when: obs_platform_root_stat.stat.exists   # set_fact never beats an explicit -e
+- name: "Bootstrap | INFO — Grafana TLS source"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: Grafana TLS: {{ 'self-signed mock (Mock B)' if (obs_tls_self_signed | default(false) | bool)
+      else ('platform CA via Traefik ACME (SVC-08)' if (obs_tls_real_ca_available | default(false) | bool)
+      else 'none (installer fails closed)') }}
+- name: "Bootstrap | Fail closed when Mock B is set while the platform CA is published"
+  ansible.builtin.assert:
+    that:
+      - not ((obs_tls_self_signed | default(false) | bool) and obs_platform_root_stat.stat.exists)
+    fail_msg: >-
+      obs_tls_self_signed=true but the SVC-08 platform CA is published (.pki/platform-root-ca.pem): the mock would
+      overwrite Traefik's CA-issued certificate for Grafana. Drop -e obs_tls_self_signed=true. Nothing was changed.
+    quiet: true
 - name: "Bootstrap | assemble the configurator child-run argv (multi -i)"
   ansible.builtin.set_fact:
     obs_configurator_argv: >-
@@ -202,7 +226,9 @@
     chdir: "{{ obs_repo_root }}"
   environment:
     # The platform-admin token observability_bao_token looks up from the child ENV
-    # for the delegated OpenBao bao-CLI secret reads (FR-15). Never on the argv.
+    # for the delegated OpenBao bao-CLI secret reads (FR-15). Never on the child
+    # ansible-playbook argv; the delegated reads then pass it to `docker exec` as
+    # `-e BAO_TOKEN=<value>` on the OpenBao guest (WS-C62).
     # BRIDGE the preflight-resolved obs_openbao_admin_token (resolved from the
     # process env OR the cluster env file — the single source of truth), falling
     # back to a direct process-env lookup so the historical SVC-06/07 exported-
@@ -215,5 +241,5 @@
          | default(lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN'), true)
          | default('', true) }}
   register: obs_observability_run
-  changed_when: "'changed=0' not in (obs_observability_run.stdout | default(''))"
+  changed_when: "(obs_observability_run.stdout | default('')) is search('changed=[1-9]')"
   no_log: true

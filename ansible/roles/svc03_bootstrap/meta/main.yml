@@ -1,0 +1,17 @@
+---
+# meta/main.yml — svc03_bootstrap
+galaxy_info:
+  role_name: svc03_bootstrap
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-03 Garage installer Phase 3 — reads (or first-time generates and stores)
+    the cluster secrets in OpenBao, runs the common baseline and the garage.yml
+    configurator as child runs with the secrets in the child environment.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+dependencies: []

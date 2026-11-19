@@ -13,7 +13,8 @@ svc01_health_delay: 5
 # (fix-handoff-banner-openbao-path-honesty, Change 1). Mirrors the
 # consumer_handoff / postgres-server pinning — the SAME shared primary at
 # 10.0.20.10, container openbao-openbao-1, admin token read from the
-# OPENBAO_ADMIN_TOKEN env (never argv), tls-skip-verify for the self-signed mock
+# OPENBAO_ADMIN_TOKEN env and passed to `docker exec` as `-e BAO_TOKEN=<value>`
+# (on that argv on the guest, WS-C62), tls-skip-verify for the self-signed mock
 # cert. The probe is READ-ONLY (`bao kv metadata get`) and NEVER mutates OpenBao;
 # it exists only so the completion banner reports the DB credential's VERIFIED
 # state (present / not written / not verified) instead of asserting it blindly.

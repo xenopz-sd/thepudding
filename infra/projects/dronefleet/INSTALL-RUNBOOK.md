@@ -28,6 +28,8 @@ ZITADEL backing DB on VLAN 20).
 
 ---
 
+> **Platform domain.** Set `PLATFORM_DOMAIN=<platform-domain>` once in your cluster env file ([`cluster.env.example`](../../../cluster.env.example)); every installer uses it as its platform domain, and an explicit `-e <service>_platform_domain=…` still wins. SVC-10 serves that zone ([runbook](../../../infra/projects/svc-10-internal-dns/INSTALL-RUNBOOK.md)).
+
 ## ⚠ Throwaway cluster only
 
 The live steps provision, mutate, and tear down real infrastructure. Run them

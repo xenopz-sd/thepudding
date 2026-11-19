@@ -1,0 +1,30 @@
+---
+# SVC-03 Garage configurator playbook (spec: svc-03-object-storage).
+#
+# CONFIGURATOR play (integration-boundaries.md §4): runs `hosts: garage` NATIVELY
+# on the three Garage LXCs, reached via the generated inventory the installer
+# wrote (ansible/inventory/svc-03-object-storage.generated.yml). Invoked by the
+# svc03_bootstrap role as a child ansible-playbook run. Bind-only: NO task logic
+# here (it lives in garage_install). The RPC secret and admin token are read from
+# the ENVIRONMENT (GARAGE_RPC_SECRET / GARAGE_ADMIN_TOKEN), never from -e.
+- name: Install and join the SVC-03 Garage nodes
+  hosts: garage
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Install + configure one Garage node (config, Compose stack)
+      ansible.builtin.import_role:
+        name: garage_install
+      tags: ["install"]
+
+    - name: Join the nodes and apply the cluster layout (once)
+      ansible.builtin.include_role:
+        name: garage_install
+        tasks_from: layout
+      tags: ["layout"]
+
+    - name: Render the S3 Traefik Route_Fragment (once)
+      ansible.builtin.include_role:
+        name: garage_install
+        tasks_from: route
+      tags: ["route"]

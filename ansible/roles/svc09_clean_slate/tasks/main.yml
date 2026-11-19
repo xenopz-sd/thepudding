@@ -141,7 +141,7 @@
   loop_control:
     label: "{{ item.name }} (vmid {{ item.vmid }})"
   register: svc09_clean_slate_runs
-  changed_when: "'changed=0' not in (svc09_clean_slate_runs.stdout | default(''))"
+  changed_when: "(svc09_clean_slate_runs.stdout | default('')) is search('changed=[1-9]')"
 
 # ---- Verification gate (empty baseline, two ways) ---------------------------
 - name: "Clean-Slate | VERIFY — list any surviving SVC-09 container on the host (pct list)"

@@ -8,7 +8,7 @@ SVC-03 provides the platform's S3-compatible object storage layer, used for buil
 
 **In scope:**
 - Garage as the default S3-compatible object store, deployed as a shared multi-node cluster.
-- MinIO as the documented fallback if Garage's feature set proves insufficient for a specific need.
+- Scality CloudServer as the documented fallback (it replaced MinIO, see §3) if Garage's feature set proves insufficient for a specific need.
 - Per-project bucket and access-key provisioning within the shared cluster.
 - Erasure coding / replication basics for data durability.
 - Scoped S3 credential handoff to project CI pipelines via OpenBao.
@@ -21,9 +21,9 @@ SVC-03 provides the platform's S3-compatible object storage layer, used for buil
 ## 3. Technology selection
 
 - **Default: Garage**. Origin: 🇪🇺 **Deuxfleurs, France** (nonprofit collective), purpose-built for small/medium self-hosted clusters ([Garage object storage — Deuxfleurs](https://garagehq.deuxfleurs.fr)). Chosen as the catalog default specifically because it targets this platform's scale (a handful of nodes, heterogeneous/modest hardware) rather than being a scaled-down version of a hyperscale design, and it ships a native, lightweight S3-compatible API without the operational weight of a full MinIO deployment.
-- **Fallback: MinIO**. Origin: 🚩 **MinIO Inc., Redwood City, California, US** ([MinIO — contact/HQ](https://www.min.io)) — flagged as non-European per the catalog's sourcing principle. MinIO remains documented as the fallback for the specific case where a project needs a MinIO-specific feature Garage does not yet support (e.g. certain advanced IAM policy constructs, or client tooling that assumes MinIO-specific extensions); it is not deployed by default.
+- **Fallback: Scality CloudServer**. Origin: 🇪🇺 **Scality, Paris, France**, Apache-2.0, image `ghcr.io/scality/cloudserver` ([GitHub](https://github.com/scality/cloudserver)). A single-node S3 server (no replication of its own): a stand-in for Garage's S3 API, not for its replication. It replaced MinIO as the fallback on 2026-11-15 because MinIO Community Edition was archived upstream (no images since October 2025, repository archived April 2026, Docker Hub images deleted September 2026). Validated once against the platform's S3 client contract (`tests/installer/test_s3_fallback_cloudserver.py`, WS-C54).
 - Garage Docker image: `dxflrs/garage`, pinned tag e.g. `v2.0.0`. Default ports observed in community Compose deployments: **3900** (S3 API), **3901** (RPC — internal inter-node communication), **3902** (S3-compatible web/static-site hosting), **3903** (administration API) ([portalzine.de — Day 38: Garage Object Storage](https://portalzine.de/day-38-garage-object-storage-the-self-hosted-s3-alternative-7-days-of-docker/)). These four ports should be treated as the standard port set for every Garage node in this deployment.
-- MinIO fallback image: `minio/minio`, default ports 9000 (S3 API) and 9001 (web console).
+- Fallback image: `ghcr.io/scality/cloudserver`, S3 API on port 8000.
 
 ## 4. Multi-tenancy model
 
@@ -103,11 +103,11 @@ Stages: lint → plan (cluster-level Terraform changes only — node count/sizin
 - [ ] Replication factor confirmed by simulating one node's unavailability and verifying reads/writes continue to succeed.
 - [ ] Scoped S3 credentials retrievable by a CI pipeline only via OpenBao — no plaintext key found in any repository or static CI variable.
 - [ ] Prometheus metrics visible for cluster health and per-bucket usage within 5 minutes of deployment.
-- [ ] MinIO fallback path documented and validated at least once in a non-production test, confirming it can be substituted without changing the S3 API contract consumed by client applications.
+- [x] Fallback (Scality CloudServer, replacing MinIO) documented and validated at least once in a non-production test, confirming it can be substituted without changing the S3 API contract consumed by client applications.
 
 ## 15. Open questions / assumptions
 
 - Assumes a 3-node minimum cluster is achievable within the available Proxmox hardware; if only 1–2 physical nodes exist initially, the cluster starts in a reduced-fault-tolerance mode with an explicit note that full replication guarantees do not apply until the third node is added.
 - Assumes full replication (factor 3) rather than erasure coding is the right trade-off at this node count; revisit if the cluster grows beyond ~6 nodes, where erasure coding's storage-efficiency advantage becomes more compelling.
 - Data-heavy ML dataset/checkpoint storage sizing is a rough estimate (§6); actual disk provisioning should be revisited once real project storage consumption is observed over the first few months.
-- The specific trigger condition for falling back to MinIO ("Garage's feature set proves insufficient") is intentionally left as a case-by-case human judgment call rather than a predefined technical threshold.
+- The specific trigger condition for falling back to CloudServer ("Garage's feature set proves insufficient") is intentionally left as a case-by-case human judgment call rather than a predefined technical threshold.

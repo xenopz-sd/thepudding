@@ -34,8 +34,9 @@
   no_log: true
   changed_when: false
 
-# Bind the OpenBao admin token (from the role ENV, never argv) so the delegated
-# bao read below can authenticate. Isolated behind one no_log task.
+# Bind the OpenBao admin token (read from the role ENV) so the delegated bao read
+# below can authenticate. Isolated behind one no_log task. The read passes it to
+# `docker exec` as `-e BAO_TOKEN=<value>` (on that argv on the guest; WS-C62).
 - name: "ZITADEL-org | Bind the OpenBao admin token for the token read (no_log)"
   ansible.builtin.set_fact:
     zop_bao_token: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"

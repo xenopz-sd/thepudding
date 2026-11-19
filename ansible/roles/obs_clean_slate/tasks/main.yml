@@ -181,7 +181,7 @@
   loop_control:
     label: "{{ item.name }} (vmid {{ item.vmid }})"
   register: obs_clean_slate_runs
-  changed_when: "'changed=0' not in (obs_clean_slate_runs.stdout | default(''))"
+  changed_when: "(obs_clean_slate_runs.stdout | default('')) is search('changed=[1-9]')"
 
 # ---- Remove the delegated Grafana cross-guest Route_Fragment ----------------
 # The Grafana guest is now destroyed (loop above). The Route_Fragment Grafana

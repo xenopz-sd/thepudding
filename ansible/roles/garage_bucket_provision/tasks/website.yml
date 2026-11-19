@@ -1,0 +1,84 @@
+---
+# tasks/website.yml — garage_bucket_provision (SVC-03 WS-C51: static website hosting)
+#
+# Included by provision.yml after the buckets exist. For every project bucket:
+#   * declared in website_purposes  -> website access ON (index document) and a
+#     Traefik Route_Fragment garage-web-<bucket> for Host(<bucket>.web.<domain>)
+#     to node 1's VLAN-20 web port (P1, ADR-0018);
+#   * not declared                  -> website access OFF and its route removed.
+# The website endpoint serves ANONYMOUS reads: anything in a website bucket is
+# public to anyone who can reach Traefik. Opt-in per bucket.
+
+- name: "Website | Bind the website set and node 1's VLAN-20 IP (on the Garage host, before any delegation)"
+  ansible.builtin.set_fact:
+    garage_bp_website_buckets: "{{ website_purposes | map('regex_replace', '^', garage_bp_bucket_prefix) | list }}"
+    garage_bp_web_backend_ip: "{{ ansible_host }}"
+  run_once: true
+
+- name: "Website | Read each bucket's current website state"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - GetBucketInfo
+      - "{{ {'id': garage_bp_bucket_ids[item]} | to_json }}"
+  loop: "{{ garage_bp_buckets }}"
+  register: garage_bp_web_state
+  run_once: true
+  changed_when: false
+
+- name: "Website | Reconcile website access per bucket"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - UpdateBucket
+      - >-
+        {{ {'id': garage_bp_bucket_ids[item.item],
+            'body': {'websiteAccess': ({'enabled': true, 'indexDocument': garage_bp_website_index}
+                                       if item.item in garage_bp_website_buckets else {'enabled': false})}}
+           | to_json }}
+  loop: "{{ garage_bp_web_state.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  run_once: true
+  changed_when: true
+  when: >-
+    ((item.stdout | from_json).websiteAccess | bool) != (item.item in garage_bp_website_buckets)
+
+- name: "Website | Render the website Route_Fragments onto the Traefik guest"
+  ansible.builtin.include_role:
+    name: traefik_route
+  vars:
+    traefik_route_enabled: true
+    route_name: "garage-web-{{ garage_bp_web_bucket }}"
+    route_host_rule: "{{ garage_bp_web_bucket }}.{{ garage_bp_web_root_domain }}"
+    route_backend_url: "http://{{ garage_bp_web_backend_ip }}:{{ garage_bp_web_port }}"
+    route_entrypoint: "websecure"
+    route_tls: true
+    traefik_guest_host: "{{ garage_bp_traefik_guest_host }}"
+    traefik_guest_user: "{{ garage_bp_traefik_guest_user }}"
+    traefik_guest_python: "{{ garage_bp_traefik_guest_python }}"
+    traefik_dynamic_config_dir: "{{ garage_bp_traefik_dynamic_config_dir }}"
+  loop: "{{ garage_bp_website_buckets }}"
+  loop_control:
+    loop_var: garage_bp_web_bucket
+  run_once: true
+
+- name: "Website | Remove the Route_Fragment of every project bucket that is not a website"
+  ansible.builtin.file:
+    path: "{{ garage_bp_traefik_dynamic_config_dir }}/garage-web-{{ item }}-route.yml"
+    state: absent
+  loop: "{{ garage_bp_buckets | difference(garage_bp_website_buckets) }}"
+  delegate_to: "{{ garage_bp_traefik_guest_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ garage_bp_traefik_guest_user }}"
+    ansible_python_interpreter: "{{ garage_bp_traefik_guest_python }}"
+  run_once: true

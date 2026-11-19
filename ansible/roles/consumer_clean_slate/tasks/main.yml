@@ -207,7 +207,7 @@
     OPENBAO_ADMIN_TOKEN: "{{ consumer_openbao_admin_token }}"
   no_log: true
   register: consumer_cs_usermgr_run
-  changed_when: "'changed=0' not in (consumer_cs_usermgr_run.stdout | default(''))"
+  changed_when: "(consumer_cs_usermgr_run.stdout | default('')) is search('changed=[1-9]')"
   failed_when:
     - consumer_cs_usermgr_run.rc != 0
     - consumer_cs_usermgr_teardown_strict | bool
@@ -226,6 +226,60 @@
     - consumer_cs_usermgr_run is defined
     - not (consumer_cs_usermgr_run.skipped | default(false))
     - (consumer_cs_usermgr_run.rc | default(0)) != 0
+# === consumer-object-storage R6: remove the project's buckets, key and OpenBao entry =========
+# Composes the SVC-03 onboarder's OWN reversal (garage-bucket-provision.yml, garage_bp_action=teardown): it
+# empties and deletes every bucket the project key is granted on plus the declared ones, deletes the key and
+# secret/proj-<slug>/garage, and gates on no residue. Never raw Garage/bao surgery from this role. Strict by
+# default; consumer_cs_object_storage_teardown_strict=false downgrades a failure (e.g. SVC-03 already torn
+# down) to a loud WARN so it cannot block the rest of the reset.
+- name: "Clean-Slate | Compose the object-storage teardown (garage-bucket-provision, teardown)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ consumer_svc03_inventory }}"
+      - "{{ consumer_garage_bucket_provision_playbook }}"
+      - -e
+      - garage_bp_action=teardown
+      - -e
+      - "project_slug={{ project_slug }}"
+      - -e
+      - "{{ {'bucket_purposes': consumer_manifest.object_storage.buckets} | to_json }}"
+      - -e
+      - "cluster_env_file={{ cluster_env_file }}"
+  args:
+    chdir: "{{ consumer_repo_root }}"
+  environment:
+    OPENBAO_ADMIN_TOKEN: "{{ consumer_openbao_admin_token }}"
+  no_log: true
+  register: consumer_cs_object_storage_run
+  changed_when: "(consumer_cs_object_storage_run.stdout | default('')) is search('changed=[1-9]')"
+  failed_when: false
+  when: consumer_manifest.object_storage is defined
+
+- name: "Clean-Slate | Fail (strict) with the teardown's output tail when the object-storage teardown failed"
+  ansible.builtin.fail:
+    msg: >-
+      The object-storage teardown for '{{ project_slug }}' failed (rc {{ consumer_cs_object_storage_run.rc }}).
+      Last output: {{ (consumer_cs_object_storage_run.stdout | default('')).splitlines()[-30:] | join(' | ') }}
+  when:
+    - consumer_manifest.object_storage is defined
+    - (consumer_cs_object_storage_run.rc | default(0)) != 0
+    - consumer_cs_object_storage_teardown_strict | bool
+
+- name: "Clean-Slate | WARN — object-storage teardown did not complete (non-strict mode)"
+  ansible.builtin.debug:
+    msg: >-
+      WARN: the object-storage teardown for '{{ project_slug }}' exited
+      {{ consumer_cs_object_storage_run.rc | default('?') }}. Buckets proj-{{ project_slug }}-*, the key
+      proj-{{ project_slug }}-cikey and secret/proj-{{ project_slug }}/garage may remain. Re-run
+      ansible/playbooks/garage-bucket-provision.yml -e garage_bp_action=teardown -e project_slug={{ project_slug }}
+      when SVC-03 and OpenBao are reachable.
+  when:
+    - consumer_manifest.object_storage is defined
+    - (consumer_cs_object_storage_run.rc | default(0)) != 0
+    - not (consumer_cs_object_storage_teardown_strict | bool)
+
 # === Reverse the OpenBao onboarding (compose the onboarder's own reversal) ====
 # OpenBao project objects (policy-<slug>, <slug>-ci, <slug>-workload, KV path)
 # are removed via the onboarders' own reversal paths. Where an onboarder exposes
@@ -351,7 +405,7 @@
       loop_control:
         label: "{{ item.name }} (vmid {{ item.vmid }})"
       register: consumer_workload_cs_runs
-      changed_when: "'changed=0' not in (consumer_workload_cs_runs.stdout | default(''))"
+      changed_when: "(consumer_workload_cs_runs.stdout | default('')) is search('changed=[1-9]')"
 
     # Residue sweep: the container-only state rm above leaves the non-guest
     # module/anchor addresses (module.workload[0], terraform_data.assert_resolvable)
@@ -499,7 +553,7 @@
   args:
     chdir: "{{ consumer_repo_root }}"
   register: consumer_cs_db_run
-  changed_when: "'changed=0' not in (consumer_cs_db_run.stdout | default(''))"
+  changed_when: "(consumer_cs_db_run.stdout | default('')) is search('changed=[1-9]')"
   failed_when: consumer_cs_db_run.rc != 0
   when:
     - consumer_manifest.database is defined

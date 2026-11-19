@@ -100,3 +100,7 @@ consumer_probe_retry_delay: 3
 # throwaway guard under its OWN --service, so a narrow AGENT_LIVE_AUTHORIZED_SERVICES scope
 # must grant them all. Composes svc-01-bootstrap.yml (the per-project DB).
 consumer_guard_composed_services: [svc01]
+
+# consumer-object-storage: the SVC-03 generated inventory (proof that SVC-03 is installed, and the -i of
+# the composed garage-bucket-provision.yml child runs). Repo-relative.
+consumer_svc03_inventory: ansible/inventory/svc-03-object-storage.generated.yml

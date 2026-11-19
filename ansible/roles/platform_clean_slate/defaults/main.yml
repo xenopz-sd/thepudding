@@ -142,6 +142,50 @@ platform_clean_slate_services:
     state_ignore_patterns:
       - terraform_data.ledger_index_assert
       - terraform_data.input_guards
+  # --- SVC-03 (Garage object storage) — spec svc-03-object-storage. Shared
+  # VLAN-20 service: svc03_clean_slate tears down the THREE Garage guests
+  # (VMIDs 20012/20013/20014 = 20 * 1000 + host_index 12/13/14, ADR-0022), removes
+  # the Traefik-side S3 Route_Fragment and residue-sweeps its state. VMIDs default
+  # at play level, so no extra_vars. Inert anchors: the root ledger-drift guard +
+  # one proxmox-compute module anchor per guest.
+  - service: svc03
+    bootstrap_playbook: ansible/playbooks/svc-03-bootstrap.yml
+    generated_inventory: ansible/inventory/svc-03-object-storage.generated.yml
+    verify_vmids: [20012, 20013, 20014]
+    verify_tf_root: infra/projects/svc-03-object-storage
+    proxmox_host_var: svc03_proxmox_host
+    extra_vars: {}
+    state_ignore_patterns:
+      - terraform_data.ledger_index_assert
+      - terraform_data.input_guards
+  # --- SVC-10 (internal DNS, PowerDNS) — spec svc-10-internal-dns. Shared VLAN-20
+  # service: svc10_clean_slate tears down the single DNS guest (VMID 20015 =
+  # 20 * 1000 + host_index 15, ADR-0022) and residue-sweeps its state. No Traefik
+  # route (DNS is not HTTP ingress). The API key stays in OpenBao, like the other
+  # services' secrets. Inert anchors: the root ledger-drift guard + the
+  # proxmox-compute module anchor.
+  - service: svc10
+    bootstrap_playbook: ansible/playbooks/svc-10-bootstrap.yml
+    generated_inventory: ansible/inventory/svc-10-internal-dns.generated.yml
+    verify_vmids: [20015]
+    verify_tf_root: infra/projects/svc-10-internal-dns
+    proxmox_host_var: svc10_proxmox_host
+    extra_vars: {}
+    state_ignore_patterns:
+      - terraform_data.ledger_index_assert
+      - terraform_data.input_guards
+  # --- SVC-08 (internal PKI, OpenBao PKI engine) — spec svc-08-internal-pki, ADR-0028. No guest and no
+  # Terraform state: the "generated inventory" is a discovery marker written by svc-08-bootstrap.yml,
+  # verify_vmids is empty and verify_tf_root is the runbook directory (no root, so `terraform state list`
+  # there yields nothing). Its clean-slate removes the PKI mounts (best effort), the published root and
+  # the PLATFORM_CA_CERT gate key from the control node.
+  - service: svc08
+    bootstrap_playbook: ansible/playbooks/svc-08-bootstrap.yml
+    generated_inventory: ansible/inventory/svc-08-internal-pki.generated.yml
+    verify_vmids: []
+    verify_tf_root: infra/projects/svc-08-internal-pki
+    extra_vars: {}
+    state_ignore_patterns: []
 
 # --- Fabric_Teardown target (design "Data Models", step (e)) ----------------- #
 # The ONLY Terraform root this role destroys directly. Service TF roots are

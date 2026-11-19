@@ -1,0 +1,140 @@
+---
+# tasks/main.yml — svc08_clean_slate (SVC-08 clean-slate branch). Option B has no guest and no
+# Terraform state: it removes the PKI mounts and issuance policies (best effort, only when OpenBao is
+# reachable and the admin token works), the published root, the PLATFORM_CA_CERT gate key, the
+# discovery marker and the trust entries, then verifies an empty baseline. Mounts disappear with
+# the guest anyway when the platform teardown destroys SVC-07, so unreachable OpenBao is tolerated.
+- name: "Clean-Slate | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ svc08_venv_python }}"
+      - "{{ svc08_throwaway_guard }}"
+      - --service
+      - svc08
+      - --env-file
+      - "{{ cluster_env_file }}"
+      - --allowlist
+      - "{{ svc08_throwaway_allowlist }}"
+  args:
+    chdir: "{{ svc08_repo_root }}"
+  register: svc08_throwaway_decision
+  changed_when: false
+  failed_when: false
+  when: agent_live_run | default(false) | bool
+- name: "Clean-Slate | INFO — agent-live authorization decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: agent-live authorization:
+      {{ (svc08_throwaway_decision.stdout | default('{}') | from_json).reason | default('no decision') }}
+  when: agent_live_run | default(false) | bool
+- name: "Clean-Slate | Refuse the reset unless the throwaway guard AUTHORIZED it"
+  ansible.builtin.assert:
+    that:
+      - "svc08_throwaway_decision.rc == 0"
+    fail_msg: >-
+      Agent-live clean-slate REFUSED by the throwaway-cluster guard:
+      {{ (svc08_throwaway_decision.stdout | default('{}') | from_json).reason
+         | default('guard produced no decision') }}.
+      Nothing was removed.
+  when: agent_live_run | default(false) | bool
+- name: "Clean-Slate | Prompt for explicit confirmation (300s timeout; skipped on force)"
+  ansible.builtin.pause:
+    prompt: >-
+      DESTRUCTIVE Clean-Slate reset of SVC-08: disables the PKI mounts (root and issuing CA keys are
+      destroyed; every issued certificate stops chaining to a live CA) and removes the published root.
+      Type 'yes' to proceed, anything else to abort
+  register: svc08_cs_prompt
+  when: (clean_slate_confirm | default('')) != 'force'
+- name: "Clean-Slate | Resolve whether the reset is confirmed"
+  ansible.builtin.set_fact:
+    svc08_cs_confirmed: >-
+      {{ (clean_slate_confirm | default('')) == 'force'
+         or ((svc08_cs_prompt.user_input | default('') | trim | lower) in ['yes', 'y']) }}
+- name: "Clean-Slate | Abort when not confirmed (removes nothing)"
+  ansible.builtin.fail:
+    # yamllint disable-line rule:line-length
+    msg: "Clean-Slate reset ABORTED — confirmation was not given. Nothing was removed. Pass -e clean_slate_confirm=force to skip the prompt."
+  when: not (svc08_cs_confirmed | bool)
+
+- name: "Clean-Slate | Resolve the OpenBao admin token when present (no_log)"
+  ansible.builtin.set_fact:
+    pki_ca_admin_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         or (lookup('ansible.builtin.file', svc08_repo_root ~ '/' ~ cluster_env_file, errors='ignore')
+             | default('', true)
+             | regex_findall('(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*[\"\']?([^\"\'\r\n]*?)[\"\']?[ \t]*$')
+             | first | default('') | trim) }}
+  no_log: true
+# The platform teardown runs this after SVC-07's clean-slate, when the OpenBao guest is gone; an SSH call to an
+# absent host aborts the play regardless of failed_when (live, 2026-11-18). Probe first, skip the OpenBao steps if
+# the guest does not answer: the mounts went with the guest.
+- name: "Clean-Slate | Is the OpenBao primary guest reachable (SSH port)?"
+  ansible.builtin.wait_for:
+    host: "{{ pki_ca_cli_host }}"
+    port: 22
+    timeout: 5
+  delegate_to: localhost
+  register: svc08_cs_openbao_reachable
+  # ignore_errors, not failed_when: false — the latter clears `failed` and hides a timeout (live, 2026-11-18).
+  ignore_errors: true
+- name: "Clean-Slate | INFO — OpenBao reachability"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: OpenBao primary {{ pki_ca_cli_host }}
+      {{ 'reachable: removing the PKI mounts and policies' if not (svc08_cs_openbao_reachable.failed | default(false))
+         else 'not reachable: the PKI mounts went with the guest, skipping OpenBao steps' }}
+- name: "Clean-Slate | Disable the PKI mounts and delete the issuance policies (best effort)"
+  ansible.builtin.include_role:
+    name: pki_ca
+    tasks_from: bao.yml
+  vars:
+    pki_bao_allow_fail: true
+    pki_bao_args: "{{ item }}"
+  loop: >-
+    {{ (svc08_cs_mounts | map('regex_replace', '^', 'secrets disable ') | map('split', ' ') | list)
+       + (svc08_cs_policy_names | map('regex_replace', '^', 'policy delete ') | map('split', ' ') | list)
+       + [['delete', 'auth/token/roles/pki-issue']] }}
+  loop_control:
+    label: "{{ item | join(' ') }}"
+  when:
+    - (pki_ca_admin_token | default('') | length) > 0
+    - not (svc08_cs_openbao_reachable.failed | default(false))
+- name: "Clean-Slate | Remove the published root and scratch files"
+  ansible.builtin.file:
+    path: "{{ svc08_repo_root }}/{{ item }}"
+    state: absent
+  loop:
+    - .pki/platform-root-ca.pem
+    - .pki/scratch
+    - .pki/scratch-selftest.pem
+  delegate_to: localhost
+  connection: local
+- name: "Clean-Slate | Remove the PLATFORM_CA_CERT gate key from the cluster env file"
+  ansible.builtin.lineinfile:
+    # yamllint disable-line rule:line-length
+    path: "{{ (svc08_repo_root ~ '/' ~ cluster_env_file) if (cluster_env_file is not match('^/')) else cluster_env_file }}"
+    regexp: '^[ \t]*PLATFORM_CA_CERT[ \t]*='
+    state: absent
+  delegate_to: localhost
+  connection: local
+  failed_when: false
+- name: "Clean-Slate | Verify an empty baseline (no published root)"
+  ansible.builtin.stat:
+    path: "{{ svc08_repo_root }}/{{ item }}"
+  loop:
+    - .pki/platform-root-ca.pem
+  register: svc08_cs_verify
+  delegate_to: localhost
+  connection: local
+- name: "Clean-Slate | Fail when anything survived"
+  ansible.builtin.assert:
+    that:
+      - svc08_cs_verify.results | selectattr('stat.exists') | list | length == 0
+    fail_msg: "SVC-08 clean-slate left artifacts behind."
+    quiet: true
+- name: "Clean-Slate | Remove the discovery marker (the SVC-08 generated inventory, WS-C42)"
+  ansible.builtin.include_role:
+    name: generated_inventory_cleanup
+  vars:
+    gic_paths:
+      - "{{ svc08_repo_root }}/{{ svc08_generated_inventory }}"

@@ -245,7 +245,7 @@
   loop_control:
     label: "{{ item.name }} (vmid {{ item.vmid }})"
   register: svc07_clean_slate_runs
-  changed_when: "'changed=0' not in (svc07_clean_slate_runs.stdout | default(''))"
+  changed_when: "(svc07_clean_slate_runs.stdout | default('')) is search('changed=[1-9]')"
 
 # ---- Remove the delegated OpenBao cross-guest Route_Fragment ----------------
 # The OpenBao primary guest is now destroyed (loop above). The Route_Fragment
@@ -523,6 +523,23 @@
   vars:
     gic_paths:
       - "{{ svc07_repo_root }}/{{ svc07_generated_inventory }}"
+# SVC-08 lives in this OpenBao (ADR-0028): destroying SVC-07 destroys the CA, so its control-node artifacts (the
+# published root, the PLATFORM_CA_CERT gate key, the discovery marker) must go too, or consumers would keep
+# selecting a CA that no longer exists (WS-C59).
+- name: "Clean-Slate | Remove SVC-08's control-node artifacts (the CA died with this OpenBao)"
+  ansible.builtin.file:
+    path: "{{ svc07_repo_root }}/{{ item }}"
+    state: absent
+  loop:
+    - .pki/platform-root-ca.pem
+    - ansible/inventory/svc-08-internal-pki.generated.yml
+- name: "Clean-Slate | Remove the PLATFORM_CA_CERT gate key from the cluster env file"
+  ansible.builtin.lineinfile:
+    path: >-
+      {{ (svc07_repo_root ~ '/' ~ cluster_env_file) if (cluster_env_file is not match('^/')) else cluster_env_file }}
+    regexp: '^[ \t]*PLATFORM_CA_CERT[ \t]*='
+    state: absent
+  failed_when: false
 - name: "Clean-Slate | Report the reset completed to an empty baseline"
   ansible.builtin.debug:
     msg: >-

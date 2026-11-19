@@ -95,6 +95,24 @@
 # a failure here (fail-closed-by-design; the swap-gate handles it) — only a TLS
 # trust failure is. Skipped when skip-verify is already on (nothing to verify) or
 # `openbao_agent_tls_preflight` is false.
+- name: "4 — SVC-08 gate: is the platform root published (control node)?"
+  ansible.builtin.stat:
+    path: "{{ openbao_agent_platform_ca_src }}"
+  delegate_to: localhost
+  become: false
+  register: openbao_agent_platform_ca_stat
+- name: "4 — SVC-08 gate: decide the Agent CA (verify with the platform root when published and not skipping)"
+  ansible.builtin.set_fact:
+    openbao_agent_ca_cert: >-
+      {{ openbao_agent_ca_container_path
+         if ((openbao_agent_platform_ca_stat.stat.exists | default(false))
+             and not (openbao_primary_tls_skip_verify | bool)) else '' }}
+- name: "4 — INFO — Agent -> Primary TLS"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: openbao-agent TLS to {{ openbao_primary_addr }}:
+      {{ 'tls_skip_verify (dev opt-in)' if (openbao_primary_tls_skip_verify | bool)
+         else ('ca_cert = platform root (SVC-08)' if (openbao_agent_ca_cert | length > 0) else 'system trust') }}
 - name: "4 — Probe the Primary TLS trust with verification ON (read-only, WS-C6)"
   ansible.builtin.uri:
     url: "{{ openbao_primary_addr }}/v1/sys/health"
@@ -102,13 +120,37 @@
     validate_certs: true
     status_code: [200, 429, 472, 473, 501, 503]
     timeout: 10
-  register: openbao_agent_tls_probe
+  register: openbao_agent_tls_probe_system
   check_mode: false
   changed_when: false
   failed_when: false
   when:
     - openbao_agent_tls_preflight | bool
     - not (openbao_primary_tls_skip_verify | bool)
+    - openbao_agent_ca_cert | length == 0
+# With the platform root as trust anchor, probe with it explicitly (ca_path is read on the control node).
+- name: "4 — Probe the Primary TLS trust against the platform root (read-only, SVC-08)"
+  ansible.builtin.uri:
+    url: "{{ openbao_primary_addr }}/v1/sys/health"
+    method: GET
+    validate_certs: true
+    ca_path: "{{ openbao_agent_platform_ca_src }}"
+    status_code: [200, 429, 472, 473, 501, 503]
+    timeout: 10
+  delegate_to: localhost
+  become: false
+  register: openbao_agent_tls_probe_ca
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  when:
+    - openbao_agent_tls_preflight | bool
+    - openbao_agent_ca_cert | length > 0
+- name: "4 — Select the TLS probe result that ran"
+  ansible.builtin.set_fact:
+    openbao_agent_tls_probe: >-
+      {{ openbao_agent_tls_probe_ca if (openbao_agent_tls_probe_ca is not skipped)
+         else openbao_agent_tls_probe_system }}
 - name: "4 — Fail closed if the Primary cert is untrusted and skip-verify is off (WS-C6)"
   ansible.builtin.assert:
     that:
@@ -148,6 +190,15 @@
     owner: root
     group: root
     mode: "0700"
+- name: "4 — Stage the platform root for the Agent (public)"
+  ansible.builtin.copy:
+    src: "{{ openbao_agent_platform_ca_src }}"
+    dest: "{{ openbao_agent_ca_host_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: openbao_agent_ca_cert | length > 0
+  notify: Recreate openbao-agent sidecar
 
 # ============================================================================
 # STEP 2 (Task 4.4) — Render agent.hcl idempotently (Req 4.1, 4.2, 4.6, 4.8)

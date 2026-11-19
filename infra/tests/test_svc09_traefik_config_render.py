@@ -226,9 +226,15 @@ class TestComposeStackShape:
         return _TASKS_MAIN.read_text()
 
     def test_docker_socket_mounted_read_only(self, tasks_text):
-        assert re.search(r"docker_socket\s*\}\}:ro", tasks_text) or re.search(
-            r"/var/run/docker\.sock.*:ro", tasks_text
+        # The volume list moved to defaults (traefik_base_volumes) so the SVC-08 CA mount can be appended
+        # conditionally; the stack must still use it and the socket entry must still be :ro.
+        defaults = (_ROLE_DIR / "defaults" / "main.yml").read_text(encoding="utf-8")
+        assert "traefik_base_volumes" in tasks_text, "the stack must mount traefik_base_volumes"
+        text = tasks_text + defaults
+        assert re.search(r"docker_socket\s*\}\}:ro", text) or re.search(
+            r"/var/run/docker\.sock.*:ro", text
         ), "the Docker socket must be mounted READ-ONLY (:ro) into the Traefik stack (§12)"
+        assert not re.search(r"docker_socket\s*\}\}\"", defaults), "no read-write socket mount in the defaults"
 
     def test_persistent_acme_named_volume(self, tasks_text):
         # The acme volume is a named volume listed in dca_volumes (persistent),

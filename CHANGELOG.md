@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-11-19
+
+Three new shared services, live-validated together by a full platform teardown and from-scratch rebuild on a
+throwaway cluster: SVC-03 object storage (Garage), SVC-10 internal DNS (PowerDNS) and SVC-08 internal PKI (the
+OpenBao PKI engine). With SVC-08, internal TLS is verified end to end: Traefik serves CA-issued certificates by ACME,
+OpenBao and its Agents verify against the platform root, and every guest trusts it. SVC-17/18 now observes every
+guest (host and container metrics, logs). Read "Upgrade notes" before upgrading an existing cluster.
+
+### Upgrade notes
+
+- **Install order** (`docs/TESTING.md`, "Dependency order"): platform, SVC-07, SVC-10, SVC-08, SVC-07 again, SVC-09,
+  SVC-06, mail catcher, SVC-03, SVC-17/18, SVC-10 again, then projects, then SVC-10 and SVC-17/18 once more. Adding
+  SVC-08 to an existing platform: run `svc-08-bootstrap.yml`, then re-run SVC-07, SVC-09 and SVC-17/18.
+- **Dev TLS skips are no longer defaults.** The consumer path no longer defaults to skipping OpenBao TLS verification
+  (WS-C13). With SVC-08 installed, remove `OPENBAO_TLS_SELF_SIGNED=true` from the cluster env file. Without SVC-08,
+  keep it (dev clusters on the self-signed mock). Passing a TLS mock flag (`traefik_tls_self_signed`,
+  `obs_tls_self_signed`) while the platform root is published now fails closed.
+- **`PLATFORM_DOMAIN`** in the cluster env file is now the platform domain for every installer (SVC-10).
+- **cAdvisor moved from host port 8080 to 9338** on every guest; external scrape configs must follow. Re-run
+  SVC-17/18 after adding or removing a service or project.
+- **`platform-admin` OpenBao policy** gains PKI and `pki-issue` token-role grants (ADR-0029); SVC-08 appends them on a
+  running cluster.
+- **Do not keep an exported `OPENBAO_ADMIN_TOKEN` across a SVC-07 rebuild**: the process environment wins over the
+  cluster env file, so a stale exported token is used and every OpenBao call is denied.
+- **SVC-03 bucket purposes** can no longer contain hyphens.
+
+### Added
+- **Every guest is observed (WS-C58)**: SVC-17/18 deploys node_exporter, cAdvisor (now host port 9338) and Promtail on
+  every guest in the generated inventories and generates one node and one cAdvisor scrape target per guest, with
+  `project` labels from the project registry. Re-run SVC-17/18 after adding or removing a service. Before this,
+  Prometheus scraped no host or container metrics and only the observability guests shipped logs.
+- **SVC-08 remaining consumers (WS-C60)**: the OpenBao Agent sidecars verify the primary with the platform root
+  (`ca_cert`); in-container `bao` calls on the primary verify (`127.0.0.1` SAN + `BAO_CACERT`); the consumer path
+  follows the WS-C6 TLS resolution order instead of a committed skip (closes WS-C13); every guest trusts the root
+  through the `common` role.
+- **SVC-08 internal PKI (OpenBao PKI engine, ADR-0028, ADR-0029), CA live-validated**: `svc-08-bootstrap.yml` configures a root
+  and an issuing CA on SVC-07, per-service issuance roles and policies, ACME on the issuing mount, a published public
+  root, trust-store installation (`pki-trust.yml`), the shared `pki_issue` role (idempotent, scoped child token,
+  verify-before-write, expiry metric) and a clean-slate with a platform catalog row.
+- **Internal CA consumers (WS-C59)**: OpenBao listeners serve CA certificates and the primary's transit seal client
+  verifies the unsealer; Traefik's `internal` resolver obtains a wildcard for the platform domain by ACME DNS-01
+  through the SVC-10 PowerDNS API (key delivered by the installer, 0600); Grafana selects the real-CA path; new
+  alerts `PlatformCertExpiringSoon` and `PlatformCertExpired`. All selected only when the platform root is published.
+- **SVC-03 object storage (Garage v2.5.0)**: a three-node Garage cluster (replication factor 3) on three VLAN-20
+  LXCs with dedicated data volumes, installed by `ansible/playbooks/svc-03-bootstrap.yml` (four phases, clean-slate,
+  platform clean-slate row). S3 through Traefik at `s3.<domain>`; cluster secrets generated once into OpenBao at
+  `secret/proj-shared-garage/garage`; Prometheus scrapes each node. `ansible/playbooks/garage-bucket-provision.yml`
+  gives a project buckets `proj-<slug>-<purpose>` and one bucket-scoped key stored at `secret/proj-<slug>/garage`
+  (idempotent, never rotates on a re-run). Live-validated on the throwaway cluster, including bucket isolation and
+  node loss. Static website hosting, manifest integration, alerts, admin-API firewalling, the MinIO fallback check and
+  key rotation are backlog WS-C50..C55.
+- **Object storage in the consumer manifest** (WS-C50): `object_storage: {buckets: [...]}` makes
+  `project-consumer-bootstrap.yml` create the project's Garage buckets and scoped key (stored at
+  `secret/proj-<slug>/garage`, printed by path in the handoff); the consumer clean-slate removes buckets (with their
+  objects), key and OpenBao entry through the new `garage_bp_action=teardown` of `garage-bucket-provision.yml`.
+  `s3_smoke.py` can empty a bucket and reach the Traefik S3 route by IP with TLS verification.
+- **Garage alerts** (WS-C52): six rules in the SVC-17/18 baseline (node down, quorum lost, under-replicated, data
+  volume over 80 %, resync errors, S3 5xx rate), unit-tested with `promtool test rules` and checked live.
+
+- **SVC-03 project key rotation** (WS-C55): `garage-bucket-provision.yml -e garage_bp_action=rotate` replaces a
+  project's key with the same bucket grants and revokes the old one; `garage_bp_rotate_min_age_days` makes it safe to
+  schedule for the 180-day cadence.
+
+- **SVC-03 static website hosting** (WS-C51): a bucket listed in `website_purposes` (manifest
+  `object_storage.website`) is served publicly at `https://<bucket>.web.<platform-domain>/` through Traefik; every run
+  reconciles the other buckets back to private.
+
+- **SVC-10 internal DNS (PowerDNS)** (WS-C57): `ansible/playbooks/svc-10-bootstrap.yml` installs a PowerDNS authoritative server and recursor on one VLAN-20 LXC (`10.0.20.25`). The zone is `PLATFORM_DOMAIN`: `*.<domain>` and `*.web.<domain>` point to Traefik, and one A record per guest is synced from the generated inventories on every run (stale records deleted). Guests keep their own resolver, so a DNS outage cannot break package installs; developer machines use split DNS (the installer prints the commands). The API key is generated once into OpenBao at `secret/proj-shared-dns/pdns`; the API and metrics ports are firewalled in the guest. Prometheus scrapes both servers; new alerts `DnsRecursorDown` and `DnsRecursorServfailRate`. Live-validated on the throwaway cluster.
+### Changed
+- **One platform domain for every installer** (SVC-10): set `PLATFORM_DOMAIN=<domain>` in the cluster env file and every bootstrap (SVC-03/06/07/09/17-18, the mail catcher, the consumer orchestrator) uses it as its platform domain. An explicit `-e <service>_platform_domain=…` still wins; without the key the placeholder `platform.example.test` stays. Re-running an installer after setting it moves that service's names (for ZITADEL, the issuer URL) to the new domain.
+- **SVC-03 fallback is now Scality CloudServer** (WS-C54), replacing MinIO, whose Community Edition was archived
+  upstream; the S3 client contract was validated against the pinned CloudServer image.
+- **SVC-03 admin API reachable only from Prometheus** (WS-C53): an in-guest firewall on each Garage node admits only
+  `garage_admin_allowed_sources` (default `10.0.20.18`) to port 3903; the installer's health check now runs on the
+  guests. Hosts that called `http://10.0.20.2x:3903` directly must be added to the allow list.
+
+### Fixed
+- Installers reported a multi-host child run as unchanged when any one host was unchanged (39 call sites).
+- Exporter roles skipped their deploy for an already-pinned image, so configuration changes never reached running
+  containers.
+- **Platform clean-slate stopped at SVC-08** when OpenBao was already gone: SVC-08's clean-slate now probes the
+  OpenBao guest and skips its OpenBao steps when it is gone.
+- **SVC-06 installer read the OpenBao admin token from the process environment only**, so ZITADEL's OpenBao reads
+  failed inside a hidden child run unless the token was exported. It now falls back to the cluster env file like
+  every other installer, and `TESTING.md` no longer needs an export.
+- SVC-10's OpenBao read failure names the token source and the stale-export remedy.
+- Consumer onboarding passed no platform domain to ZITADEL org provisioning, so with a real `PLATFORM_DOMAIN` it
+  targeted the placeholder host and failed silently.
+- **Two projects could share a bucket name** (`proj-a-b-x` from slug `a` + purpose `b-x` and slug `a-b` + purpose
+  `x`), and the second project's provisioning would have granted its key on the first project's bucket. Bucket
+  purposes no longer allow hyphens.
+
 ## [0.16.0] — 2026-11-14
 
 > Operator-visible defects found by live acceptance on a throwaway cluster and fixed test-first, consumer
@@ -1455,7 +1547,8 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
-[Unreleased]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.16.0...HEAD
+[Unreleased]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.17.0...HEAD
+[0.17.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.16.0...v0.17.0
 [0.16.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.15.0...v0.16.0
 [0.15.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.14.0...v0.15.0
 [0.14.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.13.0...v0.14.0

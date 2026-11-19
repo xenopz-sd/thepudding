@@ -1,0 +1,17 @@
+---
+# meta/main.yml — garage_bucket_provision
+galaxy_info:
+  role_name: garage_bucket_provision
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Idempotently creates a project's Garage buckets (proj-<slug>-<purpose>) and one
+    bucket-scoped key (proj-<slug>-cikey, read+write, never owner), and stores the
+    key in OpenBao at secret/proj-<slug>/garage. SVC-03 FR-2/FR-3/FR-7.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+dependencies: []

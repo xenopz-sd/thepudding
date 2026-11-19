@@ -1,0 +1,27 @@
+---
+# meta/main.yml — garage_install
+galaxy_info:
+  role_name: garage_install
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Installs one SVC-03 Garage object storage node on a Proxmox LXC as a Docker
+    Compose stack (pinned image, ports bound to the guest's own VLAN-20 IP, 0600
+    garage.toml), joins the nodes and applies the cluster layout (layout.yml), and
+    delegates the S3 Traefik Route_Fragment (route.yml).
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags:
+    - garage
+    - s3
+    - storage
+# No hard cross-role dependencies; docker-compose-app and traefik_route are
+# consumed via include_role.
+dependencies: []

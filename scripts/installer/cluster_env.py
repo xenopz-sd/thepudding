@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from typing import NamedTuple
 
@@ -407,6 +408,38 @@ def load_env_file(path: str) -> dict[str, str]:
     return parse_env(text)
 
 
+# --- Platform domain (SVC-10 design D5) ---------------------------------------
+# ONE cluster env key, PLATFORM_DOMAIN, is the default platform domain for every
+# installer's ``*_platform_domain`` variable. It is deliberately NOT a SCHEMA row:
+# it has no Terraform-variable consumer of its own (the roots that need it get it
+# by an explicit ``-var``), so the TF_VAR mapping and its tests stay unchanged.
+# The value is non-secret. Absent => None => each installer keeps its committed
+# placeholder default; an explicit ``-e`` always wins over this default.
+PLATFORM_DOMAIN_KEY = "PLATFORM_DOMAIN"
+_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_DOMAIN_RE = re.compile(rf"^(?:{_LABEL}\.)+[a-z](?:[a-z0-9-]{{0,61}}[a-z0-9])?$")
+
+
+def resolve_platform_domain(env: dict[str, str]) -> str | None:
+    """Return the validated, lower-cased PLATFORM_DOMAIN, or None when absent.
+
+    A value must be a DNS name of at least two labels with an alphabetic top
+    label (``lab.example.test``); one trailing dot is accepted and stripped.
+    An invalid value raises :class:`ValidationError` naming the key only.
+    """
+    value = _present(env, PLATFORM_DOMAIN_KEY)
+    if value is None:
+        return None
+    name = value.lower()
+    if name.endswith("."):
+        name = name[:-1]
+    if len(name) > 253 or not _DOMAIN_RE.match(name):
+        raise ValidationError(
+            f"{PLATFORM_DOMAIN_KEY} is not a valid DNS domain (expected e.g. lab.example.test)"
+        )
+    return name
+
+
 def resolve_env_file(path: str) -> dict[str, str]:
     """End-to-end: load ``path``, parse, resolve, and validate.
 
@@ -445,7 +478,24 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Validate only; do not emit resolved values to stdout.",
     )
+    parser.add_argument(
+        "--platform-domain",
+        action="store_true",
+        help="Print only the validated PLATFORM_DOMAIN (empty line when absent); "
+        "no mandatory-variable validation.",
+    )
     args = parser.parse_args(argv)
+    if args.platform_domain:
+        try:
+            domain = resolve_platform_domain(load_env_file(args.env_file))
+        except EnvFileNotFoundError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except ValidationError as exc:
+            print(f"cluster env validation failed: {exc}", file=sys.stderr)
+            return 3
+        print(domain or "")
+        return 0
 
     try:
         resolved = resolve_env_file(args.env_file)

@@ -56,3 +56,4 @@ cluster.prod.env
 # repo root is NOT matched by *.env / .env above, so it is listed explicitly.
 # Never committed.
 .svc07-*.log
+.pki/

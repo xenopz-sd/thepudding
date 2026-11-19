@@ -114,6 +114,13 @@
     agent_live_run: "{{ (lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') | trim) | length > 0 }}"
 
   tasks:
+    # PLATFORM_DOMAIN in the cluster env file is the default platform domain
+    # (SVC-10 design D5); an explicit -e still wins. Runs first, also on clean-slate.
+    - name: Resolve PLATFORM_DOMAIN from the cluster env file
+      ansible.builtin.import_role:
+        name: platform_domain
+      vars:
+        platform_domain_var: consumer_platform_domain
     # ------------------------------------------------------------------ #
     # TOP-LEVEL BRANCH: clean-slate reset vs. the normal 4-phase onboard. #
     # Each phase is exactly one import_role wrapped in its own            #

@@ -1,0 +1,17 @@
+---
+# handlers/main.yml — garage_install
+#
+# Garage reads garage.toml only at start, so a changed config recreates the
+# container (data and metadata live on the host data volume and survive).
+- name: Restart garage
+  community.docker.docker_compose_v2:
+    project_src: "{{ dca_base_dir | default('/opt/compose') }}/{{ garage_stack_name }}"
+    project_name: "{{ garage_stack_name }}"
+    state: present
+    recreate: always
+
+- name: Restart garage admin firewall
+  ansible.builtin.systemd_service:
+    name: garage-admin-firewall.service
+    state: restarted
+    daemon_reload: true

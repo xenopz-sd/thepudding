@@ -1,0 +1,77 @@
+---
+# tasks/main.yml — svc10_handoff (SVC-10 DNS installer — Phase 4: Handoff)
+#
+# Phase 4 = health sanity (R8) + Developer B completion handoff (FR-7). The health
+# gate runs as the CHILD configurator play svc10-health.yml (hosts: dns, natively
+# on the guest); the API key reaches it through the ENVIRONMENT, never argv.
+
+- name: "Handoff | Run the guest health gate as a child configurator play (svc10-health.yml, no_log)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc10_generated_inventory }}"
+      - ansible/playbooks/svc10-health.yml
+      - -e
+      - "svc10_platform_domain={{ svc10_platform_domain }}"
+      - -e
+      - "svc10_bind_ip={{ svc10_bind_ip }}"
+      - -e
+      - "svc10_traefik_ip={{ svc10_traefik_ip }}"
+      - -e
+      - "svc10_public_name={{ svc10_public_name }}"
+      - -e
+      - "svc10_health_retries={{ svc10_health_retries }}"
+      - -e
+      - "svc10_health_delay={{ svc10_health_delay }}"
+  args:
+    chdir: "{{ svc10_repo_root }}"
+  environment:
+    PDNS_API_KEY: "{{ svc10_api_key | default('') }}"
+  register: svc10_health_run
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: "Handoff | Scrub the API key fact from memory (no_log)"
+  ansible.builtin.set_fact:
+    svc10_api_key: ""
+  no_log: true
+  changed_when: false
+
+# The child's keyed task is no_log, so its output carries no secret value.
+- name: "Handoff | Fail with the health gate's output tail when it failed"
+  ansible.builtin.fail:
+    msg: >-
+      svc10-health.yml failed (rc {{ svc10_health_run.rc }}). Last output:
+      {{ (svc10_health_run.stdout | default('')).splitlines()[-40:] | join(' | ') }}
+  when: (svc10_health_run.rc | default(1)) != 0
+
+# --- Completion summary banner (FR-7: split-DNS setup for a developer machine) ------
+- name: "Handoff | Print the Developer B completion summary banner"
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Service SVC-10 (internal DNS, PowerDNS) Deployed Successfully!"
+      - "============================================================"
+      - "Status:          healthy (wildcard, guest and public names resolve; API refuses keyless requests)"
+      - "Zone:            {{ svc10_platform_domain }}"
+      - "Wildcards:       *.{{ svc10_platform_domain }} and *.web.{{ svc10_platform_domain }}"
+      - "                 -> Traefik {{ svc10_traefik_ip }}"
+      - "Resolver:        {{ svc10_bind_ip }}:53 (UDP/TCP; private networks only)"
+      - "API key:         OpenBao secret/proj-shared-dns/pdns (field api_key; value never printed)"
+      - ""
+      - "Point your workstation at it for the platform domain only (once, like the static route):"
+      - "  Linux (systemd-resolved): a drop-in that sends only this zone to SVC-10"
+      - "    sudo mkdir -p /etc/systemd/resolved.conf.d"
+      - "    echo '[Resolve]' | sudo tee /etc/systemd/resolved.conf.d/platform-dns.conf"
+      - "    echo 'DNS={{ svc10_bind_ip }}' | sudo tee -a /etc/systemd/resolved.conf.d/platform-dns.conf"
+      - "    echo 'Domains=~{{ svc10_platform_domain }}' | sudo tee -a /etc/systemd/resolved.conf.d/platform-dns.conf"
+      - "    sudo systemctl restart systemd-resolved"
+      - "  macOS:"
+      - "    sudo mkdir -p /etc/resolver"
+      - "    echo 'nameserver {{ svc10_bind_ip }}' | sudo tee /etc/resolver/{{ svc10_platform_domain }}"
+      - "  Check: dig +short svc10-20-01.{{ svc10_platform_domain }}   (expect {{ svc10_bind_ip }})"
+      - ""
+      - "Re-run this installer after installing or removing a service so its guest records follow."
+      - "============================================================"

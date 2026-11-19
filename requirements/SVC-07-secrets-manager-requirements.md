@@ -18,7 +18,7 @@ SVC-07 provides the platform's central secrets manager: a durable, audited store
 **Out of scope:**
 - HSM-backed seals (no HSM present in this homelab/office cluster; PKCS#11 not applicable).
 - Multi-region/multi-datacenter replication (Enterprise-only feature in upstream Vault; OpenBao Community has no equivalent yet).
-- Acting as the CA itself — PKI issuance for internal TLS is SVC-08 (EJBCA); OpenBao's own PKI secrets engine is not used to avoid duplicating that function.
+- Acting as the CA itself is SVC-08's scope, not this document's. Amended by ADR-0028: SVC-08 *is* the OpenBao PKI secrets engine on this OpenBao instance (separate `pki`/`pki_int` mounts, specced in `.kiro/specs/svc-08-internal-pki/`); this document's installer does not configure it.
 - End-user password vaulting / personal password manager use cases.
 
 ## 3. Technology selection

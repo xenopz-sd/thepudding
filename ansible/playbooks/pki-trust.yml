@@ -1,0 +1,9 @@
+---
+# pki-trust.yml — install the platform root in every platform guest's trust store (SVC-08 R4).
+#   ansible-playbook -i ansible/inventory/svc-XX-*.generated.yml ansible/playbooks/pki-trust.yml
+- name: Install the platform root CA on platform guests
+  hosts: all
+  become: true
+  gather_facts: false
+  roles:
+    - pki_trust

@@ -31,10 +31,11 @@ The manifest may declare exactly these top-level service blocks, and no others:
 | `secrets` | SVC-07 (OpenBao policy/path + workload AppRole) | [`secrets`](#schema-field-table) |
 | `workload` | the per-project **workload guest** (an LXC on the project VLAN to run the app) | [`workload`](#workload-block) |
 | `expose` | public ingress for the workload through the shared Traefik (SVC-09) | [`expose`](#expose-block) |
+| `object_storage` | SVC-03 (Garage buckets + one bucket-scoped key) | [`object_storage`](#object_storage-block) |
 
 Any other top-level service key — or a **duplicate** of one of these — is
 rejected at preflight, naming the offending entry (Req 1.7). The only permitted
-top-level keys are `slug`, `database`, `sso`, `secrets`, `workload`, and `expose`.
+top-level keys are `slug`, `database`, `sso`, `secrets`, `workload`, `expose`, and `object_storage`.
 
 ---
 
@@ -70,7 +71,9 @@ top-level keys are `slug`, `database`, `sso`, `secrets`, `workload`, and `expose
 | `expose.host` | string, required when enabled | §6 | a **bare** subdomain label (no dots), `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`; the platform domain is appended, giving `https://<host>.<platform-domain>` |
 | `expose.port` | integer 1..65535, optional | §6 | the workload's backend port; default `8080` |
 | `expose.tls` | enum `terminate` \| `passthrough`, optional | §6 | default `terminate` (Traefik terminates TLS) |
-| *(top-level key)* | one of `slug` / `database` / `sso` / `secrets` / `workload` / `expose` | 1.7 | unknown/duplicate key → reject naming it |
+| `object_storage.buckets` | non-empty list of unique purposes, each `^[a-z0-9]{1,32}$` (no hyphen) | WS-C50 | one bucket `proj-<slug>-<purpose>` per entry (≤ 63 chars); unknown keys under `object_storage` are rejected |
+| `object_storage.website` | list, optional, subset of `buckets` | WS-C51 | those buckets are served **publicly** at `https://proj-<slug>-<purpose>.web.<platform-domain>/`; the others are kept private (reconciled each run) |
+| *(top-level key)* | one of `slug` / `database` / `sso` / `secrets` / `workload` / `expose` / `object_storage` | 1.7 | unknown/duplicate key → reject naming it |
 
 ### `app_type` / `auth_method` combinations
 
@@ -123,10 +126,23 @@ bring-your-own host) and the end-to-end last-mile walkthrough, see the
 The optional `expose` block makes the workload **user-facing**: the deploy step registers a Traefik route
 `https://<expose.host>.<platform-domain>` to the workload guest's backend port (the ADR-0018 file-provider route,
 so no host port is published to the LAN). The platform domain comes from the operator's configuration
-(`consumer_platform_domain`), never from the manifest. The handoff checks the route and prints it. Browser OIDC
+(`PLATFORM_DOMAIN` in the cluster env file, or `-e consumer_platform_domain=…`), never from the manifest. The handoff checks the route and prints it. Browser OIDC
 login additionally needs the browser to reach both the app host and the ZITADEL issuer host; see the
 [dev issuer-reachability recipe](CONSUMER-JOURNEY.md#sso-consumption-dev-issuer-reachability-recipe-d).
 Protecting a route with SSO at the proxy (forward-auth) is not offered to consumers yet (WS-C31).
+
+### `object_storage` block
+
+The optional `object_storage` block gives the project S3 buckets on the shared SVC-03 Garage cluster. For each
+purpose the orchestrator creates `proj-<slug>-<purpose>`, and one key `proj-<slug>-cikey` with read and write on
+exactly those buckets (no owner flag, cannot create buckets). The key lands in OpenBao at
+`secret/proj-<slug>/garage` with the fields `access_key_id`, `secret_access_key`, `endpoint` (Traefik,
+`https://s3.<platform-domain>`), `internal_endpoint` (VLAN 20), `region` (`garage`) and `buckets`. Clients must use
+path-style addressing. A re-run never rotates the key; rotation is an operator action
+([SVC-03 runbook, A.4b](../infra/projects/svc-03-object-storage/INSTALL-RUNBOOK.md#a4b--rotate-a-projects-key)). Removing a purpose from the manifest does **not** delete its
+bucket (provisioning never deletes data); the consumer clean-slate deletes every bucket the key is granted on, the key
+and the OpenBao entry. Purposes have no hyphen so `proj-<slug>-<purpose>` can never equal another project's bucket
+(slugs may contain hyphens). SVC-03 must be installed first; preflight stops naming `svc-03-bootstrap.yml` otherwise.
 
 ---
 
@@ -169,6 +185,10 @@ workload:                           # OPTIONAL — per-project workload guest (R
   enabled: true                     # false/absent (default) => no guest, strict no-op
   tier: small                       # small (default) | medium
   count: 1                          # >=1 (default 1); >1 reserved for a later increment
+
+object_storage:                     # OPTIONAL — SVC-03 buckets + one scoped key (WS-C50)
+  buckets: [artifacts, datasets]    # -> proj-dronefleet-artifacts, proj-dronefleet-datasets
+  # website: [artifacts]            # OPTIONAL — PUBLIC at https://proj-dronefleet-artifacts.web.<platform-domain>/
 
 # expose:                           # OPTIONAL — public ingress for the workload (§6)
 #   enabled: true

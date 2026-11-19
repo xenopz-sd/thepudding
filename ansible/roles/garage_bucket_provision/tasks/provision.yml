@@ -1,0 +1,283 @@
+---
+# tasks/provision.yml — garage_bucket_provision (SVC-03 R9/R10; consumer-object-storage R9)
+#
+# Runs ONCE (run_once) on a Garage node of the generated inventory. All Garage
+# calls use `garage json-api` inside the container (local RPC, no admin token on
+# the wire). Idempotent:
+#   * a bucket that exists is kept; a missing one is created;
+#   * the key `proj-<slug>-cikey` is created only when absent in Garage, and is
+#     never rotated by a re-run;
+#   * the key gets read+write (never owner) on exactly the requested buckets;
+#   * OpenBao is written only when its entry does not already hold this key id.
+# Every task that sees a key secret or the OpenBao token is no_log.
+
+# --- 0. Validate inputs before any call (R10) ------------------------------------
+- name: "Bucket provision | Validate project_slug and bucket_purposes"
+  ansible.builtin.assert:
+    that:
+      - project_slug is match('^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$')
+      - bucket_purposes is iterable and bucket_purposes is not string
+      - (bucket_purposes | length) > 0
+      - (bucket_purposes | reject('match', '^[a-z0-9]{1,32}$') | list | length) == 0
+      - website_purposes is iterable and website_purposes is not string
+      - (website_purposes | difference(bucket_purposes) | length) == 0
+      - >-
+        (bucket_purposes | map('regex_replace', '^', garage_bp_bucket_prefix)
+         | map('length') | select('gt', 63) | list | length) == 0
+    fail_msg: >-
+      Invalid input: project_slug must be lowercase letters, digits and hyphens
+      (max 20, PF §4) and bucket_purposes a non-empty list of 1-32 lowercase
+      letters/digits (no hyphen, so proj-<slug>-<purpose> cannot collide with
+      another project's bucket) whose bucket name is at most 63 characters. Got project_slug='{{ project_slug }}',
+      bucket_purposes={{ bucket_purposes }}. Nothing was changed.
+    quiet: true
+  run_once: true
+
+- name: "Bucket provision | Compute the bucket names and the internal endpoint"
+  ansible.builtin.set_fact:
+    garage_bp_buckets: "{{ bucket_purposes | map('regex_replace', '^', garage_bp_bucket_prefix) | list }}"
+    garage_bp_internal_endpoint_value: "{{ garage_bp_s3_internal_endpoint }}"
+  run_once: true
+
+# --- 1. OpenBao admin token (process env first, else the cluster env file) -------
+- name: "Bucket provision | Resolve the OpenBao admin token (no_log)"
+  ansible.builtin.set_fact:
+    garage_bp_openbao_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         if ((lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim) | length > 0)
+         else ((lookup('ansible.builtin.file', (playbook_dir | dirname | dirname) ~ '/' ~ cluster_env_file,
+                       errors='ignore') | default('', true))
+               | regex_findall('(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*[\"\']?([^\"\'\r\n]*?)[\"\']?[ \t]*$')
+               | first | default('') | trim) }}
+  run_once: true
+  no_log: true
+
+- name: "Bucket provision | Fail closed without an OpenBao admin token"
+  ansible.builtin.assert:
+    that:
+      - (garage_bp_openbao_token | length) > 0
+    fail_msg: >-
+      The project key is stored only in OpenBao ({{ garage_bp_secret_path }}), so the
+      OpenBao admin token is required: set OPENBAO_ADMIN_TOKEN in the environment or
+      in {{ cluster_env_file }}. Nothing was created.
+    quiet: true
+  run_once: true
+  no_log: true
+
+# --- 2. Buckets ----------------------------------------------------------------------
+- name: "Bucket provision | Look up each bucket"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - GetBucketInfo
+      - "{{ {'globalAlias': item} | to_json }}"
+  loop: "{{ garage_bp_buckets }}"
+  register: garage_bp_bucket_lookup
+  run_once: true
+  changed_when: false
+  failed_when: false
+
+- name: "Bucket provision | Create the buckets that do not exist yet"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - CreateBucket
+      - "{{ {'globalAlias': item.item} | to_json }}"
+  loop: "{{ garage_bp_bucket_lookup.results | selectattr('rc', 'ne', 0) | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  register: garage_bp_bucket_create
+  run_once: true
+  changed_when: true
+
+- name: "Bucket provision | Map bucket name -> bucket id"
+  ansible.builtin.set_fact:
+    garage_bp_bucket_ids: >-
+      {{ dict((garage_bp_bucket_lookup.results | selectattr('rc', 'eq', 0)
+               | map(attribute='item') | list)
+              | zip(garage_bp_bucket_lookup.results | selectattr('rc', 'eq', 0)
+                    | map(attribute='stdout') | map('from_json') | map(attribute='id') | list))
+         | combine(dict((garage_bp_bucket_create.results | default([]) | map(attribute='item')
+                         | map(attribute='item') | list)
+                        | zip(garage_bp_bucket_create.results | default([]) | map(attribute='stdout')
+                              | map('from_json') | map(attribute='id') | list))) }}
+  run_once: true
+
+# --- 3. Key (created once, never rotated by a re-run) --------------------------------
+- name: "Bucket provision | List the keys"
+  ansible.builtin.command:
+    argv: ["docker", "exec", "{{ garage_container_name }}", "{{ garage_bin }}", "json-api", "ListKeys"]
+  register: garage_bp_keys
+  run_once: true
+  changed_when: false
+
+- name: "Bucket provision | Find the project key by name"
+  ansible.builtin.set_fact:
+    garage_bp_key_matches: >-
+      {{ garage_bp_keys.stdout | from_json | selectattr('name', 'eq', garage_bp_key_name) | list }}
+  run_once: true
+
+- name: "Bucket provision | Fail closed on duplicate keys with the project key name"
+  ansible.builtin.assert:
+    that:
+      - (garage_bp_key_matches | length) <= 1
+    fail_msg: >-
+      Garage holds {{ garage_bp_key_matches | length }} keys named {{ garage_bp_key_name }}
+      ({{ garage_bp_key_matches | map(attribute='id') | join(', ') }}). Delete the stray
+      ones (garage key delete) and re-run; this playbook will not guess which is live.
+    quiet: true
+  run_once: true
+
+- name: "Bucket provision | Create the project key when absent (no_log)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - CreateKey
+      - "{{ {'name': garage_bp_key_name} | to_json }}"
+  register: garage_bp_key_create
+  run_once: true
+  changed_when: true
+  no_log: true
+  when: (garage_bp_key_matches | length) == 0
+
+- name: "Bucket provision | Bind the project key id (non-secret)"
+  ansible.builtin.set_fact:
+    garage_bp_key_id: >-
+      {{ (garage_bp_key_matches | first).id if (garage_bp_key_matches | length) == 1
+         else (garage_bp_key_create.stdout | from_json).accessKeyId }}
+  run_once: true
+  no_log: true
+
+- name: "Bucket provision | Grant read+write (never owner) on each project bucket"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - AllowBucketKey
+      - >-
+        {{ {'bucketId': garage_bp_bucket_ids[item], 'accessKeyId': garage_bp_key_id,
+            'permissions': {'read': true, 'write': true, 'owner': false}} | to_json }}
+  loop: "{{ garage_bp_buckets }}"
+  register: garage_bp_allow
+  run_once: true
+  # AllowBucketKey is additive and returns the bucket's key list; report a change
+  # only when this key did not already hold read+write before the call.
+  changed_when: >-
+    item not in (garage_bp_bucket_lookup.results | selectattr('rc', 'eq', 0)
+                 | selectattr('stdout', 'search', garage_bp_key_id) | map(attribute='item') | list)
+
+# --- 3b. Static website hosting (WS-C51) ---------------------------------------------
+- name: "Bucket provision | Reconcile static website hosting"
+  ansible.builtin.include_tasks: website.yml
+
+# --- 4. OpenBao (written only when it does not already hold this key) -----------------
+- name: "Bucket provision | Read the stored project credentials (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ garage_bp_openbao_cli_bao_addr, '-e', 'BAO_TOKEN',
+          garage_bp_openbao_primary_container_name, garage_bp_openbao_bao_bin, 'kv', 'get', '-format=json']
+         + (['-tls-skip-verify'] if (garage_bp_openbao_tls_skip_verify | bool) else [])
+         + [garage_bp_secret_path] }}
+  delegate_to: "{{ garage_bp_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ garage_bp_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ garage_bp_openbao_cli_python }}"
+  environment:
+    BAO_TOKEN: "{{ garage_bp_openbao_token }}"
+  register: garage_bp_stored
+  run_once: true
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: "Bucket provision | Decide whether OpenBao must be (re)written (non-secret)"
+  ansible.builtin.set_fact:
+    garage_bp_store_needed: >-
+      {{ (garage_bp_stored.rc | default(1)) != 0
+         or ((garage_bp_stored.stdout | from_json).data.data.access_key_id | default('')) != garage_bp_key_id
+         or ((garage_bp_stored.stdout | from_json).data.data.buckets | default(''))
+            != (garage_bp_buckets | join(',')) }}
+  run_once: true
+  no_log: true
+
+- name: "Bucket provision | Read the key secret from Garage for storing (no_log)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - GetKeyInfo
+      - "{{ {'id': garage_bp_key_id, 'showSecretKey': true} | to_json }}"
+  register: garage_bp_key_info
+  run_once: true
+  changed_when: false
+  no_log: true
+  when: garage_bp_store_needed | bool
+
+- name: "Bucket provision | Store the project credentials in OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ garage_bp_openbao_cli_bao_addr, '-e', 'BAO_TOKEN',
+          '-e', 'S3_ACCESS_KEY_ID', '-e', 'S3_SECRET_ACCESS_KEY',
+          garage_bp_openbao_primary_container_name, 'sh', '-c',
+          garage_bp_openbao_bao_bin ~ ' kv put'
+          ~ (' -tls-skip-verify' if (garage_bp_openbao_tls_skip_verify | bool) else '')
+          ~ ' ' ~ garage_bp_secret_path
+          ~ ' access_key_id="$S3_ACCESS_KEY_ID" secret_access_key="$S3_SECRET_ACCESS_KEY"'
+          ~ ' endpoint=' ~ garage_bp_s3_endpoint
+          ~ ' internal_endpoint=' ~ garage_bp_internal_endpoint_value
+          ~ ' region=' ~ garage_bp_s3_region
+          ~ ' buckets=' ~ (garage_bp_buckets | join(','))] }}
+  delegate_to: "{{ garage_bp_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ garage_bp_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ garage_bp_openbao_cli_python }}"
+  environment:
+    BAO_TOKEN: "{{ garage_bp_openbao_token }}"
+    S3_ACCESS_KEY_ID: "{{ garage_bp_key_id }}"
+    S3_SECRET_ACCESS_KEY: "{{ (garage_bp_key_info.stdout | from_json).secretAccessKey }}"
+  run_once: true
+  changed_when: true
+  no_log: true
+  when: garage_bp_store_needed | bool
+
+- name: "Bucket provision | Scrub secret facts (no_log)"
+  ansible.builtin.set_fact:
+    garage_bp_openbao_token: ""
+    garage_bp_key_create: {}
+    garage_bp_key_info: {}
+  run_once: true
+  no_log: true
+
+- name: "Bucket provision | Summary (names only, never a secret)"
+  ansible.builtin.debug:
+    msg:
+      - "Project {{ project_slug }}: buckets {{ garage_bp_buckets | join(', ') }}"
+      - >-
+        Key {{ garage_bp_key_name }}
+        ({{ 'created' if (garage_bp_key_matches | length) == 0 else 'existing, not rotated' }}),
+        read+write on those buckets only
+      - >-
+        Credentials in OpenBao: {{ garage_bp_secret_path }}
+        ({{ 'written' if (garage_bp_store_needed | bool) else 'unchanged' }})
+      - "Fields: access_key_id, secret_access_key, endpoint, internal_endpoint, region, buckets"
+  run_once: true

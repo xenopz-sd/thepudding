@@ -20,7 +20,7 @@
   args:
     chdir: "{{ svc01_repo_root }}"
   register: svc01_common_run
-  changed_when: "'changed=0' not in (svc01_common_run.stdout | default(''))"
+  changed_when: "(svc01_common_run.stdout | default('')) is search('changed=[1-9]')"
 
 # Deploy the DB stack via a child postgres.yml run (hosts: postgres). The engine
 # role (postgres-server | mariadb-server) is selected inside postgres.yml by
@@ -83,5 +83,5 @@
          | default(lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN'), true)
          | default('', true) }}
   register: svc01_db_run
-  changed_when: "'changed=0' not in (svc01_db_run.stdout | default(''))"
+  changed_when: "(svc01_db_run.stdout | default('')) is search('changed=[1-9]')"
   no_log: true

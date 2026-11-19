@@ -136,7 +136,7 @@
   args:
     chdir: "{{ platform_repo_root }}"
   register: platform_gateway_run
-  changed_when: "'changed=0' not in (platform_gateway_run.stdout | default(''))"
+  changed_when: "(platform_gateway_run.stdout | default('')) is search('changed=[1-9]')"
 
 # WS-C26: the child run's stdout is captured (shown only on failure), so its WARNING that project
 # VLANs were skipped because their network slice is not applied would be invisible on a successful

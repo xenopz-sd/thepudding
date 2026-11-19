@@ -1,0 +1,207 @@
+---
+# tasks/main.yml — pki_ca (SVC-08): root + intermediate mounts, URLs, CRL, ACME, per-service
+# roles/policies, root publication. Idempotent: every write is a config set or guarded by
+# an existence probe. Keys are generated inside OpenBao (/generate/internal, not exportable, R1).
+
+# All API payloads come from scripts/installer/pki_helpers.py (one source of truth,
+# bound to the recorded OpenBao shapes by tests/installer/test_svc08_pki.py).
+- name: "pki_ca | Build the PKI plan (payloads, roles, policies)"
+  ansible.builtin.command:
+    argv:
+      - "{{ pki_ca_venv_python }}"
+      - "{{ pki_ca_helper }}"
+      - plan
+      - --base-url
+      - "{{ pki_ca_public_base_url }}"
+      - --dns-resolver
+      - "{{ pki_ca_dns_resolver }}"
+      - --domain
+      - "{{ svc08_platform_domain }}"
+      - --consumers-json
+      - "{{ pki_ca_consumers | to_json }}"
+  register: pki_ca_plan_raw
+  changed_when: false
+  delegate_to: localhost
+  connection: local
+- name: "pki_ca | Bind the plan"
+  ansible.builtin.set_fact:
+    pki_ca_plan: "{{ pki_ca_plan_raw.stdout | from_json }}"
+
+# --- platform-admin PKI grants (ADR-0029): the policy is written only at SVC-07's first init, so a
+# running SVC-07 gets the stanza appended here (the admin token already may write sys/policies/acl/*).
+- name: "pki_ca | Read the platform-admin policy"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [policy, read, platform-admin]
+- name: "pki_ca | Does it already carry the PKI grants?"
+  ansible.builtin.set_fact:
+    pki_ca_admin_policy: "{{ pki_bao_result.stdout }}"
+    pki_ca_admin_has_pki: >-
+      {{ 'path "pki_int/*"' in pki_bao_result.stdout
+         and 'auth/token/create/pki-issue' in pki_bao_result.stdout }}
+  no_log: true
+- name: "pki_ca | Append the PKI grants to platform-admin when missing"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [policy, write, platform-admin, "-"]
+    pki_bao_stdin: "{{ pki_ca_admin_policy }}\n{{ lookup('ansible.builtin.file', 'platform-admin-pki-grants.hcl') }}"
+  when: not (pki_ca_admin_has_pki | bool)
+- name: "pki_ca | List the mounted secrets engines"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [read, -format=json, sys/mounts]
+- name: "pki_ca | Record which PKI mounts exist"
+  ansible.builtin.set_fact:
+    pki_ca_mounts: "{{ (pki_bao_result.stdout | from_json).data.keys() | list }}"
+  no_log: true
+
+- name: "pki_ca | Enable the root and intermediate mounts"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [write, -format=json, "sys/mounts/{{ item.path }}", "-"]
+    pki_bao_stdin: "{{ {'type': 'pki', 'config': {'max_lease_ttl': item.ttl}} | to_json }}"
+  loop:
+    - { path: pki, ttl: "87600h" }
+    - { path: pki_int, ttl: "26280h" }
+  when: (item.path ~ '/') not in pki_ca_mounts
+
+- name: "pki_ca | Tune the intermediate mount (ACME headers, TTLs)"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [write, -format=json, sys/mounts/pki_int/tune, "-"]
+    pki_bao_stdin: "{{ pki_ca_plan.tune | to_json }}"
+
+# --- Root (R1): generated once ---------------------------------------------
+- name: "pki_ca | Probe for an existing root issuer"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [read, -format=json, pki/cert/ca]
+    pki_bao_allow_fail: true
+- name: "pki_ca | Classify the root probe"
+  ansible.builtin.set_fact:
+    pki_ca_root_exists: >-
+      {{ (pki_bao_result.rc | default(1)) == 0
+         and ((pki_bao_result.stdout | from_json).data.certificate | default('') | trim | length) > 0 }}
+  no_log: true
+- name: "pki_ca | Generate the root CA inside OpenBao (key not exportable)"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [write, -format=json, pki/root/generate/internal, "-"]
+    pki_bao_stdin: >-
+      {{ {'common_name': pki_ca_root_common_name, 'ttl': '87600h', 'key_type': 'ec', 'key_bits': 256,
+          'issuer_name': 'platform-root'} | to_json }}
+  when: not (pki_ca_root_exists | bool)
+- name: "pki_ca | Note that the root was created"
+  ansible.builtin.set_fact:
+    pki_ca_changed: true
+  when: not (pki_ca_root_exists | bool)
+
+# --- Intermediate (R1): CSR -> root signs -> set-signed ----------------------
+- name: "pki_ca | Probe for an existing intermediate issuer"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [read, -format=json, pki_int/cert/ca]
+    pki_bao_allow_fail: true
+- name: "pki_ca | Classify the intermediate probe"
+  ansible.builtin.set_fact:
+    pki_ca_int_exists: >-
+      {{ (pki_bao_result.rc | default(1)) == 0
+         and ((pki_bao_result.stdout | from_json).data.certificate | default('') | trim | length) > 0 }}
+  no_log: true
+- name: "pki_ca | Create the intermediate (only when absent)"
+  when: not (pki_ca_int_exists | bool)
+  block:
+    - name: "pki_ca | Generate the intermediate CSR (key stays in OpenBao)"
+      ansible.builtin.include_tasks: bao.yml
+      vars:
+        pki_bao_args: [write, -format=json, pki_int/intermediate/generate/internal, "-"]
+        pki_bao_stdin: >-
+          {{ {'common_name': pki_ca_int_common_name, 'key_type': 'ec', 'key_bits': 256} | to_json }}
+    - name: "pki_ca | Bind the CSR (public)"
+      ansible.builtin.set_fact:
+        pki_ca_csr: "{{ (pki_bao_result.stdout | from_json).data.csr }}"
+      no_log: true
+    - name: "pki_ca | Root signs the intermediate"
+      ansible.builtin.include_tasks: bao.yml
+      vars:
+        pki_bao_args: [write, -format=json, pki/root/sign-intermediate, "-"]
+        pki_bao_stdin: >-
+          {{ {'csr': pki_ca_csr, 'format': 'pem_bundle', 'ttl': '26280h',
+              'common_name': pki_ca_int_common_name} | to_json }}
+    - name: "pki_ca | Bind the signed intermediate (public)"
+      ansible.builtin.set_fact:
+        pki_ca_int_cert: "{{ (pki_bao_result.stdout | from_json).data.certificate }}"
+      no_log: true
+    - name: "pki_ca | Install the signed intermediate"
+      ansible.builtin.include_tasks: bao.yml
+      vars:
+        pki_bao_args: [write, -format=json, pki_int/intermediate/set-signed, "-"]
+        pki_bao_stdin: "{{ {'certificate': pki_ca_int_cert} | to_json }}"
+    - name: "pki_ca | Note that the intermediate was created"
+      ansible.builtin.set_fact:
+        pki_ca_changed: true
+
+# --- Mount configuration (idempotent sets) ------------------------------------
+- name: "pki_ca | Configure URLs, cluster path and CRL on the intermediate"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [write, -format=json, "{{ item.path }}", "-"]
+    pki_bao_stdin: "{{ item.body | to_json }}"
+  loop:
+    - { path: pki_int/config/urls, body: "{{ pki_ca_plan.urls }}" }
+    - { path: pki_int/config/cluster, body: "{{ pki_ca_plan.cluster }}" }
+    # yamllint disable-line rule:line-length
+    - { path: pki_int/config/crl, body: { expiry: "72h", auto_rebuild: true, auto_rebuild_grace_period: "12h", enable_delta: false } }
+  loop_control:
+    label: "{{ item.path }}"
+
+# --- Per-service roles and issuance policies (D2/D3) --------------------------
+- name: "pki_ca | PKI roles (one per consuming service, plus the ACME role for Traefik)"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [write, -format=json, "pki_int/roles/{{ item.name }}", "-"]
+    pki_bao_stdin: "{{ item.body | to_json }}"
+  loop: "{{ pki_ca_plan.roles }}"
+  loop_control:
+    label: "{{ item.name }}"
+- name: "pki_ca | Token role the issuer mints scoped child tokens from"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [write, -format=json, auth/token/roles/pki-issue, "-"]
+    pki_bao_stdin: "{{ pki_ca_plan.token_role | to_json }}"
+- name: "pki_ca | Issuance policies (issue on exactly one role)"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [write, -format=json, "sys/policies/acl/pki-issue-{{ item.name }}", "-"]
+    pki_bao_stdin: "{{ {'policy': item.policy} | to_json }}"
+  loop: "{{ pki_ca_plan.roles | selectattr('policy', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# ACME names a role as its default directory policy, so it is configured AFTER the roles exist (live finding).
+- name: "pki_ca | Enable ACME on the intermediate (needs the traefik role)"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [write, -format=json, pki_int/config/acme, "-"]
+    pki_bao_stdin: "{{ pki_ca_plan.acme | to_json }}"
+
+# --- Publish the PUBLIC root (R4, D6) -----------------------------------------
+- name: "pki_ca | Read the root certificate (public)"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [read, -format=json, pki/cert/ca]
+- name: "pki_ca | Ensure the artifact directory exists on the control node"
+  ansible.builtin.file:
+    path: "{{ pki_ca_repo_root }}/.pki"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  connection: local
+- name: "pki_ca | Write the published root PEM on the control node"
+  ansible.builtin.copy:
+    content: "{{ (pki_bao_result.stdout | from_json).data.certificate | trim }}\n"
+    dest: "{{ pki_ca_repo_root }}/{{ pki_ca_root_publish_path }}"
+    mode: "0644"
+  delegate_to: localhost
+  connection: local
+  register: pki_ca_root_published

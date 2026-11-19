@@ -82,8 +82,9 @@ zitadel_traefik_guest_host: "10.0.20.12"
 
 # --- OpenBao (SVC-07) secret storage ---
 # The masterkey + DB password are read from / written to OpenBao under this path
-# via the `bao` CLI docker-exec pattern. The admin token is supplied in the role
-# ENVIRONMENT (OPENBAO_ADMIN_TOKEN), never on the argv.
+# via the `bao` CLI docker-exec pattern. The admin token comes from the role
+# ENVIRONMENT (OPENBAO_ADMIN_TOKEN) and is passed to `docker exec` as
+# `-e BAO_TOKEN=<value>`, i.e. on that argv on the guest (WS-C62).
 zitadel_openbao_addr: ""   # when empty, the OpenBao read/write is skipped (dev offline)
 zitadel_openbao_primary_container_name: "openbao-openbao-1"
 zitadel_openbao_bao_bin: "bao"

@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: pki_ca
+  namespace: devinfra
+  author: Developer Services Platform
+  description: SVC-08 internal PKI (pki_ca).
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

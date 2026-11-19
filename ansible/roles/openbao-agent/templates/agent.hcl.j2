@@ -38,6 +38,8 @@ vault {
   address = "{{ openbao_primary_addr }}"
 {% if openbao_primary_tls_skip_verify | bool %}
   tls_skip_verify = true
+{% elif (openbao_agent_ca_cert | default('')) | length > 0 %}
+  ca_cert = "{{ openbao_agent_ca_cert }}"
 {% endif %}
   retry { num_retries = {{ openbao_agent_num_retries | int }} }
 }

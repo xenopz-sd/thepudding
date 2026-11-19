@@ -1,0 +1,95 @@
+---
+# SVC-08 internal PKI (OpenBao PKI secrets engine on SVC-07) automated installer — Day-0 orchestrator.
+# Spec: .kiro/specs/svc-08-internal-pki. ADR-0028. Single approved entry point: Ansible only.
+#
+#   ~/venv/devinfra/bin/ansible-playbook \
+#     -i ansible/inventory/localhost.yml \
+#     ansible/playbooks/svc-08-bootstrap.yml \
+#     -e cluster_env_file=cluster.dev.env
+#
+# Option B has NO guest and NO Terraform state, so Phase 2 (provisioning) is "verify SVC-07 and SVC-10
+# are up" and lives in preflight. Phases: preflight -> bootstrap (CA, publish, trust, listener certs)
+# -> handoff (selftest issue/verify/revoke, CRL, banner). Requires SVC-07 and SVC-10.
+# Clean-slate: -e clean_slate=true -e clean_slate_confirm=force
+- name: SVC-08 internal PKI automated installer — Day-0 orchestrator
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  any_errors_fatal: true
+  vars:
+    cluster_env_file: cluster.env
+    svc08_repo_root: "{{ playbook_dir | dirname | dirname }}"
+    svc08_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+    svc08_platform_domain: platform.example.test
+    # SVC-07 primary (ledger index 0) and SVC-10 DNS (index 15) VLAN-20 addresses; every role reads these.
+    svc08_openbao_primary_ip: "10.0.20.10"
+    svc08_dns_ip: "10.0.20.25"
+    pki_ca_root_publish_path: ".pki/platform-root-ca.pem"
+    pki_ca_cli_host: "{{ svc08_openbao_primary_ip }}"
+    pki_ca_public_base_url: "https://{{ svc08_openbao_primary_ip }}:8200"
+    pki_ca_dns_resolver: "{{ svc08_dns_ip }}:53"
+    clean_slate: false
+    clean_slate_confirm: ""
+    agent_live_run: "{{ (lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') | trim) | length > 0 }}"
+    svc08_throwaway_guard: scripts/installer/throwaway_guard.py
+    svc08_throwaway_allowlist: scripts/installer/throwaway-clusters.yml
+  tasks:
+    - name: Resolve PLATFORM_DOMAIN from the cluster env file
+      ansible.builtin.import_role:
+        name: platform_domain
+      vars:
+        platform_domain_var: svc08_platform_domain
+    # === Clean-Slate branch — runs ONLY when clean_slate is truthy. ===
+    - name: Clean-Slate reset
+      when: clean_slate | default(false) | bool
+      block:
+        - name: "Clean-Slate | Run the svc08_clean_slate role"
+          ansible.builtin.import_role:
+            name: svc08_clean_slate
+      rescue:
+        - name: Report Clean-Slate reset failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-08 installer FAILED during the Clean-Slate reset:
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+    # === Normal install path — skipped entirely on clean_slate. ===
+    - name: "Phase 1 — Preflight & environment validation"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Preflight | Run the svc08_preflight role"
+          ansible.builtin.import_role:
+            name: svc08_preflight
+      rescue:
+        - name: Report Phase 1 (Preflight) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-08 installer FAILED in Phase 1 (Preflight):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+    - name: "Phase 3 — CA bootstrap, root publication and trust"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Bootstrap | Run the svc08_bootstrap role"
+          ansible.builtin.import_role:
+            name: svc08_bootstrap
+      rescue:
+        - name: Report Phase 3 (Bootstrap) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-08 installer FAILED in Phase 3 (Bootstrap):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}
+    - name: "Phase 4 — Health sanity & Developer B handoff"
+      when: not (clean_slate | default(false) | bool)
+      block:
+        - name: "Handoff | Run the svc08_handoff role"
+          ansible.builtin.import_role:
+            name: svc08_handoff
+      rescue:
+        - name: Report Phase 4 (Handoff) failure and exit non-zero
+          ansible.builtin.fail:
+            msg: >-
+              SVC-08 installer FAILED in Phase 4 (Handoff):
+              {{ ansible_failed_task.name | default('unknown step') }}
+              — {{ ansible_failed_result.msg | default('see the failing task above') }}

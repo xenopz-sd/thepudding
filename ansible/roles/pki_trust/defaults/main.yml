@@ -1,0 +1,4 @@
+---
+# defaults/main.yml — pki_trust (SVC-08, R4/D6): install the PUBLIC platform root in a guest's OS trust store.
+pki_trust_root_src: "{{ playbook_dir | dirname | dirname }}/.pki/platform-root-ca.pem"
+pki_trust_dest: "/usr/local/share/ca-certificates/platform-root-ca.crt"

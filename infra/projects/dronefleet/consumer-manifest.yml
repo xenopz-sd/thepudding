@@ -45,3 +45,5 @@ workload:
   enabled: true     # provision the per-project workload guest (§B, VLAN 100 host_index 1 -> 10.0.100.11)
   tier: small       # small | medium
   count: 1          # single-guest validated path
+object_storage:
+  buckets: [artifacts]   # SVC-03: bucket proj-dronefleet-artifacts + scoped key at secret/proj-dronefleet/garage

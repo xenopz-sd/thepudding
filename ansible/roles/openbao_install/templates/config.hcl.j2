@@ -74,7 +74,11 @@ seal "transit" {
   token      = "{{ openbao_transit_token }}"
   key_name   = "{{ openbao_transit_key_name }}"
   mount_path = "{{ openbao_transit_mount_path }}"
-{% if openbao_tls_self_signed | default(false) | bool %}
+{% if openbao_seal_verify_with_platform_ca | default(false) | bool %}
+  # SVC-08: the unsealer serves a certificate from the platform CA (probed before rendering), so the seal client
+  # verifies it against the platform root instead of skipping verification.
+  tls_ca_cert = "{{ openbao_tls_dir }}/{{ openbao_platform_ca_cert_name }}"
+{% elif openbao_tls_self_signed | default(false) | bool %}
   # tls_skip_verify: the primary's SEAL CLIENT connects to the unsealer's API
   # over TLS to wrap/unwrap its seal key. While the unsealer presents the MOCK
   # self-signed cert (openbao_tls_self_signed), that cert chains to no known CA,

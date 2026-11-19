@@ -92,6 +92,7 @@ traefik_tls_self_signed_cn: "{{ traefik_platform_domain }}"
 traefik_tls_self_signed_sans:
   - "DNS:{{ traefik_platform_domain }}"
   - "DNS:*.{{ traefik_platform_domain }}"
+  - "DNS:*.web.{{ traefik_platform_domain }}"   # SVC-03 website hosts (WS-C51)
   - "DNS:traefik.{{ traefik_platform_domain }}"
   - "DNS:svc09-20-01"
   - "DNS:localhost"
@@ -122,3 +123,38 @@ traefik_dashboard_forward_auth_address: ""
 
 # --- Reconciliation ---
 traefik_state: "present"
+
+# --- SVC-08 internal CA via ACME DNS-01 (WS-C59, spec svc-08-internal-pki D9-D11, ADR-0028) ---
+# The `internal` resolver is selected ONLY when the platform root is published (the gate, D5): no published root
+# means today's behaviour, unchanged. Mock 3 (traefik_tls_self_signed) and this path are mutually exclusive
+# (fail closed). The PowerDNS key is read from OpenBao by the installer and written 0600 on the guest (Option B,
+# decision-log row; same practice as Garage, Grafana and SVC-01), never templated into the repo.
+traefik_internal_ca_root_src: "{{ playbook_dir | dirname | dirname }}/.pki/platform-root-ca.pem"
+traefik_internal_acme_ca_server: "https://10.0.20.10:8200/v1/pki_int/roles/traefik/acme/directory"
+traefik_internal_pdns_api_url: "http://10.0.20.25:8081"
+traefik_internal_dns_resolvers: ["10.0.20.25:53"]
+traefik_internal_dns_inventory: >-
+  {{ playbook_dir | dirname | dirname }}/ansible/inventory/svc-10-internal-dns.generated.yml
+traefik_internal_pdns_secret_path: "secret/proj-shared-dns/pdns"
+traefik_internal_ca_dir: "{{ traefik_config_dir }}/ca"
+traefik_internal_ca_file: "platform-root-ca.pem"
+traefik_internal_secret_env_file: "{{ traefik_config_dir }}/pdns.secret.env"
+traefik_internal_acme_storage: "{{ traefik_acme_mount }}/internal.json"
+# Where the installer reads the key (delegated bao CLI on the OpenBao primary, SVC-10 precedent).
+traefik_internal_openbao_cli_host: "10.0.20.10"
+traefik_internal_openbao_cli_user: "root"
+traefik_internal_openbao_container: "openbao-openbao-1"
+traefik_internal_openbao_bao_addr: "https://127.0.0.1:8200"
+traefik_internal_openbao_loopback_skip_verify: true   # loopback CLI hop inside the primary guest only
+
+# Bind mounts of the Traefik container. Docker socket read-only (SVC-09 §12); static config + dynamic dir
+# read-only; (mock) tls dir; the named acme volume (persistent, only Traefik writes it).
+traefik_base_volumes:
+  - "{{ traefik_docker_socket }}:{{ traefik_docker_socket }}:ro"
+  - "{{ traefik_static_config_file }}:/etc/traefik/traefik.yml:ro"
+  - "{{ traefik_dynamic_config_dir }}:/etc/traefik/dynamic:ro"
+  - "{{ traefik_tls_host_dir }}:/etc/traefik/tls:ro"
+  - "{{ traefik_acme_volume }}:{{ traefik_acme_mount }}"
+# Added only when the internal CA resolver is selected: the platform root for lego's trust.
+traefik_internal_volumes:
+  - "{{ traefik_internal_ca_dir }}:/etc/traefik/ca:ro"

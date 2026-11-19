@@ -70,6 +70,8 @@
 # the Compose stack comes up so the targets exist when Prometheus first loads.
 - name: "Observability (prometheus) | Generate the file_sd scrape-target files"
   ansible.builtin.include_tasks: scrape_targets.yml
+- name: "Observability (prometheus) | Render the fleet node/cAdvisor target files (WS-C58)"
+  ansible.builtin.include_tasks: fleet_targets.yml
 
 # --- 5. Deploy the Compose stack via docker-compose-app ----------------------
 # prom/prometheus + prom/alertmanager (pinned), persistent named volumes for the

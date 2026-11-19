@@ -1,0 +1,59 @@
+---
+# defaults/main.yml — garage_bucket_provision (SVC-03 FR-2/FR-3/FR-7, R9/R10)
+#
+# Gives a project its buckets and ONE bucket-scoped key, and stores the key in
+# OpenBao. NO secret value lives here.
+
+# provision (default) | teardown (destroys the project's buckets, key and OpenBao entry)
+# | rotate (replaces the project key, WS-C55).
+garage_bp_action: "provision"
+# rotate only: replace the key only when it is at least this many days old (0 = now).
+# A scheduled run with 180 implements the catalog's 180-day cadence.
+garage_bp_rotate_min_age_days: 0
+
+# REQUIRED inputs (-e). Validated before any call (R10). bucket_purposes is
+# optional for teardown (the key's grants are the primary target list).
+project_slug: ""
+bucket_purposes: []
+# Subset of bucket_purposes served as static websites at https://<bucket>.web.<domain>
+# (WS-C51). PUBLIC: the website endpoint serves anonymous reads.
+website_purposes: []
+
+# Naming (catalog doc §4): buckets proj-<slug>-<purpose>, key proj-<slug>-cikey.
+garage_bp_bucket_prefix: "proj-{{ project_slug }}-"
+garage_bp_key_name: "proj-{{ project_slug }}-cikey"
+
+# Where the project's S3 credentials go (catalog doc §9).
+garage_bp_openbao_kv_mount: "secret"
+garage_bp_secret_path: "{{ garage_bp_openbao_kv_mount }}/proj-{{ project_slug }}/garage"
+
+# The cluster env file the OpenBao admin token is read from when it is not in the
+# process environment (the WS-C45 convention). Relative to the repository root.
+cluster_env_file: cluster.env
+
+# The OpenBao primary the delegated `bao` CLI calls run on (SVC-07).
+garage_bp_openbao_cli_host: "10.0.20.10"
+garage_bp_openbao_cli_user: "root"
+garage_bp_openbao_cli_python: "/usr/bin/python3"
+garage_bp_openbao_cli_bao_addr: "https://127.0.0.1:8200"
+garage_bp_openbao_primary_container_name: "openbao-openbao-1"
+garage_bp_openbao_bao_bin: "bao"
+garage_bp_openbao_tls_skip_verify: true
+
+# Garage container + the endpoint recorded with the credentials.
+garage_container_name: "garage-garage-1"
+garage_bin: "/garage"
+garage_bp_platform_domain: "platform.example.test"
+garage_bp_s3_endpoint: "https://s3.{{ garage_bp_platform_domain }}"
+garage_bp_s3_internal_endpoint: "http://{{ ansible_host }}:3900"
+garage_bp_s3_region: "garage"
+
+# --- Static website hosting (WS-C51) ---------------------------------------------
+garage_bp_website_index: "index.html"
+garage_bp_web_root_domain: "web.{{ garage_bp_platform_domain }}"
+garage_bp_web_port: 3902
+# The Traefik guest the website Route_Fragments are delegated to (SVC-09, ledger index 2).
+garage_bp_traefik_guest_host: "10.0.20.12"
+garage_bp_traefik_guest_user: "root"
+garage_bp_traefik_guest_python: "/usr/bin/python3"
+garage_bp_traefik_dynamic_config_dir: "/etc/traefik/dynamic"

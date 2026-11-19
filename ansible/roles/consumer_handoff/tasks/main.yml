@@ -246,6 +246,37 @@
       consumer_expose_route.status | default(-1) }}).
   when: (consumer_manifest.expose.enabled | default(false)) | bool
 
+# --- Object-storage credential read-back (consumer-object-storage R4, READ-ONLY, no_log) ---
+# `bao kv metadata get` reads metadata only, never the value. The token reaches bao by NAME (-e BAO_TOKEN) with
+# the value in the task environment, never on argv. failed_when:false so an absent path DEGRADES to a reported
+# state, never fails the handoff.
+- name: "Handoff | Probe the object-storage credential path in OpenBao (READ-ONLY, no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_TOKEN', consumer_openbao_primary_container_name,
+          consumer_openbao_bao_bin, 'kv', 'metadata', 'get']
+         + (['-tls-skip-verify'] if (consumer_openbao_tls_skip_verify | bool) else [])
+         + ['secret/proj-' ~ project_slug ~ '/garage'] }}
+  delegate_to: "{{ consumer_openbao_primary_ip }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ consumer_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ consumer_openbao_cli_python }}"
+  environment:
+    BAO_TOKEN: "{{ consumer_openbao_admin_token | default('') }}"
+  register: consumer_object_storage_probe
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: consumer_manifest.object_storage is defined
+
+- name: "Handoff | Compute the object-storage credential state (non-secret, from rc only)"
+  ansible.builtin.set_fact:
+    consumer_object_storage_state: >-
+      {{ 'n/a' if (consumer_manifest.object_storage is not defined)
+         else ('present' if ((consumer_object_storage_probe.rc | default(1)) == 0) else 'not written') }}
+  changed_when: false
+
 # --- Completion summary banner (secrets by name only, Req 5.4) ---------------
 - name: "Handoff | Resolve the absolute Cluster_Env_File path + banner fields"
   ansible.builtin.set_fact:
@@ -288,6 +319,16 @@
         Secrets policy:     {{ 'policy-' ~ project_slug ~ ' ; workload AppRole ' ~ consumer_workload_approle_ref
         if (consumer_manifest.secrets is defined)
         else ('policy-' ~ project_slug if (consumer_manifest.database is defined) else 'not consumed') }}
+      - >-
+        Object storage:     {{ ((consumer_manifest.object_storage.buckets
+        | map('regex_replace', '^', 'proj-' ~ project_slug ~ '-') | join(', '))
+        ~ ' ; key at secret/proj-' ~ project_slug ~ '/garage — ' ~ consumer_object_storage_state
+        ~ ' (by path only, never shown; region garage, path-style)')
+        if (consumer_manifest.object_storage is defined) else 'not consumed' }}
+      - >-
+        Websites (public):  {{ (consumer_manifest.object_storage.website | default([])
+        | map('regex_replace', '^(.*)$', 'https://proj-' ~ project_slug ~ '-\\1.web.' ~ consumer_platform_domain)
+        | join(', ')) or 'none' }}
       # §6 (fix-consumer-ingress-browser-reachable-oidc): for a USER-FACING
       # workload the published Traefik host, so the operator sees the app is NOT
       # "done" on a green health check alone — a human still needs browser

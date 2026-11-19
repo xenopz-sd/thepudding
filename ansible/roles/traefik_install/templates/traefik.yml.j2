@@ -87,3 +87,23 @@ certificatesResolvers:
       storage: "{{ traefik_acme_storage }}"
       httpChallenge:
         entryPoint: web
+{% if traefik_internal_acme_enabled | default(false) | bool %}
+  # SVC-08 internal CA (OpenBao PKI ACME), DNS-01 through the SVC-10 PowerDNS API. The API key and lego's trust
+  # for the CA come from the 0600 secret env (PDNS_API_KEY, PDNS_API_URL, LEGO_CA_CERTIFICATES), never from here.
+  internal:
+    acme:
+      caServer: "{{ traefik_internal_acme_ca_server }}"
+      # The PKI role signs only EC P-256 keys (pki_helpers.role_body); Traefik defaults to RSA (live finding).
+      keyType: EC256
+      storage: "{{ traefik_internal_acme_storage }}"
+      dnsChallenge:
+        provider: pdns
+        # Guests keep their own resolver (SVC-10 FR-4), so the container cannot resolve the zone's NS name
+        # (live finding). Skip only the authoritative-NS check; propagation is still checked against SVC-10.
+        propagation:
+          disableANSChecks: true
+        resolvers:
+{% for r in traefik_internal_dns_resolvers %}
+          - "{{ r }}"
+{% endfor %}
+{% endif %}

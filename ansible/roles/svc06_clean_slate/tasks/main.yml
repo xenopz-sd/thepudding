@@ -133,7 +133,7 @@
   loop_control:
     label: "{{ item.name }} (vmid {{ item.vmid }})"
   register: svc06_clean_slate_runs
-  changed_when: "'changed=0' not in (svc06_clean_slate_runs.stdout | default(''))"
+  changed_when: "(svc06_clean_slate_runs.stdout | default('')) is search('changed=[1-9]')"
 
 # --- B. Orchestrate the backing-DB clean-slate (child svc-01-bootstrap) ------
 # The DB is an SVC-01 instance with its OWN state; invoke ITS clean-slate
@@ -165,7 +165,7 @@
   environment:
     AGENT_LIVE_AUTHORIZED: "{{ lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED') | default('', true) }}"
   register: svc06_db_clean_slate
-  changed_when: "'changed=0' not in (svc06_db_clean_slate.stdout | default(''))"
+  changed_when: "(svc06_db_clean_slate.stdout | default('')) is search('changed=[1-9]')"
   no_log: true
 
 # ---- Clear the stale ZITADEL provision_token FIELD from OpenBao -------------

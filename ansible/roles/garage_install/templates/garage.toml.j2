@@ -1,0 +1,30 @@
+# MANAGED BY ANSIBLE (garage_install, SVC-03) — DO NOT EDIT BY HAND.
+# Spec: .kiro/specs/svc-03-object-storage. Mode 0600: carries the cluster RPC
+# secret and the admin token (sourced from OpenBao at install time).
+replication_factor = {{ garage_replication_factor }}
+consistency_mode = "{{ garage_consistency_mode }}"
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "lmdb"
+metadata_auto_snapshot_interval = "6h"
+
+rpc_bind_addr = "0.0.0.0:{{ garage_rpc_port }}"
+rpc_public_addr = "{{ garage_bind_ip }}:{{ garage_rpc_port }}"
+rpc_secret = "{{ lookup('ansible.builtin.env', 'GARAGE_RPC_SECRET') }}"
+
+[s3_api]
+api_bind_addr = "0.0.0.0:{{ garage_s3_port }}"
+s3_region = "{{ garage_s3_region }}"
+root_domain = ".{{ garage_s3_host }}"
+public_endpoint = "https://{{ garage_s3_host }}"
+public_endpoint_path_style = true
+
+[s3_web]
+bind_addr = "0.0.0.0:{{ garage_web_port }}"
+root_domain = ".{{ garage_web_root_domain }}"
+index = "index.html"
+
+[admin]
+api_bind_addr = "0.0.0.0:{{ garage_admin_port }}"
+admin_token = "{{ lookup('ansible.builtin.env', 'GARAGE_ADMIN_TOKEN') }}"

@@ -76,7 +76,7 @@ _PLATFORM_CS_DEFAULTS = (
 #
 # SHARED (VLAN 20) — MUST be registered in platform_clean_slate_services so the
 # platform teardown discovers + tears them down:
-_SHARED_CODES = frozenset({"svc06", "svc07", "svc09", "obs", "mailcatcher"})
+_SHARED_CODES = frozenset({"svc03", "svc06", "svc07", "svc08", "svc09", "svc10", "obs", "mailcatcher"})
 # PER-PROJECT — torn down by their OWN / the consumer clean-slate path (they live
 # on project VLANs, not VLAN 20), so they are EXEMPT from the platform-catalog
 # check. They MUST still have a clean-slate role + routing (FR-1).

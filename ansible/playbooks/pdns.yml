@@ -1,0 +1,17 @@
+---
+# SVC-10 internal DNS configurator playbook (spec: svc-10-internal-dns).
+#
+# CONFIGURATOR play (integration-boundaries.md §4): runs `hosts: dns` NATIVELY on
+# the DNS LXC, reached via the generated inventory the installer wrote
+# (ansible/inventory/svc-10-internal-dns.generated.yml). Invoked by the
+# svc10_bootstrap role as a child ansible-playbook run; also runnable standalone.
+# Bind-only: NO task logic here (it lives in pdns_install). The API key is read
+# from the ENVIRONMENT (PDNS_API_KEY), never from -e (argv would expose it).
+- name: Install SVC-10 internal DNS (PowerDNS authoritative + recursor)
+  hosts: dns
+  become: true
+  tasks:
+    - name: Install + configure PowerDNS (configs, Compose stack, zone, API firewall)
+      ansible.builtin.import_role:
+        name: pdns_install
+      tags: ["install"]

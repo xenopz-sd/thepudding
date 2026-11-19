@@ -76,6 +76,8 @@ __all__ = [
     "DEFAULT_PROJECT_ROLE_ASSERTION",
     "EXPOSE_TLS_MODES",
     "EXPOSE_HOST_LABEL_RE",
+    "OBJECT_STORAGE_PURPOSE_RE",
+    "OBJECT_STORAGE_KEYS",
     "validate_manifest",
     "main",
 ]
@@ -110,7 +112,9 @@ SLUG_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$")
 #: published through the shared Traefik under a hostname in the platform base
 #: domain (so an interactive OIDC login can complete from a browser). Sibling to
 #: ``workload``; additive and backward compatible.
-CONSUMABLE_SERVICE_KEYS = ("database", "sso", "secrets", "workload", "expose")
+#: ``object_storage`` is the optional SVC-03 block (consumer-object-storage, WS-C50):
+#: bucket purposes for ``proj-<slug>-<purpose>`` buckets and one scoped key.
+CONSUMABLE_SERVICE_KEYS = ("database", "sso", "secrets", "workload", "expose", "object_storage")
 
 #: The full set of permitted top-level keys: the mandatory ``slug`` plus the
 #: optional consumable service blocks.
@@ -136,6 +140,18 @@ EXPOSE_TLS_MODES = ("terminate", "passthrough")
 #: dots) under ``${THEPUDDING_BASE_DOMAIN}`` — the deploy layer appends the base
 #: domain, so the base domain is never written into the manifest (single source
 #: of truth). A FQDN (containing a dot) is rejected.
+#: ``object_storage.buckets[]`` purpose: lowercase letters and digits only, NO hyphen,
+#: so ``proj-<slug>-<purpose>`` is unambiguous (slugs may contain hyphens; with a
+#: hyphenated purpose, slug ``a`` + ``b-x`` and slug ``a-b`` + ``x`` collide).
+OBJECT_STORAGE_PURPOSE_RE = re.compile(r"^[a-z0-9]{1,32}$")
+
+#: The keys permitted inside ``object_storage``. ``website`` (WS-C51) is the subset of
+#: ``buckets`` served as public static websites.
+OBJECT_STORAGE_KEYS = ("buckets", "website")
+
+#: S3 bucket-name length limit.
+_BUCKET_NAME_MAX = 63
+
 EXPOSE_HOST_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 #: ``sso.app_registrations[].app_type`` enum (Requirement 1.3). These are the
@@ -456,6 +472,62 @@ def _validate_expose(block: object) -> None:
         _require_enum(block["tls"], EXPOSE_TLS_MODES, "expose.tls")
 
 
+def _validate_object_storage(block: object, slug: str) -> None:
+    """Validate the optional ``object_storage`` block (consumer-object-storage R1).
+
+    ``buckets`` is REQUIRED inside the block: a non-empty list of unique purposes,
+    each matching :data:`OBJECT_STORAGE_PURPOSE_RE`, with ``proj-<slug>-<purpose>``
+    at most 63 characters. Unknown keys are rejected naming the key.
+    """
+    if not isinstance(block, dict):
+        raise ManifestValidationError(
+            f"service entry 'object_storage' must be a mapping, got {block!r}"
+        )
+    unknown = sorted(k for k in block if k not in OBJECT_STORAGE_KEYS)
+    if unknown:
+        raise ManifestValidationError(
+            f"field 'object_storage.{unknown[0]}' is not permitted; allowed keys are "
+            f"{list(OBJECT_STORAGE_KEYS)}"
+        )
+    buckets = block.get("buckets")
+    if not isinstance(buckets, list) or not buckets:
+        raise ManifestValidationError(
+            "field 'object_storage.buckets' must be a non-empty list of bucket purposes, "
+            f"got {buckets!r}"
+        )
+    seen: set[str] = set()
+    for i, purpose in enumerate(buckets):
+        field = f"object_storage.buckets[{i}]"
+        if not isinstance(purpose, str) or not OBJECT_STORAGE_PURPOSE_RE.match(purpose):
+            raise ManifestValidationError(
+                f"field '{field}' {purpose!r} must match {OBJECT_STORAGE_PURPOSE_RE.pattern!r} "
+                "(lowercase letters and digits, no hyphen)"
+            )
+        if len(f"proj-{slug}-{purpose}") > _BUCKET_NAME_MAX:
+            raise ManifestValidationError(
+                f"field '{field}': bucket name 'proj-{slug}-{purpose}' exceeds "
+                f"{_BUCKET_NAME_MAX} characters"
+            )
+        if purpose in seen:
+            raise ManifestValidationError(
+                f"field 'object_storage.buckets' lists {purpose!r} more than once"
+            )
+        seen.add(purpose)
+    if "website" in block:
+        website = block["website"]
+        if not isinstance(website, list):
+            raise ManifestValidationError(
+                f"field 'object_storage.website' must be a list of bucket purposes, got {website!r}"
+            )
+        for i, purpose in enumerate(website):
+            if purpose not in seen:
+                raise ManifestValidationError(
+                    f"field 'object_storage.website[{i}]' {purpose!r} is not one of object_storage.buckets"
+                )
+        if len(set(website)) != len(website):
+            raise ManifestValidationError("field 'object_storage.website' lists a purpose more than once")
+
+
 def validate_manifest(manifest: object) -> dict[str, Any]:
     """Validate an already-parsed Consumer_Manifest mapping; return it on accept.
 
@@ -535,6 +607,8 @@ def validate_manifest(manifest: object) -> dict[str, Any]:
         _validate_workload(manifest["workload"])
     if "expose" in manifest:
         _validate_expose(manifest["expose"])
+    if "object_storage" in manifest:
+        _validate_object_storage(manifest["object_storage"], slug)
 
     return manifest
 

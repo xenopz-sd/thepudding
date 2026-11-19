@@ -1,0 +1,108 @@
+---
+# selftest.yml — issue a throwaway certificate with the admin token, verify it chains to the root
+# (control node), revoke it, and confirm the revoke succeeded. Proves R2/R5 on every run.
+- name: "Selftest | Issue a short-lived test certificate (no_log)"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [write, -format=json, pki_int/issue/svc09, "-"]
+    pki_bao_stdin: >-
+      {{ {'common_name': 'selftest.' ~ svc08_platform_domain, 'ttl': '10m', 'format': 'pem'} | to_json }}
+- name: "Selftest | Bind the test material (no_log)"
+  ansible.builtin.set_fact:
+    # yamllint disable-line rule:line-length
+    pki_selftest_cert: "{{ (pki_bao_result.stdout | from_json).data.certificate | trim }}\n{{ (pki_bao_result.stdout | from_json).data.issuing_ca | trim }}\n"
+    pki_selftest_serial: "{{ (pki_bao_result.stdout | from_json).data.serial_number }}"
+  no_log: true
+- name: "Selftest | Verify the chain against the published root"
+  ansible.builtin.copy:
+    content: "{{ pki_selftest_cert }}"
+    dest: "{{ pki_ca_repo_root }}/.pki/scratch-selftest.pem"
+    mode: "0600"
+  delegate_to: localhost
+  connection: local
+  changed_when: false
+- name: "Selftest | Chain, SAN and validity check"
+  ansible.builtin.command:
+    argv:
+      - "{{ pki_ca_venv_python }}"
+      - "{{ pki_ca_helper }}"
+      - needs-issue
+      - --cert
+      - "{{ pki_ca_repo_root }}/.pki/scratch-selftest.pem"
+      - --root
+      - "{{ pki_ca_repo_root }}/{{ pki_ca_root_publish_path }}"
+      - --san
+      - "DNS:selftest.{{ svc08_platform_domain }}"
+      - --min-days
+      - "0"
+  changed_when: false
+  delegate_to: localhost
+  connection: local
+- name: "Selftest | Revoke it (R5)"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [write, -format=json, pki_int/revoke, "-"]
+    pki_bao_stdin: "{{ {'serial_number': pki_selftest_serial} | to_json }}"
+# The CRL is rebuilt on a schedule, not on revoke (live finding), so rotate it, then prove the serial is listed
+# and the CRL is signed by the issuing CA (R5, AC-4).
+- name: "Selftest | Rotate the CRL"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [read, -format=json, pki_int/crl/rotate]
+- name: "Selftest | Read the CRL (public)"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [read, -format=json, pki_int/cert/crl]
+- name: "Selftest | Bind the CRL"
+  ansible.builtin.set_fact:
+    pki_selftest_crl: "{{ (pki_bao_result.stdout | from_json).data.certificate | trim }}"
+  no_log: true
+- name: "Selftest | Read the issuing CA certificate (public)"
+  ansible.builtin.include_tasks: bao.yml
+  vars:
+    pki_bao_args: [read, -format=json, pki_int/cert/ca]
+- name: "Selftest | Bind the issuing CA"
+  ansible.builtin.set_fact:
+    pki_selftest_issuer: "{{ (pki_bao_result.stdout | from_json).data.certificate | trim }}"
+  no_log: true
+- name: "Selftest | Write the CRL and issuer to scratch"
+  ansible.builtin.copy:
+    content: "{{ item.content }}\n"
+    dest: "{{ pki_ca_repo_root }}/.pki/{{ item.name }}"
+    mode: "0600"
+  loop:
+    - { name: scratch-crl.pem, content: "{{ pki_selftest_crl }}" }
+    - { name: scratch-issuer.pem, content: "{{ pki_selftest_issuer }}" }
+  delegate_to: localhost
+  connection: local
+  changed_when: false
+- name: "Selftest | The CRL must list the revoked serial and be signed by the issuing CA"
+  ansible.builtin.command:
+    argv:
+      - "{{ pki_ca_venv_python }}"
+      - "{{ pki_ca_helper }}"
+      - crl-lists
+      - --crl
+      - "{{ pki_ca_repo_root }}/.pki/scratch-crl.pem"
+      - --serial
+      - "{{ pki_selftest_serial }}"
+      - --issuer
+      - "{{ pki_ca_repo_root }}/.pki/scratch-issuer.pem"
+  changed_when: false
+  delegate_to: localhost
+  connection: local
+- name: "Selftest | Remove the scratch copies"
+  ansible.builtin.file:
+    path: "{{ pki_ca_repo_root }}/.pki/{{ item }}"
+    state: absent
+  loop: [scratch-crl.pem, scratch-issuer.pem]
+  delegate_to: localhost
+  connection: local
+  changed_when: false
+- name: "Selftest | Remove the scratch copy"
+  ansible.builtin.file:
+    path: "{{ pki_ca_repo_root }}/.pki/scratch-selftest.pem"
+    state: absent
+  delegate_to: localhost
+  connection: local
+  changed_when: false

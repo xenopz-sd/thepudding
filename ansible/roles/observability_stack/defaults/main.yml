@@ -341,6 +341,27 @@ observability_builtin_scrape_targets:
     service_role: "traefik"
     project: "shared"
     port: 8082
+  # SVC-03 Garage — native Prometheus metrics on the admin API port :3903 at
+  # /metrics (no metrics_token configured, so unauthenticated on VLAN 20 like the
+  # other exporters; every other admin endpoint needs the admin token).
+  - service: "garage"
+    service_role: "garage"
+    project: "shared"
+    port: 3903
+    scrape_interval: "30s"
+  # SVC-10 internal DNS — both PowerDNS webservers expose /metrics without a
+  # password (the authoritative HTTP API on the same port still needs X-API-Key);
+  # the in-guest firewall admits the Prometheus guest.
+  - service: "pdns-auth"
+    service_role: "dns"
+    project: "shared"
+    port: 8081
+    scrape_interval: "30s"
+  - service: "pdns-recursor"
+    service_role: "dns"
+    project: "shared"
+    port: 8082
+    scrape_interval: "30s"
 
 # The resolved inventory index (service_role -> hostname -> {ip, project}).
 # Populated by tasks/scrape_targets.yml from the loaded Ansible inventory;
@@ -455,3 +476,9 @@ dcgm_metrics_deferred: true
 
 # --- Reconciliation behaviour (passed through to docker-compose-app) --------
 observability_state: "present"
+
+# --- WS-C58: fleet exporter ports (node_exporter + cAdvisor on every guest), keyed by the file_sd job name ---
+observability_fleet_ports:
+  node: 9100
+  cadvisor: 9338
+observability_projects_registry: "{{ playbook_dir | dirname | dirname }}/infra/platform-foundation/projects.yaml"

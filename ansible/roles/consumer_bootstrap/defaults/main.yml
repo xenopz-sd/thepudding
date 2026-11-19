@@ -14,10 +14,12 @@ consumer_openbao_project_onboard_role: openbao_project_onboard
 consumer_openbao_workload_approle_role: openbao_workload_approle
 consumer_zitadel_org_provision_playbook: ansible/playbooks/zitadel-org-provision.yml
 
-# TLS-skip for the primary `bao` docker-exec calls in the composed OpenBao
-# onboarders when the primary serves the self-signed mock cert (dev). Threaded
-# into the include_role vars so the composed role behaves as in its own play.
-consumer_openbao_tls_self_signed: true
+# TLS posture for the primary `bao` docker-exec calls in the composed OpenBao onboarders (WS-C13, closed by
+# SVC-08 WS-C60). NOT a committed default any more: resolved at run time in tasks/main.yml as an explicit
+# `-e consumer_openbao_tls_self_signed=` > OPENBAO_TLS_SELF_SIGNED=true in the cluster env file > false (verify).
+# With the platform CA the primary's own container verifies its loopback listener (BAO_CACERT), so `false` works.
+consumer_tls_optin_regex: >-
+  (?im)^[ ]*(export[ ]+)?OPENBAO_TLS_SELF_SIGNED[ ]*=[^a-z0-9#\n]*(true|1|yes)[^a-z0-9#\n]*(#.*)?$
 
 # The PRIMARY OpenBao guest the composed onboarder roles delegate their
 # docker-exec/cp tasks to (composed-onboarder primary-delegation bugfix). STEP 2
@@ -106,3 +108,8 @@ consumer_db_bridge_field: database_url
 # Uses the existing secret/data/<slug>/<kv_subpath> shape (agent.hcl.j2 unchanged).
 consumer_db_agent_mapping:
   - { kv_subpath: "db", kv_field: "database_url", env_key: "DATABASE_URL" }
+
+# consumer-object-storage: the SVC-03 bucket onboarder (composed as a child run against the SVC-03
+# generated inventory; it targets hosts: garage, not localhost).
+consumer_garage_bucket_provision_playbook: ansible/playbooks/garage-bucket-provision.yml
+consumer_svc03_inventory: ansible/inventory/svc-03-object-storage.generated.yml

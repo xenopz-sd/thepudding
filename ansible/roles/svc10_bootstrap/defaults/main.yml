@@ -1,0 +1,24 @@
+---
+# defaults/main.yml — svc10_bootstrap (SVC-10 DNS installer — Phase 3: Bootstrap)
+#
+# NO secret value lives here. The PowerDNS API key is generated once and stored in
+# OpenBao; this file only names WHERE (D6).
+
+# The OpenBao primary guest the delegated `bao` CLI calls run on (SVC-07).
+svc10_openbao_cli_host: "10.0.20.10"
+svc10_openbao_cli_user: "root"
+svc10_openbao_cli_python: "/usr/bin/python3"
+svc10_openbao_cli_bao_addr: "https://127.0.0.1:8200"
+svc10_openbao_primary_container_name: "openbao-openbao-1"
+svc10_openbao_bao_bin: "bao"
+# The primary serves a self-signed cert on the dev platform (P4: the skip applies
+# ONLY to this loopback CLI hop inside the primary guest).
+svc10_openbao_tls_skip_verify: true
+# Canonical KV shape (runtime-wiring guard check 3), SVC-06 `proj-shared-<svc>` precedent.
+svc10_openbao_kv_mount: "secret"
+svc10_api_key_secret_path: "{{ svc10_openbao_kv_mount }}/proj-shared-dns/pdns"
+
+svc10_platform_domain: "platform.example.test"
+# Extra source CIDR allowed through the API firewall (the operator's admin CIDR,
+# resolved by preflight from ADMIN_SOURCE_CIDR when set).
+svc10_admin_source_cidr: ""

@@ -1,0 +1,378 @@
+---
+# tasks/teardown.yml — garage_bucket_provision (consumer-object-storage R5)
+#
+# DESTRUCTIVE by design (composed by the consumer clean-slate, or run by an
+# operator): empties and deletes the project's buckets, deletes its key and its
+# OpenBao entry, then verifies none remains. Idempotent: a second run finds
+# nothing and changes nothing.
+#
+# Targets (design D4): every bucket the project key proj-<slug>-cikey is granted
+# on, plus the declared buckets (bucket_purposes, optional) that exist. Never a
+# prefix match: slug `a`'s prefix proj-a- would also match slug `a-b`'s buckets.
+# Buckets are emptied with S3 calls (s3_smoke.py purge) using the project key, or
+# a temporary key when the project key is already gone.
+
+- name: "Teardown | Validate project_slug and the optional bucket_purposes"
+  ansible.builtin.assert:
+    that:
+      - project_slug is match('^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$')
+      - bucket_purposes is iterable and bucket_purposes is not string
+      - (bucket_purposes | reject('match', '^[a-z0-9]{1,32}$') | list | length) == 0
+    fail_msg: >-
+      Invalid input: project_slug '{{ project_slug }}' or bucket_purposes
+      {{ bucket_purposes }}. Nothing was changed.
+    quiet: true
+  run_once: true
+
+- name: "Teardown | Bind names and the S3 endpoint used for emptying"
+  ansible.builtin.set_fact:
+    garage_bp_declared_buckets: "{{ bucket_purposes | map('regex_replace', '^', garage_bp_bucket_prefix) | list }}"
+    garage_bp_temp_key_name: "proj-{{ project_slug }}-teardown"
+    garage_bp_purge_endpoint: "http://{{ ansible_host }}:3900"
+  run_once: true
+
+- name: "Teardown | Resolve the OpenBao admin token (no_log)"
+  ansible.builtin.set_fact:
+    garage_bp_openbao_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         if ((lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim) | length > 0)
+         else ((lookup('ansible.builtin.file', (playbook_dir | dirname | dirname) ~ '/' ~ cluster_env_file,
+                       errors='ignore') | default('', true))
+               | regex_findall('(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*[\"\']?([^\"\'\r\n]*?)[\"\']?[ \t]*$')
+               | first | default('') | trim) }}
+  run_once: true
+  no_log: true
+
+- name: "Teardown | Fail closed without an OpenBao admin token"
+  ansible.builtin.assert:
+    that:
+      - (garage_bp_openbao_token | length) > 0
+    fail_msg: >-
+      The teardown deletes {{ garage_bp_secret_path }} and needs the OpenBao admin token
+      (OPENBAO_ADMIN_TOKEN in the environment or in {{ cluster_env_file }}). Nothing was changed.
+    quiet: true
+  run_once: true
+  no_log: true
+
+# --- 1. Discover what exists -----------------------------------------------------
+- name: "Teardown | List the keys"
+  ansible.builtin.command:
+    argv: ["docker", "exec", "{{ garage_container_name }}", "{{ garage_bin }}", "json-api", "ListKeys"]
+  register: garage_bp_td_keys
+  run_once: true
+  changed_when: false
+
+- name: "Teardown | Find the project key and any leftover temporary key"
+  ansible.builtin.set_fact:
+    garage_bp_td_key_ids: >-
+      {{ garage_bp_td_keys.stdout | from_json | selectattr('name', 'eq', garage_bp_key_name)
+         | map(attribute='id') | list }}
+    garage_bp_td_temp_ids: >-
+      {{ garage_bp_td_keys.stdout | from_json | selectattr('name', 'eq', garage_bp_temp_key_name)
+         | map(attribute='id') | list }}
+  run_once: true
+
+- name: "Teardown | Read the project key's grants and secret (no_log)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - GetKeyInfo
+      - "{{ {'id': item, 'showSecretKey': true} | to_json }}"
+  loop: "{{ garage_bp_td_key_ids }}"
+  register: garage_bp_td_key_info
+  run_once: true
+  changed_when: false
+  no_log: true
+
+- name: "Teardown | Look up the declared buckets"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - GetBucketInfo
+      - "{{ {'globalAlias': item} | to_json }}"
+  loop: "{{ garage_bp_declared_buckets }}"
+  register: garage_bp_td_declared
+  run_once: true
+  changed_when: false
+  failed_when: false
+
+- name: "Teardown | Compute the target bucket ids (granted to the project key, or declared and existing)"
+  ansible.builtin.set_fact:
+    garage_bp_td_targets: >-
+      {{ ((garage_bp_td_key_info.results | default([]) | map(attribute='stdout') | map('from_json')
+           | map(attribute='buckets') | flatten | map(attribute='id') | list)
+          + (garage_bp_td_declared.results | selectattr('rc', 'eq', 0) | map(attribute='stdout')
+             | map('from_json') | map(attribute='id') | list)) | unique }}
+  run_once: true
+  no_log: true
+
+- name: "Teardown | INFO — what will be removed (names and counts only)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO garage teardown for {{ project_slug }}: {{ garage_bp_td_targets | length }} bucket(s),
+      {{ garage_bp_td_key_ids | length }} project key(s), OpenBao entry {{ garage_bp_secret_path }}.
+  run_once: true
+
+# --- 2. Credentials for emptying the buckets ---------------------------------------
+- name: "Teardown | Create a temporary key when buckets remain but the project key is gone (no_log)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - CreateKey
+      - "{{ {'name': garage_bp_temp_key_name} | to_json }}"
+  register: garage_bp_td_temp
+  run_once: true
+  changed_when: true
+  no_log: true
+  when:
+    - (garage_bp_td_targets | length) > 0
+    - (garage_bp_td_key_ids | length) == 0
+
+- name: "Teardown | Bind the credentials used for emptying (no_log)"
+  ansible.builtin.set_fact:
+    garage_bp_td_access: >-
+      {{ ((garage_bp_td_key_info.results | first).stdout | from_json).accessKeyId
+         if (garage_bp_td_key_ids | length) > 0
+         else ((garage_bp_td_temp.stdout | default('{}')) | from_json).accessKeyId | default('') }}
+    garage_bp_td_secret: >-
+      {{ ((garage_bp_td_key_info.results | first).stdout | from_json).secretAccessKey
+         if (garage_bp_td_key_ids | length) > 0
+         else ((garage_bp_td_temp.stdout | default('{}')) | from_json).secretAccessKey | default('') }}
+  run_once: true
+  no_log: true
+  when: (garage_bp_td_targets | length) > 0
+
+- name: "Teardown | Grant the emptying key read+write on every target bucket"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - AllowBucketKey
+      - >-
+        {{ {'bucketId': item, 'accessKeyId': garage_bp_td_access,
+            'permissions': {'read': true, 'write': true, 'owner': false}} | to_json }}
+  loop: "{{ garage_bp_td_targets }}"
+  run_once: true
+  changed_when: false
+  no_log: true
+
+# --- 3. Empty and delete the buckets ---------------------------------------------------
+- name: "Teardown | Read each target bucket's alias"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - GetBucketInfo
+      - "{{ {'id': item} | to_json }}"
+  loop: "{{ garage_bp_td_targets }}"
+  register: garage_bp_td_info
+  run_once: true
+  changed_when: false
+
+- name: "Teardown | Empty each bucket over S3 (s3_smoke.py purge, credentials in env only)"
+  ansible.builtin.command:
+    argv:
+      - "{{ lookup('ansible.builtin.env', 'HOME') }}/venv/devinfra/bin/python"
+      - scripts/installer/s3_smoke.py
+      - --endpoint
+      - "{{ garage_bp_purge_endpoint }}"
+      - --bucket
+      - "{{ (item.stdout | from_json).globalAliases | first }}"
+      - purge
+  args:
+    chdir: "{{ playbook_dir | dirname | dirname }}"
+  environment:
+    S3_ACCESS_KEY_ID: "{{ garage_bp_td_access }}"
+    S3_SECRET_ACCESS_KEY: "{{ garage_bp_td_secret }}"
+  loop: "{{ garage_bp_td_info.results }}"
+  loop_control:
+    label: "{{ (item.stdout | from_json).globalAliases | first | default(item.item) }}"
+  delegate_to: localhost
+  # The play runs `become: true` for the guests; the control-node step must not sudo (found live).
+  become: false
+  register: garage_bp_td_purge
+  run_once: true
+  changed_when: "'deleted 0 object(s), aborted 0 upload(s)' not in (garage_bp_td_purge.stdout | default(''))"
+  no_log: true
+
+- name: "Teardown | Delete each bucket"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - DeleteBucket
+      - "{{ {'id': item} | to_json }}"
+  loop: "{{ garage_bp_td_targets }}"
+  run_once: true
+  changed_when: true
+
+- name: "Teardown | Remove any website Route_Fragment of the deleted buckets (WS-C51)"
+  ansible.builtin.file:
+    path: >-
+      {{ garage_bp_traefik_dynamic_config_dir }}/garage-web-{{
+      (item.stdout | from_json).globalAliases | first }}-route.yml
+    state: absent
+  loop: "{{ garage_bp_td_info.results }}"
+  loop_control:
+    label: "{{ (item.stdout | from_json).globalAliases | first | default(item.item) }}"
+  delegate_to: "{{ garage_bp_traefik_guest_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ garage_bp_traefik_guest_user }}"
+    ansible_python_interpreter: "{{ garage_bp_traefik_guest_python }}"
+  run_once: true
+
+# --- 4. Keys and the OpenBao entry -----------------------------------------------------
+- name: "Teardown | Delete the project key and any temporary key"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - DeleteKey
+      - "{{ {'id': item} | to_json }}"
+  loop: >-
+    {{ garage_bp_td_key_ids + garage_bp_td_temp_ids
+       + ([((garage_bp_td_temp.stdout | default('{}')) | from_json).accessKeyId]
+          if (garage_bp_td_temp.changed | default(false)) else []) }}
+  run_once: true
+  changed_when: true
+  no_log: true
+
+- name: "Teardown | Probe the OpenBao entry (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ garage_bp_openbao_cli_bao_addr, '-e', 'BAO_TOKEN',
+          garage_bp_openbao_primary_container_name, garage_bp_openbao_bao_bin, 'kv', 'get', '-field=access_key_id']
+         + (['-tls-skip-verify'] if (garage_bp_openbao_tls_skip_verify | bool) else [])
+         + [garage_bp_secret_path] }}
+  delegate_to: "{{ garage_bp_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ garage_bp_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ garage_bp_openbao_cli_python }}"
+  environment:
+    BAO_TOKEN: "{{ garage_bp_openbao_token }}"
+  register: garage_bp_td_bao_probe
+  run_once: true
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: "Teardown | Delete the OpenBao entry, all versions (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ garage_bp_openbao_cli_bao_addr, '-e', 'BAO_TOKEN',
+          garage_bp_openbao_primary_container_name, garage_bp_openbao_bao_bin, 'kv', 'metadata', 'delete']
+         + (['-tls-skip-verify'] if (garage_bp_openbao_tls_skip_verify | bool) else [])
+         + [garage_bp_secret_path] }}
+  delegate_to: "{{ garage_bp_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ garage_bp_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ garage_bp_openbao_cli_python }}"
+  environment:
+    BAO_TOKEN: "{{ garage_bp_openbao_token }}"
+  run_once: true
+  changed_when: true
+  no_log: true
+  when: (garage_bp_td_bao_probe.rc | default(1)) == 0
+
+# --- 5. Verify nothing remains (P3: read back, not trust the delete calls) ----------------
+- name: "Teardown | VERIFY — list the keys again"
+  ansible.builtin.command:
+    argv: ["docker", "exec", "{{ garage_container_name }}", "{{ garage_bin }}", "json-api", "ListKeys"]
+  register: garage_bp_td_keys_after
+  run_once: true
+  changed_when: false
+
+- name: "Teardown | VERIFY — look the target and declared buckets up again"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - json-api
+      - GetBucketInfo
+      - "{{ item | to_json }}"
+  loop: >-
+    {{ (garage_bp_td_targets | map('community.general.dict_kv', 'id') | list)
+       + (garage_bp_declared_buckets | map('community.general.dict_kv', 'globalAlias') | list) }}
+  register: garage_bp_td_buckets_after
+  run_once: true
+  changed_when: false
+  failed_when: false
+
+- name: "Teardown | VERIFY — probe the OpenBao entry again (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ garage_bp_openbao_cli_bao_addr, '-e', 'BAO_TOKEN',
+          garage_bp_openbao_primary_container_name, garage_bp_openbao_bao_bin, 'kv', 'get', '-field=access_key_id']
+         + (['-tls-skip-verify'] if (garage_bp_openbao_tls_skip_verify | bool) else [])
+         + [garage_bp_secret_path] }}
+  delegate_to: "{{ garage_bp_openbao_cli_host }}"
+  vars:
+    ansible_connection: ssh
+    ansible_user: "{{ garage_bp_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ garage_bp_openbao_cli_python }}"
+  environment:
+    BAO_TOKEN: "{{ garage_bp_openbao_token }}"
+  register: garage_bp_td_bao_after
+  run_once: true
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: "Teardown | GATE — no bucket, key or OpenBao entry of the project remains"
+  ansible.builtin.assert:
+    that:
+      - >-
+        (garage_bp_td_keys_after.stdout | from_json
+         | selectattr('name', 'in', [garage_bp_key_name, garage_bp_temp_key_name]) | list | length) == 0
+      - (garage_bp_td_buckets_after.results | selectattr('rc', 'eq', 0) | list | length) == 0
+      - "'No value found' in (garage_bp_td_bao_after.stderr | default(''))"
+    fail_msg: >-
+      Garage teardown for {{ project_slug }} did not reach an empty baseline:
+      keys left {{ garage_bp_td_keys_after.stdout | from_json
+                   | selectattr('name', 'in', [garage_bp_key_name, garage_bp_temp_key_name])
+                   | map(attribute='name') | list }},
+      buckets left {{ garage_bp_td_buckets_after.results | selectattr('rc', 'eq', 0) | length }},
+      OpenBao entry {{ 'still present or unreadable' if ('No value found' not in
+                       (garage_bp_td_bao_after.stderr | default(''))) else 'gone' }}.
+      Re-run the teardown when SVC-03 and OpenBao are reachable.
+    success_msg: "Garage teardown for {{ project_slug }}: no bucket, key or OpenBao entry remains."
+  run_once: true
+
+- name: "Teardown | Scrub secret facts (no_log)"
+  ansible.builtin.set_fact:
+    garage_bp_openbao_token: ""
+    garage_bp_td_access: ""
+    garage_bp_td_secret: ""
+    garage_bp_td_key_info: {}
+    garage_bp_td_temp: {}
+  run_once: true
+  no_log: true

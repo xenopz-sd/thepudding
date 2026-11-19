@@ -52,6 +52,93 @@
   when: openbao_role == "primary"
   no_log: true   # defence-in-depth: never surface the token in an assert diagnostic
 
+# --- SVC-08 gate: verify the transit seal hop against the platform root (WS-C59) ---
+- name: "SVC-08 gate | Is the platform root published on the control node?"
+  ansible.builtin.stat:
+    path: "{{ openbao_platform_ca_cert_src }}"
+  delegate_to: localhost
+  become: false
+  register: openbao_platform_ca_stat
+- name: "SVC-08 gate | Does the unsealer serve a certificate chaining to it (live probe)?"
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - s_client
+      - -connect
+      - "{{ openbao_unsealer_addr | regex_replace('^https://', '') }}"
+      - -CAfile
+      - "{{ openbao_platform_ca_cert_src }}"
+      - -verify_return_error
+      - -brief
+    stdin: ""
+  delegate_to: localhost
+  become: false
+  register: openbao_unsealer_ca_probe
+  changed_when: false
+  failed_when: false
+  when: openbao_role == "primary" and (openbao_platform_ca_stat.stat.exists | default(false))
+- name: "SVC-08 gate | Decide the seal-client TLS posture"
+  ansible.builtin.set_fact:
+    openbao_seal_verify_with_platform_ca: >-
+      {{ openbao_role == "primary"
+         and (openbao_platform_ca_stat.stat.exists | default(false))
+         and (openbao_unsealer_ca_probe.rc | default(1)) == 0 }}
+- name: "SVC-08 gate | INFO — transit seal client TLS"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: transit seal client: {{ 'verifies the unsealer against the platform root (tls_ca_cert)'
+      if (openbao_seal_verify_with_platform_ca | bool)
+      else ('tls_skip_verify (mock)' if (openbao_tls_self_signed | bool) else 'system trust') }}
+      {{ '' if (not (openbao_platform_ca_stat.stat.exists | default(false))
+                or (openbao_seal_verify_with_platform_ca | bool))
+         else '— platform root published but the unsealer does not serve a CA-issued certificate yet; '
+              ~ 'run ansible/playbooks/svc-08-bootstrap.yml, then re-run this installer' }}
+  when: openbao_role == "primary"
+# The in-container `bao` CLI reaches its own listener at https://127.0.0.1:8200. When this guest's listener serves
+# a CA certificate that also covers 127.0.0.1, BAO_CACERT in the container environment makes every loopback CLI
+# call verify (docker exec inherits it); an explicit -tls-skip-verify still overrides (WS-C60).
+- name: "SVC-08 gate | Does this guest's own listener chain to the root and cover 127.0.0.1 (live probe)?"
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - s_client
+      - -connect
+      - "{{ ansible_host }}:{{ openbao_api_port }}"
+      - -CAfile
+      - "{{ openbao_platform_ca_cert_src }}"
+      - -verify_ip
+      - 127.0.0.1
+      - -verify_return_error
+      - -brief
+    stdin: ""
+  delegate_to: localhost
+  become: false
+  register: openbao_own_listener_ca_probe
+  changed_when: false
+  failed_when: false
+  # PRIMARY ONLY: a recreated unsealer comes back sealed and its Shamir keys exist only in memory at init, so its
+  # container environment must never change after init (live-checked design, WS-C60).
+  when: openbao_role == "primary" and (openbao_platform_ca_stat.stat.exists | default(false))
+- name: "SVC-08 gate | Decide the container CA trust"
+  ansible.builtin.set_fact:
+    openbao_container_trusts_platform_ca: >-
+      {{ openbao_role == "primary"
+         and (openbao_platform_ca_stat.stat.exists | default(false))
+         and (openbao_own_listener_ca_probe.rc | default(1)) == 0 }}
+- name: "SVC-08 gate | INFO — in-container CLI TLS"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: {{ openbao_role }} container CLI: {{ 'verifies with BAO_CACERT (platform root)'
+      if (openbao_container_trusts_platform_ca | bool) else 'unchanged (no CA-issued loopback-capable listener cert)' }}
+- name: "SVC-08 gate | Install the platform root next to the listener certificate (public)"
+  ansible.builtin.copy:
+    src: "{{ openbao_platform_ca_cert_src }}"
+    dest: "{{ openbao_tls_host_dir }}/{{ openbao_platform_ca_cert_name }}"
+    owner: "{{ openbao_container_uid }}"
+    group: "{{ openbao_container_gid }}"
+    mode: "0644"
+  when: (openbao_seal_verify_with_platform_ca | bool) or (openbao_container_trusts_platform_ca | bool)
+
 - name: Template the primary config.hcl
   ansible.builtin.template:
     src: config.hcl.j2
@@ -537,7 +624,9 @@
     dca_networks: >-
       {{ [{'name': openbao_traefik_network, 'external': true}]
          if (openbao_mock_edge_network | bool) else [] }}
-    dca_env: "{{ openbao_env_primary }}"
+    dca_env: >-
+      {{ openbao_env_primary | combine({'BAO_CACERT': openbao_tls_dir ~ '/' ~ openbao_platform_ca_cert_name}
+         if (openbao_container_trusts_platform_ca | default(false) | bool) else {}) }}
   # Idempotent: docker_compose_v2 reconciles + reports changed=0 on a converged
   # stack, recreating only on real spec/.env drift (Req 13.2). NOT gated on the
   # version check — that would freeze the on-disk compose.yaml (see the Task-5.2

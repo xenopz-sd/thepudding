@@ -50,7 +50,7 @@ Origin legend: 🇪🇺 = genuinely European (company/foundation HQ or governanc
 | | | | Strict-EU alt: **MariaDB** | 🇪🇺 MariaDB Foundation, Helsinki, Finland (nonprofit) | |
 | SVC-02 | Cache / key-value store | Shared or dedicated | **Redis** (AGPLv3 since May 2025) | 🚩 Created by Salvatore Sanfilippo (🇮🇹 Italy); steward Redis Inc. is 🇺🇸 US (Mountain View). No actively-maintained fully-European equivalent found (Dragonfly, KeyDB are also non-EU) — flagged, included pragmatically. | T1 |
 | SVC-03 | Object storage (S3-compatible) | Shared | **Garage** (default) | 🇪🇺 Deuxfleurs, France (nonprofit collective), purpose-built for small/medium self-hosted clusters | T1 |
-| | | | Fallback: **MinIO** | 🚩 MinIO Inc., Redwood City, California, US | |
+| | | | Fallback: **Scality CloudServer** (single-node S3 server, Apache-2.0; replaces MinIO, whose Community Edition was archived upstream — WS-C54) | 🇪🇺 Scality, Paris, France | |
 | SVC-04 | Time-series database | Shared or dedicated | **QuestDB** (default) | 🇪🇺 QuestDB Ltd., London, UK | T2 |
 | | | | Alt (fewer services): TimescaleDB extension on SVC-01 | 🚩 Timescale Inc., New York, US | |
 | SVC-05 | Vector database | Shared or dedicated | **Qdrant** (default) | 🇪🇺 Qdrant Solutions GmbH, Berlin, Germany | T2 |
@@ -63,7 +63,7 @@ Origin legend: 🇪🇺 = genuinely European (company/foundation HQ or governanc
 | SVC-06 | Identity provider / SSO | Shared | **ZITADEL** (default) | 🇪🇺 CAOS Ltd, St. Gallen, Switzerland | T1 |
 | | | | Alt (max protocol breadth): **Keycloak** | 🚩 Originated at Red Hat, Raleigh, NC, US | |
 | SVC-07 | Secrets manager | Shared | **OpenBao** | 🚩 No clearly European alternative of comparable maturity found. OpenBao is Linux Foundation-governed (neutral, not a single national vendor) — the closest available middle ground. Flagged explicitly per your request. | T1 |
-| SVC-08 | Internal PKI / certificate authority | Shared | **EJBCA Community** (default) | 🇪🇺-origin: created by PrimeKey, Solna, Sweden; sponsor since 2022 is Keyfactor 🚩 (US, Ohio) — the Community Edition remains LGPL-2.1, fully open and self-hostable regardless of sponsor | T2 |
+| SVC-08 | Internal PKI / certificate authority | Shared | **OpenBao PKI secrets engine** on SVC-07 (default, [ADR-0028](.kiro/decisions/0028-svc08-internal-ca-technology-and-issuance-mode.md); EJBCA Community was the earlier default and was removed: no ACME in Community, vendor-positioned for non-production) | 🚩 OpenBao: Linux Foundation, already the flagged SVC-07 exception (catalog §3.5) | T2 |
 | | | | Lightweight alt: **step-ca** | 🚩 Smallstep, San Francisco, US | |
 
 ### C. Networking & edge
@@ -201,7 +201,7 @@ Each is self-contained, carries forward this catalog's origin/tenancy decisions 
 - [Redis license history — redis.io](https://redis.io/blog/redis-is-now-available-under-the-agplv3-open-source-license/), [Redis — Wikipedia](https://en.wikipedia.org/wiki/Redis)
 - [GitLab Inc. — Wikipedia](https://en.wikipedia.org/wiki/GitLab)
 - [Harbor — CNCF project journey report](https://www.cncf.io)
-- [MinIO — contact/HQ](https://www.min.io)
+- [Scality CloudServer — GitHub](https://github.com/scality/cloudserver)
 - [Proxmox Server Solutions GmbH — legal notice](https://www.proxmox.com)
 - [VictoriaMetrics origin — The Register](https://www.theregister.com/2023/12/11/victoriametrics_interview/)
 - [Zot registry project — GitHub](https://github.com/project-zot/zot), [Zot — zotregistry.dev](https://zotregistry.dev/), [Zot origin at Cisco — RudeTools](https://rudetools.dev/registries/zot), [Zot CNCF Sandbox acceptance — CNCF](https://www.cncf.io/projects/zot/)

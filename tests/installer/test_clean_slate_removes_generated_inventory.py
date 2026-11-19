@@ -31,6 +31,7 @@ _CASES = {
     "obs_clean_slate": (["{{ obs_repo_root }}/{{ obs_generated_inventory }}"], "GATE — assert an empty baseline"),
     "mailcatcher_clean_slate": (["{{ mailcatcher_repo_root }}/{{ mailcatcher_generated_inventory }}"],
                                 "GATE — assert an empty baseline"),
+    "svc08_clean_slate": (["{{ svc08_repo_root }}/{{ svc08_generated_inventory }}"], "Remove the published root"),
     "svc01_clean_slate": (["{{ svc01_repo_root }}/{{ svc01_generated_inventory }}"], "GATE — assert an empty baseline"),
     "consumer_clean_slate": (["{{ consumer_repo_root }}/ansible/inventory/{{ project_slug }}-consumer.generated.yml",
                               "{{ consumer_repo_root }}/ansible/inventory/{{ project_slug }}-workload.generated.yml"],

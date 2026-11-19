@@ -1,0 +1,110 @@
+---
+# tasks/api_firewall.yml — pdns_install (SVC-10, FR-5; WS-C53 pattern)
+#
+# Restricts the published webserver ports (the authoritative HTTP API + metrics,
+# the recursor metrics) to pdns_api_allowed_sources (+ pdns_admin_source_cidr) with
+# DOCKER-USER jumps to the PDNS-API chain, applied by a systemd oneshot unit so it
+# survives reboots and Docker restarts. pdns_api_firewall_enabled=false removes
+# chain, jumps and unit (explicit opt-out).
+- name: "Firewall | Install the API firewall script"
+  ansible.builtin.template:
+    src: pdns-api-firewall.sh.j2
+    dest: /usr/local/sbin/pdns-api-firewall
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart pdns api firewall
+  when: pdns_api_firewall_enabled | bool
+
+- name: "Firewall | Install the API firewall unit"
+  ansible.builtin.template:
+    src: pdns-api-firewall.service.j2
+    dest: /etc/systemd/system/pdns-api-firewall.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart pdns api firewall
+  when: pdns_api_firewall_enabled | bool
+
+- name: "Firewall | Enable and start the API firewall unit"
+  ansible.builtin.systemd_service:
+    name: pdns-api-firewall.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: pdns_api_firewall_enabled | bool
+
+- name: "Firewall | Apply a changed script or unit now"
+  ansible.builtin.meta: flush_handlers
+
+- name: "Firewall | VERIFY — the DOCKER-USER jumps to PDNS-API are present"
+  ansible.builtin.command:
+    argv:
+      - iptables
+      - -C
+      - DOCKER-USER
+      - -p
+      - tcp
+      - -m
+      - conntrack
+      - --ctorigdstport
+      - "{{ item }}"
+      - --ctdir
+      - ORIGINAL
+      - -j
+      - PDNS-API
+  loop:
+    - "{{ pdns_auth_web_port }}"
+    - "{{ pdns_recursor_web_port }}"
+  register: pdns_api_fw_check
+  changed_when: false
+  failed_when: false
+  when: pdns_api_firewall_enabled | bool
+
+- name: "Firewall | Fail closed when the API firewall is not in place"
+  ansible.builtin.assert:
+    that:
+      - (pdns_api_fw_check.results | map(attribute='rc') | select('ne', 0) | list | length) == 0
+    fail_msg: >-
+      A PDNS-API firewall jump is missing on {{ inventory_hostname }} after applying it.
+      Inspect `systemctl status pdns-api-firewall` and `iptables -S DOCKER-USER` on the guest.
+    success_msg: >-
+      Ports {{ pdns_auth_web_port }}/{{ pdns_recursor_web_port }} limited to
+      {{ (pdns_api_allowed_sources
+          + ([pdns_admin_source_cidr] if (pdns_admin_source_cidr | trim | length) > 0 else []))
+         | join(', ') }}.
+    quiet: true
+  when: pdns_api_firewall_enabled | bool
+
+# --- Opt-out: remove everything ---------------------------------------------------------
+- name: "Firewall | Stat the unit (opt-out path)"
+  ansible.builtin.stat:
+    path: /etc/systemd/system/pdns-api-firewall.service
+  register: pdns_api_fw_unit
+  when: not (pdns_api_firewall_enabled | bool)
+
+- name: "Firewall | Stop and disable the unit (opt-out path)"
+  ansible.builtin.systemd_service:
+    name: pdns-api-firewall.service
+    enabled: false
+    state: stopped
+  when:
+    - not (pdns_api_firewall_enabled | bool)
+    - pdns_api_fw_unit.stat.exists | default(false)
+
+- name: "Firewall | Remove the chain and the jumps (opt-out path)"
+  ansible.builtin.command:
+    argv: [/usr/local/sbin/pdns-api-firewall, remove]
+  changed_when: true
+  when:
+    - not (pdns_api_firewall_enabled | bool)
+    - pdns_api_fw_unit.stat.exists | default(false)
+
+- name: "Firewall | Remove the unit and the script (opt-out path)"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/pdns-api-firewall.service
+    - /usr/local/sbin/pdns-api-firewall
+  when: not (pdns_api_firewall_enabled | bool)

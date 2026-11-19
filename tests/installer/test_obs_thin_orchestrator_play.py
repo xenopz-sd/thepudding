@@ -24,6 +24,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
+from _orchestrator_prestep import phase_tasks  # noqa: E402  (SVC-10 D5 pre-step)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ORCHESTRATOR = _REPO_ROOT / "ansible" / "playbooks" / "svc-17-18-bootstrap.yml"
@@ -93,7 +94,9 @@ def _orchestrator_play() -> dict:
     assert len(plays) == 1, (
         f"svc-17-18-bootstrap.yml must be a single-play orchestrator; found {len(plays)}."
     )
-    return plays[0]
+    play = dict(plays[0])
+    play["tasks"] = phase_tasks(play.get("tasks"))
+    return play
 
 
 def _all_tasks() -> list[dict]:

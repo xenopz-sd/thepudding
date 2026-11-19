@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: svc08_handoff
+  namespace: devinfra
+  author: Developer Services Platform
+  description: SVC-08 internal PKI installer (svc08_handoff).
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

@@ -1,0 +1,48 @@
+---
+# tasks/main.yml — svc03_handoff (SVC-03 Garage installer — Phase 4: Handoff)
+#
+# Phase 4 = health sanity + S3 smoke (child play garage-health.yml, run natively
+# on the guests) + the Developer B completion banner (R13). No secret is read or
+# printed here: the smoke creates and removes its own scratch key inside the child.
+
+- name: "Handoff | Health gate + S3 smoke (garage-health.yml child run)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc03_generated_inventory }}"
+      - ansible/playbooks/garage-health.yml
+  args:
+    chdir: "{{ svc03_repo_root }}"
+  register: svc03_health_run
+  changed_when: false
+  failed_when: false
+
+- name: "Handoff | Fail with the health run's output tail when it failed"
+  ansible.builtin.fail:
+    msg: >-
+      SVC-03 health gate failed (rc {{ svc03_health_run.rc }}). Last output:
+      {{ (svc03_health_run.stdout | default('')).splitlines()[-40:] | join(' | ') }}
+  when: (svc03_health_run.rc | default(1)) != 0
+
+- name: "Handoff | Print the Developer B completion summary banner"
+  ansible.builtin.debug:
+    msg:
+      - "============================================================"
+      - "Service SVC-03 (Object Storage, Garage) Deployed Successfully!"
+      - "============================================================"
+      - "Status:             healthy, 3 storage nodes, replication factor 3"
+      - "Internal S3:        http://{{ svc03_guest_ips[0] }}:3900 (also .23 / .24; region garage, path-style)"
+      - "Traefik S3 URL:     https://s3.{{ svc03_platform_domain }}"
+      - "Admin API:          http://{{ svc03_guest_ips[0] }}:3903 (admin token; Prometheus guest + node only)"
+      - "Cluster secrets:    OpenBao secret/proj-shared-garage/garage (values never printed)"
+      - ""
+      - "Next Steps for Project Developers:"
+      - "  To give a project a bucket and a scoped key (stored at secret/proj-<slug>/garage), run:"
+      - "  ~/venv/devinfra/bin/ansible-playbook \\"
+      - "    -i {{ svc03_generated_inventory }} \\"
+      - "    ansible/playbooks/garage-bucket-provision.yml \\"
+      - "    -e project_slug=<project-slug> -e '{\"bucket_purposes\": [\"artifacts\"]}' \\"
+      - "    -e cluster_env_file={{ cluster_env_file }}"
+      - "  Re-run SVC-17/18 (svc-17-18-bootstrap.yml) to add the garage scrape targets."
+      - "============================================================"

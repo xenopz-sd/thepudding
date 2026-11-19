@@ -1,0 +1,13 @@
+---
+# meta/main.yml — dns_records_sync
+galaxy_info:
+  role_name: dns_records_sync
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-10: reconciles the platform zone's A records (wildcards to Traefik, one
+    record per guest) with ansible/inventory/*.generated.yml through pdnsutil on the
+    DNS guest, deletes stale records, and verifies the result.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

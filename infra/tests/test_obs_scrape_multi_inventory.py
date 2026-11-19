@@ -300,32 +300,27 @@ def test_configurator_inventories_built_from_glob_with_obs_first():
 
 
 def test_observability_plays_scoped_to_prometheus_grafana_loki():
-    """BOTH observability.yml plays must be scoped to
-    `hosts: prometheus:grafana:loki`, so a merged multi-inventory does not
-    over-apply the exporter/stack roles onto the SVC-01/06/07/09 guests.
+    """The STACK play stays scoped to `hosts: prometheus:grafana:loki` (the stack roles must never land on other
+    guests); the FLEET-EXPORTER play runs on `hosts: all` of the merged generated inventories, by design since
+    WS-C58 (spec .kiro/specs/svc-17-18-service-guest-exporters/, D1): every guest runs node_exporter, cAdvisor and
+    Promtail.
 
-    Unfixed tree: both plays are `hosts: all` -> FAILS, confirming the bug.
-
-    Validates: Requirements 2.1, 2.2
+    Validates: Requirements 2.1, 2.2 (stack scope, unchanged); WS-C58 R1 (fleet scope).
     """
     plays = _play_docs(_OBSERVABILITY_PLAY)
     assert len(plays) >= 2, (
         f"expected at least two plays in {_OBSERVABILITY_PLAY.name}, "
         f"got {len(plays)}"
     )
-
-    offenders = [
-        (idx, str(p.get("hosts")))
-        for idx, p in enumerate(plays, start=1)
-        if str(p.get("hosts")).strip() != _EXPECTED_HOST_SCOPE
-    ]
-    assert not offenders, (
-        "both observability.yml plays must be scoped to "
-        f"`hosts: {_EXPECTED_HOST_SCOPE}` (not bare `hosts: all`), so the merged "
-        "multi-inventory feeds the controller-side scrape-target index without "
-        "installing the fleet exporters / observability_stack onto the "
-        "SVC-01/06/07/09 guests now visible in the inventory. Offending plays "
-        f"(1-indexed, hosts value): {offenders!r}"
+    fleet, stack = plays[0], plays[1]
+    assert "exporters" in str(fleet.get("name", "")).lower(), fleet.get("name")
+    assert str(fleet.get("hosts")).strip() == "all", "WS-C58: the fleet-exporter play covers every guest"
+    roles = str(fleet)
+    for r in ("node_exporter", "cadvisor", "promtail_agent"):
+        assert r in roles, r
+    assert "observability_stack" not in roles, "the stack role must never run in the fleet play"
+    assert str(stack.get("hosts")).strip() == _EXPECTED_HOST_SCOPE, (
+        f"the observability_stack play must stay scoped to `hosts: {_EXPECTED_HOST_SCOPE}`"
     )
 
 

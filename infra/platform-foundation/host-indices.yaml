@@ -148,6 +148,34 @@
     host_index: 11            # -> 10.0.20.21
     status: allocated
 
+  # --- SVC-03 Garage object storage (spec svc-03-object-storage): THREE
+  #     identical cluster nodes (replication factor 3), keyed on svc_code +
+  #     instance (no component). ANCHORS: stateful object data on each node's
+  #     data volume (prevent_destroy), indices never reassigned. ---
+  - svc_code: svc03           # Garage node 1
+    instance: 1
+    host_index: 12            # -> 10.0.20.22
+    anchor: true
+    status: allocated
+  - svc_code: svc03           # Garage node 2
+    instance: 2
+    host_index: 13            # -> 10.0.20.23
+    anchor: true
+    status: allocated
+  - svc_code: svc03           # Garage node 3
+    instance: 3
+    host_index: 14            # -> 10.0.20.24
+    anchor: true
+    status: allocated
+
+  # --- SVC-10 internal DNS (PowerDNS authoritative + recursor), spec
+  #     svc-10-internal-dns. One guest. NON-ANCHOR: the zone is rebuilt from the
+  #     generated inventories by the installer, so the guest is disposable. ---
+  - svc_code: svc10           # PowerDNS (pdns-auth + pdns-recursor)
+    instance: 1
+    host_index: 15            # -> 10.0.20.25
+    status: allocated
+
 # =============================================================================
 # PROJECT VLANs (100+) — per-project dedicated tenancy (NET-00 §2, domain-rules
 # §1). Populated the FIRST time a project VLAN carries more than one Terraform

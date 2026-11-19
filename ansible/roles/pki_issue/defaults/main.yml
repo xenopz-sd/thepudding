@@ -1,0 +1,24 @@
+---
+# defaults/main.yml — pki_issue (SVC-08 shared issuance role, D3/D4)
+# Required inputs (no defaults on purpose): pki_issue_service, pki_issue_common_name,
+# pki_issue_host, pki_issue_cert_path, pki_issue_key_path, plus pki_ca_admin_token.
+pki_issue_dns_sans: []
+pki_issue_ip_sans: []
+pki_issue_ssh_user: "root"
+pki_issue_owner: "root"
+pki_issue_group: "root"
+pki_issue_cert_mode: "0644"
+pki_issue_key_mode: "0600"
+# Optional shell command run on the host after a (re)issue (reload/SIGHUP), and a
+# node_exporter textfile directory for the expiry metric (D7).
+pki_issue_reload_command: ""
+pki_issue_metric_dir: ""
+pki_issue_min_days: 30
+pki_issue_child_token_ttl: "5m"
+pki_issue_ttl: "2160h"
+# Local scratch + the published root (public).
+pki_issue_scratch: "{{ playbook_dir | dirname | dirname }}/.pki/scratch"
+pki_issue_root_path: "{{ playbook_dir | dirname | dirname }}/.pki/platform-root-ca.pem"
+pki_issue_helper: "{{ playbook_dir | dirname | dirname }}/scripts/installer/pki_helpers.py"
+pki_issue_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
+pki_issue_issue_path: "pki_int/issue/{{ pki_issue_service }}"

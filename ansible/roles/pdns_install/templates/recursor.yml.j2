@@ -1,0 +1,28 @@
+# MANAGED BY ANSIBLE (pdns_install, SVC-10) — DO NOT EDIT BY HAND.
+# Included by the image's /etc/powerdns/recursor.conf (include_dir).
+incoming:
+  port: {{ pdns_recursor_container_port }}
+  allow_from:
+{% for net in pdns_recursor_allow_from %}
+    - {{ net }}
+{% endfor %}
+recursor:
+  # The platform zone comes from the authoritative server on this guest (reached
+  # through the published port); everything else is resolved from the root.
+  forward_zones:
+    - zone: {{ pdns_platform_domain }}
+      forwarders:
+        - {{ pdns_bind_ip }}:{{ pdns_auth_dns_port }}
+dnssec:
+  # The zone is unsigned and not delegated from its (possibly signed) public parent.
+  negative_trustanchors:
+    - name: {{ pdns_platform_domain }}
+      reason: platform-internal zone served by SVC-10
+webservice:
+  webserver: true
+  address: 0.0.0.0
+  port: {{ pdns_recursor_web_port }}
+  allow_from:
+{% for net in pdns_web_allow_from %}
+    - {{ net }}
+{% endfor %}

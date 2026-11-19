@@ -33,3 +33,10 @@
 # Compose-plugin verification (spec task 3.3) is included at the END of
 # docker.yml (compose_verify.yml), so it runs right after the install/pin. No
 # separate include is needed here.
+
+# SVC-08 (WS-C60): trust the platform root from the first provision. Inside the role (not the common.yml playbook)
+# so every caller that applies the baseline, including hello-workload-deploy.yml's direct `role: common`, gets it.
+# No-op (INFO only) while no root is published.
+- name: "common | Trust the SVC-08 platform root (when published)"
+  ansible.builtin.include_role:
+    name: pki_trust

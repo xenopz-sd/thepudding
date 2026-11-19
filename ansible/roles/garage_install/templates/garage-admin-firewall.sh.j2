@@ -1,0 +1,38 @@
+#!/bin/sh
+# MANAGED BY ANSIBLE (garage_install, SVC-03 WS-C53) — DO NOT EDIT BY HAND.
+# Lets only the allowed sources open connections to the Garage admin API (container
+# port {{ garage_admin_port }}). Docker DNATs the published port, so the traffic is
+# only visible in FORWARD -> DOCKER-USER; match the ORIGINAL destination port and
+# direction so reply packets and other ports are untouched.
+#   garage-admin-firewall apply   (idempotent)
+#   garage-admin-firewall remove
+set -eu
+CHAIN=GARAGE-ADMIN
+JUMP="-p tcp -m conntrack --ctorigdstport {{ garage_admin_port }} --ctdir ORIGINAL -j $CHAIN"
+
+remove() {
+  # shellcheck disable=SC2086
+  while iptables -C DOCKER-USER $JUMP 2>/dev/null; do iptables -D DOCKER-USER $JUMP; done
+  if iptables -nL "$CHAIN" >/dev/null 2>&1; then
+    iptables -F "$CHAIN"
+    iptables -X "$CHAIN"
+  fi
+}
+
+apply() {
+  iptables -nL DOCKER-USER >/dev/null 2>&1 || { echo "DOCKER-USER chain missing (is Docker running?)" >&2; exit 1; }
+  iptables -nL "$CHAIN" >/dev/null 2>&1 || iptables -N "$CHAIN"
+  iptables -F "$CHAIN"
+{% for src in garage_admin_allowed_sources %}
+  iptables -A "$CHAIN" -s {{ src }} -j RETURN
+{% endfor %}
+  iptables -A "$CHAIN" -j DROP
+  # shellcheck disable=SC2086
+  iptables -C DOCKER-USER $JUMP 2>/dev/null || iptables -I DOCKER-USER 1 $JUMP
+}
+
+case "${1:-apply}" in
+  apply) apply ;;
+  remove) remove ;;
+  *) echo "usage: $0 apply|remove" >&2; exit 2 ;;
+esac

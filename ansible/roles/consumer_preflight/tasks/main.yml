@@ -302,7 +302,28 @@
       INFO: Consumer_Manifest for '{{ project_slug }}' declares:
       database={{ 'yes' if (consumer_manifest.database is defined) else 'no' }},
       sso={{ 'yes' if (consumer_manifest.sso is defined) else 'no' }},
-      secrets={{ 'yes' if (consumer_manifest.secrets is defined) else 'no' }}.
+      secrets={{ 'yes' if (consumer_manifest.secrets is defined) else 'no' }},
+      object_storage={{ 'yes' if (consumer_manifest.object_storage is defined) else 'no' }}.
+
+# consumer-object-storage R3: with object_storage declared, SVC-03 must be installed (its generated
+# inventory is the file-mediated proof, integration-boundaries §4). Fail before any mutation.
+- name: "Preflight | Stat the SVC-03 generated inventory (object_storage declared)"
+  ansible.builtin.stat:
+    path: "{{ consumer_repo_root }}/{{ consumer_svc03_inventory }}"
+  register: consumer_svc03_inventory_stat
+  when: consumer_manifest.object_storage is defined
+
+- name: "Preflight | Fail closed when object_storage is declared but SVC-03 is not installed"
+  ansible.builtin.assert:
+    that:
+      - consumer_svc03_inventory_stat.stat.exists | default(false)
+    fail_msg: >-
+      The Consumer_Manifest declares object_storage, but SVC-03 (Garage) is not installed:
+      {{ consumer_svc03_inventory }} does not exist. Install it first with
+      ansible/playbooks/svc-03-bootstrap.yml, then re-run. Nothing was provisioned.
+    success_msg: "SVC-03 is installed ({{ consumer_svc03_inventory }})."
+    quiet: true
+  when: consumer_manifest.object_storage is defined
 
 # === 5. Registry slug -> vlan_id resolution (Req 2.1-2.5; vlan_id NEVER input) ==
 # Warn if an operator passed -e vlan_id=...: it is IGNORED. The orchestrator

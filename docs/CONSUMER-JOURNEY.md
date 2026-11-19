@@ -92,6 +92,7 @@ preflight probes OpenBao and ZITADEL and stops, naming the missing one, before i
 | `PROXMOX_HOST_LAN_IP`, `ADMIN_SOURCE_CIDR` | converging the host gateway for the project VLAN (WS-C44); `-e consumer_proxmox_host=<ip>` overrides the host |
 | `OPENBAO_ADMIN_TOKEN` | the OpenBao writes (written there by SVC-07's bootstrap; the shell environment takes precedence, WS-C45) |
 | `OPENBAO_TLS_SELF_SIGNED` | dev clusters whose OpenBao serves the self-signed mock certificate |
+| `PLATFORM_DOMAIN` | the platform domain for the ZITADEL issuer and the `expose` hosts (`-e consumer_platform_domain=…` overrides it); the zone SVC-10 serves |
 
 **Guest VMIDs** are computed as `vlan_id * 1000 + host_index` (ADR-0022): on VLAN 101 the DB (index 0) is
 `101000` and the workload guest (index 1) `101001`. A standing DB keeps the VMID recorded in the project's generated
@@ -217,6 +218,13 @@ automated path, then re-run.
 | **SSO** (SVC-06) | ZITADEL org (`sso.org_name`) + one OIDC app per `sso.app_registrations[]` entry, project roles per `sso.roles` | per app: `secret/proj-<slug>/zitadel/oidc/<app name>` (client id and, for confidential apps, the client secret); the issuer is `https://auth.<platform-domain>`; the completion summary prints the org id |
 | **Secrets** (SVC-07) | `policy-<slug>` + KV path + `<slug>-workload` AppRole (renewable TTL) | AppRole `role_id`/`secret_id` handed off per PF FR-8 |
 
+**Object storage** (SVC-03): declare `object_storage: {buckets: [<purpose>, ...]}` in the manifest. The
+orchestrator creates buckets `proj-<slug>-<purpose>` and one bucket-scoped key whose fields (`access_key_id`,
+`secret_access_key`, `endpoint`, `internal_endpoint`, `region`, `buckets`) land at `secret/proj-<slug>/garage`; the
+handoff prints the path. Clients use path-style addressing and region `garage`. Details:
+[manifest reference, `object_storage`](CONSUMER-MANIFEST-REFERENCE.md#object_storage-block) and the
+[SVC-03 runbook, "Consuming the credentials"](../infra/projects/svc-03-object-storage/INSTALL-RUNBOOK.md#consuming-the-credentials-from-a-project).
+
 Nothing in this table is ever echoed to stdout or committed — the completion
 summary names each by **path**, never by value.
 
@@ -336,12 +344,12 @@ reachability problems, and solving one does not solve the other:
    BOTH the ZITADEL login page / OIDC authorize-redirect endpoints AND the
    project app's own published host (to land on the registered redirect URI). In
    **production** this is the public, trusted-CA + real-DNS path and needs nothing
-   extra. In **dev**, though, the browser gets no platform DNS and the issuer is
-   behind a self-signed cert — exactly like the API container below — so the
-   operator's own machine needs the dev **browser-reachability recipe** (see
+   extra. In **dev** the issuer is behind a self-signed cert, and the operator's
+   machine resolves platform names only once it uses SVC-10 for the platform
+   domain, so it needs the dev **browser-reachability recipe** (see
    ["Browser-reachability recipe" below](#browser-reachability-recipe-dev-only)):
-   an `/etc/hosts` (or split-DNS) mapping of BOTH the issuer host AND the app host
-   to the Traefik ingress IP, plus accepting the self-signed cert. Without it,
+   the one-time split-DNS setting for `<platform-domain>`, plus accepting the
+   self-signed cert. Without it,
    `signinRedirect()` dead-ends and interactive login cannot complete (the §6 bug:
    "healthy but unusable"). This is the browser-side sibling of the API-container
    recipe — they are independent and BOTH are needed in dev.
@@ -370,13 +378,14 @@ addresses exactly that container half, **in dev only**.
 
 ### Why the container cannot reach the issuer in dev
 
-In dev there is no public DNS for the platform domain and the issuer is served
-behind Traefik with a **self-signed** certificate (SVC-09's
-`traefik_tls_self_signed` mock / the SVC-07 self-signed Primary posture — no
-SVC-08/EJBCA CA yet). So from inside the API container:
+In dev the issuer is served behind Traefik with a **self-signed** certificate
+(SVC-09's `traefik_tls_self_signed` mock / the SVC-07 self-signed Primary posture —
+no SVC-08 OpenBao CA yet). SVC-10 serves the platform zone, but consumer
+containers do not use its resolver yet (that default is decided with SVC-08). So
+from inside the API container:
 
 - the issuer hostname (placeholder `auth.platform.example.test`) **does not
-  resolve** — there is no DNS record for it on the project VLAN; and
+  resolve** through the guest's own resolver; and
 - even once it resolves, the self-signed cert is **not trusted** by the
   container's default CA bundle, so the server-side JWKS fetch fails TLS
   verification.
@@ -449,38 +458,35 @@ consumer can copy it verbatim and substitute the real issuer host.
 
 The API-container recipe above solves only the **server-side** (JWKS) half. In
 dev an interactive OIDC login ALSO needs the **browser** half, applied on the
-**operator's own machine** (fix-consumer-ingress-browser-reachable-oidc, §6).
-This is the half that was previously (wrongly) assumed to "need nothing extra".
-It is the same two problems the API container has — DNS resolution + self-signed
-trust — but for the browser:
+**operator's own machine** (fix-consumer-ingress-browser-reachable-oidc, §6): DNS
+resolution and self-signed trust, for the browser.
 
-1. **Resolve BOTH the issuer host AND the project app host to the Traefik ingress
-   IP** on the machine running the browser. A minimal `/etc/hosts` (or split-DNS)
-   mapping — placeholders only:
-
-   ```
-   # DEV ONLY — operator's own machine. Never in acceptance/production.
-   10.0.20.12  auth.platform.example.test
-   10.0.20.12  moto-maintenance.thepudding.internal
-   ```
+1. **Resolve the platform domain through SVC-10** (once per machine). SVC-10's
+   zone sends `*.<platform-domain>` to Traefik, so the issuer
+   (`auth.<platform-domain>`) and every project app host under the platform domain
+   resolve with no per-host entry. On Linux this is one systemd-resolved drop-in
+   (`/etc/systemd/resolved.conf.d/platform-dns.conf` with `DNS=10.0.20.25` and
+   `Domains=~<platform-domain>`); on macOS one `/etc/resolver/<platform-domain>`
+   file. The SVC-10 installer prints both with your zone filled in; the commands,
+   checks and the undo step are in the
+   [SVC-10 runbook, A.5](../infra/projects/svc-10-internal-dns/INSTALL-RUNBOOK.md#a5--point-your-workstation-at-it-split-dns-once).
 
    The app host is the one the project declared via the consumer manifest
-   `expose` block (`<expose.host>.${THEPUDDING_BASE_DOMAIN}`) and registered as
-   its OIDC redirect URI. Without the app-host mapping the registered callback is
-   unreachable; without the issuer mapping `signinRedirect()` dead-ends.
+   `expose` block and registered as its OIDC redirect URI. An app host **outside**
+   the platform domain is not in SVC-10's zone; map that one host to the Traefik
+   ingress IP (`10.0.20.12`) in `/etc/hosts` instead.
 
 2. **Accept the self-signed cert** Traefik presents in dev (SVC-09's
    `traefik_tls_self_signed` mock) in the browser — the one-time
-   "proceed to site" / trust-this-cert step — for BOTH hosts.
+   "proceed to site" / trust-this-cert step — for both the issuer and the app host.
 
-Offline, you can confirm the mapping resolves without a live cluster:
+Offline, you can confirm the routing through Traefik without relying on DNS:
 
 <!-- doctest: offline -->
 ```bash
-# Both hosts must resolve to the Traefik ingress IP (placeholders).
-getent hosts auth.platform.example.test || true
-curl -sS --resolve "moto-maintenance.thepudding.internal:443:10.0.20.12" \
-  -k "https://moto-maintenance.thepudding.internal/" -o /dev/null -w '%{http_code}\n' || true
+# Placeholders; exits 0 offline (|| true) and prints 000 when no cluster is reachable.
+curl -sS --resolve "app.platform.example.test:443:10.0.20.12" -m 5 \
+  -k "https://app.platform.example.test/" -o /dev/null -w '%{http_code}\n' || true
 ```
 
 The live interactive-login walkthrough (authorize → callback with the registered
@@ -492,12 +498,12 @@ provision-then-test section.
 In acceptance and production the recipe is **not used and not needed**:
 
 - the issuer is served behind Traefik with a certificate from a **trusted CA**
-  (SVC-08/EJBCA issuing an internal CA, or an ACME/Let's Encrypt cert —
+  (the SVC-08 OpenBao CA issuing an internal cert, or an ACME/Let's Encrypt cert —
   `security-standards.md` "TLS and transport security"), so the API container's
   default CA bundle already trusts it — **no `OIDC_TLS_SKIP_VERIFY`, no mounted
   self-signed CA**; and
-- the issuer hostname resolves through normal DNS, so **no `extra_hosts`
-  alias** is required.
+- the issuer hostname resolves through normal DNS (or SVC-10 for internal-only
+  names), so **no `extra_hosts` alias** is required.
 
 The dev `extra_hosts`/skip-verify switches MUST therefore be absent (or forced
 off) in any non-dev deployment. Treating the self-signed/skip-verify path as

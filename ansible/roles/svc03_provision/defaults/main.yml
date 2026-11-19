@@ -1,0 +1,26 @@
+---
+# defaults/main.yml — svc03_provision (SVC-03 Garage installer — Phase 2: Provision)
+#
+# Phase-2 phase-specific defaults. Clone of mailcatcher_provision/defaults adapted for
+# the three-guest SVC-03 root. svc03_tf_env is evaluated LAZILY against the
+# Phase-1 resolved facts; every consumer sets no_log:true. NO secret value here.
+
+# The SVC-03 Garage Terraform root (absolute, so the child `terraform` process runs in
+# it regardless of the play's cwd).
+svc03_tf_root: "{{ svc03_repo_root }}/infra/projects/svc-03-object-storage"
+
+# Environment passed to the child `terraform` init/apply processes. The Proxmox
+# endpoint/token travel here as TF_VAR_* (never on the command line); every task
+# using this env sets no_log:true. Evaluated lazily against the Phase-1 facts.
+#   * TF_VAR_proxmox_endpoint uses the canonical base set in Phase 1.
+#   * TF_VAR_proxmox_insecure is derived from the single
+#     svc03_proxmox_validate_certs toggle (insecure == NOT validate_certs), so
+#     the provider's TLS verification cannot drift from preflight's.
+#   * TF_VAR_operator_ssh_public_keys is the JSON list the Phase-1 read task
+#     produced ("[]" when no key path was supplied -> strict no-op).
+svc03_tf_env:
+  TF_VAR_proxmox_endpoint: >-
+    {{ svc03_proxmox_endpoint_base | default(svc03_proxmox_endpoint) | default('') }}
+  TF_VAR_proxmox_api_token: "{{ svc03_proxmox_api_token | default('') }}"
+  TF_VAR_proxmox_insecure: "{{ (not (svc03_proxmox_validate_certs | bool)) | lower }}"
+  TF_VAR_operator_ssh_public_keys: "{{ svc03_operator_ssh_public_keys_json | default('[]') }}"

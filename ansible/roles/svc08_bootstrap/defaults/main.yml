@@ -1,0 +1,15 @@
+---
+# defaults/main.yml — svc08_bootstrap (SVC-08 Phase 3). No secret values.
+svc08_generated_inventory_glob: "ansible/inventory/svc-*.generated.yml"
+svc08_marker_inventory: ansible/inventory/svc-08-internal-pki.generated.yml
+# The OpenBao guests (SVC-07 ledger 0 and unsealer 1, VLAN 20). Cert file names/paths must match
+# what openbao_install renders into its listener stanza — verified by tests/installer/test_svc08_roles.py.
+svc08_openbao_tls_dir: "/etc/openbao/tls"
+svc08_issue_openbao_listeners: true   # issue CA certificates for the OpenBao listeners (live-checked 2026-11-16)
+svc08_openbao_listeners:
+  # yamllint disable-line rule:line-length
+  - { cn: "svc07-20-01.{{ svc08_platform_domain }}", dns: ["openbao.{{ svc08_platform_domain }}"], ip: "10.0.20.10", loopback: true, container: "openbao-openbao-1" }
+  # yamllint disable-line rule:line-length
+  - { cn: "svc07-unsealer-20-01.{{ svc08_platform_domain }}", dns: [], ip: "10.0.20.11", container: "openbao-unsealer-openbao-unsealer-1" }
+svc08_openbao_uid: "100"   # = openbao_container_uid / _gid (asserted equal by tests/installer/test_svc08_roles.py)
+svc08_openbao_gid: "1000"

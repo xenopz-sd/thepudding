@@ -71,7 +71,7 @@
         # PRIVATE VLAN-20-bound scrape port (NOT Traefik/LAN ingress). Bound to
         # this guest's own VLAN IP only; never 0.0.0.0, never a host-wide port.
         ports:
-          - "{{ cadvisor_bind_ip }}:{{ cadvisor_port }}:{{ cadvisor_port }}"
+          - "{{ cadvisor_bind_ip }}:{{ cadvisor_port }}:{{ cadvisor_container_port }}"
         # Documented UNAVOIDABLE read-only host mounts (requirements §12):
         # /var/lib/docker:ro + /sys/fs/cgroup:ro (+ /:ro, /var/run:ro, /dev/disk).
         volumes: "{{ cadvisor_host_mounts }}"
@@ -81,4 +81,5 @@
     dca_networks: []
     dca_env: {}
     dca_state: "{{ cadvisor_state }}"
-  when: not cadvisor_already_at_pinned_version
+  # Not gated on the pinned-image check: Compose reconciles (changed only on real drift), and a gate froze config
+  # changes such as the WS-C58 cAdvisor port move on already-running containers (OpenBao precedent).

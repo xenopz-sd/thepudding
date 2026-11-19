@@ -1,0 +1,12 @@
+---
+# meta/main.yml — svc03_provision (SVC-03 Garage installer — Phase 2)
+galaxy_info:
+  role_name: svc03_provision
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-03 Garage installer Phase 2 — infrastructure provisioning: Terraform
+    backend swap-gate, terraform init/apply, generate_inventory.py, known_hosts.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

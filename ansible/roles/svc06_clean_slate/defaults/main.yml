@@ -61,8 +61,9 @@ svc06_zitadel_route_fragment: "{{ svc06_traefik_dynamic_config_dir }}/zitadel-ro
 # whole-entry delete (the same KV v2 entry at svc06_openbao_secret_path also holds
 # the ZITADEL masterkey; losing it forces a full data re-encryption). Names mirror
 # zitadel-server/defaults so the SAME source + container are targeted (the clear
-# undoes exactly what zitadel-server wrote). BAO_TOKEN is supplied from
-# OPENBAO_ADMIN_TOKEN in the task ENV (never argv); the clear task is no_log.
+# undoes exactly what zitadel-server wrote). BAO_TOKEN comes from
+# OPENBAO_ADMIN_TOKEN and is passed to `docker exec` as `-e BAO_TOKEN=<value>` (on
+# that argv on the guest, WS-C62); the clear task is no_log.
 #
 # svc06_openbao_addr is ALSO a play-level var in svc-06-bootstrap.yml (default
 # 10.0.20.10); it is repeated here as a role default so a standalone role run has

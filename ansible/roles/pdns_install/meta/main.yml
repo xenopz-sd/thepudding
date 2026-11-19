@@ -1,0 +1,23 @@
+---
+# meta/main.yml — pdns_install
+galaxy_info:
+  role_name: pdns_install
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    Installs SVC-10 internal DNS on a Proxmox LXC as a Docker Compose stack:
+    PowerDNS authoritative (SQLite, pinned image, 0600 config with the API key) and
+    PowerDNS recursor (forwards the platform zone to the authoritative server), ports
+    bound to the guest's own VLAN-20 IP, the platform zone created once, and the
+    in-guest firewall limiting the API/metrics ports.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+  galaxy_tags:
+    - dns
+    - powerdns
+# docker-compose-app is consumed via include_role.
+dependencies: []

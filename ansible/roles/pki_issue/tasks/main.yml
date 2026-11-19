@@ -1,0 +1,201 @@
+---
+# tasks/main.yml — pki_issue: idempotent server-certificate issuance + push (R2, R3, R8).
+#   1. Look at the cert already on the host; keep it if it chains to the root, covers the
+#      SANs and has > pki_issue_min_days left (`changed=0`).
+#   2. Otherwise mint a 5-minute child token scoped to pki_int/issue/<service> (D3), issue,
+#      verify locally against the root, then write key (0600) and cert (leaf + issuing CA).
+#   3. Write the expiry metric (D7) and run the reload command.
+# The host is reached over SSH through inline connection vars (P2).
+- name: "pki_issue | Assert required inputs"
+  ansible.builtin.assert:
+    that:
+      - pki_issue_service is defined
+      - pki_issue_common_name is defined
+      - pki_issue_host is defined
+      - pki_issue_cert_path is defined
+      - pki_issue_key_path is defined
+      - pki_ca_admin_token is defined
+    fail_msg: "pki_issue needs pki_issue_service/common_name/host/cert_path/key_path and pki_ca_admin_token."
+    quiet: true
+- name: "pki_issue | Assert the published root exists (R9: CA configured but not bootstrapped)"
+  ansible.builtin.stat:
+    path: "{{ pki_issue_root_path }}"
+  register: pki_issue_root_stat
+  delegate_to: localhost
+  connection: local
+- name: "pki_issue | Stop with the remedy when the root is not published"
+  ansible.builtin.fail:
+    msg: >-
+      The platform root certificate is not published at {{ pki_issue_root_path }}. Run
+      ansible/playbooks/svc-08-bootstrap.yml first (the CA is not bootstrapped). Nothing was issued.
+  when: not pki_issue_root_stat.stat.exists
+- name: "pki_issue | Compute the SAN list"
+  ansible.builtin.set_fact:
+    pki_issue_sans: >-
+      {{ ['DNS:' ~ pki_issue_common_name]
+         + (pki_issue_dns_sans | map('regex_replace', '^', 'DNS:') | list)
+         + (pki_issue_ip_sans | map('regex_replace', '^', 'IP:') | list) }}
+- name: "pki_issue | Prepare the local scratch directory"
+  ansible.builtin.file:
+    path: "{{ pki_issue_scratch }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  connection: local
+  changed_when: false
+
+- name: "pki_issue | Read the certificate currently on the host"
+  ansible.builtin.slurp:
+    src: "{{ pki_issue_cert_path }}"
+  delegate_to: "{{ pki_issue_host }}"
+  vars: &pki_issue_conn
+    ansible_connection: ssh
+    ansible_user: "{{ pki_issue_ssh_user }}"
+    ansible_python_interpreter: /usr/bin/python3
+  register: pki_issue_current
+  failed_when: false
+- name: "pki_issue | Copy it to the control node for the check"
+  ansible.builtin.copy:
+    content: "{{ pki_issue_current.content | b64decode if (pki_issue_current.content is defined) else '' }}"
+    dest: "{{ pki_issue_scratch }}/{{ pki_issue_service }}-current.pem"
+    mode: "0600"
+  delegate_to: localhost
+  connection: local
+  changed_when: false
+- name: "pki_issue | Does the current certificate satisfy the request?"
+  ansible.builtin.command:
+    argv: >-
+      {{ [pki_issue_venv_python, pki_issue_helper, 'needs-issue',
+          '--cert', pki_issue_scratch ~ '/' ~ pki_issue_service ~ '-current.pem',
+          '--root', pki_issue_root_path, '--min-days', pki_issue_min_days | string]
+         + (pki_issue_sans | map('regex_replace', '^', '--san=') | list) }}
+  register: pki_issue_check
+  changed_when: false
+  failed_when: pki_issue_check.rc not in [0, 1]
+  delegate_to: localhost
+  connection: local
+- name: "pki_issue | INFO — decision (non-secret)"
+  ansible.builtin.debug:
+    # yamllint disable-line rule:line-length
+    msg: "INFO: pki_issue {{ pki_issue_service }} {{ pki_issue_common_name }}: {{ (pki_issue_check.stdout | from_json).reason }}"
+
+- name: "pki_issue | Issue and install"
+  when: pki_issue_check.rc == 1
+  block:
+    - name: "pki_issue | Mint the short-lived child token scoped to this service (no_log)"
+      ansible.builtin.include_role:
+        name: pki_ca
+        tasks_from: bao.yml
+      vars:
+        pki_bao_args:
+          - token
+          - create
+          - -format=json
+          - -role=pki-issue
+          - "-policy=pki-issue-{{ pki_issue_service }}"
+          - "-ttl={{ pki_issue_child_token_ttl }}"
+          - "-display-name=pki-issue-{{ pki_issue_service }}"
+    - name: "pki_issue | Bind the child token (no_log)"
+      ansible.builtin.set_fact:
+        pki_issue_child_token: "{{ (pki_bao_result.stdout | from_json).auth.client_token }}"
+      no_log: true
+    - name: "pki_issue | Issue the certificate with the child token (no_log)"
+      ansible.builtin.include_role:
+        name: pki_ca
+        tasks_from: bao.yml
+      vars:
+        pki_bao_token: "{{ pki_issue_child_token }}"
+        pki_bao_args: [write, -format=json, "{{ pki_issue_issue_path }}", "-"]
+        pki_bao_stdin: >-
+          {{ {'common_name': pki_issue_common_name,
+              'alt_names': (pki_issue_dns_sans | join(',')),
+              'ip_sans': (pki_issue_ip_sans | join(',')),
+              'ttl': pki_issue_ttl, 'format': 'pem'} | to_json }}
+    - name: "pki_issue | Bind the issued material (no_log)"
+      ansible.builtin.set_fact:
+        # yamllint disable-line rule:line-length
+        pki_issue_new_cert: "{{ (pki_bao_result.stdout | from_json).data.certificate | trim }}\n{{ (pki_bao_result.stdout | from_json).data.issuing_ca | trim }}\n"
+        pki_issue_new_key: "{{ (pki_bao_result.stdout | from_json).data.private_key | trim }}\n"
+        pki_issue_serial: "{{ (pki_bao_result.stdout | from_json).data.serial_number }}"
+        pki_issue_child_token: ""
+      no_log: true
+    - name: "pki_issue | Verify the new certificate against the root before writing anything"
+      ansible.builtin.copy:
+        content: "{{ pki_issue_new_cert }}"
+        dest: "{{ pki_issue_scratch }}/{{ pki_issue_service }}-new.pem"
+        mode: "0600"
+      delegate_to: localhost
+      connection: local
+      changed_when: false
+    - name: "pki_issue | Check chain, SANs and validity of the new certificate"
+      ansible.builtin.command:
+        argv: >-
+          {{ [pki_issue_venv_python, pki_issue_helper, 'needs-issue',
+              '--cert', pki_issue_scratch ~ '/' ~ pki_issue_service ~ '-new.pem',
+              '--root', pki_issue_root_path, '--min-days', '0']
+             + (pki_issue_sans | map('regex_replace', '^', '--san=') | list) }}
+      changed_when: false
+      delegate_to: localhost
+      connection: local
+    - name: "pki_issue | Write the private key (0600, no_log)"
+      ansible.builtin.copy:
+        content: "{{ pki_issue_new_key }}"
+        dest: "{{ pki_issue_key_path }}"
+        owner: "{{ pki_issue_owner }}"
+        group: "{{ pki_issue_group }}"
+        mode: "{{ pki_issue_key_mode }}"
+      delegate_to: "{{ pki_issue_host }}"
+      vars: *pki_issue_conn
+      no_log: true
+    - name: "pki_issue | Write the certificate (leaf + issuing CA)"
+      ansible.builtin.copy:
+        content: "{{ pki_issue_new_cert }}"
+        dest: "{{ pki_issue_cert_path }}"
+        owner: "{{ pki_issue_owner }}"
+        group: "{{ pki_issue_group }}"
+        mode: "{{ pki_issue_cert_mode }}"
+      delegate_to: "{{ pki_issue_host }}"
+      vars: *pki_issue_conn
+    - name: "pki_issue | Expiry metric for node_exporter (D7)"
+      when: pki_issue_metric_dir | length > 0
+      block:
+        - name: "pki_issue | Render the metric body locally"
+          ansible.builtin.command:
+            argv:
+              - "{{ pki_issue_venv_python }}"
+              - "{{ pki_issue_helper }}"
+              - metric
+              - --cert
+              - "{{ pki_issue_scratch }}/{{ pki_issue_service }}-new.pem"
+              - --cn
+              - "{{ pki_issue_common_name }}"
+              - --service
+              - "{{ pki_issue_service }}"
+          register: pki_issue_metric
+          changed_when: false
+          delegate_to: localhost
+          connection: local
+        - name: "pki_issue | Install the textfile metric"
+          ansible.builtin.copy:
+            content: "{{ pki_issue_metric.stdout }}"
+            # yamllint disable-line rule:line-length
+            dest: "{{ pki_issue_metric_dir }}/platform_tls_{{ pki_issue_service }}_{{ pki_issue_common_name | regex_replace('[^a-zA-Z0-9]', '_') }}.prom"
+            mode: "0644"
+          delegate_to: "{{ pki_issue_host }}"
+          vars: *pki_issue_conn
+    - name: "pki_issue | Reload the service"
+      ansible.builtin.command: "{{ pki_issue_reload_command }}"
+      when: pki_issue_reload_command | length > 0
+      delegate_to: "{{ pki_issue_host }}"
+      vars: *pki_issue_conn
+    - name: "pki_issue | Audit line (serial and names only)"
+      ansible.builtin.debug:
+        # yamllint disable-line rule:line-length
+        msg: "AUDIT: issued serial {{ pki_issue_serial }} for {{ pki_issue_sans | join(', ') }} (service {{ pki_issue_service }})"
+    - name: "pki_issue | Remove the scratch copies"
+      ansible.builtin.file:
+        path: "{{ pki_issue_scratch }}/{{ pki_issue_service }}-new.pem"
+        state: absent
+      delegate_to: localhost
+      connection: local
+      changed_when: false

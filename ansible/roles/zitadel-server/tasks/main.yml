@@ -53,9 +53,9 @@
 # DB password are used so the stack can still start for testing (the OpenBao
 # round-trip is the production path).
 
-# Bind the OpenBao admin token (from the role ENV, never argv) to a single
-# no_log fact so the bao-CLI argv lines below stay short and the token is
-# isolated behind one no_log task.
+# Bind the OpenBao admin token (read from the role ENV) to a single no_log fact.
+# The bao-CLI calls below pass it to `docker exec` as `-e BAO_TOKEN=<value>`, so it
+# is on that argv on the guest for each call (WS-C62); no_log hides it from Ansible output.
 - name: "ZITADEL | Bind the OpenBao admin token from the environment (no_log)"
   ansible.builtin.set_fact:
     zitadel_bao_token: "{{ lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) }}"

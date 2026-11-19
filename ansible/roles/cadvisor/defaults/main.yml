@@ -34,7 +34,10 @@ cadvisor_container_name: "{{ cadvisor_stack_name }}-cadvisor-1"
 # --- Internal (VLAN-20) scrape port -----------------------------------------
 # cAdvisor's /metrics endpoint. Internal only (no Traefik); published to the
 # guest's own VLAN IP so the observability_stack scrapes it per Docker host.
-cadvisor_port: 8080
+# Host port on the guest's own IP. NOT 8080: ZITADEL (10.0.20.15:8080) and the consumer workload (:8080) publish
+# that port on the same IP once cAdvisor runs on every guest (WS-C58). The container still listens on 8080.
+cadvisor_port: 9338
+cadvisor_container_port: 8080
 
 # The guest's VLAN-20 IP the :8080 port is bound to (private VLAN-bound port,
 # NEVER 0.0.0.0). Defaults to the inventory ansible_host (the generated inventory

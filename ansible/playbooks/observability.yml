@@ -50,7 +50,9 @@
 # *.generated.yml so the scrape-target index sees the V1_Scrape_Set groups); the
 # other merged hosts (SVC-01/06/07/09) must NOT get the exporter roles.
 - name: Deploy the fleet-wide observability exporters (node_exporter, cAdvisor, Promtail, dcgm)
-  hosts: prometheus:grafana:loki
+  # Every guest in the merged generated inventories (WS-C58): shared services, the mail catcher and project
+  # guests. obs_bootstrap passes one -i per *.generated.yml, so a new service is covered by re-running SVC-17/18.
+  hosts: all
   become: true
   tasks:
     - name: Install node_exporter (fleet-wide, FR-2)

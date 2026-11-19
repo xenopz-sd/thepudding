@@ -1,0 +1,164 @@
+---
+# tasks/main.yml — svc10_bootstrap (SVC-10 DNS installer — Phase 3: Bootstrap)
+#
+#   1. Read the PowerDNS API key from OpenBao; generate and store it the first time
+#      (D6). Re-runs REUSE it (SVC-08's DNS-01 client will hold the same key).
+#   2. common baseline child run (Docker CE + Compose + hardening) on the guest.
+#   3. pdns.yml configurator child run (configs, Compose stack, zone, API firewall),
+#      with the key in the child ENVIRONMENT (never argv).
+#   4. dns_records_sync: the zone's A records from the generated inventories.
+# The child runs are separate ansible-playbook invocations (orchestrator/configurator
+# seam, integration-boundaries.md §4). A non-zero child exit -> this phase's rescue.
+
+# --- 1. API key (OpenBao, delegated bao CLI on the primary, no_log) ----------------
+# The token reaches `bao` as BAO_TOKEN through the task ENVIRONMENT and
+# `docker exec -e BAO_TOKEN` (name only), so no secret value is ever on argv.
+- name: "Bootstrap | Read the PowerDNS API key from OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ svc10_openbao_cli_bao_addr, '-e', 'BAO_TOKEN',
+          svc10_openbao_primary_container_name, svc10_openbao_bao_bin, 'kv', 'get', '-format=json']
+         + (['-tls-skip-verify'] if (svc10_openbao_tls_skip_verify | bool) else [])
+         + [svc10_api_key_secret_path] }}
+  delegate_to: "{{ svc10_openbao_cli_host }}"
+  vars:
+    # The orchestrator play is `connection: local`; the delegated call must use SSH.
+    ansible_connection: ssh
+    ansible_user: "{{ svc10_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ svc10_openbao_cli_python }}"
+  environment:
+    BAO_TOKEN: "{{ svc10_openbao_admin_token }}"
+  register: svc10_secret_probe
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+# A missing path is the only acceptable non-zero (first install). Anything else
+# (sealed, 403, unreachable) stops the install: generating a new key then would
+# break the key holders of the real one.
+- name: "Bootstrap | Classify the OpenBao read (non-secret projection)"
+  ansible.builtin.set_fact:
+    svc10_secret_missing: >-
+      {{ (svc10_secret_probe.rc | default(1)) != 0
+         and ('No value found' in ((svc10_secret_probe.stderr | default(''))
+                                    ~ (svc10_secret_probe.stdout | default('')))) }}
+    svc10_secret_read_ok: "{{ (svc10_secret_probe.rc | default(1)) == 0 }}"
+
+- name: "Bootstrap | Fail closed when OpenBao could not be read"
+  ansible.builtin.assert:
+    that:
+      - (svc10_secret_read_ok | bool) or (svc10_secret_missing | bool)
+    fail_msg: >-
+      Reading {{ svc10_api_key_secret_path }} from OpenBao failed (rc
+      {{ svc10_secret_probe.rc | default('n/a') }}). OpenBao must be up, unsealed and
+      reachable on {{ svc10_openbao_cli_host }}, and the admin token must be valid (token source:
+      {{ svc10_openbao_token_source | default('unknown') }}). A process-env OPENBAO_ADMIN_TOKEN wins over the
+      cluster env file: after rebuilding SVC-07, unset a stale exported token. Re-run
+      ansible/playbooks/svc-07-bootstrap.yml if needed. Nothing was changed.
+    quiet: true
+
+- name: "Bootstrap | Bind the stored API key (no_log)"
+  ansible.builtin.set_fact:
+    svc10_api_key: "{{ (svc10_secret_probe.stdout | from_json).data.data.api_key | default('') }}"
+  when: svc10_secret_read_ok | bool
+  no_log: true
+
+- name: "Bootstrap | Generate the API key on first install (no_log)"
+  ansible.builtin.set_fact:
+    svc10_api_key: "{{ lookup('ansible.builtin.password', '/dev/null length=48 chars=ascii_letters,digits') }}"
+  when: svc10_secret_missing | bool
+  no_log: true
+
+- name: "Bootstrap | Store the generated API key in OpenBao (no_log)"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-e', 'BAO_ADDR=' ~ svc10_openbao_cli_bao_addr, '-e', 'BAO_TOKEN',
+          '-e', 'PDNS_API_KEY',
+          svc10_openbao_primary_container_name, 'sh', '-c',
+          svc10_openbao_bao_bin ~ ' kv put'
+          ~ (' -tls-skip-verify' if (svc10_openbao_tls_skip_verify | bool) else '')
+          ~ ' ' ~ svc10_api_key_secret_path
+          ~ ' api_key="$PDNS_API_KEY"'] }}
+  delegate_to: "{{ svc10_openbao_cli_host }}"
+  vars:
+    # The orchestrator play is `connection: local`; the delegated call must use SSH.
+    ansible_connection: ssh
+    ansible_user: "{{ svc10_openbao_cli_user }}"
+    ansible_python_interpreter: "{{ svc10_openbao_cli_python }}"
+  environment:
+    BAO_TOKEN: "{{ svc10_openbao_admin_token }}"
+    PDNS_API_KEY: "{{ svc10_api_key }}"
+  when: svc10_secret_missing | bool
+  changed_when: true
+  no_log: true
+
+- name: "Bootstrap | Fail closed on a malformed stored API key (no_log)"
+  ansible.builtin.assert:
+    that:
+      - svc10_api_key is match('^[A-Za-z0-9]{32,}$')
+    fail_msg: >-
+      The PowerDNS API key at {{ svc10_api_key_secret_path }} is malformed (expected at
+      least 32 letters/digits). Fix or delete the OpenBao entry and re-run. The value is
+      not printed.
+    quiet: true
+  no_log: true
+
+- name: "Bootstrap | INFO — API key decision (by name only)"
+  ansible.builtin.debug:
+    msg: >-
+      INFO pdns API key: {{ 'GENERATED and stored at ' if (svc10_secret_missing | bool)
+      else 'REUSED from ' }}{{ svc10_api_key_secret_path }} (field api_key; value never printed).
+
+# --- 2. Common baseline child run ----------------------------------------------
+- name: "Bootstrap | common baseline (Docker + Compose) on the DNS guest"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc10_generated_inventory }}"
+      - ansible/playbooks/common.yml
+  args:
+    chdir: "{{ svc10_repo_root }}"
+  register: svc10_common_run
+  changed_when: "(svc10_common_run.stdout | default('')) is search('changed=[1-9]')"
+
+# --- 3. PowerDNS configurator child run --------------------------------------------
+- name: "Bootstrap | PowerDNS install (pdns.yml child run, no_log)"
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_env.HOME }}/venv/devinfra/bin/ansible-playbook"
+      - -i
+      - "{{ svc10_generated_inventory }}"
+      - ansible/playbooks/pdns.yml
+      - -e
+      - "pdns_platform_domain={{ svc10_platform_domain }}"
+      - -e
+      - "pdns_admin_source_cidr={{ svc10_admin_source_cidr | default('') }}"
+  args:
+    chdir: "{{ svc10_repo_root }}"
+  environment:
+    PDNS_API_KEY: "{{ svc10_api_key }}"
+  register: svc10_pdns_run
+  changed_when: "(svc10_pdns_run.stdout | default('')) is search('changed=[1-9]')"
+  failed_when: false
+  no_log: true
+
+# The child's own secret-bearing tasks are no_log, so its output carries no secret
+# value; surfacing its tail keeps a failure diagnosable through the no_log above.
+- name: "Bootstrap | Fail with the child run's output tail when pdns.yml failed"
+  ansible.builtin.fail:
+    msg: >-
+      pdns.yml failed (rc {{ svc10_pdns_run.rc }}). Last output:
+      {{ (svc10_pdns_run.stdout | default('')).splitlines()[-40:] | join(' | ') }}
+  when: (svc10_pdns_run.rc | default(1)) != 0
+
+# The key fact stays in memory for the Phase-4 keyed API probe; svc10_handoff
+# scrubs it at the end of the run.
+
+# --- 4. Zone records from the generated inventories (D2/D3) --------------------------
+- name: "Bootstrap | Reconcile the zone's A records with the generated inventories"
+  ansible.builtin.include_role:
+    name: dns_records_sync
+  vars:
+    drs_repo_root: "{{ svc10_repo_root }}"
+    drs_platform_domain: "{{ svc10_platform_domain }}"

@@ -397,3 +397,11 @@ openbao_backup_success_marker: "OPENBAO_SNAPSHOT_OK"
 openbao_backup_script_path: "/usr/local/sbin/openbao-raft-snapshot.sh"
 openbao_backup_service_name: "openbao-raft-snapshot"
 openbao_backup_systemd_dir: "/etc/systemd/system"
+
+# --- SVC-08: verified transit seal client (WS-C59, spec svc-08-internal-pki R7/AC-2) ---
+# When the platform root is published AND the unsealer's served certificate chains to it (probed live from the
+# control node before rendering), the primary's seal stanza gets `tls_ca_cert` instead of `tls_skip_verify`.
+# Either condition false -> unchanged mock behaviour. The probe stops a CA-configured cluster whose unsealer still
+# serves the mock cert from rendering a config the primary could not unseal with.
+openbao_platform_ca_cert_src: "{{ playbook_dir | dirname | dirname }}/.pki/platform-root-ca.pem"
+openbao_platform_ca_cert_name: "platform-root-ca.pem"

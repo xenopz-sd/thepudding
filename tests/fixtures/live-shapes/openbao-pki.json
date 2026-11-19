@@ -1,0 +1,83 @@
+{
+  "_provenance": "Seeded from the OpenBao PKI API docs and corrected by the 2026-11-16 live run on the throwaway cluster (OpenBao 2.4.4). No secret values, no real hostnames.",
+  "mounts": {
+    "root": "pki",
+    "intermediate": "pki_int"
+  },
+  "paths": {
+    "mount_enable": "sys/mounts/{mount}",
+    "mount_tune": "sys/mounts/{mount}/tune",
+    "root_generate": "pki/root/generate/internal",
+    "intermediate_generate": "pki_int/intermediate/generate/internal",
+    "intermediate_sign": "pki/root/sign-intermediate",
+    "intermediate_set_signed": "pki_int/intermediate/set-signed",
+    "config_urls": "pki_int/config/urls",
+    "config_cluster": "pki_int/config/cluster",
+    "config_acme": "pki_int/config/acme",
+    "config_crl": "pki_int/config/crl",
+    "role": "pki_int/roles/{role}",
+    "issue": "pki_int/issue/{role}",
+    "revoke": "pki_int/revoke",
+    "root_ca_pem": "pki/ca/pem",
+    "crl_pem": "pki_int/crl/pem",
+    "crl_rotate": "pki_int/crl/rotate",
+    "acme_directory": "pki_int/roles/{role}/acme/directory"
+  },
+  "responses": {
+    "issue": [
+      "certificate",
+      "issuing_ca",
+      "ca_chain",
+      "private_key",
+      "private_key_type",
+      "serial_number",
+      "expiration"
+    ],
+    "root_generate": [
+      "certificate",
+      "issuer_id",
+      "issuer_name",
+      "key_id",
+      "key_name",
+      "serial_number"
+    ],
+    "intermediate_generate": [
+      "csr",
+      "key_id"
+    ],
+    "intermediate_sign": [
+      "certificate",
+      "issuing_ca",
+      "ca_chain",
+      "serial_number"
+    ],
+    "config_acme": [
+      "allowed_issuers",
+      "allowed_roles",
+      "default_directory_policy",
+      "dns_resolver",
+      "eab_policy",
+      "enabled"
+    ]
+  },
+  "acme": {
+    "role_requires_no_store_false": true,
+    "mount_tune_passthrough_request_headers": [
+      "If-Modified-Since"
+    ],
+    "mount_tune_allowed_response_headers": [
+      "Replay-Nonce",
+      "Link",
+      "Location"
+    ],
+    "default_directory_policy_role_form": "role:{role}"
+  },
+  "live_findings": [
+    "crl/rotate is a READ (a write returns 'unsupported operation')",
+    "a CRL is rebuilt on a schedule, not on revoke: rotate before reading",
+    "roles must have no_store=false or /revoke answers 'certificate not found'",
+    "config/acme names a role, so the role must exist before config/acme is written",
+    "set-signed with a pem_bundle imports the root as a second, keyless issuer; the intermediate stays default",
+    "platform-admin has no pki grants by default; token create with -role needs auth/token/create/<role>"
+  ]
+}

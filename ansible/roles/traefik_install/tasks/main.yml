@@ -14,6 +14,10 @@
 #   5. Template the static traefik.yml and the dynamic file-provider config.
 #   6. Deploy the Compose stack via docker-compose-app.
 
+# --- 0. SVC-08 internal CA (ACME DNS-01) preparation -------------------------
+- name: "Traefik | Prepare the internal CA ACME resolver (gate: published platform root)"
+  ansible.builtin.include_tasks: internal_acme.yml
+
 # --- 1. IDEMPOTENCY: version-check guard -------------------------------------
 # Detect an already-running Traefik container at the pinned image BEFORE
 # templating/bringing up the stack, so a second run against an already-installed
@@ -29,11 +33,25 @@
   failed_when: false
   changed_when: false
 
-- name: "Traefik | Set fact — already at the pinned image?"
+# A running container only picks up the internal-CA bind mount and secret env through a redeploy, so the
+# guard also requires the container's ACME wiring to match the gate (WS-C59).
+- name: "Traefik | Does the running container carry the internal-CA wiring?"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "--format={{ '{{' }}range .Config.Env{{ '}}' }}{{ '{{' }}println .{{ '}}' }}{{ '{{' }}end{{ '}}' }}"
+      - "{{ traefik_container_name }}"
+  register: traefik_running_env
+  failed_when: false
+  changed_when: false
+- name: "Traefik | Set fact — already at the pinned image (and matching ACME wiring)?"
   ansible.builtin.set_fact:
     traefik_already_at_pinned_version: >-
       {{ (traefik_running_image.rc | default(1)) == 0
-         and (traefik_running_image.stdout | default('') | trim) == traefik_image }}
+         and (traefik_running_image.stdout | default('') | trim) == traefik_image
+         and (('LEGO_CA_CERTIFICATES=' in (traefik_running_env.stdout | default('')))
+              == (traefik_internal_acme_enabled | bool)) }}
   changed_when: false
 
 - name: "Traefik | Report idempotent no-op when already at the pinned image"
@@ -171,18 +189,10 @@
           # never 0.0.0.0 — the same private-VLAN-bound-port form the fleet
           # exporters (:9100/:8080) and Loki (:3100) use.
           - "{{ traefik_metrics_bind_ip }}:{{ traefik_entrypoint_metrics_port }}:{{ traefik_entrypoint_metrics_port }}"
-        volumes:
-          # Read-only Docker socket — Traefik observes labels only (SVC-09 §12).
-          - "{{ traefik_docker_socket }}:{{ traefik_docker_socket }}:ro"
-          # Static config + dynamic file-provider dir, read-only.
-          - "{{ traefik_static_config_file }}:/etc/traefik/traefik.yml:ro"
-          - "{{ traefik_dynamic_config_dir }}:/etc/traefik/dynamic:ro"
-          # (mock) self-signed TLS material, read-only — present only when the
-          # mock is enabled; harmless to mount an empty dir otherwise.
-          - "{{ traefik_tls_host_dir }}:/etc/traefik/tls:ro"
-          # Persistent acme.json cert store — a NAMED VOLUME, never tmpfs. Only
-          # Traefik writes it; it survives restarts/re-runs (SVC-09 §7/§9).
-          - "{{ traefik_acme_volume }}:{{ traefik_acme_mount }}"
+        extra_env_files: "{{ [traefik_internal_secret_env_file] if (traefik_internal_acme_enabled | bool) else [] }}"
+        volumes: >-
+          {{ traefik_base_volumes
+             + (traefik_internal_volumes if (traefik_internal_acme_enabled | bool) else []) }}
         networks: ["edge"]
         # Dashboard router + (inert until SVC-06) forward-auth middleware are
         # applied as labels on the Traefik container itself. Internal-only route,

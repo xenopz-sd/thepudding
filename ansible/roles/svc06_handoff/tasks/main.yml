@@ -17,6 +17,9 @@
       - "svc06_zitadel_container_name={{ svc06_zitadel_container_name }}"
       - -e
       - "svc06_zitadel_http_port={{ svc06_zitadel_http_port }}"
+      # The probe's Host header is auth.<domain>; ZITADEL answers only its external domain.
+      - -e
+      - "zitadel_platform_domain={{ svc06_platform_domain }}"
       - -e
       - "svc06_health_retries={{ svc06_health_retries }}"
       - -e

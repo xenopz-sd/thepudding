@@ -1,0 +1,125 @@
+---
+# svc10-health.yml — SVC-10 DNS installer Phase-4 health gate (CHILD configurator play)
+#
+# The child play the svc10_handoff role invokes via
+# `ansible-playbook -i {{ svc10_generated_inventory }} svc10-health.yml`
+# (integration-boundaries.md §4). Runs `hosts: dns` NATIVELY on the DNS LXC (no
+# delegate_to); queries use `sdig` from the authoritative image against the
+# published VLAN-20 ports. R8 checks, each polled with a bounded retry (P3):
+#   1. both containers running;
+#   2. through the recursor: a wildcard name -> Traefik, the DNS guest's own name ->
+#      its IP, a public name -> an answer;
+#   3. the pdns API refuses a request without the key (401) and accepts the key;
+#   4. both /metrics endpoints answer.
+# The API key is read from the ENVIRONMENT (PDNS_API_KEY) inside no_log tasks only.
+- name: SVC-10 internal DNS health gate
+  hosts: dns
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    svc10_health_retries: 24
+    svc10_health_delay: 5
+    svc10_bind_ip: "10.0.20.25"
+    svc10_traefik_ip: "10.0.20.12"
+    svc10_platform_domain: "platform.example.test"
+    svc10_guest_name: "svc10-20-01"
+    svc10_public_name: "debian.org"
+    svc10_auth_container: "pdns-auth-1"
+    svc10_recursor_container: "pdns-recursor-1"
+    svc10_auth_web_port: 8081
+    svc10_recursor_web_port: 8082
+    svc10_api_base: "http://{{ svc10_bind_ip }}:{{ svc10_auth_web_port }}/api/v1"
+  tasks:
+    - name: "Health | Stage 1 — both PowerDNS containers are running"
+      ansible.builtin.command:
+        argv: [docker, inspect, -f, "{{ '{{' }}.State.Running{{ '}}' }}", "{{ item }}"]
+      loop:
+        - "{{ svc10_auth_container }}"
+        - "{{ svc10_recursor_container }}"
+      register: svc10_running
+      changed_when: false
+      failed_when: false
+      until: (svc10_running.stdout | default('') | trim) == 'true'
+      retries: "{{ svc10_health_retries | int }}"
+      delay: "{{ svc10_health_delay | int }}"
+
+    - name: "Health | Assert Stage 1"
+      ansible.builtin.assert:
+        that:
+          - (svc10_running.results | selectattr('stdout', 'equalto', 'true') | list | length) == 2
+        fail_msg: >-
+          A PowerDNS container is not running. Inspect `docker ps -a` and
+          `docker logs {{ svc10_auth_container }}` / `docker logs {{ svc10_recursor_container }}` on the guest.
+        quiet: true
+
+    - name: "Health | Stage 2 — resolve through the recursor (wildcard, guest name, public name)"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ svc10_auth_container }}"
+          - sdig
+          - "{{ svc10_bind_ip }}"
+          - "53"
+          - "{{ item.name }}"
+          - A
+          - recurse
+      loop:
+        - {name: "svc10-health-probe.{{ svc10_platform_domain }}", expect: "{{ svc10_traefik_ip }}"}
+        - {name: "{{ svc10_guest_name }}.{{ svc10_platform_domain }}", expect: "{{ svc10_bind_ip }}"}
+        - {name: "{{ svc10_public_name }}", expect: ""}
+      loop_control:
+        label: "{{ item.name }} -> {{ item.expect or 'any A record' }}"
+      register: svc10_resolve
+      changed_when: false
+      failed_when: false
+      until: >-
+        (svc10_resolve.rc | default(1)) == 0
+        and ('Rcode: 0 ' in (svc10_resolve.stdout | default('')))
+        and ((svc10_resolve.stdout | default('')) is search(
+              '\tA\t' ~ ((item.expect | regex_escape) if item.expect else '[0-9.]+') ~ '(\s|$)'))
+      retries: "{{ svc10_health_retries | int }}"
+      delay: "{{ svc10_health_delay | int }}"
+
+    - name: "Health | Assert Stage 2 (per name)"
+      ansible.builtin.assert:
+        that:
+          - (item.rc | default(1)) == 0
+          - "'Rcode: 0 ' in (item.stdout | default(''))"
+          - >-
+            (item.stdout | default('')) is search(
+              '\tA\t' ~ ((item.item.expect | regex_escape) if item.item.expect else '[0-9.]+') ~ '(\s|$)')
+        fail_msg: >-
+          {{ item.item.name }} did not resolve to {{ item.item.expect or 'an A record' }} through the
+          recursor ({{ svc10_bind_ip }}:53). Answer: {{ item.stdout | default('') }} {{ item.stderr | default('') }}
+        quiet: true
+      loop: "{{ svc10_resolve.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: "Health | Stage 3a — the pdns API refuses a request without the key"
+      ansible.builtin.uri:
+        url: "http://{{ svc10_bind_ip }}:{{ svc10_auth_web_port }}/api/v1/servers"
+        method: GET
+        status_code: [401]
+      changed_when: false
+
+    - name: "Health | Stage 3b — the pdns API accepts the key (no_log)"
+      ansible.builtin.uri:
+        url: "{{ svc10_api_base }}/servers/localhost/zones/{{ svc10_platform_domain }}."
+        method: GET
+        headers:
+          X-API-Key: "{{ lookup('ansible.builtin.env', 'PDNS_API_KEY') }}"
+        status_code: [200]
+      no_log: true
+      changed_when: false
+
+    - name: "Health | Stage 4 — both metrics endpoints answer"
+      ansible.builtin.uri:
+        url: "http://{{ svc10_bind_ip }}:{{ item }}/metrics"
+        method: GET
+        status_code: [200]
+      loop:
+        - "{{ svc10_auth_web_port }}"
+        - "{{ svc10_recursor_web_port }}"
+      changed_when: false

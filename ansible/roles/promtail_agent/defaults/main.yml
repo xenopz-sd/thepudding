@@ -67,8 +67,18 @@ promtail_docker_sd_refresh_interval: "15s"
 # project_slug / service_role so a container that carries no label still ships
 # with a meaningful project/service rather than empty.
 promtail_host_label: "{{ ansible_hostname | default(inventory_hostname) }}"
-promtail_default_project: "{{ project_slug | default('shared') }}"
-promtail_default_service: "{{ service_role | default('unknown') }}"
+# Generated inventories carry project and role as GROUPS, not host vars (WS-C58): `shared` if the host is in that
+# group, else its group that is a registered project slug (projects.yaml); the role is the remaining group.
+promtail_projects_registry: "{{ playbook_dir | dirname | dirname }}/infra/platform-foundation/projects.yaml"
+promtail_project_slugs: >-
+  {{ (lookup('ansible.builtin.file', promtail_projects_registry, errors='ignore') | default('projects: []', true)
+      | from_yaml).projects | default([]) | map(attribute='slug') | list }}
+promtail_default_project: >-
+  {{ project_slug | default('shared' if ('shared' in group_names)
+     else ((group_names | intersect(promtail_project_slugs) | sort | first) | default('shared', true))) }}
+promtail_default_service: >-
+  {{ service_role | default((group_names | difference(['shared'] + promtail_project_slugs) | sort | first)
+     | default('unknown', true)) }}
 
 # Docker container-label keys relabel_configs read `project` / `service` from.
 # Compose stamps `com.docker.compose.*` labels automatically; a service MAY also

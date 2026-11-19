@@ -120,3 +120,34 @@ def test_agent_hcl_template_omits_tls_skip_verify_when_disabled():
 def test_agent_hcl_template_one_stanza_per_mapping():
     rendered = _render_template(_golden_context())
     assert rendered.count("template {") == 2  # Req 4.2 / Property 5
+
+
+def test_ca_cert_branch_matches_the_pure_renderer():
+    """SVC-08 WS-C60: with the platform root (skip off) the Jinja template and render_agent_hcl agree byte for byte."""
+    import dataclasses
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "installer"))
+    from workload_auth import AgentConfig, SecretMapping, render_agent_hcl
+
+    ctx = _golden_context()
+    ctx["openbao_primary_tls_skip_verify"] = False
+    ctx["openbao_agent_ca_cert"] = "/openbao/agent/rendered/platform-root-ca.pem"
+    rendered = _render_template(ctx)
+    cfg = AgentConfig(
+        project_slug="demo-slug",
+        primary_addr="https://10.0.20.10:8200",
+        role_id_file_path="/openbao/agent/role-id",
+        secret_id_file_path="/openbao/agent/secret-id",
+        token_sink_path="/openbao/agent/token",
+        rendered_secret_file="/openbao/agent/rendered/secrets.env",
+        secret_mappings=[
+            SecretMapping(kv_subpath="db", kv_field="password", env_key="DB_PASSWORD"),
+            SecretMapping(kv_subpath="oidc", kv_field="client_secret", env_key="OIDC_CLIENT_SECRET"),
+        ],
+        tls_skip_verify=False,
+        ca_cert="/openbao/agent/rendered/platform-root-ca.pem",
+    )
+    assert rendered == render_agent_hcl(cfg)
+    assert 'ca_cert = "/openbao/agent/rendered/platform-root-ca.pem"' in rendered
+    assert "tls_skip_verify" not in rendered.split("auto_auth")[0]

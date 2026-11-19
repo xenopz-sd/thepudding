@@ -27,13 +27,24 @@
   args:
     chdir: "{{ svc09_repo_root }}"
   register: svc09_common_run
-  changed_when: "'changed=0' not in (svc09_common_run.stdout | default(''))"
+  changed_when: "(svc09_common_run.stdout | default('')) is search('changed=[1-9]')"
 
 # --- Task 8.2 — Traefik install child configurator run ----------------------
 # Deploys the Traefik Compose stack via a child traefik.yml run (hosts: traefik)
 # so the configurator play targets the freshly-generated inventory as its own
 # `-i`. The mock flags are bridged with -e so a Traefik-less-CA / no-SSO Day-0
 # bring-up works when the operator opts in. A child non-zero exit -> rescue.
+# SVC-08 gate: when the platform root is published the child needs the OpenBao admin token to read the PowerDNS
+# key (installer-time read, Option B). It goes through the child's ENVIRONMENT only, never argv, no_log.
+- name: "Bootstrap | Resolve the OpenBao admin token for the internal-CA key read (no_log)"
+  ansible.builtin.set_fact:
+    svc09_internal_ca_token: >-
+      {{ (lookup('ansible.builtin.env', 'OPENBAO_ADMIN_TOKEN') | default('', true) | trim)
+         or (lookup('ansible.builtin.file', svc09_repo_root ~ '/' ~ cluster_env_file, errors='ignore')
+             | default('', true)
+             | regex_findall('(?m)^[ \t]*OPENBAO_ADMIN_TOKEN[ \t]*=[ \t]*[\"\']?([^\"\'\r\n]*?)[\"\']?[ \t]*$')
+             | first | default('') | trim) }}
+  no_log: true
 - name: "Bootstrap | Traefik install (traefik.yml child run against the generated inventory)"
   ansible.builtin.command:
     argv:
@@ -53,5 +64,7 @@
       - "traefik_dashboard_forward_auth_address={{ traefik_dashboard_forward_auth_address | default('') }}"
   args:
     chdir: "{{ svc09_repo_root }}"
+  environment:
+    OPENBAO_ADMIN_TOKEN: "{{ svc09_internal_ca_token | default('') }}"
   register: svc09_traefik_run
-  changed_when: "'changed=0' not in (svc09_traefik_run.stdout | default(''))"
+  changed_when: "(svc09_traefik_run.stdout | default('')) is search('changed=[1-9]')"

@@ -1,0 +1,30 @@
+---
+# defaults/main.yml — pki_ca (SVC-08: OpenBao PKI secrets engine on SVC-07)
+# NO secret value here. The admin token arrives as `pki_ca_admin_token` (no_log).
+
+# The OpenBao primary guest the delegated `bao` CLI calls run on (SVC-07).
+pki_ca_cli_host: "10.0.20.10"
+pki_ca_cli_user: "root"
+pki_ca_cli_python: "/usr/bin/python3"
+pki_ca_bao_addr: "https://127.0.0.1:8200"
+pki_ca_container: "openbao-openbao-1"
+# Loopback CLI hop INSIDE the primary guest (same documented exception as SVC-10's
+# svc10_openbao_tls_skip_verify); removed from the dev path once the primary serves a CA cert.
+pki_ca_tls_skip_verify: true
+# Where Traefik and other VLAN-20 clients reach the CA (ACME/CRL/AIA URLs).
+pki_ca_public_base_url: "https://10.0.20.10:8200"
+pki_ca_root_common_name: "Platform Root CA"
+pki_ca_int_common_name: "Platform Issuing CA"
+pki_ca_dns_resolver: "10.0.20.25:53"   # SVC-10 recursor (D9); OpenBao checks DNS-01 TXT here
+# Platform domain (platform_domain role sets the SVC-08 one); roles are scoped to it.
+svc08_platform_domain: "platform.example.test"
+# One PKI role + policy per consuming service (D2). `allow_subdomains` only where needed.
+pki_ca_consumers:
+  - { name: svc07, subdomains: true }
+  - { name: svc09, subdomains: true }
+  - { name: svc17, subdomains: true }
+# Publication of the PUBLIC root certificate (R4, D6). Gitignored artifact.
+pki_ca_root_publish_path: ".pki/platform-root-ca.pem"
+pki_ca_repo_root: "{{ playbook_dir | dirname | dirname }}"
+pki_ca_helper: "{{ pki_ca_repo_root }}/scripts/installer/pki_helpers.py"
+pki_ca_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"

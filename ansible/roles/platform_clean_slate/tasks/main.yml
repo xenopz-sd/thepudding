@@ -307,7 +307,7 @@
   loop_control:
     label: "{{ item.service }}"
   register: platform_cs_service_runs
-  changed_when: "'changed=0' not in (platform_cs_service_runs.stdout | default(''))"
+  changed_when: "(platform_cs_service_runs.stdout | default('')) is search('changed=[1-9]')"
   environment:
     # Propagate the armed interlock to the child so its OWN guard consult sees it.
     AGENT_LIVE_AUTHORIZED: "{{ lookup('ansible.builtin.env', 'AGENT_LIVE_AUTHORIZED', default='') }}"
@@ -643,7 +643,7 @@
   args:
     chdir: "{{ platform_repo_root }}"
   register: platform_cs_gateway_teardown
-  changed_when: "'changed=0' not in (platform_cs_gateway_teardown.stdout | default(''))"
+  changed_when: "(platform_cs_gateway_teardown.stdout | default('')) is search('changed=[1-9]')"
 
 - name: "Clean-Slate | INFO — host L3 gateway teardown outcome"
   ansible.builtin.debug:

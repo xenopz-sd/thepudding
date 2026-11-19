@@ -1,0 +1,23 @@
+---
+# tasks/route.yml — garage_install (SVC-03): S3 Route_Fragment (R5, P1/ADR-0018)
+#
+# Runs ONCE. Renders the `garage-s3` Route_Fragment onto the Traefik guest's
+# watched file-provider directory: Host(s3.<platform_domain>) on websecure (TLS at
+# Traefik) -> plain HTTP to node 1's VLAN-20 S3 port. The delegate target is made
+# connectable by the traefik_route role's inline connection vars (P2). Removed on
+# teardown by svc03_clean_slate.
+- name: "Route | Render + delegate the S3 Route_Fragment onto the Traefik guest"
+  ansible.builtin.include_role:
+    name: traefik_route
+  vars:
+    traefik_route_enabled: "{{ garage_traefik_route_enabled | bool }}"
+    route_name: "garage-s3"
+    route_host_rule: "{{ garage_s3_host }}"
+    route_backend_url: "http://{{ garage_bind_ip }}:{{ garage_s3_port }}"
+    route_entrypoint: "websecure"
+    route_tls: true
+    traefik_guest_host: "{{ garage_traefik_guest_host }}"
+    traefik_guest_user: "{{ garage_traefik_guest_user }}"
+    traefik_guest_python: "{{ garage_traefik_guest_python }}"
+    traefik_dynamic_config_dir: "{{ garage_traefik_dynamic_config_dir }}"
+  run_once: true

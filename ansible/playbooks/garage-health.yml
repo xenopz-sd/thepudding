@@ -1,0 +1,173 @@
+---
+# garage-health.yml — SVC-03 installer Phase-4 health gate + S3 smoke (CHILD play)
+#
+# Invoked by svc03_handoff as `ansible-playbook -i <generated inventory>
+# garage-health.yml` (integration-boundaries.md §4). Runs `hosts: garage`
+# NATIVELY on the Garage LXCs. Spec: .kiro/specs/svc-03-object-storage (R13).
+#
+#   Stage 1 — every node answers /health on its own VLAN-20 admin port, checked on the guest (200).
+#   Stage 2 — GetClusterHealth: status healthy, every storage node up (polled, P3).
+#   Stage 3 — S3 round trip: a scratch bucket + key are created through the admin
+#             API (json-api, local RPC), the control node's s3_smoke.py puts, gets
+#             and deletes an object over the VLAN-20 S3 port, then the scratch key
+#             and bucket are removed (always, even when the round trip fails).
+# The scratch key secret is handed to s3_smoke.py through its ENVIRONMENT only.
+- name: SVC-03 Garage health gate
+  hosts: garage
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    garage_container_name: "garage-garage-1"
+    garage_bin: "/garage"
+    garage_admin_port: 3903
+    garage_s3_port: 3900
+    garage_expected_nodes: 3
+    garage_health_retries: 30
+    garage_health_delay: 4
+    svc03_repo_root: "{{ playbook_dir | dirname | dirname }}"
+    svc03_venv_python: "{{ lookup('ansible.builtin.env', 'HOME') }}/venv/devinfra/bin/python"
+  tasks:
+    - name: "Health | Stage 1 — every node answers /health on its admin port"
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ garage_admin_port }}/health"
+        status_code: [200]
+      register: garage_node_health
+      until: (garage_node_health.status | default(0)) == 200
+      retries: "{{ garage_health_retries | int }}"
+      delay: "{{ garage_health_delay | int }}"
+      # On the guest itself (WS-C53): the admin API only admits Prometheus from the network.
+      changed_when: false
+
+    - name: "Health | Stage 2 — wait for a healthy cluster with every storage node up"
+      ansible.builtin.command:
+        argv: ["docker", "exec", "{{ garage_container_name }}", "{{ garage_bin }}", "json-api", "GetClusterHealth"]
+      register: garage_cluster_health
+      run_once: true
+      changed_when: false
+      failed_when: false
+      until: >-
+        (garage_cluster_health.rc | default(1)) == 0
+        and (garage_cluster_health.stdout | from_json).status == 'healthy'
+        and ((garage_cluster_health.stdout | from_json).storageNodesUp | int) >= (garage_expected_nodes | int)
+      retries: "{{ garage_health_retries | int }}"
+      delay: "{{ garage_health_delay | int }}"
+
+    - name: "Health | Assert Stage 2 — cluster healthy"
+      ansible.builtin.assert:
+        that:
+          - (garage_cluster_health.rc | default(1)) == 0
+          - (garage_cluster_health.stdout | from_json).status == 'healthy'
+          - ((garage_cluster_health.stdout | from_json).storageNodesUp | int) >= (garage_expected_nodes | int)
+        fail_msg: >-
+          The Garage cluster is not healthy with {{ garage_expected_nodes }} storage nodes up:
+          {{ garage_cluster_health.stdout | default('no output') | truncate(400) }}.
+          Inspect `docker logs {{ garage_container_name }}` on each guest.
+        success_msg: "Garage cluster healthy (Stage 2 passed)."
+        quiet: true
+      run_once: true
+
+    - name: "Health | Stage 3 — S3 round trip through a scratch bucket and key"
+      run_once: true
+      block:
+        - name: "Smoke | Name the scratch bucket and key for this run"
+          ansible.builtin.set_fact:
+            garage_smoke_name: "svc03-smoke-{{ lookup('ansible.builtin.pipe', 'date +%s') }}"
+
+        - name: "Smoke | Create the scratch bucket"
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ garage_container_name }}"
+              - "{{ garage_bin }}"
+              - json-api
+              - CreateBucket
+              - "{{ {'globalAlias': garage_smoke_name} | to_json }}"
+          register: garage_smoke_bucket
+          changed_when: false
+
+        - name: "Smoke | Create the scratch key (no_log: the response carries its secret)"
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ garage_container_name }}"
+              - "{{ garage_bin }}"
+              - json-api
+              - CreateKey
+              - "{{ {'name': garage_smoke_name} | to_json }}"
+          register: garage_smoke_key
+          changed_when: false
+          no_log: true
+
+        - name: "Smoke | Grant the scratch key read+write on the scratch bucket"
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ garage_container_name }}"
+              - "{{ garage_bin }}"
+              - json-api
+              - AllowBucketKey
+              - >-
+                {{ {'bucketId': (garage_smoke_bucket.stdout | from_json).id,
+                    'accessKeyId': (garage_smoke_key.stdout | from_json).accessKeyId,
+                    'permissions': {'read': true, 'write': true, 'owner': false}} | to_json }}
+          changed_when: false
+          no_log: true
+
+        - name: "Smoke | Put, get and delete an object from the control node (s3_smoke.py)"
+          ansible.builtin.command:
+            argv:
+              - "{{ svc03_venv_python }}"
+              - scripts/installer/s3_smoke.py
+              - --endpoint
+              - "http://{{ ansible_host }}:{{ garage_s3_port }}"
+              - --bucket
+              - "{{ garage_smoke_name }}"
+              - roundtrip
+          args:
+            chdir: "{{ svc03_repo_root }}"
+          environment:
+            S3_ACCESS_KEY_ID: "{{ (garage_smoke_key.stdout | from_json).accessKeyId }}"
+            S3_SECRET_ACCESS_KEY: "{{ (garage_smoke_key.stdout | from_json).secretAccessKey }}"
+          delegate_to: localhost
+          register: garage_smoke_rt
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: "Smoke | Assert the S3 round trip succeeded"
+          ansible.builtin.assert:
+            that:
+              - (garage_smoke_rt.rc | default(1)) == 0
+            fail_msg: "S3 round trip failed: {{ garage_smoke_rt.stdout | default('no output') }}"
+            success_msg: "S3 round trip passed: {{ garage_smoke_rt.stdout | default('') }}"
+            quiet: true
+      always:
+        - name: "Smoke | Remove the scratch key"
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ garage_container_name }}"
+              - "{{ garage_bin }}"
+              - json-api
+              - DeleteKey
+              - "{{ {'id': (garage_smoke_key.stdout | from_json).accessKeyId} | to_json }}"
+          when: (garage_smoke_key.rc | default(1)) == 0
+          changed_when: false
+          no_log: true
+
+        - name: "Smoke | Remove the scratch bucket"
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ garage_container_name }}"
+              - "{{ garage_bin }}"
+              - json-api
+              - DeleteBucket
+              - "{{ {'id': (garage_smoke_bucket.stdout | from_json).id} | to_json }}"
+          when: (garage_smoke_bucket.rc | default(1)) == 0
+          changed_when: false

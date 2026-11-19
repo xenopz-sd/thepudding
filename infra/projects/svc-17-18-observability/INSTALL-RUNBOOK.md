@@ -45,6 +45,8 @@ re-explaining them.
 
 ---
 
+> **Platform domain.** Set `PLATFORM_DOMAIN=<platform-domain>` once in your cluster env file ([`cluster.env.example`](../../../cluster.env.example)); every installer uses it as its platform domain, and an explicit `-e <service>_platform_domain=…` still wins. SVC-10 serves that zone ([runbook](../../../infra/projects/svc-10-internal-dns/INSTALL-RUNBOOK.md)).
+
 ## ⚠ Throwaway cluster only
 
 The live steps provision, mutate, and tear down real infrastructure. Run them
@@ -262,6 +264,21 @@ requirements FR-18/AC-10). A surviving resource FAILS the gate rather than
 reporting a false-clean.
 
 ---
+
+## A.4 — Every guest is observed (WS-C58)
+
+The bootstrap deploys node_exporter, cAdvisor (host port 9338) and Promtail on **every** guest listed in any
+`ansible/inventory/*.generated.yml`, not only on the three observability guests, and writes one `node-<host>.yaml`
+and one `cadvisor-<host>.yaml` file_sd target per guest (labels `host`, `project`, `service`). **Re-run this
+installer after adding or removing a service or project**, so new guests are observed and removed ones stop being
+scraped. Check the target count:
+
+<!-- doctest: requires-infra -->
+```bash
+ssh root@10.0.20.18 'docker exec prometheus-prometheus-1 wget -qO- "http://localhost:9090/api/v1/targets?state=active"' | grep -o '"health":"[a-z]*"' | sort | uniq -c
+```
+
+The ZITADEL backing database guest is not in any generated inventory yet (WS-C63), so it is not covered.
 
 ## A.5 — Grafana reachable through Traefik (cross-guest file-provider route)
 

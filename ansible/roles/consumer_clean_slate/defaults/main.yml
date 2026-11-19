@@ -90,3 +90,9 @@ consumer_guard_composed_services: [svc01]
 # WS-C4: strict teardown of the per-org user-manager identity (machine user + OpenBao secret).
 # false downgrades a failed teardown (e.g. ZITADEL already torn down) to a WARN.
 consumer_cs_usermgr_teardown_strict: true
+
+# consumer-object-storage R6: the SVC-03 bucket onboarder + its inventory, and strictness of its teardown
+# (true: a failed teardown fails the reset; false: loud WARN with the re-run command).
+consumer_garage_bucket_provision_playbook: ansible/playbooks/garage-bucket-provision.yml
+consumer_svc03_inventory: ansible/inventory/svc-03-object-storage.generated.yml
+consumer_cs_object_storage_teardown_strict: true

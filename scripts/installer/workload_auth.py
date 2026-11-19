@@ -198,6 +198,9 @@ class AgentConfig:
     rendered_secret_file: str
     secret_mappings: Sequence[SecretMapping]
     tls_skip_verify: bool = False
+    # SVC-08 (WS-C60): path INSIDE the agent container of the platform root; emitted only when non-empty and
+    # tls_skip_verify is false. Default "" keeps the rendered text byte-identical to before.
+    ca_cert: str = ""
     num_retries: int = 0
     approle_mount_path: str = "auth/approle"
     remove_secret_id_after_read: bool = False
@@ -252,6 +255,8 @@ def render_agent_hcl(config: AgentConfig) -> str:
     lines.append(f'  address = "{config.primary_addr}"')
     if config.tls_skip_verify:
         lines.append("  tls_skip_verify = true")
+    elif config.ca_cert:
+        lines.append(f'  ca_cert = "{config.ca_cert}"')
     lines.append(f"  retry {{ num_retries = {int(config.num_retries)} }}")
     lines.append("}")
     lines.append("")

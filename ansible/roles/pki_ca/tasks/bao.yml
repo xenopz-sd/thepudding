@@ -1,0 +1,31 @@
+---
+# bao.yml — one delegated `bao` call on the primary. Inputs: pki_bao_args (list),
+# pki_bao_stdin (optional JSON string, non-secret), pki_bao_allow_fail (bool).
+# Result in `pki_bao_result` (stdout may be sensitive for issue calls: never printed).
+- name: "pki_ca | bao {{ pki_bao_args | join(' ') }}"
+  ansible.builtin.command:
+    argv: >-
+      {{ ['docker', 'exec', '-i', '-e', 'BAO_ADDR=' ~ pki_ca_bao_addr, '-e', 'BAO_TOKEN']
+         + (['-e', 'BAO_SKIP_VERIFY=true'] if (pki_ca_tls_skip_verify | bool) else [])
+         + [pki_ca_container, 'bao'] + pki_bao_args }}
+    stdin: "{{ pki_bao_stdin | default(omit) }}"
+  delegate_to: "{{ pki_ca_cli_host }}"
+  vars:
+    # The orchestrator play is `connection: local`; the delegated call must use SSH (P2).
+    ansible_connection: ssh
+    ansible_user: "{{ pki_ca_cli_user }}"
+    ansible_python_interpreter: "{{ pki_ca_cli_python }}"
+  environment:
+    BAO_TOKEN: "{{ pki_bao_token | default(pki_ca_admin_token) }}"
+  register: pki_bao_result
+  changed_when: false
+  failed_when: false
+  no_log: true
+- name: "pki_ca | Stop on a failed bao call (stderr only, never stdout)"
+  ansible.builtin.fail:
+    msg: >-
+      bao {{ pki_bao_args[0] }} {{ pki_bao_args[-2:] | join(' ') }} failed (rc {{ pki_bao_result.rc }}):
+      {{ (pki_bao_result.stderr | default('')).splitlines()[-3:] | join(' | ') }}
+  when: >-
+    ((pki_bao_result.rc | default(1)) != 0 or (pki_bao_result.unreachable | default(false)))
+    and not (pki_bao_allow_fail | default(false) | bool)

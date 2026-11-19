@@ -42,7 +42,7 @@ import discover_tf_roots  # noqa: E402  (sys.path set above)
 
 _HELPER = _CI_DIR / "discover_tf_roots.py"
 
-# The design's pinned on-disk baseline: TEN roots, ONE excluded module.
+# The pinned on-disk baseline: THIRTEEN roots, ONE excluded module.
 _KNOWN_ROOTS = {
     "infra/platform-foundation",
     "infra/projects/_TEMPLATE",
@@ -55,6 +55,8 @@ _KNOWN_ROOTS = {
     "infra/projects/svc-09-reverse-proxy",
     "infra/projects/mailcatcher",
     "infra/projects/svc-17-18-observability",
+    "infra/projects/svc-03-object-storage",
+    "infra/projects/svc-10-internal-dns",
 }
 _EXCLUDED_MODULE = "infra/modules/proxmox-compute"
 

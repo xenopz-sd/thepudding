@@ -1,0 +1,25 @@
+---
+# defaults/main.yml — svc03_bootstrap (SVC-03 Garage installer — Phase 3: Bootstrap)
+#
+# NO secret value lives here. The cluster secrets are generated once and stored in
+# OpenBao; this file only names WHERE (R6).
+
+# The OpenBao primary guest the delegated `bao` CLI calls run on (SVC-07).
+svc03_openbao_cli_host: "10.0.20.10"
+svc03_openbao_cli_user: "root"
+svc03_openbao_cli_python: "/usr/bin/python3"
+svc03_openbao_cli_bao_addr: "https://127.0.0.1:8200"
+svc03_openbao_primary_container_name: "openbao-openbao-1"
+svc03_openbao_bao_bin: "bao"
+# The primary serves a self-signed cert on the dev platform (P4: the skip applies
+# ONLY to this loopback CLI hop inside the primary guest).
+svc03_openbao_tls_skip_verify: true
+
+# Cluster-level secret path. The catalog doc's `secret/shared/garage/admin` does not
+# match the platform's canonical KV shape (runtime-wiring guard check 3), so the
+# SVC-06 `proj-shared-<svc>` precedent is used (requirements, cross-cutting §4).
+svc03_openbao_kv_mount: "secret"
+svc03_cluster_secret_path: "{{ svc03_openbao_kv_mount }}/proj-shared-garage/garage"
+
+# Platform domain for the S3 Host() rule (bridged to the configurator child run).
+svc03_platform_domain: "platform.example.test"

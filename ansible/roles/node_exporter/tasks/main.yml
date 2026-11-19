@@ -102,9 +102,10 @@
     dca_networks: []
     dca_env: {}
     dca_state: "{{ node_exporter_state }}"
+  # Not gated on the pinned-image check: Compose reconciles (changed only on real drift), and a gate froze config
+  # changes such as the WS-C58 cAdvisor port move on already-running containers (OpenBao precedent).
   when:
     - node_exporter_mode == "sidecar"
-    - not (node_exporter_already_at_pinned_version | default(false))
 
 # --- 3b. HOST-UNIT MODE — upstream static binary + systemd unit --------------
 # The unprivileged-LXC exception: install the upstream static binary and a

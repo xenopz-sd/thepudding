@@ -1,0 +1,13 @@
+---
+# meta/main.yml — svc10_handoff (SVC-10 DNS installer — Phase 4)
+galaxy_info:
+  role_name: svc10_handoff
+  namespace: devinfra
+  author: Developer Services Platform
+  description: >-
+    SVC-10 DNS installer Phase 4 — health sanity & Developer B handoff:
+    invokes the svc10-health.yml child gate and prints the completion banner with
+    the developer split-DNS commands.
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

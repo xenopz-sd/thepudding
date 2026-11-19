@@ -1,0 +1,45 @@
+---
+# tasks/plan.yml — dns_records_sync: run the pure helper on a zone listing.
+# Input: drs_listing (the `pdnsutil zone list` output). Output fact: drs_plan.
+- name: "DNS records | Write the zone listing to a temp file"
+  ansible.builtin.tempfile:
+    state: file
+    suffix: .zone
+  register: drs_listing_file
+  # Scratch file on the control node, not managed state: never reported as a change.
+  changed_when: false
+
+- name: "DNS records | Store the listing"
+  ansible.builtin.copy:
+    dest: "{{ drs_listing_file.path }}"
+    content: "{{ drs_listing }}\n"
+    mode: "0600"
+  changed_when: false
+
+- name: "DNS records | Run dns_records.py"
+  ansible.builtin.command:
+    argv: >-
+      {{ [drs_venv_python, drs_helper, '--domain', drs_platform_domain,
+          '--traefik-ip', drs_traefik_ip, '--current', drs_listing_file.path]
+         + (drs_inventories.files | map(attribute='path') | sort | list) }}
+    chdir: "{{ drs_repo_root }}"
+  register: drs_helper_run
+  changed_when: false
+  failed_when: false
+
+- name: "DNS records | Remove the temp file"
+  ansible.builtin.file:
+    path: "{{ drs_listing_file.path }}"
+    state: absent
+  changed_when: false
+
+- name: "DNS records | Fail when the helper rejected the inputs"
+  ansible.builtin.fail:
+    msg: >-
+      dns_records.py failed (rc {{ drs_helper_run.rc }}):
+      {{ (drs_helper_run.stdout | default('{}') | from_json).error | default(drs_helper_run.stderr) }}
+  when: (drs_helper_run.rc | default(1)) != 0
+
+- name: "DNS records | Bind the plan"
+  ansible.builtin.set_fact:
+    drs_plan: "{{ drs_helper_run.stdout | from_json }}"

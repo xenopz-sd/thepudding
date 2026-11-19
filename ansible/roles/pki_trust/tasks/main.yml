@@ -1,0 +1,24 @@
+---
+# tasks/main.yml — pki_trust: runs ON the guest (configurator mode). Skipped when no root is
+# published (the CA is not configured; behaviour unchanged, R7).
+- name: "pki_trust | Is a platform root published?"
+  ansible.builtin.stat:
+    path: "{{ pki_trust_root_src }}"
+  delegate_to: localhost
+  connection: local
+  become: false   # control-node check needs no sudo (the play's become applies to the guests)
+  register: pki_trust_src_stat
+- name: "pki_trust | INFO — gate decision"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: pki_trust: {{ 'installing the platform root (PLATFORM_CA_CERT gate set)'
+      if pki_trust_src_stat.stat.exists else 'no published root — trust store unchanged' }}
+- name: "pki_trust | Install the platform root certificate (public)"
+  ansible.builtin.copy:
+    src: "{{ pki_trust_root_src }}"
+    dest: "{{ pki_trust_dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: pki_trust_src_stat.stat.exists
+  notify: Update CA certificates

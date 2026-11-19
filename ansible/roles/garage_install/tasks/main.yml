@@ -1,0 +1,118 @@
+---
+# tasks/main.yml — garage_install (SVC-03 Garage object storage node)
+#
+# Runs on EVERY Garage guest (hosts: garage) as the configurator child play
+# ansible/playbooks/garage.yml. Order: (1) fail closed on missing secrets,
+# (2) guest dirs on the dedicated data volume, (3) 0600 garage.toml, (4) Compose
+# stack (ports bound to the guest's own VLAN-20 IP), (5) flush the restart handler,
+# (6) wait for the local RPC to answer (P3: a real polled signal, never a sleep).
+# The cluster join + layout runs ONCE afterwards (tasks/layout.yml), and the S3
+# Route_Fragment once (tasks/route.yml), both from garage.yml.
+
+- name: "Garage | Fail closed unless the cluster secrets were bridged from OpenBao (R6, no_log)"
+  ansible.builtin.assert:
+    that:
+      - (lookup('ansible.builtin.env', 'GARAGE_RPC_SECRET') | default('', true) | length) == 64
+      - (lookup('ansible.builtin.env', 'GARAGE_ADMIN_TOKEN') | default('', true) | length) > 0
+    fail_msg: >-
+      GARAGE_RPC_SECRET (64 hex chars) and GARAGE_ADMIN_TOKEN must be in the
+      environment of this play. Run it through ansible/playbooks/svc-03-bootstrap.yml,
+      which reads them from OpenBao (secret/proj-shared-garage/garage).
+    success_msg: "Garage cluster secrets present in the play environment."
+    quiet: true
+  no_log: true
+
+- name: "Garage | Ensure the metadata and data directories exist on the data volume"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop:
+    - "{{ garage_data_root }}"
+    - "{{ garage_meta_dir }}"
+    - "{{ garage_data_dir }}"
+
+- name: "Garage | Ensure the config directory exists"
+  ansible.builtin.file:
+    path: "{{ garage_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: "Garage | Render garage.toml at 0600 (carries the RPC secret + admin token, no_log)"
+  ansible.builtin.template:
+    src: garage.toml.j2
+    dest: "{{ garage_config_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart garage
+
+# All three ports are published on the guest's OWN VLAN-20 IP only (R4): S3 for
+# Traefik and VLAN-20 clients, RPC for the other two nodes, admin for the control
+# node and Prometheus. The sanctioned VLAN20_Port exception (ADR-0018), not
+# ingress. 3902 is the static website endpoint (WS-C51), reached through per-bucket Traefik routes.
+- name: "Garage | Deploy the Compose stack (docker-compose-app)"
+  ansible.builtin.include_role:
+    name: docker-compose-app
+  vars:
+    dca_app_name: "{{ garage_stack_name }}"
+    dca_services:
+      - name: garage
+        image: "{{ garage_image }}"
+        restart: "unless-stopped"
+        env_file: false
+        ports:
+          - "{{ garage_bind_ip }}:{{ garage_s3_port }}:{{ garage_s3_port }}"
+          - "{{ garage_bind_ip }}:{{ garage_rpc_port }}:{{ garage_rpc_port }}"
+          - "{{ garage_bind_ip }}:{{ garage_admin_port }}:{{ garage_admin_port }}"
+          - "{{ garage_bind_ip }}:{{ garage_web_port }}:{{ garage_web_port }}"
+        volumes:
+          - "{{ garage_config_file }}:/etc/garage.toml:ro"
+          - "{{ garage_meta_dir }}:/var/lib/garage/meta"
+          - "{{ garage_data_dir }}:/var/lib/garage/data"
+
+- name: "Garage | Apply a pending config restart now"
+  ansible.builtin.meta: flush_handlers
+
+- name: "Garage | Restrict the admin API to the allowed sources (WS-C53)"
+  ansible.builtin.include_tasks: admin_firewall.yml
+
+- name: "Garage | Wait until the local node answers over RPC (node id)"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ garage_container_name }}"
+      - "{{ garage_bin }}"
+      - node
+      - id
+      - -q
+  register: garage_node_id_run
+  changed_when: false
+  failed_when: false
+  until: >-
+    (garage_node_id_run.rc | default(1)) == 0
+    and ('@' in (garage_node_id_run.stdout | default('')))
+  retries: "{{ garage_ready_retries | int }}"
+  delay: "{{ garage_ready_delay | int }}"
+
+- name: "Garage | Assert the node answered and record its id"
+  ansible.builtin.assert:
+    that:
+      - (garage_node_id_run.rc | default(1)) == 0
+      - "'@' in (garage_node_id_run.stdout | default(''))"
+    fail_msg: >-
+      The Garage node on {{ inventory_hostname }} did not answer `garage node id`
+      within {{ (garage_ready_retries | int) * (garage_ready_delay | int) }} s.
+      Inspect `docker logs {{ garage_container_name }}` on the guest.
+    success_msg: "Garage node {{ inventory_hostname }} is up."
+    quiet: true
+
+- name: "Garage | Record this node's id@addr (non-secret)"
+  ansible.builtin.set_fact:
+    garage_node_id_full: "{{ garage_node_id_run.stdout | trim | split('\n') | last | trim }}"

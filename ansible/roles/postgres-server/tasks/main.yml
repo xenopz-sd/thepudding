@@ -140,8 +140,10 @@
 # installer stores them at provision. We use the `bao` CLI via `docker exec`
 # against the SVC-07 primary (the SAME mechanism the platform already uses to
 # talk to OpenBao — e.g. the openbao onboard role), rather than adding a new
-# community.hashi_vault collection dependency. The admin token travels in the
-# command ENVIRONMENT (BAO_TOKEN), never on the argv; no_log on the whole task.
+# community.hashi_vault collection dependency. The admin token is passed to
+# `docker exec` as `-e BAO_TOKEN=<value>`, so it is on that process's argv on the
+# guest for the call's duration (accepted on single-tenant guests; new code uses the
+# name-only `-e BAO_TOKEN` form, WS-C62). no_log on the whole task.
 # Gated on an OpenBao address being available (OPENBAO_ADDR / openbao_addr): when
 # OpenBao is not reachable (e.g. an offline unit render) the write is skipped and
 # the generated passwords remain only in the 0600 runtime env on the guest.
