@@ -1,0 +1,6 @@
+---
+# defaults/main.yml — control_route_check (WS-C64). No secret values.
+crc_vlans: [20]
+crc_repo_root: "{{ playbook_dir | dirname | dirname }}"
+crc_helper: "{{ crc_repo_root }}/scripts/installer/route_check.py"
+crc_venv_python: "{{ ansible_env.HOME | default(lookup('ansible.builtin.env', 'HOME')) }}/venv/devinfra/bin/python"

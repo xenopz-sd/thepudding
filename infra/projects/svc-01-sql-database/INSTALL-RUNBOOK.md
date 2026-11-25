@@ -122,7 +122,7 @@ To stand the MariaDB alternative up instead, add `-e db_engine=mariadb`.
 <!-- cwd: . -->
 ```bash
 # The app credential is retrievable ONLY from OpenBao — never a repo/CI log.
-~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/svc-01-sql-database.generated.yml \
+~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/svc-01-<project-slug>.generated.yml \
   ansible/playbooks/svc01-health.yml -e project_slug=dronefleet -e vlan_id=100
 ```
 
@@ -134,7 +134,7 @@ The `postgres-server` role derives BOTH the server `ssl` setting and the
 
 | `postgres_ssl_enabled` | `postgresql.conf` | `pg_hba` app/exporter rule | app-role client posture |
 |---|---|---|---|
-| `false` (**default** today — no SVC-08/EJBCA cert) | `ssl = off` | `host … scram-sha-256` | **plaintext** TCP on the project VLAN (do NOT use `sslmode=require`) |
+| `false` (**default** — no certificate issued to the DB) | `ssl = off` | `host … scram-sha-256` | **plaintext** TCP on the project VLAN (do NOT use `sslmode=require`) |
 | `true` (once a cert exists) | `ssl = on` + `ssl_cert_file`/`ssl_key_file` | `hostssl … scram-sha-256` | TLS (`sslmode=require`/`verify-full`) |
 
 Under the default posture the least-privilege app role connects over **plaintext**
@@ -156,8 +156,8 @@ PGPASSWORD="$APP_PASSWORD" psql \
   -tAc "SELECT 1"
 ```
 
-**Future flip to TLS** (once SVC-08/EJBCA — or a deliberate self-signed dev
-stand-in — issues the DB a cert): set `postgres_ssl_enabled=true` and drop the
+**Future flip to TLS** (once a certificate is issued to the DB, for example by SVC-08, the OpenBao PKI,
+or a deliberate self-signed dev stand-in): set `postgres_ssl_enabled=true` and drop the
 cert/key at `postgres_ssl_cert_file` / `postgres_ssl_key_file`. The next converge
 renders `ssl = on` + `hostssl` with no hostname/role change; clients then switch
 to `sslmode=verify-full`.

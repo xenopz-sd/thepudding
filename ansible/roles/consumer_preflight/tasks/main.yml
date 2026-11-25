@@ -379,6 +379,11 @@
       {{ (consumer_registry_resolve.stdout | regex_search('VLAN\s+(\d+)', '\1') | first) | int }}
   changed_when: false
 
+- name: "Preflight | Control-node route to the platform VLAN(s) goes via the Proxmox host (WS-C64)"
+  ansible.builtin.include_role:
+    name: control_route_check
+  vars:
+    crc_vlans: [20, "{{ consumer_vlan_id }}"]
 - name: "Preflight | INFO — resolved VLAN (Registry-authoritative)"
   ansible.builtin.debug:
     msg: >-

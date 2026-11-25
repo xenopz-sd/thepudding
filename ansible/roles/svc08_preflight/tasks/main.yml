@@ -2,6 +2,11 @@
 # tasks/main.yml — svc08_preflight (SVC-08 Phase 1). Option B has no guest: preflight proves
 # SVC-07 is up and unsealed, the admin token works, and SVC-10 exists (R15). Fails closed with the
 # remedy naming the missing installer; nothing is changed.
+- name: "Preflight | Control-node route to the platform VLAN(s) goes via the Proxmox host (WS-C64)"
+  ansible.builtin.include_role:
+    name: control_route_check
+  vars:
+    crc_vlans: [20]
 - name: "Preflight | Consult the throwaway-cluster authorization guard (Agent_Live_Run only)"
   ansible.builtin.command:
     argv:

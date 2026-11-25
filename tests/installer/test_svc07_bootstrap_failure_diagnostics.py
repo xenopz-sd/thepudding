@@ -339,3 +339,68 @@ def test_secret_marker_classifier_flags_only_secrets():
     assert not has_marker(pointer_fragment)
     assert has_marker("{{ svc07_primary_bootstrap.stdout }}")
     assert has_marker("TOKEN={{ svc07_admin_token }}")
+
+
+# --------------------------------------------------------------------------- #
+# Follow-up (2026-11-25 live-acceptance review): the debug capture must also run
+# when Task 8.4 FAILS. With the default failed_when (rc != 0) a failing child sent
+# the play straight to the Phase-3 rescue, so the guarded debug_probes import never
+# ran and the pointer's "re-run with -e svc07_debug_instrumentation=true" produced
+# no .svc07-task84-child.log for the very failure it was meant to explain.
+# --------------------------------------------------------------------------- #
+import jinja2  # noqa: E402
+
+
+def _main_tasks() -> list[dict]:
+    return _flat_tasks(_BOOTSTRAP_MAIN)
+
+
+def _failed_when_expr(task: dict) -> str:
+    fw = task.get("failed_when")
+    assert fw is not None, (
+        "Task 8.4 must carry an explicit failed_when so a failing child does not skip the debug capture"
+    )
+    return " and ".join(str(x) for x in fw) if isinstance(fw, list) else str(fw)
+
+
+def _eval(expr: str, rc: int, instrumented: bool) -> bool:
+    env = jinja2.Environment()
+    # Ansible's `bool` filter (only bool inputs occur here).
+    env.filters["bool"] = lambda v: v if isinstance(v, bool) else str(v).strip().lower() in ("true", "1", "yes", "on")
+    src = "{{ (" + expr.replace("{{", "").replace("}}", "") + ") }}"
+    out = env.from_string(src).render(
+        svc07_primary_bootstrap={"rc": rc}, svc07_debug_instrumentation=instrumented)
+    return out.strip() == "True"
+
+
+@pytest.mark.parametrize("rc,instrumented,expected", [
+    (1, False, True),   # preservation: a failing child still fails Task 8.4 when not instrumented
+    (0, False, False),
+    (1, True, False),   # fix: instrumented, Task 8.4 itself does not fail ...
+    (0, True, False),
+])
+def test_task84_failed_when_defers_failure_only_when_instrumented(rc, instrumented, expected):
+    expr = _failed_when_expr(_find_primary_bootstrap_task())
+    assert _eval(expr, rc, instrumented) is expected
+
+
+def test_instrumented_failure_is_raised_after_the_debug_capture():
+    """... the failure is raised by the LAST task of debug_probes.yml (imported only when
+    instrumented), after the 0600 child-log write, and that import sits before the drift
+    guard (which assumes a successful child)."""
+    probes = _flat_tasks(_DEBUG_PROBES)
+    write = next(i for i, t in enumerate(probes) if "ansible.builtin.copy" in t or "copy" in t)
+    fails = [(i, t) for i, t in enumerate(probes) if "ansible.builtin.fail" in t or "fail" in t]
+    assert fails, "debug_probes.yml must raise the deferred Task 8.4 failure"
+    i, t = fails[-1]
+    assert i > write, "the deferred fail must come after the 0600 child-log write"
+    assert "svc07_primary_bootstrap.rc" in str(t.get("when", "")), "the deferred fail must be gated on the child rc"
+    blob = _task_blob(t) + " " + _msg_text(t)
+    for marker in _SECRET_MARKERS:
+        assert marker not in blob, f"the deferred fail must not reference {marker!r}"
+    tasks = _main_tasks()
+    names = [str(x.get("name", "")) for x in tasks]
+    imp = next(k for k, x in enumerate(tasks)
+               if (x.get("ansible.builtin.import_tasks") or x.get("import_tasks")) == "debug_probes.yml")
+    drift = next(k for k, n in enumerate(names) if n.startswith("Bootstrap | Drift guard"))
+    assert imp < drift, "the debug_probes import (and its deferred fail) must run before the drift guard"

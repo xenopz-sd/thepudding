@@ -120,6 +120,6 @@ in the SSO section of the consumer journey — see
 [`docs/CONSUMER-JOURNEY.md` → "SSO consumption: dev issuer-reachability recipe (§D)"](../../../docs/CONSUMER-JOURNEY.md#sso-consumption-dev-issuer-reachability-recipe-d).
 A consumer whose workload **does** validate ZITADEL tokens copies that fragment
 onto their workload service as a dev-only overlay (flagged dev-only; the
-production posture is the SVC-08/EJBCA trusted-CA path, never the skip-verify
+production posture is the SVC-08 (OpenBao PKI) trusted-CA path, never the skip-verify
 switch). This is the §D demonstration Req 4.2 points at; it is not duplicated
 here.

@@ -225,4 +225,6 @@
   vars:
     gic_paths:
       - "{{ svc01_repo_root }}/{{ svc01_generated_inventory }}"
+      # WS-C63: also the pre-WS-C63 shared file, when it still describes this instance.
+      - "{{ svc01_repo_root }}/ansible/inventory/svc-01-sql-database.generated.yml"
     gic_only_if_vmid: "{{ svc01_vmid }}"

@@ -11,6 +11,9 @@ __pycache__/
 *.tfplan
 tfplan*
 crash.log
+# Lock files belong to root modules only; a manual `terraform init` inside a
+# shared module directory must not leave one behind.
+infra/modules/**/.terraform.lock.hcl
 # Local backend override for solo/offline apply (never commit — see
 # infra/projects/<slug>/INSTALL-RUNBOOK.md "Initialize the state backend").
 *_override.tf

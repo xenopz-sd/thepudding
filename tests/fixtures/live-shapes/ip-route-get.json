@@ -1,0 +1,10 @@
+{
+  "_provenance": "Recorded live 2026-11-19 with `ip -j route get <addr>` (iproute2) on the control node and the Proxmox host; VPN case transcribed from the same session's `ip route get` text output (dev tun0, no gateway). Addresses are the platform's own computed ones; the LAN addresses are documentation-style placeholders.",
+  "proxmox_lan_ip": "192.0.2.69",
+  "cases": {
+    "workstation_via_proxmox": [{"dst": "10.0.20.1", "gateway": "192.0.2.69", "dev": "enp86s0", "prefsrc": "192.0.2.219", "flags": [], "uid": 1000, "cache": []}],
+    "on_proxmox_host": [{"dst": "10.0.20.1", "dev": "p20", "prefsrc": "10.0.20.1", "flags": [], "uid": 0, "cache": []}],
+    "vpn_captures_range": [{"dst": "10.0.20.1", "dev": "tun0", "prefsrc": "10.0.0.2", "flags": [], "uid": 1000, "cache": []}],
+    "default_route_only": [{"dst": "10.0.20.1", "gateway": "192.0.2.1", "dev": "enp86s0", "prefsrc": "192.0.2.219", "flags": [], "uid": 1000, "cache": []}]
+  }
+}

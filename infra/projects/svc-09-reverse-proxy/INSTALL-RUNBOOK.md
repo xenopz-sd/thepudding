@@ -48,20 +48,21 @@ deletes the Traefik LXC (and, with it, the `acme.json` cert store on its rootfs)
 
 ---
 
-## Dependencies and the mock stand-ins (SVC-08 / SVC-06 not built yet)
+## Dependencies and the mock stand-ins (SVC-08 / SVC-06)
 
-SVC-09 depends on two services that do not exist yet, and ships **permanent,
-default-off mock stand-ins** for each (per
+SVC-09 depends on SVC-08 (internal PKI) and SVC-06 (identity provider). Both exist
+now. SVC-09 still ships **permanent, default-off mock stand-ins** for each, for a
+cluster without that service or to isolate a fault (per
 [`mock-stand-ins.md`](../../../.kiro/steering/mock-stand-ins.md)):
 
 | Real dependency | Mock stand-in (opt-in, default OFF) | What the mock provides |
 |---|---|---|
-| **SVC-08 / EJBCA + Let's Encrypt** (TLS certs) | `traefik_tls_self_signed=true` (Mock 3) | A self-signed default cert so `websecure` serves HTTPS before any CA exists. Clients use `curl -k` / `validate_certs:false`. No public trust chain. |
+| **SVC-08 (OpenBao PKI) + Let's Encrypt** (TLS certs) | `traefik_tls_self_signed=true` (Mock 3) | A self-signed default cert so `websecure` serves HTTPS without a CA. Clients use `curl -k` / `validate_certs:false`. No public trust chain. With SVC-08 installed (`svc-08-bootstrap.yml`), leave it off: Traefik uses the `internal` ACME resolver and passing the flag while the platform root is published fails closed. |
 | **SVC-06 / ZITADEL** (dashboard forward-auth) | `traefik_dashboard_auth_disabled=true` (Mock 4) | The dashboard on an internal-only route with forward-auth inert. Never anonymous `:8080`. |
 
-On a throwaway bring-up before SVC-08/SVC-06 exist, enable **both** mocks. In
-production leave both OFF: deploy SVC-08 (or make Let's Encrypt reachable) and
-SVC-06, and the real resolver + real forward-auth take over with no change to
+On a throwaway cluster without SVC-08/SVC-06, enable the mocks you need. With
+SVC-08 and SVC-06 installed, leave both OFF: install SVC-08 (or make Let's Encrypt
+reachable) and SVC-06, and the real resolver + real forward-auth take over with no change to
 Traefik's config. With the TLS mock OFF and no CA reachable, the role **fails
 closed** at render with a clear remedy — it never silently serves no TLS, and the
 dashboard is never left anonymous.
@@ -119,7 +120,7 @@ SVC-09 Preflight phase fails closed naming `p20` if it is absent.
 
 ### A.2 — One-command install (provision → bootstrap → health)
 
-On a throwaway cluster before SVC-08/SVC-06 exist, enable both mocks:
+On a throwaway cluster without SVC-08/SVC-06 installed, enable both mocks (omit the TLS mock if SVC-08 is installed):
 
 <!-- doctest: requires-infra -->
 <!-- cwd: . -->

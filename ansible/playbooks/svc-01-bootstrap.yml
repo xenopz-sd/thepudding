@@ -29,7 +29,9 @@
     cluster_env_file: cluster.env
     svc01_repo_root: "{{ playbook_dir | dirname | dirname }}"
     svc01_venv_python: "{{ ansible_env.HOME }}/venv/devinfra/bin/python"
-    svc01_generated_inventory: ansible/inventory/svc-01-sql-database.generated.yml
+    # One file per instance (WS-C63): the old shared svc-01-sql-database.generated.yml was last-writer-wins, so a
+    # project DB made the ZITADEL backing DB disappear from SVC-10, SVC-17/18 and SVC-08.
+    svc01_generated_inventory: "ansible/inventory/svc-01-{{ project_slug }}.generated.yml"
 
     # --- Per-project parameters (REQUIRED via -e, except the defaulted ones). ---
     # project_slug + vlan_id + svc01_vmid are the per-instance identity; the

@@ -438,6 +438,23 @@ wiring:
   -e project_slug=dronefleet -e hello_workload_enabled=true
 ```
 
+> **Publishing the workload (`expose`).** This deploy step reads the manifest's `expose` block itself
+> (`fix-consumer-expose-route-and-gateway-docs`). With, for example,
+>
+> <!-- doctest: display-only -->
+> ```yaml
+> expose:
+>   enabled: true
+>   host: dronefleet
+>   port: 8080
+>   health_path: /cgi-bin/healthz   # the reference hello-workload serves no "/"
+> ```
+>
+> it renders the Traefik route `https://dronefleet.<PLATFORM_DOMAIN>` (the platform domain comes from the
+> cluster env file named by `-e cluster_env_file=…`) and then checks it end to end through Traefik at
+> `health_path`, failing closed on 404 or 502–504. Onboarding no longer checks the route; it only prints the URL.
+> Without `expose` the route keeps the default internal host.
+
 > **Co-locate override (no dedicated guest).** If you onboarded WITHOUT a
 > `workload` block (the co-locate topology), stand the reference up on the DB
 > guest instead by pointing the play at the consumer inventory and overriding the

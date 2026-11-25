@@ -27,19 +27,18 @@ consumer_network_slice_state_name: "{{ project_slug }}-infra"
 #     reachable-oidc, §6) -----------------------------------------------------
 # When the manifest declares an `expose` block (enabled: true), the workload is
 # USER-FACING and is published through the shared Traefik under
-# <expose.host>.<consumer_platform_domain> via the EXISTING ADR-0018 traefik_route
-# path (the openbao-agent role already carries that wiring; the deploy step feeds
-# it the real base-domain host rule these facts resolve). consumer_platform_domain
-# is the base domain the subdomain label is appended to (single source of truth;
-# placeholder default).
+# <expose.host>.<platform-domain>. The deploy step (hello_workload_deploy) derives
+# and renders that route from the manifest itself; onboarding only runs the
+# cross-VLAN reachability preflight below. consumer_platform_domain is the
+# platform domain (set from PLATFORM_DOMAIN; placeholder default).
 consumer_platform_domain: "platform.example.test"
 # The Traefik guest the backend must be reachable from (ADR-0015 host_index 2 →
 # 10.0.20.12); the cross-VLAN reachability preflight probes from here.
 consumer_traefik_guest_host: "10.0.20.12"
 # The Phase-2 cross-VLAN preflight probes L3 reachability on this port (sshd),
 # NOT the application port — the workload is only deployed in Phase 3, so the
-# app port cannot be listening yet. The app route itself is verified end-to-end
-# through Traefik post-deploy in Phase 4 (consumer_handoff).
+# app port cannot be listening yet. The app route itself is verified end to end
+# through Traefik by the deploy step (hello_workload_deploy, expose.health_path).
 consumer_expose_l3_probe_port: 22
 consumer_traefik_guest_ssh_user: "root"
 consumer_traefik_guest_python: "/usr/bin/python3"
@@ -52,7 +51,6 @@ consumer_svc01_bootstrap_playbook: ansible/playbooks/svc-01-bootstrap.yml
 # The generated inventory the SVC-01 installer emits + the consumer-scoped copy
 # the orchestrator keys later phases on (design "Phase 2": generate_inventory.py
 # -> <slug>-consumer.generated.yml).
-consumer_svc01_generated_inventory: ansible/inventory/svc-01-sql-database.generated.yml
 consumer_generated_inventory: "ansible/inventory/{{ project_slug }}-consumer.generated.yml"
 
 # The per-project DB guest VMID override (ADR-0022). 0 = computed (vlan_id * 1000 + host_index). WS-C48: a standing

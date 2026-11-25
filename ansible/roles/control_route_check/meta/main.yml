@@ -1,0 +1,9 @@
+---
+galaxy_info:
+  role_name: control_route_check
+  namespace: devinfra
+  author: Developer Services Platform
+  description: Fail fast when the control node's route to a platform VLAN does not go via the Proxmox host (WS-C64).
+  license: MIT
+  min_ansible_version: "2.14"
+dependencies: []

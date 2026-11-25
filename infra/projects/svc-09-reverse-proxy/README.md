@@ -59,14 +59,16 @@ service itself is configured by the
   attaches to, and
 - deploys the Traefik Compose stack via the generic `docker-compose-app` role.
 
-## Mock stand-ins (SVC-08 / SVC-06 not built yet)
+## Mock stand-ins (SVC-08 / SVC-06)
 
-Two permanent, default-off mocks let Traefik come up and be validated before its
-dependencies exist (see
+Two permanent, default-off mocks let Traefik come up and be validated on a cluster
+without SVC-08 or SVC-06, or isolate a fault (see
 [`mock-stand-ins.md`](../../../.kiro/steering/mock-stand-ins.md) Mock 3 + Mock 4):
-`traefik_tls_self_signed` (self-signed cert, stand-in for SVC-08/Let's Encrypt)
+`traefik_tls_self_signed` (self-signed cert, stand-in for SVC-08 (OpenBao PKI)/Let's Encrypt)
 and `traefik_dashboard_auth_disabled` (internal-only dashboard route, stand-in
-for SVC-06 forward-auth). Production leaves both off.
+for SVC-06 forward-auth). With SVC-08 installed, the real path is the `internal`
+ACME resolver and the TLS mock fails closed while the platform root is published.
+Production leaves both off.
 
 ## Terraform state isolation
 

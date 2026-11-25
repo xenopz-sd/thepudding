@@ -24,13 +24,15 @@ driven (see design "Served-VLAN status payload"). This emitter reports only the
 per-project VLANs recorded in ``projects.yaml``.
 
 The command reads only the registry file (no network, no Terraform state, no
-Proxmox call) and writes JSON to stdout, so the operator can feed it into the
-gateway playbook as ``--extra-vars``::
+Proxmox call) and writes JSON to stdout. To feed it straight into the gateway
+playbook as ``--extra-vars``, pass ``--ansible-vars`` so the keys carry the role's
+variable names (``sdn_gateway_active_vlan_ids`` ...)::
 
+    PYTHONPATH=infra/platform-foundation/scripts ~/venv/devinfra/bin/python \\
+      infra/platform-foundation/scripts/registry_status.py --json --ansible-vars --out /tmp/vlan-status.json
     ~/venv/devinfra/bin/ansible-playbook -i ansible/inventory/proxmox-hosts.yml \\
       ansible/playbooks/sdn-gateway.yml \\
-      --extra-vars "@$(~/venv/devinfra/bin/python \\
-        infra/platform-foundation/scripts/registry_status.py --json --out /tmp/vlan-status.json; echo /tmp/vlan-status.json)" \\
+      --extra-vars "@/tmp/vlan-status.json" \\
       --extra-vars "sdn_gateway_admin_source_cidr=<dev-net-cidr>"
 
 Invoke via the project venv binary by absolute path, e.g.::
@@ -90,6 +92,25 @@ def compute_vlan_status(registry: dict[str, Any]) -> dict[str, list[int]]:
     }
 
 
+#: Payload key -> the ``sdn_gateway`` role input variable it feeds (``--ansible-vars``).
+SDN_GATEWAY_VAR_NAMES = {
+    "active_vlan_ids": "sdn_gateway_active_vlan_ids",
+    "decommissioned_vlan_ids": "sdn_gateway_decommissioned_vlan_ids",
+}
+
+
+def as_sdn_gateway_vars(payload: dict[str, list[int]]) -> dict[str, list[int]]:
+    """Rename the payload keys to the ``sdn_gateway`` role's input variable names.
+
+    The default payload keys (``active_vlan_ids`` ...) are what ``platform_gateway``
+    parses; the role itself reads ``sdn_gateway_active_vlan_ids`` /
+    ``sdn_gateway_decommissioned_vlan_ids``. A file fed straight to
+    ``sdn-gateway.yml`` with ``--extra-vars @<file>`` must use the role's names, or
+    the role sees an empty active set (fix-consumer-expose-route-and-gateway-docs).
+    """
+    return {SDN_GATEWAY_VAR_NAMES[key]: value for key, value in payload.items()}
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argparse CLI parser."""
     parser = argparse.ArgumentParser(
@@ -116,6 +137,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to the projects.yaml VLAN-ID registry "
             f"(default: {_DEFAULT_REGISTRY})."
+        ),
+    )
+    parser.add_argument(
+        "--ansible-vars",
+        action="store_true",
+        help=(
+            "Name the keys after the sdn_gateway role's input variables "
+            "(sdn_gateway_active_vlan_ids / sdn_gateway_decommissioned_vlan_ids), "
+            "so the file can be passed to sdn-gateway.yml as --extra-vars @<file>. "
+            "Same values; without this flag the keys are active_vlan_ids / "
+            "decommissioned_vlan_ids."
         ),
     )
     parser.add_argument(
@@ -148,6 +180,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    if args.ansible_vars:
+        payload = as_sdn_gateway_vars(payload)
     rendered = json.dumps(payload)
     if args.out is not None:
         try:

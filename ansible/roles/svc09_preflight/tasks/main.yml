@@ -12,6 +12,11 @@
 # prereq/version checks. Publishes the facts consumed by svc09_provision.
 
 # --- Env-file load + validation (delegates to cluster_env.py) ---------------
+- name: "Preflight | Control-node route to the platform VLAN(s) goes via the Proxmox host (WS-C64)"
+  ansible.builtin.include_role:
+    name: control_route_check
+  vars:
+    crc_vlans: [20]
 - name: "Preflight | Resolve + validate the cluster env file ({{ cluster_env_file }})"
   ansible.builtin.command:
     argv:

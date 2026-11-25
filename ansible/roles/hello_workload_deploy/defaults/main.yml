@@ -150,3 +150,32 @@ hello_workload_cluster_env_path: >-
 # lines do not match. Only a literal \n inside a class (Jinja/YAML escape-safe).
 hello_workload_tls_optin_regex: >-
   (?im)^[ ]*(export[ ]+)?OPENBAO_TLS_SELF_SIGNED[ ]*=[^a-z0-9#\n]*(true|1|yes)[^a-z0-9#\n]*(#.*)?$
+
+# =============================================================================
+# Published route from the manifest's `expose` block
+# (fix-consumer-expose-route-and-gateway-docs)
+# =============================================================================
+# The Traefik route is rendered HERE (by the composed openbao-agent), not by
+# onboarding, so this role reads the project's manifest itself. With
+# `expose.enabled: true` the route host becomes <expose.host>.<platform-domain>
+# and its backend port expose.port (default 8080); without it the openbao-agent
+# defaults are untouched. An explicit -e of any openbao_agent_* route var wins.
+# A missing manifest (bring-your-own / standalone use) means "no expose".
+hello_workload_manifest_path: >-
+  {{ playbook_dir | dirname | dirname }}/infra/projects/{{ project_slug }}/consumer-manifest.yml
+
+# The platform domain appended to expose.host. Set from PLATFORM_DOMAIN in the
+# cluster env file (as every installer does); this placeholder stays when the key
+# is absent, and an explicit -e hello_workload_platform_domain=... wins.
+hello_workload_platform_domain: "platform.example.test"
+
+# End-to-end route check (owned by this deploy step; onboarding no longer
+# probes): GET https://<ingress><expose.health_path> with Host = the published
+# FQDN, sent from the control node to the Traefik ingress (ADR-0015 host_index 2).
+hello_workload_traefik_ingress_host: "10.0.20.12"
+hello_workload_route_check_retries: 12
+hello_workload_route_check_delay: 5
+# OFF by default: the probe connects by IP, so the certificate name never matches;
+# the route's certificate chain is verified in the live acceptance instead. The
+# probe sends no credential.
+hello_workload_route_validate_certs: false

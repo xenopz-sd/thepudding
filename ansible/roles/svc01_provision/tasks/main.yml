@@ -297,6 +297,21 @@
       - "svc01_generated_inventory_stat.stat.exists"
     fail_msg: "generate_inventory.py did not produce {{ svc01_generated_inventory }}; halting before Bootstrap."
     success_msg: "Generated inventory present: {{ svc01_generated_inventory }}."
+# WS-C63: the per-instance file replaces the old shared one. Remove the legacy file only when it describes THIS
+# instance (its VMID), so another instance's still-current entry is never deleted by mistake.
+- name: "Provisioning | Read this instance's VMID from its generated inventory (computed or overridden)"
+  ansible.builtin.set_fact:
+    svc01_this_vmid: >-
+      {{ lookup('ansible.builtin.file', svc01_repo_root ~ '/' ~ svc01_generated_inventory)
+         | regex_findall('(?m)^[ ]*vmid:[ ]*([0-9]+)[ ]*$') | first | default('') }}
+- name: "Provisioning | Remove the legacy shared SVC-01 inventory when it describes this instance (WS-C63)"
+  ansible.builtin.include_role:
+    name: generated_inventory_cleanup
+  when: (svc01_this_vmid | string | length) > 0
+  vars:
+    gic_paths:
+      - "{{ svc01_repo_root }}/ansible/inventory/svc-01-sql-database.generated.yml"
+    gic_only_if_vmid: "{{ svc01_this_vmid }}"
 
 - name: "Provisioning | add_host the DB guest into the in-memory inventory"
   ansible.builtin.add_host:

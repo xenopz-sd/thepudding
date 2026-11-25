@@ -127,3 +127,27 @@ def test_cli_aborts_cleanly_on_missing_registry(tmp_path, capsys) -> None:
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "ERROR" in captured.err
+
+
+def test_cli_ansible_vars_names_keys_after_the_role_inputs(tmp_path, capsys) -> None:
+    """``--ansible-vars`` renames the keys to the sdn_gateway role's input variables.
+
+    fix-consumer-expose-route-and-gateway-docs: fed to sdn-gateway.yml as
+    ``--extra-vars @<file>``, the default keys were not read by the role, which then
+    saw an empty active set.
+    """
+    out_path = tmp_path / "vlan-status.json"
+    exit_code = main(["--json", "--ansible-vars", "--out", str(out_path)])
+    assert exit_code == 0
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    assert payload == {
+        "sdn_gateway_active_vlan_ids": [100, 101, 102],
+        "sdn_gateway_decommissioned_vlan_ids": [],
+    }
+    assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_cli_default_keys_unchanged_without_ansible_vars(capsys) -> None:
+    """Without ``--ansible-vars`` the payload keeps the keys platform_gateway parses."""
+    assert main(["--json"]) == 0
+    assert sorted(json.loads(capsys.readouterr().out)) == ["active_vlan_ids", "decommissioned_vlan_ids"]

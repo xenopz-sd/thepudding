@@ -348,6 +348,14 @@
     OPENBAO_BOOTSTRAP_TRANSIT_TOKEN: "{{ svc07_primary_transit_token }}"
   register: svc07_primary_bootstrap
   changed_when: "(svc07_primary_bootstrap.stdout | default('')) is search('changed=[1-9]')"
+  # A failing child normally fails here (-> the Phase-3 rescue). With the dev-only
+  # svc07_debug_instrumentation opt-in the failure is deferred to the task right
+  # after the debug capture below, so the 0600 .svc07-task84-child.log is written
+  # for the failing run too (the rescue pointer tells operators to re-run with the
+  # flag to see why it failed).
+  failed_when: >-
+    (svc07_primary_bootstrap.rc | default(1)) != 0
+    and not (svc07_debug_instrumentation | default(false) | bool)
   # Secret hygiene (Req 3.1–3.4, design "Phase-3 primary bootstrap — secret
   # hygiene fix"): this task is no_log:true because the child's captured stdout
   # carries the revealed Admin_Token (TOKEN=<value>) and the child env carries
@@ -372,6 +380,7 @@
 - name: "Bootstrap | DEV-DEBUG — Phase-3 probes for the Task 8.4 child run (guarded include)"
   ansible.builtin.import_tasks: debug_probes.yml
   when: svc07_debug_instrumentation | default(false) | bool
+
 
 # Drift guard (Req 5.11): the role mints + reveals the Admin_Token only
 # inside the fresh bootstrap window (initialized:false). If the primary

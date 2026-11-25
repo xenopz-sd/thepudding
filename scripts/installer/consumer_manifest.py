@@ -154,6 +154,12 @@ _BUCKET_NAME_MAX = 63
 
 EXPOSE_HOST_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
+#: ``expose.health_path`` (fix-consumer-expose-route-and-gateway-docs): the path the
+#: deploy step requests through Traefik to prove the published route end to end.
+#: Optional; the deploy step defaults it to ``/``. Absolute, no whitespace.
+EXPOSE_HEALTH_PATH_RE = re.compile(r"^/\S*$")
+EXPOSE_HEALTH_PATH_MAX = 255
+
 #: ``sso.app_registrations[].app_type`` enum (Requirement 1.3). These are the
 #: manifest's own DESCRIPTIVE forms; they are NOT reused verbatim by the sibling
 #: zitadel-spa-pkce-onboarding role, which accepts the short forms
@@ -435,7 +441,7 @@ def _validate_expose(block: object) -> None:
 
     Opt-in, default-absent — a manifest with no ``expose`` block is unaffected.
     Fields are validated in fixed order (``enabled`` → ``host`` → ``port`` →
-    ``tls``) so the first offender is well-defined. ``host`` is REQUIRED when
+    ``tls`` → ``health_path``) so the first offender is well-defined. ``host`` is REQUIRED when
     ``enabled`` is true and must be a bare DNS subdomain LABEL (the base domain is
     appended by the deploy layer); a FQDN is rejected.
     """
@@ -470,6 +476,14 @@ def _validate_expose(block: object) -> None:
             )
     if "tls" in block:
         _require_enum(block["tls"], EXPOSE_TLS_MODES, "expose.tls")
+    if "health_path" in block:
+        path = block["health_path"]
+        if (not isinstance(path, str) or not EXPOSE_HEALTH_PATH_RE.match(path)
+                or len(path) > EXPOSE_HEALTH_PATH_MAX):
+            raise ManifestValidationError(
+                f"field 'expose.health_path' must be an absolute URL path (starts with '/', "
+                f"no whitespace, at most {EXPOSE_HEALTH_PATH_MAX} characters), got {path!r}"
+            )
 
 
 def _validate_object_storage(block: object, slug: str) -> None:

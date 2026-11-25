@@ -197,8 +197,8 @@ walkthrough in
 [`../../../infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md`](../../../infra/projects/svc-07-secrets-manager/INSTALL-RUNBOOK.md)
 §6 (gated on `AGENT_LIVE_AUTHORIZED` + the throwaway guard; never CI/acc/prod).
 
-The homelab Primary serves the **self-signed mock cert**
-(`openbao_tls_self_signed=true`, no SVC-08/EJBCA). Because
+A Primary without SVC-08 serves the **self-signed mock cert**
+(`openbao_tls_self_signed=true`); with SVC-08 installed, use the platform CA instead. Because
 `openbao_primary_tls_skip_verify` derives from `openbao_tls_self_signed` (default
 **false**), a live run against a mock-cert Primary **must** set
 `openbao_tls_self_signed=true` or every `bao` docker-exec call fails
@@ -206,5 +206,5 @@ The homelab Primary serves the **self-signed mock cert**
 under `no_log`). This is exactly how the sibling `openbao_project_onboard` path is
 driven. The runbook's manual role runs pass `-e openbao_tls_self_signed=true`; the
 integration harness threads it into every role run by default
-(`_DEFAULT_ROLE_EXTRA_VARS`), overridable per-test for a real-EJBCA-cert Primary.
+(`_DEFAULT_ROLE_EXTRA_VARS`), overridable per-test for a Primary with a platform-CA cert (SVC-08).
 The production default stays `false` — the skip is a dev/mock affordance only.

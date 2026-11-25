@@ -16,7 +16,7 @@
 #   # 1. Emit the desired-state VLAN sets to a vars file (offline, reads the registry only):
 #   PYTHONPATH=infra/platform-foundation/scripts \
 #     ~/venv/devinfra/bin/python \
-#     infra/platform-foundation/scripts/registry_status.py --json \
+#     infra/platform-foundation/scripts/registry_status.py --json --ansible-vars \
 #     --out /tmp/vlan-status.json
 #
 #   # 2. Run the gateway role, feeding it the emitter output plus the admin source CIDR:

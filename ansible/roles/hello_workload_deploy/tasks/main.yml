@@ -52,6 +52,99 @@
          else (hello_workload_envfile_text | string
                is search(hello_workload_tls_optin_regex)) }}
 # ============================================================================
+# STEP 0c — Published route inputs from the manifest's `expose` block
+# (fix-consumer-expose-route-and-gateway-docs)
+# ============================================================================
+# The route is rendered by openbao-agent in THIS run, so the route inputs must be
+# derived here; facts set by onboarding (a separate process) never arrive. All
+# reads happen on the control node and carry no secret. A missing manifest means
+# "no expose" (route left at the openbao-agent defaults, Req 3.1); an invalid one
+# fails closed before any change.
+- name: "Hello-workload | Stat the project's consumer manifest (control node)"
+  ansible.builtin.stat:
+    path: "{{ hello_workload_manifest_path }}"
+  delegate_to: localhost
+  run_once: true
+  register: hello_workload_manifest_stat
+
+- name: "Hello-workload | Validate the consumer manifest (consumer_manifest.py --check)"
+  ansible.builtin.command:
+    argv:
+      - "{{ lookup('ansible.builtin.env', 'HOME') }}/venv/devinfra/bin/python"
+      - "{{ playbook_dir | dirname | dirname }}/scripts/installer/consumer_manifest.py"
+      - --check
+      - "{{ hello_workload_manifest_path }}"
+  delegate_to: localhost
+  run_once: true
+  register: hello_workload_manifest_check
+  changed_when: false
+  failed_when: false
+  when: hello_workload_manifest_stat.stat.exists
+
+- name: "Hello-workload | Fail closed on an invalid consumer manifest"
+  ansible.builtin.assert:
+    that:
+      - hello_workload_manifest_check.rc == 0
+    fail_msg: >-
+      The consumer manifest {{ hello_workload_manifest_path }} is invalid, so the
+      published route cannot be derived (nothing was changed):
+      {{ (hello_workload_manifest_check.stderr | default('') | trim)
+         or (hello_workload_manifest_check.stdout | default('') | trim) }}
+    quiet: true
+  when: hello_workload_manifest_stat.stat.exists
+
+- name: "Hello-workload | Load the consumer manifest"
+  ansible.builtin.set_fact:
+    hello_workload_manifest: >-
+      {{ (lookup('ansible.builtin.file', hello_workload_manifest_path) | from_yaml)
+         if hello_workload_manifest_stat.stat.exists else {} }}
+
+- name: "Hello-workload | Decide whether the workload is published (expose.enabled)"
+  ansible.builtin.set_fact:
+    hello_workload_expose_enabled: >-
+      {{ ((hello_workload_manifest.expose | default({})).enabled | default(false)) | bool }}
+
+- name: "Hello-workload | Read PLATFORM_DOMAIN from the cluster env file (control node)"
+  ansible.builtin.command:
+    argv:
+      - "{{ lookup('ansible.builtin.env', 'HOME') }}/venv/devinfra/bin/python"
+      - "{{ playbook_dir | dirname | dirname }}/scripts/installer/cluster_env.py"
+      - --env-file
+      - "{{ hello_workload_cluster_env_path }}"
+      - --platform-domain
+  delegate_to: localhost
+  run_once: true
+  register: hello_workload_platform_domain_lookup
+  changed_when: false
+  # rc 2 = env file missing: the placeholder default stays.
+  failed_when: hello_workload_platform_domain_lookup.rc not in [0, 2]
+  when: hello_workload_expose_enabled | bool
+
+- name: "Hello-workload | Use PLATFORM_DOMAIN as the platform domain (an explicit -e still wins)"
+  ansible.builtin.set_fact:
+    hello_workload_platform_domain: "{{ hello_workload_platform_domain_lookup.stdout | trim }}"
+  when:
+    - hello_workload_expose_enabled | bool
+    - hello_workload_platform_domain_lookup.rc == 0
+    - (hello_workload_platform_domain_lookup.stdout | trim | length) > 0
+
+- name: "Hello-workload | Derive the published route from expose (host.platform-domain, port)"
+  ansible.builtin.set_fact:
+    openbao_agent_workload_host_rule: "{{ hello_workload_manifest.expose.host ~ '.' ~ hello_workload_platform_domain }}"
+    openbao_agent_workload_http_port: "{{ hello_workload_manifest.expose.port | default(8080) }}"
+    openbao_agent_traefik_route_enabled: true
+  when: hello_workload_expose_enabled | bool
+
+- name: "Hello-workload | INFO — published route decision"
+  ansible.builtin.debug:
+    msg: >-
+      {{ ('INFO: expose enabled — route https://' ~ openbao_agent_workload_host_rule
+          ~ ' -> port ' ~ openbao_agent_workload_http_port ~ ', checked at '
+          ~ (hello_workload_manifest.expose.health_path | default('/')) ~ ' after deploy.')
+         if (hello_workload_expose_enabled | bool)
+         else 'INFO: expose not enabled in the manifest — the openbao-agent route defaults are used.' }}
+
+# ============================================================================
 # STEP 1 — Stage the reference entrypoint onto the target host (service-owned)
 # ============================================================================
 # The reference image is STOCK (busybox); the /healthz-iff-secret behaviour is
@@ -226,3 +319,56 @@
       into the Rendered_Secret_File and read at container start; /healthz returns
       200 only once it is present (swap-gate observable at the workload layer).
       No new agent wiring; no secret value shown.
+
+# ============================================================================
+# STEP 4 — End-to-end route check through Traefik (expose only)
+# ============================================================================
+# fix-consumer-expose-route-and-gateway-docs: this deploy step renders the route,
+# so it is the one place the route can be proven (onboarding runs before it and
+# no longer probes; operator decision Q1). Sent from the control node to the
+# Traefik ingress with Host = the published FQDN, for expose.health_path
+# (default "/"). No response (-1) = the ingress is unreachable; 404 = no router
+# for that host, or the workload does not serve that path; 502-504 = the router
+# exists but the backend is not answering. Read-only, carries no credential.
+- name: "Hello-workload | Probe the published route through Traefik (bounded)"
+  ansible.builtin.uri:
+    url: >-
+      https://{{ hello_workload_traefik_ingress_host }}{{
+      hello_workload_manifest.expose.health_path | default('/') }}
+    method: GET
+    headers:
+      Host: "{{ openbao_agent_workload_host_rule }}"
+    validate_certs: "{{ hello_workload_route_validate_certs | bool }}"
+    follow_redirects: none
+    status_code: [-1, 100, 101, 200, 201, 202, 204, 301, 302, 303, 304, 307, 308,
+                  400, 401, 403, 404, 405, 500, 502, 503, 504]
+    timeout: 10
+  delegate_to: localhost
+  register: hello_workload_route_probe
+  until: (hello_workload_route_probe.status | default(-1) | int) not in [-1, 404, 502, 503, 504]
+  retries: "{{ hello_workload_route_check_retries }}"
+  delay: "{{ hello_workload_route_check_delay }}"
+  failed_when: false
+  changed_when: false
+  when: hello_workload_expose_enabled | bool
+
+- name: "Hello-workload | Fail closed if the published route is not served end to end"
+  ansible.builtin.assert:
+    that:
+      - "(hello_workload_route_probe.status | default(-1) | int) != -1"
+      - "(hello_workload_route_probe.status | default(-1) | int) != 404"
+      - "(hello_workload_route_probe.status | default(-1) | int) not in [502, 503, 504]"
+    fail_msg: >-
+      The published route https://{{ openbao_agent_workload_host_rule }}{{
+      hello_workload_manifest.expose.health_path | default('/') }} (health_path) is
+      not served end to end through Traefik ({{ hello_workload_traefik_ingress_host }}):
+      HTTP status {{ hello_workload_route_probe.status | default(-1) }}. -1 = the
+      ingress is unreachable from this machine; 404 = Traefik has no router for that
+      host, or the workload does not serve that path (set expose.health_path to a
+      path it serves); 502-504 = the workload backend (port
+      {{ openbao_agent_workload_http_port }}) is not answering.
+    success_msg: >-
+      Published route served end to end through Traefik (HTTP status {{
+      hello_workload_route_probe.status | default(-1) }} at {{
+      hello_workload_manifest.expose.health_path | default('/') }}).
+  when: hello_workload_expose_enabled | bool

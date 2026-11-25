@@ -71,14 +71,18 @@ top-level keys are `slug`, `database`, `sso`, `secrets`, `workload`, `expose`, a
 | `expose.host` | string, required when enabled | §6 | a **bare** subdomain label (no dots), `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`; the platform domain is appended, giving `https://<host>.<platform-domain>` |
 | `expose.port` | integer 1..65535, optional | §6 | the workload's backend port; default `8080` |
 | `expose.tls` | enum `terminate` \| `passthrough`, optional | §6 | default `terminate` (Traefik terminates TLS) |
+| `expose.health_path` | string, optional | §6 | absolute path (starts with `/`, no whitespace, at most 255 characters) the deploy step requests through Traefik to prove the route; default `/`. Use a path the workload serves, e.g. `/cgi-bin/healthz` for the reference hello-workload |
 | `object_storage.buckets` | non-empty list of unique purposes, each `^[a-z0-9]{1,32}$` (no hyphen) | WS-C50 | one bucket `proj-<slug>-<purpose>` per entry (≤ 63 chars); unknown keys under `object_storage` are rejected |
 | `object_storage.website` | list, optional, subset of `buckets` | WS-C51 | those buckets are served **publicly** at `https://proj-<slug>-<purpose>.web.<platform-domain>/`; the others are kept private (reconciled each run) |
 | *(top-level key)* | one of `slug` / `database` / `sso` / `secrets` / `workload` / `expose` / `object_storage` | 1.7 | unknown/duplicate key → reject naming it |
 
 ### `app_type` / `auth_method` combinations
 
-The `app_type` values are reused verbatim from the `zitadel-spa-pkce-onboarding`
-spec. The typical valid combinations:
+The manifest uses descriptive values. The ZITADEL provisioning role (`zitadel-org-provision`) takes short ones,
+and onboarding maps between them at `consumer_bootstrap` STEP 4 (`consumer_app_type_map` /
+`consumer_auth_method_map`): `public-spa` → `spa`, `confidential-web` → `web`, `api` → `api`; `none` → `none`,
+`basic` → `basic`, `jwt-profile` → `jwt`. Write the descriptive form in the manifest; a value outside these maps
+stops onboarding naming the entry (`fix-consumer-manifest-app-type-mapping`). The typical valid combinations:
 
 | `app_type` | `auth_method` | Typical use |
 |---|---|---|
@@ -126,7 +130,7 @@ bring-your-own host) and the end-to-end last-mile walkthrough, see the
 The optional `expose` block makes the workload **user-facing**: the deploy step registers a Traefik route
 `https://<expose.host>.<platform-domain>` to the workload guest's backend port (the ADR-0018 file-provider route,
 so no host port is published to the LAN). The platform domain comes from the operator's configuration
-(`PLATFORM_DOMAIN` in the cluster env file, or `-e consumer_platform_domain=…`), never from the manifest. The handoff checks the route and prints it. Browser OIDC
+(`PLATFORM_DOMAIN` in the cluster env file; `-e consumer_platform_domain=…` for onboarding, `-e hello_workload_platform_domain=…` for the deploy step), never from the manifest. The deploy step (`hello-workload-deploy.yml`) reads `expose` from the manifest, renders the route and then checks it end to end through Traefik at `expose.health_path`; onboarding only prints the URL. A workload deployed with `openbao-agent` directly, not through `hello_workload_deploy`, must pass the same inputs itself (`openbao_agent_workload_host_rule`, `openbao_agent_workload_http_port`, `openbao_agent_traefik_route_enabled: true`). Browser OIDC
 login additionally needs the browser to reach both the app host and the ZITADEL issuer host; see the
 [dev issuer-reachability recipe](CONSUMER-JOURNEY.md#sso-consumption-dev-issuer-reachability-recipe-d).
 Protecting a route with SSO at the proxy (forward-auth) is not offered to consumers yet (WS-C31).
@@ -195,6 +199,7 @@ object_storage:                     # OPTIONAL — SVC-03 buckets + one scoped k
 #   host: dronefleet                # bare label -> https://dronefleet.<platform-domain>
 #   port: 8080
 #   tls: terminate
+#   health_path: /cgi-bin/healthz   # path the deploy step probes through Traefik (default /)
 ```
 
 ---

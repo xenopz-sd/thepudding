@@ -742,6 +742,12 @@ pct list                 # no svc guests remain
 terraform state list     # empty, per root
 ```
 
+If a Terraform step fails with `fork/exec .terraform/providers/.../terraform-provider-proxmox_...: permission
+denied`, the repository sits on a filesystem that dropped the provider binary's execute bit (seen on an NFS copy of
+the tree). Put the provider cache on local disk with `plugin_cache_dir = "$HOME/.terraform.d/plugin-cache"` in
+`~/.terraformrc` and re-run `terraform init -upgrade` in the affected root; the provider is then linked from the cache
+and keeps its execute bit.
+
 Two known teardown gotchas:
 
 - If a root was left after an offline `terraform init -backend=false`, a live state
@@ -887,7 +893,7 @@ copy-and-verify commands.
 PYTHONPATH=infra/platform-foundation/scripts \
   ~/venv/devinfra/bin/python \
   infra/platform-foundation/scripts/registry_status.py \
-  --json --out /tmp/vlan-status.json
+  --json --ansible-vars --out /tmp/vlan-status.json
 ~/venv/devinfra/bin/ansible-playbook \
   -i ansible/inventory/proxmox-hosts.yml \
   ansible/playbooks/sdn-gateway.yml \
@@ -909,6 +915,19 @@ workstation's traffic to the VLAN subnet is sent via the Proxmox host's LAN IP
 <!-- cwd: . -->
 ```bash
 sudo ip route add 10.0.<vlan_id>.0/24 via <proxmox-lan-ip>
+```
+
+**Prefer one `/24` per VLAN over a single `10.0.0.0/16` route.** A VPN or other
+network that also routes part of `10.0.0.0/16` (a common private range) at a better
+metric silently takes over a `/16` platform route, and every guest becomes unreachable.
+A `/24` per VLAN always wins over such a `/16` by prefix length. Every service installer
+now checks this in its preflight (`scripts/installer/route_check.py`, WS-C64) and stops
+before changing anything, naming the interface that took the traffic. Check it by hand:
+
+<!-- doctest: requires-infra -->
+<!-- cwd: . -->
+```bash
+~/venv/devinfra/bin/python scripts/installer/route_check.py --env-file cluster.env --vlan 20
 ```
 
 Then confirm the control host can now reach a served-VLAN guest over SSH before
@@ -1156,7 +1175,7 @@ Now converge:
 PYTHONPATH=infra/platform-foundation/scripts \
   ~/venv/devinfra/bin/python \
   infra/platform-foundation/scripts/registry_status.py \
-  --json --out /tmp/vlan-status.json
+  --json --ansible-vars --out /tmp/vlan-status.json
 ~/venv/devinfra/bin/ansible-playbook \
   -i ansible/inventory/proxmox-hosts.yml \
   ansible/playbooks/sdn-gateway.yml \
@@ -1246,7 +1265,7 @@ project VLAN and converge once so the gateway + ALLOW rule for `<scratch-vlan>` 
 PYTHONPATH=infra/platform-foundation/scripts \
   ~/venv/devinfra/bin/python \
   infra/platform-foundation/scripts/registry_status.py \
-  --registry /tmp/projects.scratch.yaml --json --out /tmp/vlan-status.json
+  --registry /tmp/projects.scratch.yaml --json --ansible-vars --out /tmp/vlan-status.json
 ~/venv/devinfra/bin/ansible-playbook \
   -i ansible/inventory/proxmox-hosts.yml \
   ansible/playbooks/sdn-gateway.yml \
@@ -1271,7 +1290,7 @@ longer `active`, the emitter puts `<scratch-vlan>` in `decommissioned_vlan_ids`,
 PYTHONPATH=infra/platform-foundation/scripts \
   ~/venv/devinfra/bin/python \
   infra/platform-foundation/scripts/registry_status.py \
-  --registry /tmp/projects.scratch.yaml --json --out /tmp/vlan-status.json
+  --registry /tmp/projects.scratch.yaml --json --ansible-vars --out /tmp/vlan-status.json
 ~/venv/devinfra/bin/ansible-playbook \
   -i ansible/inventory/proxmox-hosts.yml \
   ansible/playbooks/sdn-gateway.yml \

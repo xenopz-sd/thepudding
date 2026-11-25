@@ -67,7 +67,7 @@ See [`defaults/main.yml`](./defaults/main.yml) for the full set. Highlights:
 |---|---|---|
 | `openbao_role` | `primary` | Selects which config to render (`primary` \| `unsealer`). |
 | `openbao_image` | `openbao/openbao:2.4` | Pinned image, pulled through Zot (SVC-14). |
-| `openbao_tls_cert_source` | `svc08` | TLS material source (`svc08` EJBCA, or `letsencrypt` fallback). |
+| `openbao_tls_cert_source` | `svc08` | TLS material source (`svc08` = SVC-08 OpenBao PKI, or `letsencrypt` fallback). |
 | `openbao_storage_path` | `/openbao/data` | Raft integrated-storage path (Req 11). |
 | `openbao_telemetry_retention` | `24h` | Prometheus retention (must be ≥ 1 min, Req 10.1). |
 | `openbao_unsealer_addr` | `https://10.0.20.11:8200` | Transit seal endpoint on the primary (Req 5.2). |

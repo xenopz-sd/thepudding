@@ -191,7 +191,7 @@ it if absent — apply platform-foundation first (see Prerequisites above).
 
 ### A.2 — One-command install (provision → bootstrap → health)
 
-On a throwaway cluster before SVC-08 (CA) and a Grafana OIDC client exist, enable
+On a throwaway cluster without SVC-08 (CA) and without a Grafana OIDC client, enable
 the TLS mock and leave OIDC/GPU at their defaults (the three mock flags and their
 flip-to-real are documented in
 [`mock-stand-ins.md`](../../../.kiro/steering/mock-stand-ins.md) — not restated
@@ -409,7 +409,7 @@ fail-closed behavior, and exact flip-to-real triggers are catalogued in
 | Flag (default) | Stands in for | Flip to real |
 |---|---|---|
 | `grafana_oidc_enabled` (false) | SVC-06 Grafana OIDC client (un-registered) | register the client in ZITADEL + store its secret in OpenBao, then `-e grafana_oidc_enabled=true` |
-| `obs_tls_self_signed` (false) | SVC-08 CA / Let's Encrypt (not built) | deploy SVC-08 (or reach Let's Encrypt) — leave the flag false; Traefik's real resolver issues the Grafana cert |
+| `obs_tls_self_signed` (false) | SVC-08 CA (OpenBao PKI) / Let's Encrypt | install SVC-08 (`svc-08-bootstrap.yml`) and re-run SVC-17/18, or reach Let's Encrypt. Leave the flag false; Traefik's real resolver issues the Grafana cert. The flag fails closed while the platform root is published. |
 | `dcgm_metrics_deferred` (true) | SVC-23 GPU host (not built) | a `gpu`-tagged host exists, then `-e dcgm_metrics_deferred=false` |
 
 The default-off/`deferred` posture IS the real-vs-mock swap gate: it defaults to

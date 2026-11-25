@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-11-25
+A maintenance release from live acceptance on a throwaway cluster. A route check stops installers early when the
+control node cannot reach a platform VLAN the right way. Each SVC-01 instance keeps its own generated inventory.
+A published consumer workload now gets its route from the manifest's `expose` block and is checked where it is
+deployed. The documented manual gateway command works again. The SVC-07 debug re-run captures a failing primary
+bootstrap. Validated by full platform teardowns and from-scratch rebuilds on 2026-11-24 and 2026-11-25.
+
+### Upgrade notes
+- **Route check:** every service preflight now stops when the control node's route to a platform VLAN does not go via
+  the Proxmox host. If a VPN claims `10.0.0.0/16`, add per-VLAN `/24` routes (`docs/TESTING.md`).
+- **SVC-01 generated inventories are per instance** (`svc-01-<slug>.generated.yml`). Re-run `svc-06-bootstrap.yml`
+  and each project's onboarding so every instance writes its own file, then re-run SVC-10 and SVC-17/18.
+- **Published workloads (`expose`):** re-run `hello-workload-deploy.yml` so the route uses
+  `https://<expose.host>.<PLATFORM_DOMAIN>`. The deploy step now checks the route at `expose.health_path` (default
+  `/`) and fails closed on 404 or 502–504, so set `health_path` to a path the workload serves. Onboarding no longer
+  checks the route; its variables `consumer_traefik_ingress_host` and `consumer_expose_route_validate_certs` are
+  replaced by `hello_workload_traefik_ingress_host` and `hello_workload_route_validate_certs`.
+- **Manual gateway command:** pass `--ansible-vars` to `registry_status.py` when feeding its output to
+  `sdn-gateway.yml` with `--extra-vars @<file>`.
+
+### Added
+- **Route check in every service preflight** (WS-C64): installers stop within seconds, before changing anything,
+  when the control node's route to a platform VLAN does not go via the Proxmox host (for example a VPN claiming
+  `10.0.0.0/16`), naming the interface and the per-VLAN `/24` remedy.
+- **`expose.health_path`** in the consumer manifest (optional, default `/`): the path the deploy step requests
+  through Traefik to prove a published workload's route.
+- **`registry_status.py --ansible-vars`**: names the keys after the `sdn_gateway` role's inputs, for the manual
+  `sdn-gateway.yml --extra-vars @<file>` command. The default output is unchanged.
+
+### Changed
+- **Operator docs describe SVC-08 (the OpenBao PKI engine) as the platform CA** in the SVC-01, SVC-07, SVC-09 and
+  SVC-17/18 runbooks and the OpenBao role READMEs; the self-signed mocks remain as opt-ins for a cluster without
+  SVC-08 or for isolating a TLS fault.
+
+### Fixed
+- **SVC-07: the debug re-run now captures a failing primary bootstrap.** With `-e svc07_debug_instrumentation=true`,
+  a failing Task 8.4 child no longer skips the capture: the 0600 `.svc07-task84-child.log` is written and the run then fails
+  with the child's exit code. Before, the pointer printed on a Phase-3 failure sent operators to a re-run that never
+  wrote the log.
+- **A published workload's route now uses the `expose` host** (`fix-consumer-expose-route-and-gateway-docs`).
+  `hello-workload-deploy.yml` reads `expose` from the manifest and renders `https://<expose.host>.<PLATFORM_DOMAIN>`
+  on `expose.port`; before, the route kept the default `<slug>-workload.example.test` host because the values set
+  by onboarding never reached the deploy run. The end-to-end route check moved from the onboarding handoff (which
+  runs before the workload exists and probed `/`) to the deploy step, at `expose.health_path`.
+- **The documented manual gateway command serves opted-in project VLANs.** It fed the emitter's keys straight to
+  `sdn-gateway.yml`, where the role did not read them and refused every opted-in project VLAN as "NOT in the
+  registry-active set ([])". The `sdn-gateway.yml` header and `docs/TESTING.md` now pass `--ansible-vars`.
+- **Each SVC-01 instance writes its own generated inventory** (`svc-01-<slug>.generated.yml`, WS-C63). The shared
+  file was last-writer-wins, so after a project database the ZITADEL backing database lost its DNS record, its
+  monitoring and its trust of the platform root.
+
 ## [0.17.0] — 2026-11-19
 
 Three new shared services, live-validated together by a full platform teardown and from-scratch rebuild on a
@@ -1547,7 +1598,8 @@ foundation**, validated from-scratch on the live cluster.
   Terraform `bpg/proxmox` + Ansible; SDN VLAN-per-project addressing; offline
   test suite made offline-by-construction).
 
-[Unreleased]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.17.0...HEAD
+[Unreleased]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.18.0...HEAD
+[0.18.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.17.0...v0.18.0
 [0.17.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.16.0...v0.17.0
 [0.16.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.15.0...v0.16.0
 [0.15.0]: https://git.xenopz.com/xenopzsd_internal/devinfra/-/compare/v0.14.0...v0.15.0

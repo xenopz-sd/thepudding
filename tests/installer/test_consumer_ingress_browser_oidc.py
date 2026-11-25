@@ -96,15 +96,27 @@ def test_expose_enabled_must_be_bool():
 # =========================================================================== #
 # Component 2/3 — deploy wiring + cross-VLAN preflight (structural).
 # =========================================================================== #
-def test_consumer_provision_drives_expose_route():
-    """Gated on expose.enabled, consumer_provision feeds the openbao-agent
-    traefik_route path a real base-domain host rule + enables the real route."""
-    text = _CONSUMER_PROVISION.read_text(encoding="utf-8")
-    assert "expose" in text, "consumer_provision must consume the expose block (FAILS on unfixed code)"
+_HELLO_WORKLOAD_DEPLOY = (
+    _REPO_ROOT / "ansible" / "roles" / "hello_workload_deploy" / "tasks" / "main.yml"
+)
+
+
+def test_deploy_step_drives_expose_route():
+    """Gated on expose.enabled, the deploy step (the run that renders the route)
+    feeds the openbao-agent traefik_route path a real base-domain host rule and
+    enables the real route.
+
+    Retargeted by fix-consumer-expose-route-and-gateway-docs: these facts used to
+    be set in consumer_provision, a separate process whose facts never reached the
+    deploy run (caught live 2026-11-24). Detailed coverage:
+    tests/installer/test_consumer_expose_route_wiring.py.
+    """
+    text = _HELLO_WORKLOAD_DEPLOY.read_text(encoding="utf-8")
+    assert "expose" in text, "hello_workload_deploy must consume the expose block"
     assert "openbao_agent_workload_host_rule" in text, (
         "the expose path must feed a real base-domain openbao_agent_workload_host_rule"
     )
-    assert "openbao_agent_traefik_route_enabled" in text or "openbao_agent_mock_edge_network" in text, (
+    assert "openbao_agent_traefik_route_enabled" in text, (
         "the expose path must select the real ADR-0018 cross-guest route"
     )
 
@@ -160,8 +172,8 @@ import yaml  # noqa: E402
 _CONSUMER_PROVISION_DEFAULTS = (
     _REPO_ROOT / "ansible" / "roles" / "consumer_provision" / "defaults" / "main.yml"
 )
-_CONSUMER_HANDOFF_DEFAULTS = (
-    _REPO_ROOT / "ansible" / "roles" / "consumer_handoff" / "defaults" / "main.yml"
+_HELLO_WORKLOAD_DEPLOY_DEFAULTS = (
+    _REPO_ROOT / "ansible" / "roles" / "hello_workload_deploy" / "defaults" / "main.yml"
 )
 
 
@@ -203,34 +215,41 @@ def test_phase2_preflight_probes_l3_not_the_not_yet_deployed_app_port():
     assert int(defaults["consumer_expose_l3_probe_port"]) == 22
 
 
-def test_handoff_verifies_exposed_route_end_to_end_through_traefik():
-    """Phase 4 must prove the published route works THROUGH Traefik (Host header
-    = the exposed FQDN, sent to the Traefik ingress), gated on expose.enabled,
-    and fail closed on a missing route (404) or dead backend (502-504)."""
-    tasks = _tasks(_CONSUMER_HANDOFF)
-    names = [t.get("name", "") for t in tasks]
-    probes = [t for t in tasks if "ansible.builtin.uri" in t]
+def test_deploy_step_verifies_exposed_route_end_to_end_through_traefik():
+    """The deploy step must prove the published route works THROUGH Traefik (Host
+    header = the published FQDN, sent to the Traefik ingress), gated on expose, and
+    fail closed on a missing route (404) or dead backend (502-504).
+
+    Retargeted by fix-consumer-expose-route-and-gateway-docs: the check used to sit
+    in the onboarding handoff (Phase 4), which runs before the workload is deployed
+    and probed "/"; it now lives in the deploy step and requests expose.health_path
+    (operator decision Q1: onboarding makes no route check).
+    """
+    tasks = _tasks(_HELLO_WORKLOAD_DEPLOY)
     route_probes = [
-        t for t in probes
-        if "consumer_traefik_ingress_host" in str(t["ansible.builtin.uri"].get("url", ""))
+        t for t in tasks
+        if "ansible.builtin.uri" in t
+        and "hello_workload_traefik_ingress_host" in str(t["ansible.builtin.uri"].get("url", ""))
     ]
-    assert route_probes, "Phase 4 must probe the exposed route via the Traefik ingress"
+    assert route_probes, "the deploy step must probe the published route via the Traefik ingress"
     probe = route_probes[0]
     uri = probe["ansible.builtin.uri"]
-    assert "expose.host" in str(uri.get("headers", {}).get("Host", "")), (
-        "the route probe must send the exposed FQDN as the Host header"
+    assert "openbao_agent_workload_host_rule" in str(uri.get("headers", {}).get("Host", "")), (
+        "the route probe must send the published FQDN as the Host header"
     )
-    assert "expose.enabled" in str(probe.get("when", "")), "probe must be gated on expose.enabled"
+    assert "health_path" in str(uri.get("url", "")), "the probe must request expose.health_path"
+    assert "expose" in str(probe.get("when", "")), "probe must be gated on expose"
     asserts = [
         t for t in tasks
-        if "ansible.builtin.assert" in t and "expose.enabled" in str(t.get("when", ""))
-        and "consumer_expose_route" in str(t["ansible.builtin.assert"].get("that", ""))
+        if "ansible.builtin.assert" in t
+        and "hello_workload_route_probe" in str(t["ansible.builtin.assert"].get("that", ""))
     ]
     assert asserts, "a fail-closed assert on the route probe result is required"
     that = " ".join(map(str, asserts[0]["ansible.builtin.assert"]["that"]))
     for code in ("404", "502", "503", "504"):
         assert code in that, f"the route assert must treat HTTP {code} as failure"
-    banner = next(i for i, n in enumerate(names) if "completion summary banner" in n)
-    assert names.index(probe["name"]) < banner, "route check must run before the banner"
-    defaults = yaml.safe_load(_CONSUMER_HANDOFF_DEFAULTS.read_text(encoding="utf-8"))
-    assert defaults["consumer_traefik_ingress_host"] == "10.0.20.12"
+    assert not [t for t in _tasks(_CONSUMER_HANDOFF) if "ansible.builtin.uri" in t and "expose" in str(t)], (
+        "the onboarding handoff must no longer probe the route"
+    )
+    defaults = yaml.safe_load(_HELLO_WORKLOAD_DEPLOY_DEFAULTS.read_text(encoding="utf-8"))
+    assert defaults["hello_workload_traefik_ingress_host"] == "10.0.20.12"

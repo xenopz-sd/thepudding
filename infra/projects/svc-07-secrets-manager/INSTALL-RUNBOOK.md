@@ -637,6 +637,12 @@ Two structural points worth calling out for a maintainer:
   each imported once under `when: svc07_debug_instrumentation | default(false) |
   bool`, with none left inline in the functional loops. Enable them for a single
   run with `-e svc07_debug_instrumentation=true`.
+- **Troubleshooting a Phase-3 (primary bootstrap) failure.** The child run is
+  `no_log`, so a failure prints a secret-free pointer instead of its output. The
+  two detail paths are: re-run with `-e svc07_debug_instrumentation=true`, which
+  writes the full child output to the 0600 `.svc07-task84-child.log` on the control
+  node; or read `docker logs openbao-openbao-1` on the primary (`10.0.20.10`)
+  (spec `fix-svc07-bootstrap-failure-diagnostics`).
 
 ---
 
@@ -1455,23 +1461,27 @@ to install, initialise/unseal/bootstrap, and onboard (Req 4.3, 4.6):
 > the bootstrap against an `Initialized true` guest — it will skip init and you will
 > not get a token.
 
-> **Step 0 — TLS material prerequisite (homelab bring-up WITHOUT SVC-08/EJBCA).**
+> **Step 0 — TLS material prerequisite (bring-up WITHOUT SVC-08, the internal PKI).**
 > OpenBao's listener is TLS-enabled, so it needs `cert.pem` + `key.pem` in
 > `/etc/openbao/tls` **before** the container starts, or it dies at start with
 > `error loading TLS cert: open /openbao/tls/cert.pem: permission denied` (or a
-> missing-file error). In production that material is issued by **SVC-08 (EJBCA)**
-> and dropped in out-of-band — but **SVC-08 is not built yet**. For a homelab /
-> bootstrap bring-up, the `openbao_install` role can generate a **self-signed
-> MOCK stand-in** for the EJBCA-issued cert on the host, as an **explicit opt-in**
-> (default is **false** — production expects EJBCA). Pass
+> missing-file error). SVC-08 (the OpenBao PKI engine on this service) exists:
+> with SVC-08 installed, `svc-08-bootstrap.yml` issues the listener certificates
+> from the platform CA at the same path, and `OPENBAO_TLS_SELF_SIGNED=true` must be
+> removed from the cluster env file. On the very first SVC-07 bring-up, and on a
+> cluster without SVC-08, the `openbao_install` role can instead generate a
+> **self-signed MOCK stand-in** for the CA-issued cert on the host, as an
+> **explicit opt-in** (default is **false**). It also remains available to isolate
+> a TLS fault. Pass
 > `-e openbao_tls_self_signed=true` on the `openbao.yml` install runs below (both
 > the unsealer Step 1 install run and the primary Step 5 install/init run).
-> The mock cert carries the same SANs EJBCA would issue
+> The mock cert carries the same SANs the platform CA issues
 > (`svc07-20-01`, `svc07-unsealer-20-01`, `localhost`, `openbao.<platform_domain>`,
 > and IPs `10.0.20.10` / `10.0.20.11` / `127.0.0.1`), is owned by the openbao
 > container uid/gid, and its key stays non-world-readable — it is generated
-> on-host and **never committed or echoed**. When SVC-08 exists, drop the real
-> EJBCA-issued cert at the **same path** and set `openbao_tls_self_signed=false`:
+> on-host and **never committed or echoed**. To select the real
+> path, run `svc-08-bootstrap.yml` (it writes the CA-issued cert at the **same
+> path**) and set `openbao_tls_self_signed=false`:
 > OpenBao references the cert by path, so **nothing in OpenBao changes**. Example
 > (append the flag to each install run):
 >
@@ -1480,7 +1490,7 @@ to install, initialise/unseal/bootstrap, and onboard (Req 4.3, 4.6):
 > ```bash
 > # Append `-e openbao_tls_self_signed=true` to BOTH the unsealer install run
 > # (Step 1) and the primary install run (Step 5) shown later in this section.
-> echo "openbao_tls_self_signed=true is an explicit homelab opt-in; default is false (production = SVC-08/EJBCA)."
+> echo "openbao_tls_self_signed=true is an explicit homelab opt-in; default is false (the real path = SVC-08, OpenBao PKI)."
 > ```
 
 The per-project onboarding step is in
@@ -1602,9 +1612,9 @@ never committed (`security-standards.md`, PF FR-8).
 Install the unsealer's Compose stack via the **unsealer-first play** (Play 1 of
 `openbao.yml`, `hosts: openbao-unsealer`), then (on the recovery path) initialise
 and unseal it. Run the install for the unsealer group only. Add
-`-e openbao_tls_self_signed=true` for a homelab bring-up WITHOUT SVC-08/EJBCA
+`-e openbao_tls_self_signed=true` for a bring-up WITHOUT SVC-08
 (Step 0) — it generates the mock TLS cert so OpenBao's listener can start; OMIT it
-once SVC-08 issues the real cert:
+once SVC-08 has issued the real cert (re-run SVC-07 after `svc-08-bootstrap.yml`):
 
 <!-- doctest: requires-infra -->
 <!-- cwd: . -->
@@ -1612,7 +1622,7 @@ once SVC-08 issues the real cert:
 ~/venv/devinfra/bin/ansible-playbook \
   -i ansible/inventory/svc-07-secrets-manager.generated.yml \
   ansible/playbooks/openbao.yml --tags install --limit openbao-unsealer \
-  -e openbao_tls_self_signed=true          # homelab mock TLS (Step 0); drop when SVC-08/EJBCA issues the real cert
+  -e openbao_tls_self_signed=true          # mock TLS (Step 0); drop once SVC-08 has issued the real cert
 ```
 
 Then (recovery path) `bao operator init` the unsealer and **capture its Shamir
@@ -1635,8 +1645,8 @@ is committed or echoed; the keys are shown only as `<unseal-key-N>` /
 # -tls-skip-verify is REQUIRED on every `bao` command below: the listener uses the
 # self-signed MOCK cert (Step 0), which is not in any trust store, so bao's own CLI
 # would otherwise fail with `tls: failed to verify certificate: x509: certificate
-# signed by unknown authority`. Drop -tls-skip-verify once SVC-08/EJBCA issues a
-# cert chaining to a trusted CA. NOTE on flag placement: -tls-skip-verify must come
+# signed by unknown authority`. Drop -tls-skip-verify once SVC-08 has issued a
+# cert chaining to the platform root (BAO_CACERT=.pki/platform-root-ca.pem). NOTE on flag placement: -tls-skip-verify must come
 # AFTER the subcommand and BEFORE any positional argument — e.g.
 # `bao operator unseal -tls-skip-verify <key>` (NOT `... unseal <key> -tls-skip-verify`,
 # and NOT `bao operator -tls-skip-verify unseal ...`).
@@ -1687,7 +1697,7 @@ With that exported, run the unsealer init path so the Transit engine +
 Play 1 (`hosts: openbao-unsealer`) sets `openbao_role: unsealer` as a play var).
 The role reads `OPENBAO_UNSEALER_ROOT_TOKEN` from the environment to authenticate,
 and `-e openbao_tls_self_signed=true` makes it pass `-tls-skip-verify` for the
-mock cert (drop that flag once SVC-08/EJBCA issues a trusted-CA cert):
+mock cert (drop that flag once SVC-08 has issued a platform-CA cert):
 
 <!-- doctest: requires-infra -->
 <!-- cwd: . -->
@@ -1974,7 +1984,7 @@ token is referenced by env-var **name** only (`OPENBAO_ADMIN_TOKEN`, exported ab
 
 > **Mock-cert bring-up: pass `-e openbao_tls_self_signed=true` on onboard too.**
 > If the primary was brought up with the self-signed MOCK cert (a homelab run with
-> `-e openbao_tls_self_signed=true`, no SVC-08/EJBCA trusted CA), the onboard run
+> `-e openbao_tls_self_signed=true`, no SVC-08 platform CA), the onboard run
 > must ALSO pass that flag. `--tags onboard` is a standalone play that does not see
 > the install-time choice, so `openbao_primary_tls_skip_verify` (derived from
 > `openbao_tls_self_signed`) otherwise resolves **false** and no `bao` call gets
@@ -1994,7 +2004,7 @@ token is referenced by env-var **name** only (`OPENBAO_ADMIN_TOKEN`, exported ab
 >
 > To reveal the censored `bao` error for one run on a THROWAWAY cluster, also append
 > `-e openbao_dev_expose_secrets=true` (dev-only, off by default — never committed,
-> never in CI/acceptance/production). With a real SVC-08/EJBCA trusted-CA cert this
+> never in CI/acceptance/production). With a real SVC-08 platform-CA cert this
 > flag is unnecessary: the toggle stays false and `bao` verifies the cert normally.
 
 At the end of this section the primary is operational and auto-unsealing against
@@ -2486,14 +2496,14 @@ tokens are referenced by name only.
 
 > **Self-signed mock-cert Primary (the homelab default).** The suite drives both
 > feature roles against the mock-cert Primary the 6.1–6.3 bring-up created
-> (`openbao_tls_self_signed=true`, no SVC-08/EJBCA), so its `_run_role` helper
+> (`openbao_tls_self_signed=true`, no SVC-08), so its `_run_role` helper
 > threads `openbao_tls_self_signed=true` into **every** role run by default
 > (`_DEFAULT_ROLE_EXTRA_VARS`) — exactly the flag 6.2 and 6.3 pass by hand. Both
 > roles derive `openbao_primary_tls_skip_verify` from `openbao_tls_self_signed`
 > (default **false**), so WITHOUT this the roles' `bao` docker-exec calls and the
 > Agent's auto-auth would fail `x509: certificate signed by unknown authority`
 > against the self-signed cert. You do **not** pass the flag to `pytest` — the
-> harness owns it. When SVC-08/EJBCA issues a real trusted-CA cert, a run against
+> harness owns it. When SVC-08 has issued a real platform-CA cert, a run against
 > that Primary overrides the default to `false` per-test (the helper merges
 > caller extra-vars over the default).
 

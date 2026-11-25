@@ -1,0 +1,26 @@
+---
+# tasks/main.yml — control_route_check (WS-C64). Runs on the control node, read-only, before anything is changed.
+# A route to 10.0.<vlan>.1 that does not go via the Proxmox host (for example a VPN claiming 10.0.0.0/16) would make
+# every guest unreachable and fail the run only after long SSH timeouts.
+- name: "Route check | Does the control node reach the platform VLAN(s) via the Proxmox host?"
+  ansible.builtin.command:
+    argv: >-
+      {{ [crc_venv_python, crc_helper, '--env-file',
+          (cluster_env_file if (cluster_env_file is match('^/')) else crc_repo_root ~ '/' ~ cluster_env_file)]
+         + (crc_vlans | map('int') | unique | map('string') | map('regex_replace', '^', '--vlan=') | list) }}
+  delegate_to: localhost
+  become: false
+  register: crc_result
+  changed_when: false
+  failed_when: false
+- name: "Route check | INFO — result"
+  ansible.builtin.debug:
+    msg: >-
+      INFO: {{ (crc_result.stdout | default('{}') | from_json).messages
+               | default([crc_result.stderr | default('')]) }}
+- name: "Route check | Fail closed on a wrong route (nothing was changed)"
+  ansible.builtin.fail:
+    msg: >-
+      {{ ((crc_result.stdout | default('{}') | from_json).messages | default([crc_result.stderr | default('')]))
+         | join(' ') }} Nothing was changed.
+  when: crc_result.rc != 0

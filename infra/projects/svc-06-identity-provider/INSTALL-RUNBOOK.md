@@ -211,6 +211,17 @@ over both guests (`pct list` + `terraform state list`).
 > a clean-slate that left the backing DB standing fails the gate rather than
 > reporting clean (spec `fix-svc06-clean-slate-backing-db-residue`).
 
+> The clean-slate also clears the stale ZITADEL `provision_token` field in OpenBao (field-scoped: the `masterkey`
+> and the backing DB's `app_password` are untouched), so the next bootstrap stores a fresh FirstInstance token
+> and project onboarding does not fail with 401 (spec `fix-svc06-clean-slate-provision-token-residue`).
+
+> **TLS verification of the production-path provisioner.** Project onboarding calls ZITADEL through Traefik
+> (`https://auth.<platform-domain>`). `zop_base_url_tls_skip_verify` (role `zitadel-org-provision`) decides whether
+> the helper gets `--insecure`; it defaults to `true`, which tolerates the self-signed mock certificate
+> (spec `fix-zitadel-org-provision-production-path-insecure-tls`). A direct `zitadel-org-provision.yml` run takes
+> `-e zop_base_url_tls_skip_verify=false`. Project onboarding (`project-consumer-bootstrap.yml`) does not forward the
+> variable to its child run, so there it stays `true` even with SVC-08 installed.
+
 ---
 
 ## A.5 — ZITADEL reachable through Traefik (cross-guest file-provider route)

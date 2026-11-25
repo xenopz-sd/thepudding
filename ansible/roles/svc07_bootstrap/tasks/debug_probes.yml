@@ -56,3 +56,14 @@
       - "task_8_4_stdout_length={{ svc07_primary_bootstrap.stdout | default('') | length }}"
       - "task_8_4_has_TOKEN_marker={{ 'TOKEN=' in (svc07_primary_bootstrap.stdout | default('')) }}"
   no_log: false
+
+# The deferred Task 8.4 failure: with the debug opt-in, Task 8.4's failed_when does
+# not fail the task, so the capture above also runs for a FAILING child. Raise that
+# failure here, after the 0600 log is written. The message carries the non-secret rc only.
+- name: "Bootstrap | Task 8.4 — fail after the debug capture if the primary-bootstrap child failed"
+  ansible.builtin.fail:
+    msg: >-
+      The primary-bootstrap child run (Task 8.4) exited with rc={{ svc07_primary_bootstrap.rc | default('n/a') }}.
+      Its full output is in the 0600 .svc07-task84-child.log on this control node
+      (it contains secrets; delete it after use).
+  when: (svc07_primary_bootstrap.rc | default(1)) != 0
